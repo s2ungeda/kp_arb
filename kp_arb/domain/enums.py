@@ -17,6 +17,14 @@ class Underlying(StrEnum):
             Underlying.HYUNDAI: "005380",
         }[self]
 
+    @classmethod
+    def from_krx_code(cls, code: str) -> Underlying | None:
+        """KRX 종목코드를 underlying으로 역매핑. 미지 코드는 None."""
+        for underlying in cls:
+            if underlying.krx_code == code:
+                return underlying
+        return None
+
 
 class Venue(StrEnum):
     LS = "ls"
