@@ -15,11 +15,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from ..domain.enums import Account, Instrument, OrderType, Side, Venue
+from ..domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from ..domain.models import OrderIntent, Position
 from ..routing import account_for
 from .base import LSGateway
 from .ls_rest import LSRestClient, RestError, RestResponse
+
+_UNDERLYING_BY_CODE: dict[str, Underlying] = {u.krx_code: u for u in Underlying}
 
 
 @dataclass
@@ -40,6 +42,13 @@ class LSApiGateway(LSGateway):
     SPOT_AMEND_TR = "CSPAT00701"
     SPOT_CANCEL_TR = "CSPAT00801"
     SPOT_PATH = "/stock/order"
+
+    # 잔고·예수금·증거금 조회 (계좌별). 정확한 TR 필드명은 라이브 구현 시 확인.
+    STOCK_DEPOSIT_TR = "CSPAQ22200"     # 주식 예수금 (대안 주문가능 CDPCQ04700)
+    STOCK_POSITIONS_TR = "CSPAQ12300"   # 주식 잔고 (대안 t0424)
+    DERIV_TR = "FOCCQ33600"             # 선물옵션 잔고·증거금
+    STOCK_ACC_PATH = "/stock/accno"
+    DERIV_ACC_PATH = "/futureoption/accno"
 
     _SPOT: frozenset[Instrument] = frozenset({Instrument.KR_STOCK, Instrument.KR_ETF})
     _SUCCESS: frozenset[str] = frozenset({"00000"})
@@ -91,10 +100,74 @@ class LSApiGateway(LSGateway):
         self._check_ok(resp, self.SPOT_CANCEL_TR)
 
     async def get_positions(self, account: Account) -> Sequence[Position]:
-        raise NotImplementedError("잔고/포지션 조회는 블록 1-5")
+        """계좌별 잔고(포지션) 조회. 주식 CSPAQ12300 / 선물 FOCCQ33600."""
+        if account is Account.KR_STOCK:
+            resp = await self._rest.request(
+                self.STOCK_POSITIONS_TR, {"account": account.value}, path=self.STOCK_ACC_PATH
+            )
+            rows = self._rows(resp, self.STOCK_POSITIONS_TR)
+            return [self._stock_position(r) for r in rows]
+        resp = await self._rest.request(
+            self.DERIV_TR, {"account": account.value}, path=self.DERIV_ACC_PATH
+        )
+        rows = self._rows(resp, self.DERIV_TR)
+        return [self._deriv_position(r) for r in rows]
 
     async def get_balance(self, account: Account) -> float:
-        raise NotImplementedError("예수금/증거금 조회는 블록 1-5")
+        """계좌별 가용자금 조회. 주식 예수금 CSPAQ22200 / 선물 증거금 FOCCQ33600."""
+        if account is Account.KR_STOCK:
+            resp = await self._rest.request(
+                self.STOCK_DEPOSIT_TR, {"account": account.value}, path=self.STOCK_ACC_PATH
+            )
+            return self._amount(resp, self.STOCK_DEPOSIT_TR, "DpsAmt")
+        resp = await self._rest.request(
+            self.DERIV_TR, {"account": account.value}, path=self.DERIV_ACC_PATH
+        )
+        return self._amount(resp, self.DERIV_TR, "OrdAbleAmt")
+
+    # --- 잔고/포지션 파싱 ---
+
+    def _rows(self, resp: RestResponse, tr_cd: str) -> list[dict[str, Any]]:
+        self._check_ok(resp, tr_cd)
+        block = resp.body.get(f"{tr_cd}OutBlock3")
+        return list(block) if isinstance(block, list) else []
+
+    def _amount(self, resp: RestResponse, tr_cd: str, field: str) -> float:
+        self._check_ok(resp, tr_cd)
+        block = resp.body.get(f"{tr_cd}OutBlock2")
+        if not isinstance(block, dict) or field not in block:
+            raise RestError(f"{field} missing in {tr_cd} response")
+        return float(block[field])
+
+    def _stock_position(self, row: dict[str, Any]) -> Position:
+        # 주식 잔고는 롱 전용(공매도 미사용).
+        return Position(
+            venue=Venue.LS,
+            instrument=Instrument.KR_STOCK,
+            underlying=self._underlying(str(row["IsuNo"])),
+            side=Side.BUY,
+            qty=float(row["BalQty"]),
+            avg_price=float(row["AvrPrc"]),
+            account=Account.KR_STOCK,
+        )
+
+    def _deriv_position(self, row: dict[str, Any]) -> Position:
+        side = Side.BUY if str(row["BnsTpCode"]) == "2" else Side.SELL  # 1매도 2매수
+        return Position(
+            venue=Venue.LS,
+            instrument=Instrument.KR_STOCK_FUTURE,
+            underlying=self._underlying(str(row["IsuNo"])),
+            side=side,
+            qty=float(row["BalQty"]),
+            avg_price=float(row["AvrPrc"]),
+            account=Account.KR_DERIV,
+        )
+
+    def _underlying(self, code: str) -> Underlying:
+        underlying = _UNDERLYING_BY_CODE.get(code)
+        if underlying is None:
+            raise RestError(f"unknown issue code {code}")
+        return underlying
 
     # --- 요청 본문 구성 (TR 필드명/코드는 라이브 구현 시 확인) ---
 
