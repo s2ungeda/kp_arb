@@ -21,8 +21,6 @@ from ..routing import account_for
 from .base import LSGateway
 from .ls_rest import LSRestClient, RestError, RestResponse
 
-_UNDERLYING_BY_CODE: dict[str, Underlying] = {u.krx_code: u for u in Underlying}
-
 
 @dataclass
 class OrderContext:
@@ -164,7 +162,7 @@ class LSApiGateway(LSGateway):
         )
 
     def _underlying(self, code: str) -> Underlying:
-        underlying = _UNDERLYING_BY_CODE.get(code)
+        underlying = Underlying.from_krx_code(code)
         if underlying is None:
             raise RestError(f"unknown issue code {code}")
         return underlying

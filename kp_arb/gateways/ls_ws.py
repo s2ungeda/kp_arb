@@ -22,8 +22,6 @@ QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1"})
 FILL_TRS: frozenset[str] = frozenset({"SC0", "SC1", "SC2", "SC3", "SC4"})
 STATUS_TR = "JIF"
 
-_UNDERLYING_BY_CODE: dict[str, Underlying] = {u.krx_code: u for u in Underlying}
-
 
 class Fill(BaseModel):
     """체결 이벤트(DESIGN.md §10 fills). 추후 StateStore에서 재사용 가능."""
@@ -151,7 +149,7 @@ class LSWebSocketClient:
 
     def _parse_quote(self, msg: dict[str, Any]) -> Quote | None:
         code = msg.get("header", {}).get("tr_key", "")
-        underlying = _UNDERLYING_BY_CODE.get(code)
+        underlying = Underlying.from_krx_code(code)
         if underlying is None:
             return None
         body = msg["body"]
