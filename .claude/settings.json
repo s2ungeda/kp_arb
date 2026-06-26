@@ -1,0 +1,13 @@
+{
+  "_comment": "예시. PostToolUse 훅 스키마는 Claude Code 버전마다 다를 수 있으니 공식 문서에서 현재 문법을 확인할 것.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "./.claude/hooks/check.sh" }
+        ]
+      }
+    ]
+  }
+}
