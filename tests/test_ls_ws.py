@@ -129,6 +129,23 @@ async def test_reconnect_exhausted_raises() -> None:
     assert connector.connects == 2
 
 
+async def test_ack_frame_without_body_is_skipped() -> None:
+    # LS 구독 등록 ACK 등 body 없는 프레임은 크래시 없이 무시(on_raw로는 관측).
+    frame = json.dumps({"header": {"tr_cd": "JIF", "rsp_cd": "00000"}, "body": None})
+    session = FakeConnection([frame])
+    client = LSWebSocketClient(FakeConnector([session]))
+    statuses: list[MarketStatus] = []
+    raws: list[str] = []
+    client.on_market_status.append(statuses.append)
+    client.on_raw.append(raws.append)
+    client.subscribe_market_status(Underlying.SAMSUNG)
+
+    await client.run()  # 예외 없이 통과
+
+    assert statuses == []       # 데이터로 처리 안 함
+    assert len(raws) == 1       # 원시 프레임은 관측됨
+
+
 async def test_unknown_tr_is_ignored() -> None:
     frame = json.dumps({"header": {"tr_cd": "XXX"}, "body": {}})
     session = FakeConnection([frame])

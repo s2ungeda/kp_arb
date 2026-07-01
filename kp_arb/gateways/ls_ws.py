@@ -74,6 +74,7 @@ class LSWebSocketClient:
         self.on_quote: list[Callable[[Quote], None]] = []
         self.on_fill: list[Callable[[Fill], None]] = []
         self.on_market_status: list[Callable[[MarketStatus], None]] = []
+        self.on_raw: list[Callable[[str], None]] = []  # 진단: 모든 원시 프레임
 
     # --- 구독 등록(희망 상태). 실제 전송은 connect 시 _resubscribe ---
 
@@ -131,7 +132,11 @@ class LSWebSocketClient:
 
     def _dispatch(self, raw: str) -> None:
         msg = json.loads(raw)
+        for raw_handler in self.on_raw:
+            raw_handler(raw)
         tr_cd = msg.get("header", {}).get("tr_cd")
+        if not isinstance(msg.get("body"), dict):
+            return  # 등록 ACK/시스템 프레임(body 없음) — 데이터 아님, 무시
         if tr_cd in QUOTE_TRS:
             quote = self._parse_quote(msg)
             if quote is not None:
