@@ -1,0 +1,85 @@
+"""InstrumentSelector 계약 테스트. 순수 로직(세션 맵 입력)."""
+from kp_arb.domain.enums import Account, Instrument, SessionPhase, Side, Underlying
+from kp_arb.domain.models import InstrumentStatus
+from kp_arb.instrument_selector import InstrumentSelector, Selection
+from kp_arb.session import build_session
+
+SAMSUNG = Underlying.SAMSUNG
+
+
+def _status(instrument: Instrument, *, tradeable: bool) -> InstrumentStatus:
+    return InstrumentStatus(instrument=instrument, tradeable=tradeable)
+
+
+# --- 정규장 ---
+
+
+def test_regular_long_selects_cheapest() -> None:
+    session = build_session(SessionPhase.REGULAR)
+    # 주식이 가장 저렴 → 주식/주식계좌 선택.
+    sel = InstrumentSelector(
+        costs={
+            Instrument.KR_STOCK: 0.0005,
+            Instrument.KR_ETF: 0.002,
+            Instrument.KR_STOCK_FUTURE: 0.001,
+        }
+    ).select(SAMSUNG, Side.BUY, session)
+    assert sel == Selection(Instrument.KR_STOCK, Account.KR_STOCK)
+
+
+def test_regular_short_selects_future_not_spot() -> None:
+    session = build_session(SessionPhase.REGULAR)
+    # 숏: 주식·ETF 제외 → 정규장에서 유일 후보는 주식선물.
+    sel = InstrumentSelector().select(SAMSUNG, Side.SELL, session)
+    assert sel == Selection(Instrument.KR_STOCK_FUTURE, Account.KR_DERIV)
+
+
+def test_short_never_selects_spot_even_if_only_spot() -> None:
+    # 주식만 거래가능한 상황에서 숏이면 선택 불가(None).
+    session = {Instrument.KR_STOCK: _status(Instrument.KR_STOCK, tradeable=True)}
+    assert InstrumentSelector().select(SAMSUNG, Side.SELL, session) is None
+
+
+def test_short_excludes_etf_too() -> None:
+    session = {
+        Instrument.KR_ETF: _status(Instrument.KR_ETF, tradeable=True),
+        Instrument.KR_STOCK_FUTURE: _status(Instrument.KR_STOCK_FUTURE, tradeable=True),
+    }
+    sel = InstrumentSelector().select(SAMSUNG, Side.SELL, session)
+    assert sel is not None and sel.instrument is Instrument.KR_STOCK_FUTURE
+
+
+# --- 야간 ---
+
+
+def test_night_selects_night_future() -> None:
+    session = build_session(SessionPhase.NIGHT_DERIV)
+    for side in (Side.BUY, Side.SELL):
+        sel = InstrumentSelector().select(SAMSUNG, side, session)
+        assert sel == Selection(Instrument.KR_NIGHT_FUTURE, Account.KR_DERIV)
+
+
+# --- tiebreak / 가용성 ---
+
+
+def test_liquidity_breaks_cost_tie() -> None:
+    session = build_session(SessionPhase.REGULAR)
+    # 비용 동률 → 유동성 높은 ETF 선택.
+    sel = InstrumentSelector(
+        liquidity={Instrument.KR_ETF: 100.0},
+    ).select(SAMSUNG, Side.BUY, session)
+    assert sel is not None and sel.instrument is Instrument.KR_ETF
+
+
+def test_deadzone_returns_none() -> None:
+    session = build_session(SessionPhase.DEAD)
+    assert InstrumentSelector().select(SAMSUNG, Side.BUY, session) is None
+
+
+def test_untradeable_excluded() -> None:
+    session = {
+        Instrument.KR_STOCK: _status(Instrument.KR_STOCK, tradeable=False),
+        Instrument.KR_STOCK_FUTURE: _status(Instrument.KR_STOCK_FUTURE, tradeable=True),
+    }
+    sel = InstrumentSelector().select(SAMSUNG, Side.BUY, session)
+    assert sel is not None and sel.instrument is Instrument.KR_STOCK_FUTURE
