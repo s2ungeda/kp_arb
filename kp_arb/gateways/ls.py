@@ -186,6 +186,14 @@ class LSApiGateway(LSGateway):
         )
         return self._amount(resp, self.DERIV_TR, "OrdAbleAmt")
 
+    async def raw_request(
+        self, account: Account, tr_cd: str, path: str, *, method: str = "POST"
+    ) -> RestResponse:
+        """진단용 원시 TR 요청(계좌 자격 주입, 파싱 없음). 실 응답 필드 확인용."""
+        return await self._rest_for(account).request(
+            tr_cd, self._account_fields(account), path=path, method=method
+        )
+
     # --- 잔고/포지션 파싱 ---
 
     def _rows(self, resp: RestResponse, tr_cd: str) -> list[dict[str, Any]]:

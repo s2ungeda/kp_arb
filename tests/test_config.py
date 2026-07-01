@@ -60,6 +60,23 @@ def test_env_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     assert EnvSecrets().get("NOPE_XYZ") is None
 
 
+def test_env_secrets_empty_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 빈 .env 값(LS_X=)이 keyring 폴백을 가리지 않도록.
+    monkeypatch.setenv("EMPTY_XYZ", "")
+    assert EnvSecrets().get("EMPTY_XYZ") is None
+
+
+def test_load_treats_empty_as_missing() -> None:
+    from kp_arb.config import LSAccounts
+
+    class Blanks:
+        def get(self, name: str) -> str | None:
+            return ""  # 전부 빈 값
+
+    with pytest.raises(ConfigError):
+        LSAccounts.load(Blanks())
+
+
 def test_chained_prefers_first_then_falls_back() -> None:
     chain = ChainedSecrets(MockSecrets({"X": "a"}), MockSecrets({"X": "b", "Y": "c"}))
     assert chain.get("X") == "a"   # 앞 provider 우선

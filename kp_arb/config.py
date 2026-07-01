@@ -46,10 +46,10 @@ class SecretProvider(Protocol):
 
 
 class EnvSecrets:
-    """OS 환경변수에서 조회."""
+    """OS 환경변수에서 조회. 빈 문자열은 '없음'으로 취급(빈 .env 값이 keyring을 가리지 않게)."""
 
     def get(self, name: str) -> str | None:
-        return os.environ.get(name)
+        return os.environ.get(name) or None
 
 
 class KeyringSecrets:
@@ -67,7 +67,7 @@ class KeyringSecrets:
             value = keyring.get_password(self._service, name)
         except Exception:  # 백엔드 미가용 등 → 폴백
             return None
-        return value if isinstance(value, str) else None
+        return value if isinstance(value, str) and value else None
 
 
 class ChainedSecrets:
@@ -117,7 +117,7 @@ class LSAccounts:
 
         def req(name: str) -> str:
             value = provider.get(name)
-            if value is None:
+            if not value:
                 raise ConfigError(f"missing secret {name}")
             return value
 
