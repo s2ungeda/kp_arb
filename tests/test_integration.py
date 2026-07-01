@@ -1,13 +1,13 @@
 """통합 드라이런 스모크 테스트 (BUILD_PLAN Phase 5-1). 라이브 호출 없음.
 
-mock 게이트웨이 + NoopStrategy로 한 사이클: 시세→MarketState→리스크→상태저장→FX 발행.
-검증: 주문 0건 / 노출 보고 1회 이상 / 상태 저장됨.
+mock 게이트웨이 + NoopStrategy로 한 사이클: 시세→MarketState→리스크→상태저장→노출 데이터 전송.
+검증: 주문 0건 / 노출 전송 1회 이상 / 상태 저장됨.
 """
 from pathlib import Path
 
 from kp_arb.domain.enums import Account, Instrument, Side, Underlying, Venue
 from kp_arb.domain.models import Position, Quote
-from kp_arb.fx_reporter import ExposureReport, FXExposureReporter
+from kp_arb.fx_reporter import FXExposureReporter, Signal
 from kp_arb.gateways.hl import Mark
 from kp_arb.gateways.ls_ws import MarketStatus
 from kp_arb.gateways.mock_hl import MockHLGateway
@@ -24,10 +24,10 @@ SAMSUNG_CODE = Underlying.SAMSUNG.krx_code
 
 class MockSink:
     def __init__(self) -> None:
-        self.published: list[ExposureReport] = []
+        self.sent: list[Signal] = []
 
-    async def publish(self, report: ExposureReport) -> bool:
-        self.published.append(report)
+    async def send(self, signal: Signal) -> bool:
+        self.sent.append(signal)
         return True
 
 
@@ -42,7 +42,7 @@ async def test_dry_run_cycle_smoke(tmp_path: Path) -> None:
     hl.seed_position(Position(venue=Venue.HYPERLIQUID, instrument=Instrument.HL_PERP,
                               underlying=SAMSUNG, side=Side.SELL, qty=2, avg_price=52.0))
     sink = MockSink()
-    reporter = FXExposureReporter(sink, source_id="kp-arb")
+    reporter = FXExposureReporter(sink, token="tok")
 
     async with StateStore(str(tmp_path / "state.db")) as store:
         runner = DryRunner(
@@ -65,9 +65,11 @@ async def test_dry_run_cycle_smoke(tmp_path: Path) -> None:
     # 1) 주문 0건 (NoopStrategy)
     assert order_ids == []
     assert ls.placed == [] and hl.placed == []
-    # 2) 노출 보고 1회 이상
-    assert len(sink.published) >= 1
-    assert sink.published[0].exposure_usd == -104.0  # -2 * 52
+    # 2) 노출 전송 1회 이상 (total_coin = 국내 롱 명목: 주식 100*70000)
+    assert len(sink.sent) >= 1
+    assert sink.sent[0].total_coin == 7_000_000.0
+    assert sink.sent[0].total_domestic == 0.0
+    assert sink.sent[0].fx == 1_350.0
     assert reporter.last_sent_ok is True
     # 3) 상태 저장됨
     assert len(positions) == 2  # 국내 + HL 포지션 영속화
@@ -79,7 +81,7 @@ async def test_dry_run_deadzone_no_reference(tmp_path: Path) -> None:
     session = SessionService()
     ls = MockLSGateway()
     hl = MockHLGateway()
-    reporter = FXExposureReporter(MockSink(), source_id="kp-arb")
+    reporter = FXExposureReporter(MockSink(), token="tok")
 
     async with StateStore(str(tmp_path / "state.db")) as store:
         runner = DryRunner(session=session, strategy=NoopStrategy(), ls=ls, hl=hl,
@@ -87,4 +89,4 @@ async def test_dry_run_deadzone_no_reference(tmp_path: Path) -> None:
         order_ids = await runner.run_cycle(ts=1.0)
 
     assert order_ids == []
-    assert reporter.last_sent_ok is True  # 노출 0이라도 보고는 됨
+    assert reporter.last_sent_ok is True  # 노출 0이라도 전송은 됨

@@ -10,6 +10,7 @@ from __future__ import annotations
 from .domain.enums import Account, Underlying
 from .domain.models import MarketState, Position, Quote
 from .engine import ArbEngine
+from .fx import usd_exposure
 from .fx_reporter import FXExposureReporter
 from .gateways.base import HLGateway, LSGateway
 from .gateways.hl import Mark
@@ -69,11 +70,12 @@ class DryRunner:
         for position in positions:
             await self._store.save_position(position, ts=ts)
 
-        report = await self._reporter.report(
-            positions, self._engine.market.hl_mark_usd, ts=ts
-        )
+        fx = self._engine.market.usdkrw or 0.0
+        await self._reporter.report(positions, fx, id=f"cycle-{ts}", datetime=str(ts))
+        # DB 감사용 값은 HL USD 명목(usd_exposure), #2로는 total_coin(KRW)을 전송.
+        usd = usd_exposure(positions, self._engine.market.hl_mark_usd)
         await self._store.add_fx_report(
-            ts=ts, exposure_usd=report.exposure_usd, sent_ok=bool(self._reporter.last_sent_ok)
+            ts=ts, exposure_usd=usd, sent_ok=bool(self._reporter.last_sent_ok)
         )
         await self._store.log_event(
             ts=ts, level="INFO", component="runner", message=f"cycle orders={len(order_ids)}"

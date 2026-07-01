@@ -1,87 +1,96 @@
 """FXExposureReporter 계약 테스트. 라이브 없음(mock sink). USD/KRW 주문 없음."""
 from kp_arb.domain.enums import Account, Instrument, Side, Underlying, Venue
 from kp_arb.domain.models import Position
-from kp_arb.fx_reporter import ExposureReport, FXExposureReporter
+from kp_arb.fx_reporter import FXExposureReporter, Signal
 
 SAMSUNG = Underlying.SAMSUNG
 
 
 class MockSink:
-    """발행된 노출 메시지를 기록하는 mock. sent_ok 반환값 설정 가능."""
+    """전송된 Signal을 기록하는 mock. sent_ok 반환값 설정 가능."""
 
     def __init__(self, *, ok: bool = True) -> None:
         self.ok = ok
-        self.published: list[ExposureReport] = []
+        self.sent: list[Signal] = []
 
-    async def publish(self, report: ExposureReport) -> bool:
-        self.published.append(report)
+    async def send(self, signal: Signal) -> bool:
+        self.sent.append(signal)
         return self.ok
 
 
-def hl_pos(underlying: Underlying, side: Side, qty: float, avg: float) -> Position:
-    return Position(venue=Venue.HYPERLIQUID, instrument=Instrument.HL_PERP,
-                    underlying=underlying, side=side, qty=qty, avg_price=avg)
+def dom(instrument: Instrument, qty: float, avg: float, side: Side = Side.BUY) -> Position:
+    spot = instrument in (Instrument.KR_STOCK, Instrument.KR_ETF)
+    acct = Account.KR_STOCK if spot else Account.KR_DERIV
+    return Position(venue=Venue.LS, instrument=instrument, underlying=SAMSUNG,
+                    side=side, qty=qty, avg_price=avg, account=acct)
 
 
-def ls_pos() -> Position:
-    return Position(venue=Venue.LS, instrument=Instrument.KR_STOCK, underlying=SAMSUNG,
-                    side=Side.BUY, qty=100, avg_price=70_000, account=Account.KR_STOCK)
+def hl(side: Side = Side.SELL) -> Position:
+    return Position(venue=Venue.HYPERLIQUID, instrument=Instrument.HL_PERP, underlying=SAMSUNG,
+                    side=side, qty=2, avg_price=52.0)
 
 
-async def test_report_computes_and_publishes() -> None:
+async def test_report_computes_total_coin() -> None:
     sink = MockSink()
-    reporter = FXExposureReporter(sink, source_id="kp-arb")
-    report = await reporter.report([hl_pos(SAMSUNG, Side.SELL, 2, 52.0)], ts=1.0)
+    reporter = FXExposureReporter(sink, token="secret")
+    positions = [
+        dom(Instrument.KR_STOCK, 100, 70_000),        # 100*70000*1 = 7,000,000
+        dom(Instrument.KR_STOCK_FUTURE, 2, 71_000),   # 2*71000*10  = 1,420,000
+        dom(Instrument.KR_ETF, 10, 50_000),           # 10*50000*2  = 1,000,000
+    ]
+    signal = await reporter.report(positions, fx=1_350.0, id="s1", datetime="2026-07-01")
 
-    assert report.exposure_usd == -104.0  # signed -2 * 52
-    assert report.source_id == "kp-arb"
-    assert report.ts == 1.0
-    assert sink.published == [report]  # mock sink로 발행됨
+    assert signal.total_coin == 9_420_000.0
+    assert signal.total_domestic == 0.0
+    assert signal.fx == 1_350.0
+    assert signal.token == "secret"
+    assert signal.id == "s1"
+    assert sink.sent == [signal]
     assert reporter.last_sent_ok is True
 
 
-async def test_marks_override_avg_price() -> None:
-    sink = MockSink()
-    reporter = FXExposureReporter(sink, source_id="kp-arb")
-    report = await reporter.report(
-        [hl_pos(SAMSUNG, Side.BUY, 3, 52.0)], marks={SAMSUNG: 60.0}, ts=1.0
-    )
-    assert report.exposure_usd == 180.0  # 3 * 60 (mark override)
+async def test_hl_and_short_excluded() -> None:
+    reporter = FXExposureReporter(MockSink())
+    positions = [hl(Side.SELL), dom(Instrument.KR_STOCK, 5, 70_000, side=Side.SELL)]
+    signal = await reporter.report(positions, fx=1_350.0, id="s1")
+    assert signal.total_coin == 0.0  # HL 제외 + 국내 숏 제외(롱만)
 
 
-async def test_domestic_positions_excluded() -> None:
-    sink = MockSink()
-    reporter = FXExposureReporter(sink, source_id="kp-arb")
-    report = await reporter.report([ls_pos()], ts=1.0)
-    assert report.exposure_usd == 0.0  # 국내(KRW) 포지션은 USD 노출 아님
-    assert len(sink.published) == 1
+async def test_multipliers_override() -> None:
+    reporter = FXExposureReporter(MockSink(), multipliers={Instrument.KR_ETF: 1.0})
+    signal = await reporter.report([dom(Instrument.KR_ETF, 10, 50_000)], fx=1_350.0, id="s1")
+    assert signal.total_coin == 500_000.0  # 10*50000*1 (오버라이드)
+
+
+async def test_id_generated_when_omitted() -> None:
+    reporter = FXExposureReporter(MockSink())
+    signal = await reporter.report([], fx=1_350.0)
+    assert signal.id  # 자동 생성(uuid), 비어있지 않음
 
 
 async def test_report_if_changed_skips_unchanged() -> None:
     sink = MockSink()
-    reporter = FXExposureReporter(sink, source_id="kp-arb")
-    positions = [hl_pos(SAMSUNG, Side.SELL, 2, 52.0)]
-    first = await reporter.report_if_changed(positions, ts=1.0)
-    second = await reporter.report_if_changed(positions, ts=2.0)
-
+    reporter = FXExposureReporter(sink)
+    positions = [dom(Instrument.KR_STOCK, 100, 70_000)]
+    first = await reporter.report_if_changed(positions, fx=1_350.0, id="a")
+    second = await reporter.report_if_changed(positions, fx=1_350.0, id="b")
     assert first is not None
-    assert second is None  # 변동 없으면 재발행 안 함
-    assert len(sink.published) == 1
+    assert second is None  # total_coin 불변 → 재전송 안 함
+    assert len(sink.sent) == 1
 
 
 async def test_report_if_changed_publishes_on_change() -> None:
     sink = MockSink()
-    reporter = FXExposureReporter(sink, source_id="kp-arb")
-    await reporter.report_if_changed([hl_pos(SAMSUNG, Side.SELL, 2, 52.0)], ts=1.0)
-    changed = await reporter.report_if_changed([hl_pos(SAMSUNG, Side.SELL, 3, 52.0)], ts=2.0)
+    reporter = FXExposureReporter(sink)
+    await reporter.report_if_changed([dom(Instrument.KR_STOCK, 100, 70_000)], fx=1_350.0, id="a")
+    changed = await reporter.report_if_changed(
+        [dom(Instrument.KR_STOCK, 200, 70_000)], fx=1_350.0, id="b"
+    )
+    assert changed is not None and changed.total_coin == 14_000_000.0
+    assert len(sink.sent) == 2
 
-    assert changed is not None
-    assert changed.exposure_usd == -156.0  # -3 * 52
-    assert len(sink.published) == 2
 
-
-async def test_publish_failure_tracked() -> None:
-    sink = MockSink(ok=False)
-    reporter = FXExposureReporter(sink, source_id="kp-arb")
-    await reporter.report([hl_pos(SAMSUNG, Side.SELL, 2, 52.0)], ts=1.0)
-    assert reporter.last_sent_ok is False  # 발행 실패 감지(→ kill-switch 연동 가능)
+async def test_send_failure_tracked() -> None:
+    reporter = FXExposureReporter(MockSink(ok=False))
+    await reporter.report([dom(Instrument.KR_STOCK, 1, 70_000)], fx=1_350.0, id="s1")
+    assert reporter.last_sent_ok is False
