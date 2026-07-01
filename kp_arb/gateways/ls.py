@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +41,12 @@ class LSApiGateway(LSGateway):
     SPOT_CANCEL_TR = "CSPAT00801"
     SPOT_PATH = "/stock/order"
 
+    # 선물옵션 주문 TR (LS: 정상/정정/취소, POST /futureoption/order).
+    FUTURE_ORDER_TR = "CFOAT00100"
+    FUTURE_AMEND_TR = "CFOAT00200"
+    FUTURE_CANCEL_TR = "CFOAT00300"
+    FUTURE_PATH = "/futureoption/order"
+
     # 잔고·예수금·증거금 조회 (계좌별). 정확한 TR 필드명은 라이브 구현 시 확인.
     STOCK_DEPOSIT_TR = "CSPAQ22200"     # 주식 예수금 (대안 주문가능 CDPCQ04700)
     STOCK_POSITIONS_TR = "CSPAQ12300"   # 주식 잔고 (대안 t0424)
@@ -51,8 +57,11 @@ class LSApiGateway(LSGateway):
     _SPOT: frozenset[Instrument] = frozenset({Instrument.KR_STOCK, Instrument.KR_ETF})
     _SUCCESS: frozenset[str] = frozenset({"00000"})
 
-    def __init__(self, rest: LSRestClient) -> None:
+    def __init__(
+        self, rest: LSRestClient, *, futures_symbols: Mapping[Underlying, str] | None = None
+    ) -> None:
         self._rest = rest
+        self._futures_symbols: dict[Underlying, str] = dict(futures_symbols or {})
         self._orders: dict[str, OrderContext] = {}
         self.connected = False
 
@@ -64,13 +73,16 @@ class LSApiGateway(LSGateway):
         if intent.venue is not Venue.LS:
             raise ValueError("LSApiGateway only handles LS orders")
         account = account_for(intent.instrument)  # 라우팅 계약(불변식)
-        if intent.instrument not in self._SPOT:
-            raise NotImplementedError(
-                f"{intent.instrument} 주문 TR 미정 [OPEN §13 #3] — 현물(주식/ETF)만 구현"
-            )
-        body = self._spot_order_body(intent, account)
-        resp = await self._rest.request(self.SPOT_ORDER_TR, body, path=self.SPOT_PATH)
-        order_id = self._parse_order_id(resp, self.SPOT_ORDER_TR)
+        if intent.instrument in self._SPOT:
+            tr_cd, path = self.SPOT_ORDER_TR, self.SPOT_PATH
+            body = self._spot_order_body(intent, account)
+        elif intent.instrument is Instrument.KR_STOCK_FUTURE:
+            tr_cd, path = self.FUTURE_ORDER_TR, self.FUTURE_PATH
+            body = self._future_order_body(intent, account)
+        else:
+            raise NotImplementedError(f"{intent.instrument} 주문 TR 미정 [OPEN §13 #3]")
+        resp = await self._rest.request(tr_cd, body, path=path)
+        order_id = self._parse_order_id(resp, tr_cd)
         self._orders[order_id] = OrderContext(order_id, intent, account, body)
         return order_id
 
@@ -83,9 +95,14 @@ class LSApiGateway(LSGateway):
     ) -> str:
         """원주문을 정정. 원주문 컨텍스트(계좌·종목)를 참조해 새 주문 id 반환."""
         ctx = self._require(order_id)
-        body = self._amend_body(ctx, qty, price)
-        resp = await self._rest.request(self.SPOT_AMEND_TR, body, path=self.SPOT_PATH)
-        new_id = self._parse_order_id(resp, self.SPOT_AMEND_TR)
+        if ctx.intent.instrument in self._SPOT:
+            tr_cd, path = self.SPOT_AMEND_TR, self.SPOT_PATH
+            body = self._amend_body(ctx, qty, price)
+        else:
+            tr_cd, path = self.FUTURE_AMEND_TR, self.FUTURE_PATH
+            body = self._future_amend_body(ctx, qty, price)
+        resp = await self._rest.request(tr_cd, body, path=path)
+        new_id = self._parse_order_id(resp, tr_cd)
         self._orders[new_id] = OrderContext(
             new_id, ctx.intent, ctx.account, body, replaces=order_id
         )
@@ -93,9 +110,14 @@ class LSApiGateway(LSGateway):
 
     async def cancel_order(self, order_id: str) -> None:
         ctx = self._require(order_id)
-        body = self._cancel_body(ctx)
-        resp = await self._rest.request(self.SPOT_CANCEL_TR, body, path=self.SPOT_PATH)
-        self._check_ok(resp, self.SPOT_CANCEL_TR)
+        if ctx.intent.instrument in self._SPOT:
+            tr_cd, path = self.SPOT_CANCEL_TR, self.SPOT_PATH
+            body = self._cancel_body(ctx)
+        else:
+            tr_cd, path = self.FUTURE_CANCEL_TR, self.FUTURE_PATH
+            body = self._future_cancel_body(ctx)
+        resp = await self._rest.request(tr_cd, body, path=path)
+        self._check_ok(resp, tr_cd)
 
     async def get_positions(self, account: Account) -> Sequence[Position]:
         """계좌별 잔고(포지션) 조회. 주식 CSPAQ12300 / 선물 FOCCQ33600."""
@@ -179,6 +201,42 @@ class LSApiGateway(LSGateway):
             "BnsTpCode": "2" if intent.side is Side.BUY else "1",  # 1매도 2매수
             "OrdprcPtnCode": "00" if intent.order_type is OrderType.LIMIT else "03",
         }
+
+    def _future_order_body(self, intent: OrderIntent, account: Account) -> dict[str, Any]:
+        return {
+            "account": account.value,
+            "FnoIsuNo": self._futures_symbol(intent.underlying),  # 선물 종목코드(config)
+            "OrdQty": intent.qty,
+            "FnoOrdPrc": intent.price if intent.price is not None else 0.0,
+            "BnsTpCode": "2" if intent.side is Side.BUY else "1",  # 1매도 2매수
+            "FnoOrdprcPtnCode": "00" if intent.order_type is OrderType.LIMIT else "03",
+        }
+
+    def _future_amend_body(
+        self, ctx: OrderContext, qty: float | None, price: float | None
+    ) -> dict[str, Any]:
+        return {
+            "account": ctx.account.value,
+            "FnoIsuNo": self._futures_symbol(ctx.intent.underlying),
+            "OrgOrdNo": ctx.order_id,  # 원주문 보존
+            "MdfyQty": qty if qty is not None else ctx.intent.qty,
+            "FnoOrdPrc": price if price is not None else (ctx.intent.price or 0.0),
+            "FnoOrdprcPtnCode": "00",
+        }
+
+    def _future_cancel_body(self, ctx: OrderContext) -> dict[str, Any]:
+        return {
+            "account": ctx.account.value,
+            "FnoIsuNo": self._futures_symbol(ctx.intent.underlying),
+            "OrgOrdNo": ctx.order_id,  # 원주문 보존
+            "CancQty": ctx.intent.qty,
+        }
+
+    def _futures_symbol(self, underlying: Underlying) -> str:
+        try:
+            return self._futures_symbols[underlying]
+        except KeyError as exc:
+            raise RestError(f"no futures symbol configured for {underlying}") from exc
 
     def _amend_body(
         self, ctx: OrderContext, qty: float | None, price: float | None

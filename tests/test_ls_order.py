@@ -66,11 +66,13 @@ class RejectTransport:
         return RestResponse(status_code=200, body={"rsp_cd": "40510", "rsp_msg": "잔고부족"})
 
 
-def _gateway(transport: Any) -> LSApiGateway:
+def _gateway(
+    transport: Any, *, futures_symbols: dict[Underlying, str] | None = None
+) -> LSApiGateway:
     clock = _Clock()
     tm = TokenManager("k", "s", _TokenStub(), now=clock)
     rl = RateLimiter(now=clock, default_per_second=100)
-    return LSApiGateway(LSRestClient(BASE_URL, tm, transport, rl))
+    return LSApiGateway(LSRestClient(BASE_URL, tm, transport, rl), futures_symbols=futures_symbols)
 
 
 def _intent(instrument: Instrument, *, side: Side = Side.BUY) -> OrderIntent:
@@ -104,16 +106,47 @@ async def test_etf_routes_to_stock_account() -> None:
     assert transport.requests[-1]["body"]["account"] == Account.KR_STOCK.value
 
 
-@pytest.mark.parametrize(
-    "instrument",
-    [Instrument.KR_STOCK_FUTURE],
-)
-async def test_futures_route_to_deriv_but_tr_open(instrument: Instrument) -> None:
-    # 라우팅 계약: 선물 → 선물옵션계좌. 단 주문 TR은 [OPEN]이라 가드.
-    assert account_for(instrument) is Account.KR_DERIV
-    gw = _gateway(OrderTransport())
-    with pytest.raises(NotImplementedError):
-        await gw.place_order(_intent(instrument, side=Side.SELL))
+async def test_future_order_uses_cfoat_and_routes_to_deriv() -> None:
+    # 선물 → 선물옵션계좌(라우팅 계약) + CFOAT00100 신규주문.
+    assert account_for(Instrument.KR_STOCK_FUTURE) is Account.KR_DERIV
+    transport = OrderTransport()
+    gw = _gateway(transport, futures_symbols={Underlying.SAMSUNG: "1AB3000"})
+    oid = await gw.place_order(_intent(Instrument.KR_STOCK_FUTURE, side=Side.SELL))
+    req = transport.requests[-1]
+    assert req["headers"]["tr_cd"] == LSApiGateway.FUTURE_ORDER_TR
+    assert req["body"]["account"] == Account.KR_DERIV.value
+    assert req["body"]["FnoIsuNo"] == "1AB3000"
+    assert oid == "0000001"
+
+
+async def test_future_order_without_symbol_raises() -> None:
+    gw = _gateway(OrderTransport())  # futures_symbols 미설정
+    with pytest.raises(RestError):
+        await gw.place_order(_intent(Instrument.KR_STOCK_FUTURE))
+
+
+async def test_future_amend_uses_cfoat00200() -> None:
+    transport = OrderTransport()
+    gw = _gateway(transport, futures_symbols={Underlying.SAMSUNG: "1AB3000"})
+    oid = await gw.place_order(_intent(Instrument.KR_STOCK_FUTURE))
+    new_id = await gw.amend_order(oid, qty=5, price=71_000.0)
+    req = transport.requests[-1]
+    assert req["headers"]["tr_cd"] == LSApiGateway.FUTURE_AMEND_TR
+    assert req["body"]["OrgOrdNo"] == oid  # 원주문 보존
+    assert req["body"]["FnoIsuNo"] == "1AB3000"
+    assert req["body"]["MdfyQty"] == 5
+    assert new_id != oid
+
+
+async def test_future_cancel_uses_cfoat00300() -> None:
+    transport = OrderTransport()
+    gw = _gateway(transport, futures_symbols={Underlying.SAMSUNG: "1AB3000"})
+    oid = await gw.place_order(_intent(Instrument.KR_STOCK_FUTURE))
+    await gw.cancel_order(oid)
+    req = transport.requests[-1]
+    assert req["headers"]["tr_cd"] == LSApiGateway.FUTURE_CANCEL_TR
+    assert req["body"]["OrgOrdNo"] == oid
+    assert req["body"]["CancQty"] == 10  # 원주문 수량
 
 
 async def test_rejects_hl_order() -> None:
