@@ -76,8 +76,9 @@ def _gateway(
     clock = _Clock()
     tm = TokenManager("k", "s", _TokenStub(), now=clock)
     rl = RateLimiter(now=clock, default_per_second=100)
+    rest = LSRestClient(BASE_URL, tm, transport, rl)
     return LSApiGateway(
-        LSRestClient(BASE_URL, tm, transport, rl),
+        {Account.KR_STOCK: rest, Account.KR_DERIV: rest},  # 테스트는 두 계좌 같은 mock
         accounts=accounts,
         futures_symbols=futures_symbols,
     )
@@ -170,6 +171,55 @@ async def test_order_injects_account_number_and_password() -> None:
     assert body["AcntNo"] == "STK-1"
     assert body["InptPwd"] == "spw"
     assert "account" not in body  # 플레이스홀더 대신 실 계좌필드
+
+
+class _AppkeyTokenTransport:
+    """appkey별로 다른 토큰을 발급 → 계좌별 토큰 라우팅 확인용."""
+
+    async def fetch_token(self, appkey: str, appsecret: str) -> TokenResponse:
+        return TokenResponse(access_token=f"tok-{appkey}", expires_in=3600.0)
+
+
+async def test_from_accounts_uses_per_account_token() -> None:
+    accounts = LSAccounts(
+        LSAccount("STK-1", "spw", "stock-ak", "stock-as"),
+        LSAccount("DRV-1", "dpw", "deriv-ak", "deriv-as"),
+    )
+    rest_tx = OrderTransport()
+    gw = LSApiGateway.from_accounts(
+        accounts,
+        token_transport=_AppkeyTokenTransport(),
+        rest_transport=rest_tx,
+        futures_symbols={Underlying.SAMSUNG: "1AB3000"},
+    )
+    await gw.place_order(_intent(Instrument.KR_STOCK))          # 주식계좌 토큰
+    await gw.place_order(_intent(Instrument.KR_STOCK_FUTURE))   # 선물계좌 토큰
+
+    # 계좌별로 서로 다른 appkey→토큰으로 요청됨.
+    assert rest_tx.requests[0]["headers"]["authorization"] == "Bearer tok-stock-ak"
+    assert rest_tx.requests[1]["headers"]["authorization"] == "Bearer tok-deriv-ak"
+    assert rest_tx.requests[0]["body"]["AcntNo"] == "STK-1"  # 계좌 자격 주입
+
+
+async def test_routes_to_per_account_client() -> None:
+    clock = _Clock()
+
+    def _rest(tx: OrderTransport) -> LSRestClient:
+        tm = TokenManager("k", "s", _TokenStub(), now=clock)
+        rl = RateLimiter(now=clock, default_per_second=100)
+        return LSRestClient(BASE_URL, tm, tx, rl)
+
+    stock_tx, deriv_tx = OrderTransport(), OrderTransport()
+    gw = LSApiGateway(
+        {Account.KR_STOCK: _rest(stock_tx), Account.KR_DERIV: _rest(deriv_tx)},
+        futures_symbols={Underlying.SAMSUNG: "1AB3000"},
+    )
+    await gw.place_order(_intent(Instrument.KR_STOCK))          # → 주식 클라이언트
+    await gw.place_order(_intent(Instrument.KR_STOCK_FUTURE))   # → 선물 클라이언트
+
+    assert len(stock_tx.requests) == 1 and len(deriv_tx.requests) == 1
+    assert stock_tx.requests[0]["headers"]["tr_cd"] == LSApiGateway.SPOT_ORDER_TR
+    assert deriv_tx.requests[0]["headers"]["tr_cd"] == LSApiGateway.FUTURE_ORDER_TR
 
 
 async def test_rejects_hl_order() -> None:

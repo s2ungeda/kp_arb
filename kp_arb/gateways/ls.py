@@ -11,7 +11,8 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,7 +21,11 @@ from ..domain.enums import Account, Instrument, OrderType, Side, Underlying, Ven
 from ..domain.models import OrderIntent, Position
 from ..routing import account_for
 from .base import LSGateway
-from .ls_rest import LSRestClient, RestError, RestResponse
+from .ls_auth import TokenManager, TokenTransport
+from .ls_rest import LSRestClient, RateLimiter, RestError, RestResponse, RestTransport
+
+LIVE_BASE_URL = "https://openapi.ls-sec.co.kr:8080"
+_LS_ACCOUNTS: tuple[Account, ...] = (Account.KR_STOCK, Account.KR_DERIV)
 
 
 @dataclass
@@ -60,16 +65,39 @@ class LSApiGateway(LSGateway):
 
     def __init__(
         self,
-        rest: LSRestClient,
+        rest_by_account: Mapping[Account, LSRestClient],
         *,
         accounts: LSAccounts | None = None,
         futures_symbols: Mapping[Underlying, str] | None = None,
     ) -> None:
-        self._rest = rest
+        self._rest_by_account = dict(rest_by_account)
         self._accounts = accounts
         self._futures_symbols: dict[Underlying, str] = dict(futures_symbols or {})
         self._orders: dict[str, OrderContext] = {}
         self.connected = False
+
+    @classmethod
+    def from_accounts(
+        cls,
+        accounts: LSAccounts,
+        *,
+        token_transport: TokenTransport,
+        rest_transport: RestTransport,
+        base_url: str = LIVE_BASE_URL,
+        futures_symbols: Mapping[Underlying, str] | None = None,
+        now: Callable[[], float] = time.monotonic,
+    ) -> LSApiGateway:
+        """계좌별 키로 계좌별 토큰·REST 클라이언트를 조립. (레이트리밋은 계좌별 독립.)"""
+        rest_by_account: dict[Account, LSRestClient] = {}
+        for account in _LS_ACCOUNTS:
+            cred = accounts.for_account(account)
+            tokens = TokenManager(cred.appkey, cred.appsecret, token_transport, now=now)
+            limiter = RateLimiter(now=now)
+            rest_by_account[account] = LSRestClient(base_url, tokens, rest_transport, limiter)
+        return cls(rest_by_account, accounts=accounts, futures_symbols=futures_symbols)
+
+    def _rest_for(self, account: Account) -> LSRestClient:
+        return self._rest_by_account[account]
 
     def _account_fields(self, account: Account) -> dict[str, Any]:
         """주문/조회 요청에 넣을 계좌 식별 필드. 실 계좌번호·비번은 env(LSAccounts)."""
@@ -94,7 +122,7 @@ class LSApiGateway(LSGateway):
             body = self._future_order_body(intent, account)
         else:
             raise NotImplementedError(f"{intent.instrument} 주문 TR 미정 [OPEN §13 #3]")
-        resp = await self._rest.request(tr_cd, body, path=path)
+        resp = await self._rest_for(account).request(tr_cd, body, path=path)
         order_id = self._parse_order_id(resp, tr_cd)
         self._orders[order_id] = OrderContext(order_id, intent, account, body)
         return order_id
@@ -114,7 +142,7 @@ class LSApiGateway(LSGateway):
         else:
             tr_cd, path = self.FUTURE_AMEND_TR, self.FUTURE_PATH
             body = self._future_amend_body(ctx, qty, price)
-        resp = await self._rest.request(tr_cd, body, path=path)
+        resp = await self._rest_for(ctx.account).request(tr_cd, body, path=path)
         new_id = self._parse_order_id(resp, tr_cd)
         self._orders[new_id] = OrderContext(
             new_id, ctx.intent, ctx.account, body, replaces=order_id
@@ -129,18 +157,18 @@ class LSApiGateway(LSGateway):
         else:
             tr_cd, path = self.FUTURE_CANCEL_TR, self.FUTURE_PATH
             body = self._future_cancel_body(ctx)
-        resp = await self._rest.request(tr_cd, body, path=path)
+        resp = await self._rest_for(ctx.account).request(tr_cd, body, path=path)
         self._check_ok(resp, tr_cd)
 
     async def get_positions(self, account: Account) -> Sequence[Position]:
         """계좌별 잔고(포지션) 조회. 주식 CSPAQ12300 / 선물 FOCCQ33600."""
         if account is Account.KR_STOCK:
-            resp = await self._rest.request(
+            resp = await self._rest_for(account).request(
                 self.STOCK_POSITIONS_TR, self._account_fields(account), path=self.STOCK_ACC_PATH
             )
             rows = self._rows(resp, self.STOCK_POSITIONS_TR)
             return [self._stock_position(r) for r in rows]
-        resp = await self._rest.request(
+        resp = await self._rest_for(account).request(
             self.DERIV_TR, self._account_fields(account), path=self.DERIV_ACC_PATH
         )
         rows = self._rows(resp, self.DERIV_TR)
@@ -149,11 +177,11 @@ class LSApiGateway(LSGateway):
     async def get_balance(self, account: Account) -> float:
         """계좌별 가용자금 조회. 주식 예수금 CSPAQ22200 / 선물 증거금 FOCCQ33600."""
         if account is Account.KR_STOCK:
-            resp = await self._rest.request(
+            resp = await self._rest_for(account).request(
                 self.STOCK_DEPOSIT_TR, self._account_fields(account), path=self.STOCK_ACC_PATH
             )
             return self._amount(resp, self.STOCK_DEPOSIT_TR, "DpsAmt")
-        resp = await self._rest.request(
+        resp = await self._rest_for(account).request(
             self.DERIV_TR, self._account_fields(account), path=self.DERIV_ACC_PATH
         )
         return self._amount(resp, self.DERIV_TR, "OrdAbleAmt")

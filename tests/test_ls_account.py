@@ -65,7 +65,8 @@ def _gateway(transport: Any) -> LSApiGateway:
     clock = _Clock()
     tm = TokenManager("k", "s", _TokenStub(), now=clock)
     rl = RateLimiter(now=clock, default_per_second=100)
-    return LSApiGateway(LSRestClient(BASE_URL, tm, transport, rl))
+    rest = LSRestClient(BASE_URL, tm, transport, rl)
+    return LSApiGateway({Account.KR_STOCK: rest, Account.KR_DERIV: rest})
 
 
 # --- 잔고(예수금/증거금) ---
