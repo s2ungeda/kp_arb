@@ -15,6 +15,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from ..config import LSAccounts
 from ..domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from ..domain.models import OrderIntent, Position
 from ..routing import account_for
@@ -58,12 +59,24 @@ class LSApiGateway(LSGateway):
     _SUCCESS: frozenset[str] = frozenset({"00000"})
 
     def __init__(
-        self, rest: LSRestClient, *, futures_symbols: Mapping[Underlying, str] | None = None
+        self,
+        rest: LSRestClient,
+        *,
+        accounts: LSAccounts | None = None,
+        futures_symbols: Mapping[Underlying, str] | None = None,
     ) -> None:
         self._rest = rest
+        self._accounts = accounts
         self._futures_symbols: dict[Underlying, str] = dict(futures_symbols or {})
         self._orders: dict[str, OrderContext] = {}
         self.connected = False
+
+    def _account_fields(self, account: Account) -> dict[str, Any]:
+        """주문/조회 요청에 넣을 계좌 식별 필드. 실 계좌번호·비번은 env(LSAccounts)."""
+        if self._accounts is None:
+            return {"account": account.value}  # 플레이스홀더(테스트/드라이런)
+        acct = self._accounts.for_account(account)
+        return {"AcntNo": acct.number, "InptPwd": acct.password}  # 실 필드명은 라이브 확인
 
     async def connect(self) -> None:
         # 토큰은 LSRestClient.request 시점에 lazy 발급. 여기선 연결 플래그만.
@@ -123,12 +136,12 @@ class LSApiGateway(LSGateway):
         """계좌별 잔고(포지션) 조회. 주식 CSPAQ12300 / 선물 FOCCQ33600."""
         if account is Account.KR_STOCK:
             resp = await self._rest.request(
-                self.STOCK_POSITIONS_TR, {"account": account.value}, path=self.STOCK_ACC_PATH
+                self.STOCK_POSITIONS_TR, self._account_fields(account), path=self.STOCK_ACC_PATH
             )
             rows = self._rows(resp, self.STOCK_POSITIONS_TR)
             return [self._stock_position(r) for r in rows]
         resp = await self._rest.request(
-            self.DERIV_TR, {"account": account.value}, path=self.DERIV_ACC_PATH
+            self.DERIV_TR, self._account_fields(account), path=self.DERIV_ACC_PATH
         )
         rows = self._rows(resp, self.DERIV_TR)
         return [self._deriv_position(r) for r in rows]
@@ -137,11 +150,11 @@ class LSApiGateway(LSGateway):
         """계좌별 가용자금 조회. 주식 예수금 CSPAQ22200 / 선물 증거금 FOCCQ33600."""
         if account is Account.KR_STOCK:
             resp = await self._rest.request(
-                self.STOCK_DEPOSIT_TR, {"account": account.value}, path=self.STOCK_ACC_PATH
+                self.STOCK_DEPOSIT_TR, self._account_fields(account), path=self.STOCK_ACC_PATH
             )
             return self._amount(resp, self.STOCK_DEPOSIT_TR, "DpsAmt")
         resp = await self._rest.request(
-            self.DERIV_TR, {"account": account.value}, path=self.DERIV_ACC_PATH
+            self.DERIV_TR, self._account_fields(account), path=self.DERIV_ACC_PATH
         )
         return self._amount(resp, self.DERIV_TR, "OrdAbleAmt")
 
@@ -193,8 +206,7 @@ class LSApiGateway(LSGateway):
 
     def _spot_order_body(self, intent: OrderIntent, account: Account) -> dict[str, Any]:
         return {
-            # Account enum → 실제 계좌상품코드 매핑은 config [OPEN §13 #3].
-            "account": account.value,
+            **self._account_fields(account),
             "IsuNo": intent.underlying.krx_code,
             "OrdQty": intent.qty,
             "OrdPrc": intent.price if intent.price is not None else 0.0,
@@ -204,7 +216,7 @@ class LSApiGateway(LSGateway):
 
     def _future_order_body(self, intent: OrderIntent, account: Account) -> dict[str, Any]:
         return {
-            "account": account.value,
+            **self._account_fields(account),
             "FnoIsuNo": self._futures_symbol(intent.underlying),  # 선물 종목코드(config)
             "OrdQty": intent.qty,
             "FnoOrdPrc": intent.price if intent.price is not None else 0.0,
@@ -216,7 +228,7 @@ class LSApiGateway(LSGateway):
         self, ctx: OrderContext, qty: float | None, price: float | None
     ) -> dict[str, Any]:
         return {
-            "account": ctx.account.value,
+            **self._account_fields(ctx.account),
             "FnoIsuNo": self._futures_symbol(ctx.intent.underlying),
             "OrgOrdNo": ctx.order_id,  # 원주문 보존
             "MdfyQty": qty if qty is not None else ctx.intent.qty,
@@ -226,7 +238,7 @@ class LSApiGateway(LSGateway):
 
     def _future_cancel_body(self, ctx: OrderContext) -> dict[str, Any]:
         return {
-            "account": ctx.account.value,
+            **self._account_fields(ctx.account),
             "FnoIsuNo": self._futures_symbol(ctx.intent.underlying),
             "OrgOrdNo": ctx.order_id,  # 원주문 보존
             "CancQty": ctx.intent.qty,
@@ -242,7 +254,7 @@ class LSApiGateway(LSGateway):
         self, ctx: OrderContext, qty: float | None, price: float | None
     ) -> dict[str, Any]:
         return {
-            "account": ctx.account.value,
+            **self._account_fields(ctx.account),
             "OrgOrdNo": ctx.order_id,  # 원주문 보존
             "IsuNo": ctx.intent.underlying.krx_code,
             "OrdQty": qty if qty is not None else ctx.intent.qty,
@@ -251,7 +263,7 @@ class LSApiGateway(LSGateway):
 
     def _cancel_body(self, ctx: OrderContext) -> dict[str, Any]:
         return {
-            "account": ctx.account.value,
+            **self._account_fields(ctx.account),
             "OrgOrdNo": ctx.order_id,  # 원주문 보존
             "IsuNo": ctx.intent.underlying.krx_code,
             "OrdQty": ctx.intent.qty,

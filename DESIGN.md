@@ -105,6 +105,7 @@
 
 ### 5.1 LSGateway (2계좌: 주식 1 + 선물옵션 1)
 - **책임:** LS Open API(REST `https://openapi.ls-sec.co.kr:8080`, OAuth2 Bearer + `tr_cd`) 연결·인증·시세·**장운영데이터**·주문·잔고. **주식계좌·선물옵션계좌 2개를 보유하고 instrument로 라우팅.**
+- **인증은 계좌별(확정 v0.4):** appkey/appsecret이 계좌마다 다르므로 **계좌별 OAuth2 토큰·REST 컨텍스트**를 분리한다. 주문/조회는 대상 계좌의 토큰으로 전송.
 - **계좌 라우팅:** 주식·ETF → 주식계좌(`CSPAT00601` 등) / 주식선물·야간선물 → **단일 선물옵션계좌**(선물옵션 주문 TR, 주간·야간 공용). 잔고·증거금·미체결은 **계좌별로 분리 추적**.
 - **인터페이스 → LS TR 매핑:**
 
@@ -228,7 +229,8 @@
 - **외부 #2:** 노출 발행 엔드포인트·프로토콜·주기.
 - 전략: 플러그인 선택자(임계값 등 세부는 전략 확정 후).
 - 한도: LS 5,000/일 + TR별 초당, HL 마진비율 하한, 일일 손실 한도.
-- 비밀값(환경변수): `LS_APPKEY`, `LS_APPSECRET`, HL agent 키 — 평문 저장 금지.
+- **실행 모드:** `KP_MODE`(env)로 사용자가 전환 — `paper`(모의, 기본·안전) | `live`(운영). 엔드포인트/안전 게이트 선택용 플래그.
+- 비밀값(평문 파일 저장 금지): **저장 = Windows 자격증명관리자(DPAPI, keyring), env는 오버라이드/폴백** (`SecretProvider`). 등록 `python -m kp_arb.secrets_cli set <NAME>`. 이름 — **LS 키는 계좌별**: 주식 `LS_STOCK_APPKEY/APPSECRET/ACCT/ACCT_PW`, 선물옵션 `LS_DERIV_APPKEY/APPSECRET/ACCT/ACCT_PW`. HL `HL_AGENT_KEY`.
 
 ---
 

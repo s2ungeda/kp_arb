@@ -3,6 +3,7 @@ from typing import Any
 
 import pytest
 
+from kp_arb.config import LSAccount, LSAccounts
 from kp_arb.domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent
 from kp_arb.gateways.ls import LSApiGateway
@@ -67,12 +68,19 @@ class RejectTransport:
 
 
 def _gateway(
-    transport: Any, *, futures_symbols: dict[Underlying, str] | None = None
+    transport: Any,
+    *,
+    futures_symbols: dict[Underlying, str] | None = None,
+    accounts: LSAccounts | None = None,
 ) -> LSApiGateway:
     clock = _Clock()
     tm = TokenManager("k", "s", _TokenStub(), now=clock)
     rl = RateLimiter(now=clock, default_per_second=100)
-    return LSApiGateway(LSRestClient(BASE_URL, tm, transport, rl), futures_symbols=futures_symbols)
+    return LSApiGateway(
+        LSRestClient(BASE_URL, tm, transport, rl),
+        accounts=accounts,
+        futures_symbols=futures_symbols,
+    )
 
 
 def _intent(instrument: Instrument, *, side: Side = Side.BUY) -> OrderIntent:
@@ -147,6 +155,21 @@ async def test_future_cancel_uses_cfoat00300() -> None:
     assert req["headers"]["tr_cd"] == LSApiGateway.FUTURE_CANCEL_TR
     assert req["body"]["OrgOrdNo"] == oid
     assert req["body"]["CancQty"] == 10  # 원주문 수량
+
+
+async def test_order_injects_account_number_and_password() -> None:
+    # 실 계좌번호·비번(env→LSAccounts)이 주문 body에 주입됨. (테스트는 더미값)
+    accounts = LSAccounts(
+        LSAccount("STK-1", "spw", "sak", "sas"),
+        LSAccount("DRV-1", "dpw", "dak", "das"),
+    )
+    transport = OrderTransport()
+    gw = _gateway(transport, accounts=accounts)
+    await gw.place_order(_intent(Instrument.KR_STOCK))
+    body = transport.requests[-1]["body"]
+    assert body["AcntNo"] == "STK-1"
+    assert body["InptPwd"] == "spw"
+    assert "account" not in body  # 플레이스홀더 대신 실 계좌필드
 
 
 async def test_rejects_hl_order() -> None:
