@@ -22,7 +22,7 @@ _JIF_PHASE: dict[str, SessionPhase] = {
     "10": SessionPhase.PRE_OPEN,     # 장개시전 동시호가
     "20": SessionPhase.REGULAR,      # 정규장
     "30": SessionPhase.NXT,          # 시간외/NXT
-    "40": SessionPhase.NIGHT_DERIV,  # 파생 야간
+    "40": SessionPhase.AFTER_MARKET,  # 애프터마켓 ~20:00
     "90": SessionPhase.DEAD,         # 장마감
 }
 

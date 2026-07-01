@@ -106,7 +106,7 @@ async def test_etf_routes_to_stock_account() -> None:
 
 @pytest.mark.parametrize(
     "instrument",
-    [Instrument.KR_STOCK_FUTURE, Instrument.KR_NIGHT_FUTURE],
+    [Instrument.KR_STOCK_FUTURE],
 )
 async def test_futures_route_to_deriv_but_tr_open(instrument: Instrument) -> None:
     # 라우팅 계약: 선물 → 선물옵션계좌. 단 주문 TR은 [OPEN]이라 가드.

@@ -41,8 +41,7 @@ class Account(StrEnum):
 class Instrument(StrEnum):
     KR_STOCK = "kr_stock"
     KR_ETF = "kr_etf"
-    KR_STOCK_FUTURE = "kr_stock_future"
-    KR_NIGHT_FUTURE = "kr_night_future"
+    KR_STOCK_FUTURE = "kr_stock_future"  # 정규장 + 애프터마켓(~20:00, 2026-09-14~) 공용
     HL_PERP = "hl_perp"
 
     @property
@@ -63,8 +62,8 @@ class OrderType(StrEnum):
 class SessionPhase(StrEnum):
     """장운영 단계. 실제 값은 LS 장운영데이터에서 산출되며, 여기선 입력으로 받는다."""
 
-    REGULAR = "regular"          # 정규장
-    PRE_OPEN = "pre_open"        # 동시호가/장전
-    NXT = "nxt"                  # NXT/시간외
-    NIGHT_DERIV = "night_deriv"  # 파생 야간
-    DEAD = "dead"                # 데드존/휴장
+    REGULAR = "regular"            # 정규장
+    PRE_OPEN = "pre_open"          # 동시호가/장전
+    NXT = "nxt"                    # NXT/시간외
+    AFTER_MARKET = "after_market"  # 애프터마켓 ~20:00 (2026-09-14~, 주식·주식선물)
+    DEAD = "dead"                  # 데드존/휴장

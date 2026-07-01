@@ -7,7 +7,6 @@ _KR_ROUTING: dict[Instrument, Account] = {
     Instrument.KR_STOCK: Account.KR_STOCK,
     Instrument.KR_ETF: Account.KR_STOCK,
     Instrument.KR_STOCK_FUTURE: Account.KR_DERIV,
-    Instrument.KR_NIGHT_FUTURE: Account.KR_DERIV,
 }
 
 

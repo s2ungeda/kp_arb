@@ -21,7 +21,7 @@ def jif(code: str, jang_cd: str) -> MarketStatus:
 def test_phase_from_jif_mapping() -> None:
     assert phase_from_jif({"jang_cd": "10"}) is SessionPhase.PRE_OPEN
     assert phase_from_jif({"jang_cd": "20"}) is SessionPhase.REGULAR
-    assert phase_from_jif({"jang_cd": "40"}) is SessionPhase.NIGHT_DERIV
+    assert phase_from_jif({"jang_cd": "40"}) is SessionPhase.AFTER_MARKET
     assert phase_from_jif({"jang_cd": "90"}) is SessionPhase.DEAD
 
 
@@ -42,16 +42,15 @@ def test_regular_jif_yields_regular_session() -> None:
     assert Instrument.KR_STOCK in t
     assert Instrument.KR_ETF in t
     assert Instrument.KR_STOCK_FUTURE in t
-    assert Instrument.KR_NIGHT_FUTURE not in t
     assert reference_instrument(s) is Instrument.KR_STOCK
 
 
-def test_night_jif_yields_night_session() -> None:
+def test_after_market_jif_yields_after_market_session() -> None:
     svc = SessionService()
     svc.on_market_status(jif(SAMSUNG_CODE, "40"))
     s = svc.session_for(SAMSUNG)
-    assert tradeable_instruments(s) == {Instrument.KR_NIGHT_FUTURE}
-    assert reference_instrument(s) is Instrument.KR_NIGHT_FUTURE
+    assert tradeable_instruments(s) == {Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE}
+    assert reference_instrument(s) is Instrument.KR_STOCK
 
 
 def test_preopen_is_auction_no_reference() -> None:
@@ -89,9 +88,11 @@ def test_unknown_issue_code_ignored() -> None:
 def test_per_underlying_independent() -> None:
     svc = SessionService()
     svc.on_market_status(jif(SAMSUNG_CODE, "20"))  # 삼성 정규장
-    svc.on_market_status(jif(HYNIX_CODE, "40"))    # 하이닉스 야간
-    assert reference_instrument(svc.session_for(SAMSUNG)) is Instrument.KR_STOCK
-    assert reference_instrument(svc.session_for(HYNIX)) is Instrument.KR_NIGHT_FUTURE
+    svc.on_market_status(jif(HYNIX_CODE, "40"))    # 하이닉스 애프터마켓
+    # 정규장은 ETF 거래 가능, 애프터마켓은 불가 → 종목별 독립 산출 확인.
+    assert Instrument.KR_ETF in tradeable_instruments(svc.session_for(SAMSUNG))
+    assert Instrument.KR_ETF not in tradeable_instruments(svc.session_for(HYNIX))
+    assert reference_instrument(svc.session_for(HYNIX)) is Instrument.KR_STOCK
 
 
 def test_sessions_covers_all_underlyings() -> None:

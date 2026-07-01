@@ -8,14 +8,14 @@ def test_regular_session() -> None:
     assert Instrument.KR_STOCK in t
     assert Instrument.KR_ETF in t
     assert Instrument.KR_STOCK_FUTURE in t
-    assert Instrument.KR_NIGHT_FUTURE not in t
     assert reference_instrument(s) == Instrument.KR_STOCK
 
 
-def test_night_session() -> None:
-    s = build_session(SessionPhase.NIGHT_DERIV)
-    assert tradeable_instruments(s) == {Instrument.KR_NIGHT_FUTURE}
-    assert reference_instrument(s) == Instrument.KR_NIGHT_FUTURE
+def test_after_market_session() -> None:
+    # 애프터마켓(~20:00): 주식·주식선물만 거래, ETF 없음. 레퍼런스 = 주식.
+    s = build_session(SessionPhase.AFTER_MARKET)
+    assert tradeable_instruments(s) == {Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE}
+    assert reference_instrument(s) == Instrument.KR_STOCK
 
 
 def test_deadzone_has_nothing() -> None:

@@ -49,14 +49,15 @@ def test_short_excludes_etf_too() -> None:
     assert sel is not None and sel.instrument is Instrument.KR_STOCK_FUTURE
 
 
-# --- 야간 ---
+# --- 애프터마켓 ---
 
 
-def test_night_selects_night_future() -> None:
-    session = build_session(SessionPhase.NIGHT_DERIV)
+def test_after_market_selects_stock_future() -> None:
+    # 애프터마켓: 주식·주식선물 거래. 롱/숏 모두 주식선물 선택(기본 우선순위 + 숏은 spot 제외).
+    session = build_session(SessionPhase.AFTER_MARKET)
     for side in (Side.BUY, Side.SELL):
         sel = InstrumentSelector().select(SAMSUNG, side, session)
-        assert sel == Selection(Instrument.KR_NIGHT_FUTURE, Account.KR_DERIV)
+        assert sel == Selection(Instrument.KR_STOCK_FUTURE, Account.KR_DERIV)
 
 
 # --- tiebreak / 가용성 ---

@@ -12,7 +12,6 @@ _KR_INSTRUMENTS: tuple[Instrument, ...] = (
     Instrument.KR_STOCK,
     Instrument.KR_ETF,
     Instrument.KR_STOCK_FUTURE,
-    Instrument.KR_NIGHT_FUTURE,
 )
 
 
@@ -32,9 +31,13 @@ def build_session(
         status[Instrument.KR_STOCK] = InstrumentStatus(
             instrument=Instrument.KR_STOCK, tradeable=True, is_reference=True
         )
-    elif phase is SessionPhase.NIGHT_DERIV:
-        status[Instrument.KR_NIGHT_FUTURE] = InstrumentStatus(
-            instrument=Instrument.KR_NIGHT_FUTURE, tradeable=True, is_reference=True
+    elif phase is SessionPhase.AFTER_MARKET:
+        # 애프터마켓 ~20:00 (2026-09-14~): 주식·주식선물 연장 거래. 레퍼런스 = 주식.
+        status[Instrument.KR_STOCK_FUTURE] = InstrumentStatus(
+            instrument=Instrument.KR_STOCK_FUTURE, tradeable=True
+        )
+        status[Instrument.KR_STOCK] = InstrumentStatus(
+            instrument=Instrument.KR_STOCK, tradeable=True, is_reference=True
         )
     elif phase in (SessionPhase.PRE_OPEN, SessionPhase.NXT):
         # 동시호가/시간외: 거래 가능 표시하되 레퍼런스로는 쓰지 않음(보수적)

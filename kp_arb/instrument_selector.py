@@ -24,7 +24,6 @@ _DEFAULT_PRIORITY: tuple[Instrument, ...] = (
     Instrument.KR_STOCK_FUTURE,
     Instrument.KR_STOCK,
     Instrument.KR_ETF,
-    Instrument.KR_NIGHT_FUTURE,
 )
 
 
