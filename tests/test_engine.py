@@ -101,6 +101,24 @@ async def test_routes_intents_to_correct_gateways() -> None:
     assert len(hl.placed) == 1 and hl.placed[0].instrument is Instrument.HL_PERP
 
 
+async def test_risk_blocks_routing() -> None:
+    from kp_arb.risk import RiskLimits, RiskManager, RiskState
+
+    ls = MockLSGateway()
+    hl = MockHLGateway()
+    engine = ArbEngine(
+        session=SessionService(),
+        strategy=RoutingStrategy(),
+        ls=ls,
+        hl=hl,
+        risk=RiskManager(RiskLimits()),
+    )
+    engine.risk_state = RiskState(kill_switch=True)  # 전부 차단
+    order_ids = await engine.step(Underlying.SAMSUNG)
+    assert order_ids == []
+    assert ls.placed == [] and hl.placed == []
+
+
 async def test_step_collects_positions_from_both_venues() -> None:
     strategy = CapturingStrategy()
     ls = MockLSGateway()

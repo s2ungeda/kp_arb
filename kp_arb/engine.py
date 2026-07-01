@@ -13,6 +13,7 @@ from .domain.enums import Account, Underlying, Venue
 from .domain.models import MarketState, OrderIntent, Position, Quote
 from .gateways.base import HLGateway, LSGateway
 from .gateways.hl import Mark
+from .risk import RiskManager, RiskState
 from .session import reference_instrument
 from .session_service import SessionService
 from .strategy.base import Strategy
@@ -35,12 +36,15 @@ class ArbEngine:
         strategy: Strategy,
         ls: LSGateway,
         hl: HLGateway,
+        risk: RiskManager | None = None,
     ) -> None:
         self._session = session
         self._strategy = strategy
         self._ls = ls
         self._hl = hl
+        self._risk = risk
         self.market = MarketData()
+        self.risk_state = RiskState()  # 리스크 판단 상태(러너/게이트웨이가 갱신)
 
     # --- 시세 스냅샷 갱신(게이트웨이 콜백 연결용) ---
 
@@ -74,8 +78,11 @@ class ArbEngine:
     async def step(self, underlying: Underlying) -> list[str]:
         positions = await self._collect_positions()
         state = self.build_market_state(underlying, positions)
+        intents = list(self._strategy.evaluate(state))
+        if self._risk is not None:
+            intents = self._risk.filter(intents, self.risk_state)
         order_ids: list[str] = []
-        for intent in self._strategy.evaluate(state):
+        for intent in intents:
             order_ids.append(await self._route(intent))
         return order_ids
 
