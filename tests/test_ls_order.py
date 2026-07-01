@@ -168,8 +168,8 @@ async def test_order_injects_account_number_and_password() -> None:
     gw = _gateway(transport, accounts=accounts)
     await gw.place_order(_intent(Instrument.KR_STOCK))
     body = transport.requests[-1]["body"]
-    assert body["AcntNo"] == "STK-1"
-    assert body["InptPwd"] == "spw"
+    assert body["AcntNo"] == "STK1"  # 대시 제거됨
+    assert body["Pwd"] == "spw"
     assert "account" not in body  # 플레이스홀더 대신 실 계좌필드
 
 
@@ -198,7 +198,7 @@ async def test_from_accounts_uses_per_account_token() -> None:
     # 계좌별로 서로 다른 appkey→토큰으로 요청됨.
     assert rest_tx.requests[0]["headers"]["authorization"] == "Bearer tok-stock-ak"
     assert rest_tx.requests[1]["headers"]["authorization"] == "Bearer tok-deriv-ak"
-    assert rest_tx.requests[0]["body"]["AcntNo"] == "STK-1"  # 계좌 자격 주입
+    assert rest_tx.requests[0]["body"]["AcntNo"] == "STK1"  # 계좌 자격 주입(대시 제거)
 
 
 async def test_routes_to_per_account_client() -> None:

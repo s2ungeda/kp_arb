@@ -12,7 +12,8 @@ BASE_URL = "https://openapi.ls-sec.co.kr:8080"
 
 # 녹화 픽스처: TR별 응답.
 FIXTURES: dict[str, dict[str, Any]] = {
-    "CSPAQ22200": {"rsp_cd": "00000", "CSPAQ22200OutBlock2": {"DpsAmt": 5_000_000}},
+    # 모의 성공코드 "00136"(운영 "00000"), 실필드 MnyOrdAbleAmt(현금주문가능).
+    "CSPAQ22200": {"rsp_cd": "00136", "CSPAQ22200OutBlock2": {"MnyOrdAbleAmt": 5_000_000}},
     "CSPAQ12300": {
         "rsp_cd": "00000",
         "CSPAQ12300OutBlock3": [
@@ -20,10 +21,10 @@ FIXTURES: dict[str, dict[str, Any]] = {
             {"IsuNo": "000660", "BalQty": 50, "AvrPrc": 180_000},
         ],
     },
-    "FOCCQ33600": {
-        "rsp_cd": "00000",
-        "FOCCQ33600OutBlock2": {"OrdAbleAmt": 3_000_000},
-        "FOCCQ33600OutBlock3": [
+    "CFOBQ10500": {"rsp_cd": "00136", "CFOBQ10500OutBlock2": {"MnyOrdAbleAmt": 3_000_000}},
+    "CFOAQ50600": {
+        "rsp_cd": "00136",
+        "CFOAQ50600OutBlock3": [
             {"IsuNo": "005930", "BalQty": 2, "AvrPrc": 71_000, "BnsTpCode": "1"},
         ],
     },
@@ -85,7 +86,7 @@ async def test_deriv_balance_uses_margin_tr() -> None:
     gw = _gateway(transport)
     bal = await gw.get_balance(Account.KR_DERIV)
     assert bal == 3_000_000
-    assert transport.seen_trs == ["FOCCQ33600"]
+    assert transport.seen_trs == ["CFOBQ10500"]
 
 
 async def test_balances_route_to_different_trs() -> None:
@@ -93,7 +94,7 @@ async def test_balances_route_to_different_trs() -> None:
     gw = _gateway(transport)
     await gw.get_balance(Account.KR_STOCK)
     await gw.get_balance(Account.KR_DERIV)
-    assert transport.seen_trs == ["CSPAQ22200", "FOCCQ33600"]
+    assert transport.seen_trs == ["CSPAQ22200", "CFOBQ10500"]
 
 
 # --- 포지션 ---
@@ -128,7 +129,7 @@ async def test_positions_route_to_different_trs() -> None:
     gw = _gateway(transport)
     await gw.get_positions(Account.KR_STOCK)
     await gw.get_positions(Account.KR_DERIV)
-    assert transport.seen_trs == ["CSPAQ12300", "FOCCQ33600"]
+    assert transport.seen_trs == ["CSPAQ12300", "CFOAQ50600"]
 
 
 # --- 응답 오류 ---

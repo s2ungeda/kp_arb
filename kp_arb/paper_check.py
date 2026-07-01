@@ -19,9 +19,16 @@ from .domain.enums import Account
 from .gateways.ls import LIVE_BASE_URL, LSApiGateway
 from .gateways.ls_http import AiohttpRestTransport, AiohttpTokenTransport
 
-_ACCT_TR = {
-    Account.KR_STOCK: (LSApiGateway.STOCK_DEPOSIT_TR, LSApiGateway.STOCK_ACC_PATH),
-    Account.KR_DERIV: (LSApiGateway.DERIV_TR, LSApiGateway.DERIV_ACC_PATH),
+# 계좌별 조회 TR 프로브(원시 응답 확인용).
+_PROBES = {
+    Account.KR_STOCK: [
+        (LSApiGateway.STOCK_DEPOSIT_TR, LSApiGateway.STOCK_ACC_PATH),      # 예수금
+        (LSApiGateway.STOCK_POSITIONS_TR, LSApiGateway.STOCK_ACC_PATH),    # 잔고
+    ],
+    Account.KR_DERIV: [
+        (LSApiGateway.DERIV_DEPOSIT_TR, LSApiGateway.DERIV_ACC_PATH),      # 예탁금·증거금
+        (LSApiGateway.DERIV_POSITIONS_TR, LSApiGateway.DERIV_ACC_PATH),    # 잔고(모의 미제공)
+    ],
 }
 
 
@@ -38,20 +45,20 @@ async def _run(base_url: str) -> None:
         await gw.connect()
 
         for account in (Account.KR_STOCK, Account.KR_DERIV):
-            tr_cd, path = _ACCT_TR[account]
-            print(f"\n=== {account.value} : {tr_cd} ===")
-            try:
-                raw = await gw.raw_request(account, tr_cd, path)
-                print(f"  status={raw.status_code}")
-                print(f"  raw body keys: {list(raw.body)}")
-                print(f"  raw body: {raw.body}")
-            except Exception as exc:  # noqa: BLE001 - 진단 출력
-                print(f"  RAW ERROR: {exc!r}")
-            try:
-                bal = await gw.get_balance(account)
-                print(f"  parsed balance = {bal}")
-            except Exception as exc:  # noqa: BLE001
-                print(f"  parse balance ERROR (필드명 정합 필요): {exc!r}")
+            for tr_cd, path in _PROBES[account]:
+                print(f"\n=== {account.value} : {tr_cd} (path={path}) ===")
+                try:
+                    raw = await gw.raw_request(account, tr_cd, path)
+                    print(f"  status={raw.status_code}  keys={list(raw.body)}")
+                    print(f"  raw body: {raw.body}")
+                except Exception as exc:  # noqa: BLE001 - 진단 출력
+                    print(f"  RAW ERROR: {exc!r}")
+            for label, coro in (("balance", gw.get_balance(account)),
+                                ("positions", gw.get_positions(account))):
+                try:
+                    print(f"  parsed {label} = {await coro}")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  parse {label} ERROR (필드 정합 필요): {exc!r}")
 
 
 def main() -> None:

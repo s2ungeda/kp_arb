@@ -221,7 +221,7 @@
 재시작 시 `positions`+`inventory`+미체결 `orders`로 복구.
 
 ---
-
+1
 ## 11. 설정 / 파라미터 (config.yaml)
 
 - underlying·instrument 목록, 세션별 instrument 우선순위.
@@ -250,7 +250,7 @@
 1. ~~야간선물 커버리지~~ **[확정 v0.4]** 개별주식선물 **오버나이트 없음**. **2026-09-14부터 애프터마켓 ~20:00**(주식·주식선물). 애프터마켓 선물 = `KR_STOCK_FUTURE` 세션 연장 → `KR_NIGHT_FUTURE`/`NIGHT_DERIV` **제거**, `AFTER_MARKET` phase 추가. 시각은 장운영데이터(JIF) 판정. 국내 다리 매수 전용. → §7.
 2. ~~#2 노출 발행 인터페이스~~ **[확정 v0.4]** 기존 `SignalLink`(UDP 8888 발견 + TCP `<ID>\t<Name>\t<Msg>\n`) 재사용, JSON Signal 스키마. → §5.7·§9.
 3. **계좌 상품코드 / 선물 주문 TR** — LS 선물 주문 **구현 완료**: 신규 `CFOAT00100` / 정정 `CFOAT00200` / 취소 `CFOAT00300` (POST `/futureoption/order`, 종목코드 config 주입). **미확정:** 계좌번호 체계, 선물 종목코드값. (참고: `CCENT001/002/003` = KRX야간파생 위탁 주문 — 애프터마켓 적용 여부 별도 확인.)
-   - **[라이브 확인 v6.1]** OAuth2 `scope="oob"` 필수. **모의투자 성공 rsp_cd="00136"**(운영 "00000"). 주식 예수금 CSPAQ22200 실필드: `CSPAQ22200OutBlock2.Dps`(예수금)·`MnyOrdAbleAmt`(현금주문가능). 계좌번호는 대시 없이 11자리(`55504974701`). 선물 FOCCQ33600 조회는 실패 → path/파라미터 재확인 필요. 파서 필드 정합은 후속.
+   - **[라이브 확인·정합 v6.1]** OAuth2 `scope="oob"` 필수. LS 성공 rsp_cd는 "0"으로 시작(모의 "00136"/운영 "00000"). 요청 계좌필드 = `AcntNo`(대시 제거)·`Pwd`. **잔고/증거금 조회 라이브 검증 완료:** 주식 `CSPAQ22200OutBlock2.MnyOrdAbleAmt`(5억)·잔고 `CSPAQ12300OutBlock3`; 선물 증거금 **`CFOBQ10500`**`OutBlock2.MnyOrdAbleAmt`(4.55억)·잔고 **`CFOAQ50600`**(모의 미제공 rsp_cd "01900"→빈결과). placeholder `FOCCQ33600`은 무효 TR이라 교체됨. 포지션 행 필드(`IsuNo/BalQty/AvrPrc`)는 보유분 생기면 재확인.
    - **[라이브 확인 v6.2 — WS]** 실시간 WS는 **모의/실전 포트가 다름**: 실전 `:9443` / 모의 `:29443` (`/websocket`). REST(:8080)와 달리 토큰-서버 일치 필요(불일치 시 rsp_cd "10001"). 구독 ACK는 `body:null` 프레임(스킵 처리). 모의 29443에서 H1_/NH1/JIF 구독 정상(rsp_cd "00000"). 실시간 데이터/필드 정합은 장중 확인.
 4. ~~HL perp 사양~~ **[확정 v0.4]** 심볼 `SAMSUNG`·`SKHYNIX`·`HYUNDAI`(005930/000660/005380), 최대 **10x**. 펀딩 주기·`dex:COIN` 정확 표기는 라이브 시 SDK로 확정.
 5. **자본 배분 / 리스크 사이징** — 추후 리스크 관리 로직과 함께 결정(지금 보류).

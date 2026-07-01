@@ -56,12 +56,12 @@ class LSApiGateway(LSGateway):
     # 잔고·예수금·증거금 조회 (계좌별). 정확한 TR 필드명은 라이브 구현 시 확인.
     STOCK_DEPOSIT_TR = "CSPAQ22200"     # 주식 예수금 (대안 주문가능 CDPCQ04700)
     STOCK_POSITIONS_TR = "CSPAQ12300"   # 주식 잔고 (대안 t0424)
-    DERIV_TR = "FOCCQ33600"             # 선물옵션 잔고·증거금
+    DERIV_DEPOSIT_TR = "CFOBQ10500"     # 선물옵션 예탁금·증거금 (get_balance)
+    DERIV_POSITIONS_TR = "CFOAQ50600"   # 선물옵션 잔고·평가 (get_positions, 모의 미제공→빈결과)
     STOCK_ACC_PATH = "/stock/accno"
     DERIV_ACC_PATH = "/futureoption/accno"
 
     _SPOT: frozenset[Instrument] = frozenset({Instrument.KR_STOCK, Instrument.KR_ETF})
-    _SUCCESS: frozenset[str] = frozenset({"00000"})
 
     def __init__(
         self,
@@ -104,7 +104,7 @@ class LSApiGateway(LSGateway):
         if self._accounts is None:
             return {"account": account.value}  # 플레이스홀더(테스트/드라이런)
         acct = self._accounts.for_account(account)
-        return {"AcntNo": acct.number, "InptPwd": acct.password}  # 실 필드명은 라이브 확인
+        return {"AcntNo": acct.number.replace("-", ""), "Pwd": acct.password}  # 라이브 확인필드
 
     async def connect(self) -> None:
         # 토큰은 LSRestClient.request 시점에 lazy 발급. 여기선 연결 플래그만.
@@ -169,22 +169,22 @@ class LSApiGateway(LSGateway):
             rows = self._rows(resp, self.STOCK_POSITIONS_TR)
             return [self._stock_position(r) for r in rows]
         resp = await self._rest_for(account).request(
-            self.DERIV_TR, self._account_fields(account), path=self.DERIV_ACC_PATH
+            self.DERIV_POSITIONS_TR, self._account_fields(account), path=self.DERIV_ACC_PATH
         )
-        rows = self._rows(resp, self.DERIV_TR)
+        rows = self._rows(resp, self.DERIV_POSITIONS_TR)
         return [self._deriv_position(r) for r in rows]
 
     async def get_balance(self, account: Account) -> float:
-        """계좌별 가용자금 조회. 주식 예수금 CSPAQ22200 / 선물 증거금 FOCCQ33600."""
+        """계좌별 가용자금(현금주문가능). 주식 CSPAQ22200 / 선물 CFOBQ10500."""
         if account is Account.KR_STOCK:
             resp = await self._rest_for(account).request(
                 self.STOCK_DEPOSIT_TR, self._account_fields(account), path=self.STOCK_ACC_PATH
             )
-            return self._amount(resp, self.STOCK_DEPOSIT_TR, "DpsAmt")
+            return self._amount(resp, self.STOCK_DEPOSIT_TR, "MnyOrdAbleAmt")  # 현금주문가능
         resp = await self._rest_for(account).request(
-            self.DERIV_TR, self._account_fields(account), path=self.DERIV_ACC_PATH
+            self.DERIV_DEPOSIT_TR, self._account_fields(account), path=self.DERIV_ACC_PATH
         )
-        return self._amount(resp, self.DERIV_TR, "OrdAbleAmt")
+        return self._amount(resp, self.DERIV_DEPOSIT_TR, "MnyOrdAbleAmt")
 
     async def raw_request(
         self, account: Account, tr_cd: str, path: str, *, method: str = "POST"
@@ -314,8 +314,9 @@ class LSApiGateway(LSGateway):
         return ctx
 
     def _check_ok(self, resp: RestResponse, tr_cd: str) -> None:
+        # LS 성공 rsp_cd는 "0"으로 시작(운영 "00000", 모의 "00136" 등). 오류는 "4xxxx"/"IGW…".
         rsp_cd = resp.body.get("rsp_cd")
-        if rsp_cd is not None and rsp_cd not in self._SUCCESS:
+        if rsp_cd is not None and not str(rsp_cd).startswith("0"):
             raise RestError(f"{tr_cd} rejected ({rsp_cd}): {resp.body.get('rsp_msg')}")
 
     def _parse_order_id(self, resp: RestResponse, tr_cd: str) -> str:
