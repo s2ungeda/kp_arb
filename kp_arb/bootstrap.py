@@ -19,7 +19,7 @@ import asyncio
 from collections.abc import Callable
 
 from .config import LSAccounts
-from .domain.enums import Account, Underlying, Venue
+from .domain.enums import Account, Instrument, Underlying, Venue
 from .domain.models import OrderIntent, Position, Quote
 from .engine import ArbEngine
 from .gateways.base import HLGateway
@@ -109,6 +109,10 @@ class LiveSystem:
         self.order_book.load_snapshot(
             positions=positions, balances=balances, open_orders=open_orders
         )
+
+    async def price_snapshots(self) -> dict[tuple[Underlying, Instrument], float]:
+        """취급 전 종목 현재가 1회 조회(창 오픈 시 초기 표시용 — 마감 후엔 종가)."""
+        return await self._gw.get_price_snapshots()
 
     # --- 주문 (등록까지 한 번에 — 이후 상태는 이벤트로만) ---
 

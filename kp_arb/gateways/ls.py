@@ -250,6 +250,52 @@ class LSApiGateway(LSGateway):
             avg_fill_price=float(row.get("ExecPrc", 0) or 0),
         )
 
+    STOCK_PRICE_TR = "t1102"    # 주식/ETF 현재가 (실측: OutBlock.price)
+    FUTURES_PRICE_TR = "t8402"  # 주식선물 현재가 (실측: OutBlock.price)
+    STOCK_MARKET_PATH = "/stock/market-data"
+
+    async def get_last_price(self, code: str, *, futures: bool = False) -> float | None:
+        """종목 1개의 현재가(마감 후엔 종가) 조회. 모니터 초기 표시용."""
+        if futures:
+            tr, path, key = self.FUTURES_PRICE_TR, self.FUTURES_MARKET_PATH, "focode"
+            account = Account.KR_DERIV
+        else:
+            tr, path, key = self.STOCK_PRICE_TR, self.STOCK_MARKET_PATH, "shcode"
+            account = Account.KR_STOCK
+        resp = await self._rest_for(account).request(
+            tr, {f"{tr}InBlock": {key: code}}, path=path
+        )
+        self._check_ok(resp, tr)
+        block = resp.body.get(f"{tr}OutBlock", {})
+        try:
+            return float(block["price"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    async def get_price_snapshots(
+        self, *, pause_s: float = 0.6
+    ) -> dict[tuple[Underlying, Instrument], float]:
+        """취급 전 종목(주식/ETF/선물)의 현재가 일괄 조회 — 창 오픈 시 최초 1회용.
+
+        조회 사이 pause로 TR별 초당 한도(2회)를 지킨다.
+        """
+        import asyncio as _asyncio
+
+        out: dict[tuple[Underlying, Instrument], float] = {}
+        targets: list[tuple[Underlying, Instrument, str, bool]] = []
+        for u in Underlying:
+            targets.append((u, Instrument.KR_STOCK, u.krx_code, False))
+        for u, code in self._etf_symbols.items():
+            targets.append((u, Instrument.KR_ETF, code, False))
+        for u, code in self._futures_symbols.items():
+            targets.append((u, Instrument.KR_STOCK_FUTURE, code, True))
+        for u, instrument, code, futures in targets:
+            price = await self.get_last_price(code, futures=futures)
+            if price is not None and price > 0:
+                out[(u, instrument)] = price
+            await _asyncio.sleep(pause_s)
+        return out
+
     async def fetch_futures_master(self) -> list[dict[str, Any]]:
         """주식선물 마스터(t8401) 전 종목. 행: {hname, shcode, expcode, basecode}."""
         resp = await self._rest_for(Account.KR_DERIV).request(

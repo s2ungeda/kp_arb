@@ -159,6 +159,14 @@ def main() -> None:
                         pass
                 await asyncio.sleep(FUNDING_INTERVAL_S / 4)
 
+        async def _initial_prices(system: LiveSystem) -> None:
+            # 창 오픈 시 최초 1회: LS 현재가(마감 후엔 종가) 조회로 표를 채운다.
+            try:
+                for key, price in (await system.price_snapshots()).items():
+                    state.trades.setdefault(key, price)  # 실시간 체결이 오면 그쪽 우선
+            except Exception:  # noqa: BLE001 - 표시용, 실패해도 실시간은 계속
+                pass
+
         async def _run() -> None:
             import aiohttp
 
@@ -172,10 +180,12 @@ def main() -> None:
                 system.on_funding.append(state.on_funding)
                 await system.start()
                 funding_task = asyncio.create_task(_prev_funding_loop(system))
+                prices_task = asyncio.create_task(_initial_prices(system))
                 try:
                     await system.wait()
                 finally:
                     funding_task.cancel()
+                    prices_task.cancel()
 
         asyncio.run(_run())
 
@@ -204,7 +214,7 @@ def main() -> None:
     ls_tree = make_tree(root, [
         ("name", "종목", 110), ("ask_qty", "매도잔량", 70), ("ask", "매도가", 80),
         ("last", "현재가", 80), ("bid", "매수가", 80), ("bid_qty", "매수잔량", 70),
-        ("exp", "예상가", 80),
+        ("exp", "예상체결가", 85),
     ], height=9)
 
     tk.Label(root, text="HL (Hyperliquid)", anchor="w", font=font).pack(fill="x", padx=4)
