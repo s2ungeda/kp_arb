@@ -182,6 +182,42 @@ async def test_order_events_dispatched_by_kind() -> None:
     assert events[1].order_id == "9901" and events[1].org_order_id == "9852"
 
 
+async def test_futures_fill_c01_parsed() -> None:
+    # 실측 C01: ordno 10자리 zero-pad, cheprice는 원화의 1/100(3000.00 = 300,000원).
+    frame = json.dumps({"header": {"tr_cd": "C01"},
+                        "body": {"ordno": "0000010996", "chevol": "1",
+                                 "cheprice": "3000.00", "chetime": "103212739",
+                                 "yakseq": "00000016809", "expcode": "KR4A11670002"}})
+    session = FakeConnection([frame])
+    client = LSWebSocketClient(FakeConnector([session]))
+    fills: list[Fill] = []
+    client.on_fill.append(fills.append)
+
+    await client.run()
+
+    assert len(fills) == 1
+    assert fills[0].order_id == "10996"   # zero-pad 정규화
+    assert fills[0].qty == 1
+    assert fills[0].price == 300_000.0    # ×100 단위 변환
+
+
+async def test_futures_cancel_h01_event() -> None:
+    # 실측 H01: 원주문 필드는 ordordno.
+    frame = json.dumps({"header": {"tr_cd": "H01"},
+                        "body": {"ordno": "0000010974", "ordordno": "0000010963",
+                                 "qty": "1"}})
+    session = FakeConnection([frame])
+    client = LSWebSocketClient(FakeConnector([session]))
+    events = []
+    client.on_order_event.append(events.append)
+
+    await client.run()
+
+    assert events[0].kind == "cancel"
+    assert events[0].order_id == "10974"
+    assert events[0].org_order_id == "10963"  # 정규화된 원주문
+
+
 async def test_unknown_tr_is_ignored() -> None:
     frame = json.dumps({"header": {"tr_cd": "XXX"}, "body": {}})
     session = FakeConnection([frame])

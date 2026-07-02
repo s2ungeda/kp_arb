@@ -13,6 +13,9 @@
 - **체결통보(SC0~SC4)는 tr_type="1"(계좌 등록)** — "3"으로 보내면 ACK만 오고 등록되지 않는다.
   SC1(체결) body 실필드: ``ordno``(주문번호)·``execno``(체결번호)·``execqty``·``execprc``·
   ``exectime``(HHMMSSmmm). SC0=접수, SC2=정정, SC3=취소, SC4=거부 → ``OrderEvent``로 분화.
+- **선물 통보(v6.7 실측)**: O01=접수(``ordno`` 패딩 없음), C01=체결(``ordno`` 10자리 zero-pad,
+  ``chevol``·``chetime``·``cheprice``는 **원화의 1/100 단위**), H01=정정취소(원주문=``ordordno``).
+  주문번호 패딩이 프레임마다 달라 ``_norm_ordno``로 정규화해 매칭한다.
 """
 from __future__ import annotations
 
@@ -27,10 +30,22 @@ from ..domain.enums import Instrument, Underlying
 from ..domain.models import Quote
 
 QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1"})
-FILL_TR = "SC1"  # 체결 통보만 Fill. 나머지 SC는 주문 이벤트.
-ORDER_EVENT_TRS: dict[str, str] = {"SC0": "ack", "SC2": "amend", "SC3": "cancel", "SC4": "reject"}
-ACCOUNT_TRS: tuple[str, ...] = ("SC0", "SC1", "SC2", "SC3", "SC4")
+FILL_TRS: frozenset[str] = frozenset({"SC1", "C01"})  # 체결: 주식 SC1 / 선물 C01
+ORDER_EVENT_TRS: dict[str, str] = {
+    "SC0": "ack", "SC2": "amend", "SC3": "cancel", "SC4": "reject",  # 주식
+    "O01": "ack", "H01": "cancel",                                    # 선물(H01=정정취소 공용)
+}
+ACCOUNT_TRS: tuple[str, ...] = ("SC0", "SC1", "SC2", "SC3", "SC4", "O01", "C01", "H01")
 STATUS_TR = "JIF"
+
+
+def _norm_ordno(raw: object) -> str:
+    """주문번호 정규화 — 프레임마다 zero-pad가 달라("10963" vs "0000010996") 매칭용."""
+    text = str(raw).strip()
+    try:
+        return str(int(text))
+    except ValueError:
+        return text
 
 
 class Fill(BaseModel):
@@ -165,8 +180,8 @@ class LSWebSocketClient:
             if quote is not None:
                 for handler in self.on_quote:
                     handler(quote)
-        elif tr_cd == FILL_TR:
-            fill = self._parse_fill(msg)
+        elif tr_cd in FILL_TRS:
+            fill = self._parse_fill(tr_cd, msg)
             for fill_handler in self.on_fill:
                 fill_handler(fill)
         elif tr_cd in ORDER_EVENT_TRS:
@@ -194,12 +209,22 @@ class LSWebSocketClient:
             ts=float(body["hotime"]),
         )
 
-    def _parse_fill(self, msg: dict[str, Any]) -> Fill:
-        # SC1 실측 필드: ordno/execno/execqty/execprc/exectime(HHMMSSmmm).
+    def _parse_fill(self, tr_cd: str, msg: dict[str, Any]) -> Fill:
         body = msg["body"]
+        if tr_cd == "C01":
+            # 선물 체결 실측: chevol/chetime, cheprice는 원화의 1/100(실측: 3000.00=300,000원).
+            return Fill(
+                fill_id=str(body.get("yakseq") or body.get("seq", "")),
+                order_id=_norm_ordno(body["ordno"]),
+                qty=float(body["chevol"]),
+                price=float(body["cheprice"]) * 100.0,
+                fee=0.0,
+                ts=float(body["chetime"]),
+            )
+        # 주식 SC1 실측 필드: ordno/execno/execqty/execprc/exectime(HHMMSSmmm).
         return Fill(
             fill_id=str(body["execno"]),
-            order_id=str(body["ordno"]),
+            order_id=_norm_ordno(body["ordno"]),
             qty=float(body["execqty"]),
             price=float(body["execprc"]),
             fee=0.0,  # 수수료 필드(cmsnamtexecamt)는 모의에서 공백 — 라이브 확정 시 반영
@@ -208,11 +233,12 @@ class LSWebSocketClient:
 
     def _parse_order_event(self, tr_cd: str, msg: dict[str, Any]) -> OrderEvent:
         body = msg["body"]
-        org = str(body.get("orgordno", "") or "").strip()
+        # 원주문 필드: 주식(SC*)=orgordno / 선물(H01)=ordordno.
+        org = _norm_ordno(body.get("orgordno") or body.get("ordordno") or "")
         return OrderEvent(
             kind=ORDER_EVENT_TRS[tr_cd],
-            order_id=str(body.get("ordno", "")),
-            org_order_id=org if org and org != "0" else None,
+            order_id=_norm_ordno(body.get("ordno", "")),
+            org_order_id=org if org not in ("", "0") else None,
             body=body,
         )
 
