@@ -191,6 +191,31 @@ async def test_etf_quote_subscribed_and_parsed() -> None:
     assert quotes[0].mid == 17_600
 
 
+async def test_futures_quote_subscribed_and_parsed() -> None:
+    # 선물 호가(JH0): t8401 코드로 구독하고, 프레임은 KR_STOCK_FUTURE로 해석.
+    from kp_arb.domain.enums import Instrument
+
+    fut_frame = json.dumps({
+        "header": {"tr_cd": "JH0", "tr_key": "A1167000"},
+        "body": {"shcode": "A1167000", "bidho1": "293000", "offerho1": "293500",
+                 "hotime": "100000"},
+    })
+    session = FakeConnection([fut_frame])
+    client = LSWebSocketClient(FakeConnector([session]))
+    quotes: list[Quote] = []
+    client.on_quote.append(quotes.append)
+    client.subscribe_futures_quotes({Underlying.SAMSUNG: "A1167000"})
+
+    await client.run()
+
+    sent = [json.loads(m)["body"] for m in session.sent]
+    assert {"tr_cd": "JH0", "tr_key": "A1167000"} in sent
+    assert len(quotes) == 1
+    assert quotes[0].instrument is Instrument.KR_STOCK_FUTURE
+    assert quotes[0].underlying is Underlying.SAMSUNG
+    assert quotes[0].mid == 293_250
+
+
 async def test_order_events_dispatched_by_kind() -> None:
     # SC0=접수(ack) / SC3=취소(cancel, orgordno=원주문) → OrderEvent로 분화.
     ack = json.dumps({"header": {"tr_cd": "SC0"}, "body": {"ordno": "9852", "orgordno": "0"}})

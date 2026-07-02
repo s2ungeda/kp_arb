@@ -30,6 +30,7 @@ class MarketData:
     def __init__(self) -> None:
         self.reference_price_krw: dict[Underlying, float] = {}  # 주식(레퍼런스) 중간가
         self.etf_price_krw: dict[Underlying, float] = {}        # 레버리지 ETF 중간가
+        self.futures_price_krw: dict[Underlying, float] = {}    # 주식선물 중간가
         self.hl_mark_usd: dict[Underlying, float] = {}
         self.usdkrw: float | None = None
 
@@ -63,9 +64,11 @@ class ArbEngine:
     # --- 시세 스냅샷 갱신(게이트웨이 콜백 연결용) ---
 
     def on_quote(self, quote: Quote) -> None:
-        # ETF 시세는 별도 보관 — 주식(레퍼런스) 가격을 덮어쓰지 않는다.
+        # ETF·선물 시세는 별도 보관 — 주식(레퍼런스) 가격을 덮어쓰지 않는다.
         if quote.instrument is Instrument.KR_ETF:
             self.market.etf_price_krw[quote.underlying] = quote.mid
+        elif quote.instrument is Instrument.KR_STOCK_FUTURE:
+            self.market.futures_price_krw[quote.underlying] = quote.mid
         else:
             self.market.reference_price_krw[quote.underlying] = quote.mid
 

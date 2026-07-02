@@ -30,6 +30,7 @@ from ..domain.enums import Instrument, Underlying
 from ..domain.models import Quote
 
 QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1"})
+FUTURES_QUOTE_TR = "JH0"  # 주식선물 호가 (body 필드는 H1_와 동일 가정 — 장중 실확인 예정)
 FILL_TRS: frozenset[str] = frozenset({"SC1", "C01"})  # 체결: 주식 SC1 / 선물 C01
 ORDER_EVENT_TRS: dict[str, str] = {
     "SC0": "ack", "SC2": "amend", "SC3": "cancel", "SC4": "reject",  # 주식
@@ -107,6 +108,8 @@ class LSWebSocketClient:
         # ETF 종목코드(config.yaml 주입) — 호가 구독·해석에 사용.
         self._etf_symbols = dict(etf_symbols or {})
         self._etf_underlying = {v: k for k, v in self._etf_symbols.items()}
+        # 선물 종목코드(t8401 자동 조회값 주입) — 선물 호가 구독·해석에 사용.
+        self._futures_underlying: dict[str, Underlying] = {}
         self._max_reconnects = max_reconnects
         self._reconnect_backoff_s = reconnect_backoff_s
         self._subs: list[tuple[str, str, str]] = []  # (tr_cd, tr_key, tr_type) 희망 구독 상태
@@ -127,6 +130,12 @@ class LSWebSocketClient:
         for code in codes:
             self._add("H1_", code)
             self._add("NH1", code)
+
+    def subscribe_futures_quotes(self, symbols: dict[Underlying, str]) -> None:
+        """주식선물 호가(JH0) 구독. symbols = t8401 자동 조회 결과(최근월물 코드)."""
+        for underlying, code in symbols.items():
+            self._futures_underlying[code] = underlying
+            self._add(FUTURES_QUOTE_TR, code)
 
     def subscribe_fills(self) -> None:
         """주식+선물 체결통보 전부 구독(단일 연결용 — 계좌 통보는 해당 토큰 계좌 것만 온다)."""
@@ -199,6 +208,11 @@ class LSWebSocketClient:
             if quote is not None:
                 for handler in self.on_quote:
                     handler(quote)
+        elif tr_cd == FUTURES_QUOTE_TR:
+            fut_quote = self._parse_futures_quote(msg)
+            if fut_quote is not None:
+                for handler in self.on_quote:
+                    handler(fut_quote)
         elif tr_cd in FILL_TRS:
             fill = self._parse_fill(tr_cd, msg)
             for fill_handler in self.on_fill:
@@ -233,6 +247,24 @@ class LSWebSocketClient:
             ask=float(body["offerho1"]),
             ts=float(body["hotime"]),
         )
+
+    def _parse_futures_quote(self, msg: dict[str, Any]) -> Quote | None:
+        # JH0 body 필드는 H1_와 동일(bidho1/offerho1/hotime/shcode) 가정 — 장중 실확인 예정.
+        body = msg["body"]
+        code = str(body.get("shcode") or msg.get("header", {}).get("tr_key", ""))
+        underlying = self._futures_underlying.get(code)
+        if underlying is None:
+            return None
+        try:
+            return Quote(
+                underlying=underlying,
+                instrument=Instrument.KR_STOCK_FUTURE,
+                bid=float(body["bidho1"]),
+                ask=float(body["offerho1"]),
+                ts=float(body.get("hotime", 0) or 0),
+            )
+        except (KeyError, ValueError):
+            return None  # 필드 가정이 다르면 조용히 무시(on_raw로 실프레임 확인)
 
     def _parse_fill(self, tr_cd: str, msg: dict[str, Any]) -> Fill:
         body = msg["body"]

@@ -70,8 +70,10 @@ class LiveSystem:
         deriv_ws: LSWebSocketClient | None = None,
         hl_gateway: HLGateway | None = None,
         hl_ws: HLWebSocketClient | None = None,
+        futures_symbols: dict[Underlying, str] | None = None,
     ) -> None:
         self._gw = gateway
+        self._futures_symbols = dict(futures_symbols or {})
         self._hl = hl_gateway
         self._hl_ws = hl_ws
         self.order_book = order_book
@@ -145,6 +147,8 @@ class LiveSystem:
 
         for underlying in Underlying:
             self._stock_ws.subscribe_quotes(underlying)
+        if self._futures_symbols:
+            self._stock_ws.subscribe_futures_quotes(self._futures_symbols)
         self._stock_ws.subscribe_market_status()
         self._stock_ws.subscribe_stock_fills()
         self._stock_ws.on_quote.append(fan_quote)
@@ -292,6 +296,7 @@ async def bootstrap_live(
         deriv_ws=await ws_for(Account.KR_DERIV),
         hl_gateway=hl_gateway,
         hl_ws=hl_ws,
+        futures_symbols=futures_symbols,
     )
 
 
