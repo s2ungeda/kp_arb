@@ -26,7 +26,13 @@ from .gateways.base import HLGateway
 from .gateways.hl import Mark
 from .gateways.hl_ws import HLWebSocketClient
 from .gateways.ls import LSApiGateway
-from .gateways.ls_ws import Fill, LSWebSocketClient, OrderEvent
+from .gateways.ls_ws import (
+    ExpectedPrice,
+    Fill,
+    LSWebSocketClient,
+    OrderEvent,
+    TradeTick,
+)
 from .order_book import OrderBook, TrackedOrder
 from .risk import RiskManager, RiskState
 from .session import reference_instrument
@@ -80,8 +86,11 @@ class LiveSystem:
         self.session = session
         self._stock_ws = stock_ws
         self._deriv_ws = deriv_ws
-        self.on_quote: list[Callable[[Quote], None]] = []  # 엔진/전략 결선용
-        self.on_mark: list[Callable[[Mark], None]] = []    # HL 마크 → 엔진/전략
+        self.on_quote: list[Callable[[Quote], None]] = []  # 호가(LS 주식/선물/ETF + HL bbo)
+        self.on_mark: list[Callable[[Mark], None]] = []    # HL 마크
+        self.on_trade: list[Callable[[TradeTick], None]] = []        # 체결(현재가)
+        self.on_expected: list[Callable[[ExpectedPrice], None]] = []  # 예상체결가
+        self.on_funding: list[Callable[[Underlying, float], None]] = []  # HL 예정 펀딩률
         self._tasks: list[asyncio.Task[None]] = []
 
     # --- 스냅샷 (최초 실행 + 온디맨드/UI 조회 버튼) ---
@@ -139,6 +148,14 @@ class LiveSystem:
             for handler in self.on_quote:
                 handler(quote)
 
+        def fan_trade(tick: TradeTick) -> None:
+            for handler in self.on_trade:
+                handler(tick)
+
+        def fan_expected(expected: ExpectedPrice) -> None:
+            for handler in self.on_expected:
+                handler(expected)
+
         def apply_fill(fill: Fill) -> None:
             self.order_book.on_fill(fill)
 
@@ -147,11 +164,14 @@ class LiveSystem:
 
         for underlying in Underlying:
             self._stock_ws.subscribe_quotes(underlying)
+            self._stock_ws.subscribe_trades(underlying)  # 현재가(S3_) + 예상체결(YS3)
         if self._futures_symbols:
             self._stock_ws.subscribe_futures_quotes(self._futures_symbols)
         self._stock_ws.subscribe_market_status()
         self._stock_ws.subscribe_stock_fills()
         self._stock_ws.on_quote.append(fan_quote)
+        self._stock_ws.on_trade.append(fan_trade)
+        self._stock_ws.on_expected.append(fan_expected)
         self._stock_ws.on_market_status.append(self.session.on_market_status)
         self._stock_ws.on_fill.append(apply_fill)
         self._stock_ws.on_order_event.append(apply_event)
@@ -164,8 +184,15 @@ class LiveSystem:
                 for handler in self.on_mark:
                     handler(mark)
 
+            def fan_funding(underlying: Underlying, rate: float) -> None:
+                for handler in self.on_funding:
+                    handler(underlying, rate)
+
             self._hl_ws.subscribe_marks()
+            self._hl_ws.subscribe_bbo()  # 최우선호가+잔량 → on_quote(HL_PERP)
             self._hl_ws.on_mark.append(fan_mark)
+            self._hl_ws.on_quote.append(fan_quote)
+            self._hl_ws.on_funding.append(fan_funding)
             self._hl_ws.on_fill.append(apply_fill)  # HL 체결 → OrderBook (oid로 매칭)
 
     async def start(self) -> None:

@@ -30,7 +30,10 @@ from ..domain.enums import Instrument, Underlying
 from ..domain.models import Quote
 
 QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1"})
-FUTURES_QUOTE_TR = "JH0"  # 주식선물 호가 (body 필드는 H1_와 동일 가정 — 장중 실확인 예정)
+FUTURES_QUOTE_TR = "JH0"   # 주식선물 호가 (body 필드는 H1_와 동일 가정 — 장중 실확인 예정)
+STOCK_TRADE_TR = "S3_"     # 주식 체결 (현재가 — body 'price' 가정, 장중 실확인 예정)
+FUTURES_TRADE_TR = "JC0"   # 주식선물 체결 (동일 가정)
+EXPECTED_TR = "YS3"        # 예상체결 (실측: yeprice/shcode — 장전 동시호가에 흐름)
 FILL_TRS: frozenset[str] = frozenset({"SC1", "C01"})  # 체결: 주식 SC1 / 선물 C01
 ORDER_EVENT_TRS: dict[str, str] = {
     "SC0": "ack", "SC2": "amend", "SC3": "cancel", "SC4": "reject",  # 주식
@@ -78,6 +81,23 @@ class OrderEvent(BaseModel):
     body: dict[str, Any] = {}
 
 
+class TradeTick(BaseModel):
+    """체결(현재가) 이벤트 — 주식 S3_ / 선물 JC0."""
+
+    underlying: Underlying
+    instrument: Instrument
+    price: float
+    ts: float = 0.0
+
+
+class ExpectedPrice(BaseModel):
+    """예상체결가 이벤트(YS3) — 동시호가 시간대."""
+
+    underlying: Underlying
+    price: float
+    ts: float = 0.0
+
+
 class WSConnection(Protocol):
     """단일 WS 세션. 구독 메시지 전송 + 프레임 비동기 수신."""
 
@@ -115,6 +135,8 @@ class LSWebSocketClient:
         self._subs: list[tuple[str, str, str]] = []  # (tr_cd, tr_key, tr_type) 희망 구독 상태
         self._conn: WSConnection | None = None
         self.on_quote: list[Callable[[Quote], None]] = []
+        self.on_trade: list[Callable[[TradeTick], None]] = []          # 체결(현재가)
+        self.on_expected: list[Callable[[ExpectedPrice], None]] = []   # 예상체결가
         self.on_fill: list[Callable[[Fill], None]] = []
         self.on_order_event: list[Callable[[OrderEvent], None]] = []
         self.on_market_status: list[Callable[[MarketStatus], None]] = []
@@ -132,10 +154,16 @@ class LSWebSocketClient:
             self._add("NH1", code)
 
     def subscribe_futures_quotes(self, symbols: dict[Underlying, str]) -> None:
-        """주식선물 호가(JH0) 구독. symbols = t8401 자동 조회 결과(최근월물 코드)."""
+        """주식선물 호가(JH0)+체결(JC0) 구독. symbols = t8401 자동 조회 결과."""
         for underlying, code in symbols.items():
             self._futures_underlying[code] = underlying
             self._add(FUTURES_QUOTE_TR, code)
+            self._add(FUTURES_TRADE_TR, code)
+
+    def subscribe_trades(self, underlying: Underlying) -> None:
+        """주식 체결(S3_, 현재가)과 예상체결(YS3) 구독."""
+        self._add(STOCK_TRADE_TR, underlying.krx_code)
+        self._add(EXPECTED_TR, underlying.krx_code)
 
     def subscribe_fills(self) -> None:
         """주식+선물 체결통보 전부 구독(단일 연결용 — 계좌 통보는 해당 토큰 계좌 것만 온다)."""
@@ -213,6 +241,16 @@ class LSWebSocketClient:
             if fut_quote is not None:
                 for handler in self.on_quote:
                     handler(fut_quote)
+        elif tr_cd in (STOCK_TRADE_TR, FUTURES_TRADE_TR):
+            tick = self._parse_trade(tr_cd, msg)
+            if tick is not None:
+                for trade_handler in self.on_trade:
+                    trade_handler(tick)
+        elif tr_cd == EXPECTED_TR:
+            expected = self._parse_expected(msg)
+            if expected is not None:
+                for expected_handler in self.on_expected:
+                    expected_handler(expected)
         elif tr_cd in FILL_TRS:
             fill = self._parse_fill(tr_cd, msg)
             for fill_handler in self.on_fill:
@@ -239,13 +277,15 @@ class LSWebSocketClient:
             if stock_underlying is None:
                 return None
             instrument, underlying = Instrument.KR_STOCK, stock_underlying
-        # 실측 필드: bidho1/offerho1(1호가), hotime(HHMMSS). 값은 문자열.
+        # 실측 필드: bidho1/offerho1(1호가), bidrem1/offerrem1(잔량), hotime(HHMMSS).
         return Quote(
             underlying=underlying,
             instrument=instrument,
             bid=float(body["bidho1"]),
             ask=float(body["offerho1"]),
             ts=float(body["hotime"]),
+            bid_qty=float(body.get("bidrem1", 0) or 0),
+            ask_qty=float(body.get("offerrem1", 0) or 0),
         )
 
     def _parse_futures_quote(self, msg: dict[str, Any]) -> Quote | None:
@@ -262,9 +302,43 @@ class LSWebSocketClient:
                 bid=float(body["bidho1"]),
                 ask=float(body["offerho1"]),
                 ts=float(body.get("hotime", 0) or 0),
+                bid_qty=float(body.get("bidrem1", 0) or 0),
+                ask_qty=float(body.get("offerrem1", 0) or 0),
             )
         except (KeyError, ValueError):
             return None  # 필드 가정이 다르면 조용히 무시(on_raw로 실프레임 확인)
+
+    def _parse_trade(self, tr_cd: str, msg: dict[str, Any]) -> TradeTick | None:
+        # S3_/JC0 체결가 필드는 'price' 가정(장중 실확인 예정) — 다르면 무시+on_raw로 확인.
+        body = msg["body"]
+        code = str(body.get("shcode") or msg.get("header", {}).get("tr_key", ""))
+        if tr_cd == FUTURES_TRADE_TR:
+            underlying = self._futures_underlying.get(code)
+            instrument = Instrument.KR_STOCK_FUTURE
+        else:
+            etf_u = self._etf_underlying.get(code)
+            underlying = etf_u if etf_u is not None else Underlying.from_krx_code(code)
+            instrument = Instrument.KR_ETF if etf_u is not None else Instrument.KR_STOCK
+        if underlying is None or "price" not in body:
+            return None
+        try:
+            return TradeTick(underlying=underlying, instrument=instrument,
+                             price=float(body["price"]),
+                             ts=float(body.get("chetime", 0) or 0))
+        except ValueError:
+            return None
+
+    def _parse_expected(self, msg: dict[str, Any]) -> ExpectedPrice | None:
+        # YS3 실측 필드: yeprice(예상체결가), shcode.
+        body = msg["body"]
+        code = str(body.get("shcode") or msg.get("header", {}).get("tr_key", ""))
+        underlying = Underlying.from_krx_code(code)
+        if underlying is None or "yeprice" not in body:
+            return None
+        try:
+            return ExpectedPrice(underlying=underlying, price=float(body["yeprice"]))
+        except ValueError:
+            return None
 
     def _parse_fill(self, tr_cd: str, msg: dict[str, Any]) -> Fill:
         body = msg["body"]

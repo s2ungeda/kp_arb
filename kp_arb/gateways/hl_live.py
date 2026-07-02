@@ -189,6 +189,19 @@ class HLSdkGateway(HLGateway):
                 return float(ctx.get("funding", 0.0))
         raise HLError(f"{coin} not in {HL_DEX} universe")
 
+    async def get_prev_funding(self, underlying: Underlying) -> float:
+        """직전(가장 최근 적용된) 펀딩률. fundingHistory 최근 1건."""
+        import time
+
+        coin = self._symbol(underlying)
+        start = int((time.time() - 3 * 3600) * 1000)  # 최근 3시간이면 충분(펀딩은 매시)
+        rows = await self._post_info(
+            {"type": "fundingHistory", "coin": coin, "startTime": start}
+        )
+        if isinstance(rows, list) and rows:
+            return float(rows[-1].get("fundingRate", 0.0))
+        return 0.0
+
     async def get_mark(self, underlying: Underlying) -> float:
         coin = self._symbol(underlying)
         meta, ctxs = await self._post_info({"type": "metaAndAssetCtxs", "dex": HL_DEX})

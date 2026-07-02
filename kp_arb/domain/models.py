@@ -12,6 +12,8 @@ class Quote(BaseModel):
     bid: float
     ask: float
     ts: float
+    bid_qty: float | None = None  # 매수 1호가 잔량 (모니터/전략 참고용)
+    ask_qty: float | None = None  # 매도 1호가 잔량
 
     @property
     def mid(self) -> float:

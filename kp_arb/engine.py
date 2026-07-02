@@ -69,6 +69,8 @@ class ArbEngine:
             self.market.etf_price_krw[quote.underlying] = quote.mid
         elif quote.instrument is Instrument.KR_STOCK_FUTURE:
             self.market.futures_price_krw[quote.underlying] = quote.mid
+        elif quote.instrument is Instrument.HL_PERP:
+            return  # HL 가격은 on_mark 경로 사용(원화 가격 저장소 오염 방지)
         else:
             self.market.reference_price_krw[quote.underlying] = quote.mid
 

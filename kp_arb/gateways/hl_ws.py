@@ -17,7 +17,8 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from ..domain.enums import Underlying
+from ..domain.enums import Instrument, Underlying
+from ..domain.models import Quote
 from .hl import Mark
 from .hl_live import HL_SYMBOLS
 from .ls_ws import Fill, WSConnection, WSConnector
@@ -43,6 +44,8 @@ class HLWebSocketClient:
         self._reconnect_backoff_s = reconnect_backoff_s
         self._subs: list[dict[str, Any]] = []  # subscription payload 희망 상태
         self.on_mark: list[Callable[[Mark], None]] = []
+        self.on_quote: list[Callable[[Quote], None]] = []          # 최우선호가(bbo)
+        self.on_funding: list[Callable[[Underlying, float], None]] = []  # 예정 펀딩률
         self.on_fill: list[Callable[[Fill], None]] = []
         self.on_raw: list[Callable[[str], None]] = []
 
@@ -51,6 +54,11 @@ class HLWebSocketClient:
     def subscribe_marks(self) -> None:
         for coin in self._symbols.values():
             self._add({"type": "activeAssetCtx", "coin": coin})
+
+    def subscribe_bbo(self) -> None:
+        """최우선호가(매수/매도 1호가 + 잔량) 구독 → on_quote(Quote[HL_PERP])."""
+        for coin in self._symbols.values():
+            self._add({"type": "bbo", "coin": coin})
 
     def subscribe_user_fills(self, address: str) -> None:
         self._add({"type": "userFills", "user": address})
@@ -95,6 +103,12 @@ class HLWebSocketClient:
             if mark is not None:
                 for handler in self.on_mark:
                     handler(mark)
+            self._emit_funding(data)
+        elif channel == "bbo":
+            quote = self._parse_bbo(data)
+            if quote is not None:
+                for quote_handler in self.on_quote:
+                    quote_handler(quote)
         elif channel == "userFills":
             if data.get("isSnapshot"):
                 return  # 과거 체결 일괄 — 이벤트 아님
@@ -109,6 +123,33 @@ class HLWebSocketClient:
             return None
         return Mark(underlying=underlying, price=float(ctx["markPx"]),
                     ts=float(ctx.get("time", 0.0)))
+
+    def _emit_funding(self, data: dict[str, Any]) -> None:
+        underlying = self._by_symbol.get(str(data.get("coin", "")))
+        ctx = data.get("ctx", {})
+        if underlying is None or "funding" not in ctx:
+            return
+        for handler in self.on_funding:
+            handler(underlying, float(ctx["funding"]))
+
+    def _parse_bbo(self, data: dict[str, Any]) -> Quote | None:
+        # bbo 프레임: {coin, time, bbo: [매수1호가, 매도1호가]} — 각 호가 {px, sz, n}.
+        underlying = self._by_symbol.get(str(data.get("coin", "")))
+        levels = data.get("bbo")
+        if underlying is None or not isinstance(levels, list) or len(levels) != 2:
+            return None
+        bid, ask = levels[0] or {}, levels[1] or {}
+        if "px" not in bid or "px" not in ask:
+            return None
+        return Quote(
+            underlying=underlying,
+            instrument=Instrument.HL_PERP,
+            bid=float(bid["px"]),
+            ask=float(ask["px"]),
+            ts=float(data.get("time", 0.0)),
+            bid_qty=float(bid.get("sz", 0) or 0),
+            ask_qty=float(ask.get("sz", 0) or 0),
+        )
 
     def _parse_fills(self, data: dict[str, Any]) -> list[Fill]:
         fills: list[Fill] = []
