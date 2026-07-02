@@ -52,3 +52,7 @@ class HLGateway(ABC):
 
     @abstractmethod
     async def get_funding(self, underlying: Underlying) -> float: ...
+
+    @abstractmethod
+    async def get_open_orders(self) -> Sequence[TrackedOrder]:
+        """미체결 주문 스냅샷(최초 실행/온디맨드 조회용)."""

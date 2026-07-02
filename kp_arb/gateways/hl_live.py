@@ -135,6 +135,40 @@ class HLSdkGateway(HLGateway):
             )
         return positions
 
+    async def get_open_orders(self) -> Sequence[Any]:
+        """미체결 스냅샷(frontendOpenOrders, dex 스코프) → TrackedOrder."""
+        from ..order_book import OrderStatus, TrackedOrder
+
+        rows = await self._post_info(
+            {"type": "frontendOpenOrders", "user": self._address, "dex": HL_DEX}
+        )
+        orders: list[TrackedOrder] = []
+        for row in rows if isinstance(rows, list) else []:
+            underlying = self._by_symbol.get(str(row.get("coin", "")))
+            if underlying is None:
+                continue
+            intent = OrderIntent(
+                venue=Venue.HYPERLIQUID,
+                underlying=underlying,
+                instrument=Instrument.HL_PERP,
+                side=Side.BUY if str(row.get("side")) == "B" else Side.SELL,
+                qty=float(row["origSz"]),
+                order_type=OrderType.LIMIT,
+                price=float(row["limitPx"]),
+            )
+            filled = float(row["origSz"]) - float(row["sz"])  # sz = 잔여
+            oid = str(row["oid"])
+            self._order_coin[oid] = str(row["coin"])  # 취소 가능하도록 coin 기억
+            orders.append(
+                TrackedOrder(
+                    order_id=oid,
+                    intent=intent,
+                    status=OrderStatus.PARTIAL if filled > 0 else OrderStatus.ACCEPTED,
+                    filled_qty=filled,
+                )
+            )
+        return orders
+
     async def get_margin(self) -> float:
         """xyz dex 계정 가치(USDC). HIP-3는 dex별 마진 분리."""
         state = await self._post_info(

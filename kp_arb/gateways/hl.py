@@ -135,6 +135,9 @@ class HLApiGateway(HLGateway):
         resp = await self._info({"type": "funding", "coin": coin})
         return float(resp["funding"])
 
+    async def get_open_orders(self) -> Sequence[Any]:
+        return []  # 미체결 스냅샷은 라이브 구현(HLSdkGateway.get_open_orders) 사용
+
     # --- 마크 WS ---
 
     def subscribe_mark(self, underlying: Underlying) -> None:

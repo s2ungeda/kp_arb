@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from ..domain.enums import Underlying, Venue
 from ..domain.models import OrderIntent, Position
 from .base import HLGateway
+
+if TYPE_CHECKING:
+    from ..order_book import TrackedOrder
 
 
 class MockHLGateway(HLGateway):
@@ -34,6 +38,9 @@ class MockHLGateway(HLGateway):
 
     async def get_funding(self, underlying: Underlying) -> float:
         return self._funding.get(underlying, 0.0)
+
+    async def get_open_orders(self) -> Sequence[TrackedOrder]:
+        return []  # mock: 미체결 없음
 
     # --- 테스트 픽스처 주입 헬퍼 ---
     def seed_position(self, position: Position) -> None:

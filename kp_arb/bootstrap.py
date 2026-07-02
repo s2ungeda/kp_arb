@@ -19,8 +19,11 @@ import asyncio
 from collections.abc import Callable
 
 from .config import LSAccounts
-from .domain.enums import Account, Underlying
+from .domain.enums import Account, Underlying, Venue
 from .domain.models import OrderIntent, Position, Quote
+from .gateways.base import HLGateway
+from .gateways.hl import Mark
+from .gateways.hl_ws import HLWebSocketClient
 from .gateways.ls import LSApiGateway
 from .gateways.ls_ws import Fill, LSWebSocketClient, OrderEvent
 from .order_book import OrderBook, TrackedOrder
@@ -61,13 +64,18 @@ class LiveSystem:
         session: SessionService,
         stock_ws: LSWebSocketClient,
         deriv_ws: LSWebSocketClient | None = None,
+        hl_gateway: HLGateway | None = None,
+        hl_ws: HLWebSocketClient | None = None,
     ) -> None:
         self._gw = gateway
+        self._hl = hl_gateway
+        self._hl_ws = hl_ws
         self.order_book = order_book
         self.session = session
         self._stock_ws = stock_ws
         self._deriv_ws = deriv_ws
         self.on_quote: list[Callable[[Quote], None]] = []  # 엔진/전략 결선용
+        self.on_mark: list[Callable[[Mark], None]] = []    # HL 마크 → 엔진/전략
         self._tasks: list[asyncio.Task[None]] = []
 
     # --- 스냅샷 (최초 실행 + 온디맨드/UI 조회 버튼) ---
@@ -80,6 +88,9 @@ class LiveSystem:
             balances[account] = await self._gw.get_balance(account)
             positions.extend(await self._gw.get_positions(account))
             open_orders.extend(await self._gw.get_open_orders(account))
+        if self._hl is not None:
+            positions.extend(await self._hl.get_positions())
+            open_orders.extend(await self._hl.get_open_orders())
         self.order_book.load_snapshot(
             positions=positions, balances=balances, open_orders=open_orders
         )
@@ -87,7 +98,13 @@ class LiveSystem:
     # --- 주문 (등록까지 한 번에 — 이후 상태는 이벤트로만) ---
 
     async def place(self, intent: OrderIntent) -> str:
-        order_id = await self._gw.place_order(intent)
+        """venue 라우팅 주문 + OrderBook 등록. 이후 상태는 이벤트로만."""
+        if intent.venue is Venue.LS:
+            order_id = await self._gw.place_order(intent)
+        elif self._hl is not None:
+            order_id = await self._hl.place_order(intent)
+        else:
+            raise RuntimeError("HL gateway not configured")
         self.order_book.track(order_id, intent)
         return order_id
 
@@ -134,6 +151,14 @@ class LiveSystem:
             self._deriv_ws.subscribe_futures_fills()
             self._deriv_ws.on_fill.append(apply_fill)
             self._deriv_ws.on_order_event.append(apply_event)
+        if self._hl_ws is not None:
+            def fan_mark(mark: Mark) -> None:
+                for handler in self.on_mark:
+                    handler(mark)
+
+            self._hl_ws.subscribe_marks()
+            self._hl_ws.on_mark.append(fan_mark)
+            self._hl_ws.on_fill.append(apply_fill)  # HL 체결 → OrderBook (oid로 매칭)
 
     async def start(self) -> None:
         """최초 스냅샷 → 세션 초기값(옵션) → WS 결선 → 실시간 수신 시작(재연결 포함)."""
@@ -143,6 +168,8 @@ class LiveSystem:
         self._tasks = [asyncio.create_task(self._stock_ws.run())]
         if self._deriv_ws is not None:
             self._tasks.append(asyncio.create_task(self._deriv_ws.run()))
+        if self._hl_ws is not None:
+            self._tasks.append(asyncio.create_task(self._hl_ws.run()))
 
     async def wait(self) -> None:
         await asyncio.gather(*self._tasks)
@@ -155,11 +182,10 @@ class LiveSystem:
 
 
 async def bootstrap_live(session: object) -> LiveSystem:
-    """라이브(모의/실전) 조립 — aiohttp 세션을 받아 LS-only LiveSystem 구성.
-
-    HL 게이트웨이는 라이브 결선 시 이 함수에 추가(슬롯 예비).
-    """
-    from .config import current_mode
+    """라이브(모의/실전) 조립 — LS + HL. HL 비밀 미등록 시 LS-only로 동작."""
+    from .config import ConfigError, current_mode, default_secrets
+    from .gateways.hl_live import HLSdkGateway
+    from .gateways.hl_ws import HLWebSocketConnector
     from .gateways.ls import LIVE_BASE_URL
     from .gateways.ls_http import AiohttpRestTransport, AiohttpTokenTransport
     from .gateways.ls_ws_live import LSWebSocketConnector, ls_ws_url
@@ -189,12 +215,24 @@ async def bootstrap_live(session: object) -> LiveSystem:
         token = (await token_tx.fetch_token(cred.appkey, cred.appsecret)).access_token
         return LSWebSocketClient(LSWebSocketConnector(url), token=token)
 
+    # HL 슬롯 — 비밀(HL_AGENT_KEY/HL_ACCOUNT_ADDRESS) 없으면 LS-only.
+    hl_gateway = None
+    hl_ws = None
+    try:
+        hl_gateway = HLSdkGateway.from_secrets()
+        hl_ws = HLWebSocketClient(HLWebSocketConnector())
+        hl_ws.subscribe_user_fills(str(default_secrets().get("HL_ACCOUNT_ADDRESS")))
+    except ConfigError:
+        pass
+
     return LiveSystem(
         gateway=gateway,
         order_book=OrderBook(),
         session=SessionService(),
         stock_ws=await ws_for(Account.KR_STOCK),
         deriv_ws=await ws_for(Account.KR_DERIV),
+        hl_gateway=hl_gateway,
+        hl_ws=hl_ws,
     )
 
 
@@ -216,7 +254,9 @@ def main() -> None:
         async with aiohttp.ClientSession() as http:
             system = await bootstrap_live(http)
             quotes = {"n": 0}
+            marks: dict[str, float] = {}
             system.on_quote.append(lambda q: quotes.__setitem__("n", quotes["n"] + 1))
+            system.on_mark.append(lambda m: marks.__setitem__(m.underlying.value, m.price))
             await system.start()
             ob = system.order_book
             print(f"[snapshot] stock bal = {ob.balance(Account.KR_STOCK):,.0f}")
@@ -226,6 +266,7 @@ def main() -> None:
             print(f"[live] {seconds:.0f}s 실시간 수신 중 ...")
             await asyncio.sleep(seconds)
             print(f"[live] quotes received = {quotes['n']}")
+            print(f"[live] hl marks = {marks}")
             print(f"[live] session phase(samsung) = "
                   f"{system.session.phase_for(Underlying.SAMSUNG).value}")
             await system.stop()

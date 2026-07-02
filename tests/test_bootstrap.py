@@ -153,6 +153,68 @@ async def test_session_init_invalid_stays_dead(monkeypatch) -> None:  # type: ig
     assert system.session.phase_for(SAMSUNG) is SessionPhase.DEAD  # 보수 유지
 
 
+async def test_hl_slot_snapshot_marks_and_fills() -> None:
+    # HL 슬롯: 스냅샷 포지션 합류 + 마크 fan-out + HL 체결 → OrderBook.
+    import json as _json
+
+    from kp_arb.gateways.hl_ws import HLWebSocketClient
+    from kp_arb.gateways.mock_hl import MockHLGateway
+
+    hl_gw = MockHLGateway()
+    hl_gw.seed_position(Position(venue=Venue.HYPERLIQUID, instrument=Instrument.HL_PERP,
+                                 underlying=SAMSUNG, side=Side.SELL, qty=0.1, avg_price=184.0))
+    hl_fill = _json.dumps({"channel": "userFills", "data": {"fills": [
+        {"coin": "xyz:SMSN", "px": "185.0", "sz": "0.2", "side": "A",
+         "oid": 777, "tid": 1, "time": 1.0}]}})
+    mark = _json.dumps({"channel": "activeAssetCtx",
+                        "data": {"coin": "xyz:SMSN", "ctx": {"markPx": "184.5"}}})
+    hl_ws = HLWebSocketClient(FakeConnector([mark, hl_fill]))
+
+    gw = MockLSGateway()
+    system = LiveSystem(
+        gateway=gw,  # type: ignore[arg-type]
+        order_book=OrderBook(),
+        session=SessionService(),
+        stock_ws=LSWebSocketClient(FakeConnector([])),
+        hl_gateway=hl_gw,
+        hl_ws=hl_ws,
+    )
+    hl_intent = OrderIntent(venue=Venue.HYPERLIQUID, underlying=SAMSUNG,
+                            instrument=Instrument.HL_PERP, side=Side.SELL, qty=0.2,
+                            order_type=OrderType.MARKET)
+    marks: list[float] = []
+    system.on_mark.append(lambda m: marks.append(m.price))
+    system.order_book.track("777", hl_intent)  # HL 체결 매칭용
+    await system.start()
+    await system.wait()
+
+    # 스냅샷: HL 포지션 합류 (숏 0.1)
+    assert system.order_book.position_qty(SAMSUNG, Instrument.HL_PERP) == -0.1 - 0.2
+    assert marks == [184.5]  # 마크 fan-out
+    assert system.order_book.order("777").filled_qty == 0.2  # HL 체결 반영
+
+
+async def test_place_routes_hl_to_hl_gateway() -> None:
+    from kp_arb.gateways.hl_ws import HLWebSocketClient
+    from kp_arb.gateways.mock_hl import MockHLGateway
+
+    hl_gw = MockHLGateway()
+    system = LiveSystem(
+        gateway=MockLSGateway(),  # type: ignore[arg-type]
+        order_book=OrderBook(),
+        session=SessionService(),
+        stock_ws=LSWebSocketClient(FakeConnector([])),
+        hl_gateway=hl_gw,
+        hl_ws=HLWebSocketClient(FakeConnector([])),
+    )
+    await system.start()
+    oid = await system.place(OrderIntent(venue=Venue.HYPERLIQUID, underlying=SAMSUNG,
+                                         instrument=Instrument.HL_PERP, side=Side.SELL,
+                                         qty=0.1, order_type=OrderType.MARKET))
+    assert oid.startswith("HL-") and len(hl_gw.placed) == 1
+    await system.wait()
+
+
 async def test_deriv_ws_subscribes_futures_fills_only() -> None:
     system, _, deriv_connector = _system([], deriv_frames=[])
     await system.start()

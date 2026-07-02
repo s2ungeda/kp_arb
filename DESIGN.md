@@ -154,8 +154,9 @@
 ### 5.8 StateStore / Monitor
 - SQLite 영속화(재시작 복구), 로깅, 알림(임계·연결끊김·체결실패·데드존·노출보고 실패).
 
-### 5.9a Bootstrap — 시동 절차 (구현 v6.8)
-- `kp_arb/bootstrap.py`: 계좌 로드 → 계좌별 게이트웨이 → **t8401 선물 최근월물 자동 조회** → 최초 스냅샷(잔고·포지션·미체결) → WS 결선(계좌별 2연결: 주식 WS=시세·JIF·SC*, 파생 WS=O01·C01·H01) → 상시 실시간. 수동 시동: `python -m kp_arb.bootstrap`. HL 슬롯 예비.
+### 5.9a Bootstrap — 시동 절차 (구현 v6.8, HL 결선 v6.12)
+- `kp_arb/bootstrap.py`: 계좌 로드 → 계좌별 게이트웨이 → **t8401 선물 최근월물 자동 조회** → 최초 스냅샷(잔고·포지션·미체결 — **HL 포지션·미체결 포함**) → WS 결선 → 상시 실시간. 수동 시동: `python -m kp_arb.bootstrap`.
+- WS 3연결: 주식 WS(시세·JIF·SC*) + 파생 WS(O01·C01·H01) + **HL WS(activeAssetCtx 마크·userFills 체결→OrderBook)**. `place()`는 venue로 LS/HL 라우팅. HL 비밀 미등록 시 LS-only로 동작. **전체 시동 라이브 검증**(HL 마크 3종 실시간 수신).
 - **[확정 v6.9] 세션 초기화 정책:** LS REST에는 "현재 장상태" 조회 TR이 **없다**(364 TR 카탈로그 확인 — JIF는 변화 push만). 따라서 ① **표준 운영 = 개장 전 시동**(JIF 카운트다운 자연 수신) ② 장중 재시작은 **`KP_SESSION_INIT`**(env, 예: regular)으로 운영자가 명시 시딩 — 이미 수신한 JIF는 덮지 않고, 이후 JIF가 항상 우선. 미설정/미지 값은 보수적 DEAD. 휴장일도 조회 TR 부재 → 시세·JIF 무수신 시 DEAD 유지로 안전.
 
 ### 5.9 OrderBook — 주문·포지션·잔고의 실시간 관리 (확정 v0.5)
