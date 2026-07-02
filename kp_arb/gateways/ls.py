@@ -62,6 +62,8 @@ class LSApiGateway(LSGateway):
     DERIV_POSITIONS_TR = "CFOAQ50600"   # 선물옵션 잔고·평가 (get_positions, 모의 미제공→빈결과)
     STOCK_ACC_PATH = "/stock/accno"
     DERIV_ACC_PATH = "/futureoption/accno"
+    FUTURES_MASTER_TR = "t8401"         # 주식선물 마스터 (종목코드 조회, 실측 v6.7)
+    FUTURES_MARKET_PATH = "/futureoption/market-data"
 
     _SPOT: frozenset[Instrument] = frozenset({Instrument.KR_STOCK, Instrument.KR_ETF})
 
@@ -240,6 +242,17 @@ class LSApiGateway(LSGateway):
             filled_qty=exec_qty,
             avg_fill_price=float(row.get("ExecPrc", 0) or 0),
         )
+
+    async def fetch_futures_master(self) -> list[dict[str, Any]]:
+        """주식선물 마스터(t8401) 전 종목. 행: {hname, shcode, expcode, basecode}."""
+        resp = await self._rest_for(Account.KR_DERIV).request(
+            self.FUTURES_MASTER_TR,
+            {f"{self.FUTURES_MASTER_TR}InBlock": {"dummy": "0"}},
+            path=self.FUTURES_MARKET_PATH,
+        )
+        self._check_ok(resp, self.FUTURES_MASTER_TR)
+        rows = resp.body.get(f"{self.FUTURES_MASTER_TR}OutBlock")
+        return list(rows) if isinstance(rows, list) else []
 
     async def raw_request(
         self, account: Account, tr_cd: str, path: str, *, method: str = "POST"

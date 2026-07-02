@@ -35,7 +35,9 @@ ORDER_EVENT_TRS: dict[str, str] = {
     "SC0": "ack", "SC2": "amend", "SC3": "cancel", "SC4": "reject",  # 주식
     "O01": "ack", "H01": "cancel",                                    # 선물(H01=정정취소 공용)
 }
-ACCOUNT_TRS: tuple[str, ...] = ("SC0", "SC1", "SC2", "SC3", "SC4", "O01", "C01", "H01")
+STOCK_FILL_TRS: tuple[str, ...] = ("SC0", "SC1", "SC2", "SC3", "SC4")     # 주식계좌 토큰 WS
+FUTURES_FILL_TRS: tuple[str, ...] = ("O01", "C01", "H01")                  # 선물옵션계좌 토큰 WS
+ACCOUNT_TRS: tuple[str, ...] = STOCK_FILL_TRS + FUTURES_FILL_TRS
 STATUS_TR = "JIF"
 
 
@@ -119,8 +121,17 @@ class LSWebSocketClient:
         self._add("NH1", code)
 
     def subscribe_fills(self) -> None:
-        # 계좌 이벤트(SC*)는 tr_type "1"로 등록해야 수신된다(실측 — "3"은 ACK만 옴).
-        for tr in ACCOUNT_TRS:
+        """주식+선물 체결통보 전부 구독(단일 연결용 — 계좌 통보는 해당 토큰 계좌 것만 온다)."""
+        self.subscribe_stock_fills()
+        self.subscribe_futures_fills()
+
+    def subscribe_stock_fills(self) -> None:
+        # 계좌 이벤트는 tr_type "1"로 등록해야 수신된다(실측 — "3"은 ACK만 옴).
+        for tr in STOCK_FILL_TRS:
+            self._add(tr, "", tr_type="1")
+
+    def subscribe_futures_fills(self) -> None:
+        for tr in FUTURES_FILL_TRS:
             self._add(tr, "", tr_type="1")
 
     def subscribe_market_status(self) -> None:

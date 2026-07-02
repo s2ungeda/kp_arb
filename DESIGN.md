@@ -154,6 +154,10 @@
 ### 5.8 StateStore / Monitor
 - SQLite 영속화(재시작 복구), 로깅, 알림(임계·연결끊김·체결실패·데드존·노출보고 실패).
 
+### 5.9a Bootstrap — 시동 절차 (구현 v6.8)
+- `kp_arb/bootstrap.py`: 계좌 로드 → 계좌별 게이트웨이 → **t8401 선물 최근월물 자동 조회** → 최초 스냅샷(잔고·포지션·미체결) → WS 결선(계좌별 2연결: 주식 WS=시세·JIF·SC*, 파생 WS=O01·C01·H01) → 상시 실시간. 수동 시동: `python -m kp_arb.bootstrap`. HL 슬롯 예비.
+- **[미해결]** 장중 시작 시 세션 phase 초기값: JIF는 상태 "변화" 시에만 발행 → 시작 직후는 DEAD(보수) 유지. 장운영/휴장일 REST 조회로 초기화 필요(§5.1 표의 "휴장일/운영시간 조회 TR" — 구현 시 확인).
+
 ### 5.9 OrderBook — 주문·포지션·잔고의 실시간 관리 (확정 v0.5)
 - **운영 모델:** ① **최초 실행 시 REST 스냅샷 1회**(계좌·포지션·잔고·미체결 주문 조회) → ② 이후는 **실시간 이벤트(WS 체결통보)가 기본** — 주문 상태 전이·포지션·잔고를 체결 이벤트로 증분 갱신한다(체결 대기 폴링 금지). ③ 동일 스냅샷 조회는 **온디맨드**(추후 UI 조회 버튼)로 재사용.
 - **TrackedOrder:** `order_id, intent, account, status, filled_qty, avg_fill_price`. 상태 전이는 이벤트로만: `NEW → ACCEPTED(SC0) → PARTIAL/FILLED(SC1)` / `CANCELLED(SC3)` / `REJECTED(SC4)`.
