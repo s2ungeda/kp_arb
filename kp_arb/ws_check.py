@@ -39,7 +39,7 @@ async def _run(seconds: float) -> None:
     client.on_market_status.append(lambda s: print("MARKET", s.tr_key, s.body))
     client.on_fill.append(lambda f: print("FILL", f.order_id, f.qty, f.price))
     client.subscribe_quotes(Underlying.SAMSUNG)
-    client.subscribe_market_status(Underlying.SAMSUNG)
+    client.subscribe_market_status()
     try:
         await asyncio.wait_for(client.run(), timeout=seconds)
     except TimeoutError:

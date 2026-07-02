@@ -4,7 +4,13 @@
 연결 끊김 시 자동 재연결·재구독, on_quote / on_fill / on_market_status 이벤트 노출.
 
 라이브 없음: 실제 WS는 주입된 ``WSConnector``/``WSConnection``(Protocol) 뒤로 격리.
-테스트는 가짜 WS 서버(녹화 프레임)만 사용한다. 정확한 LS 프레임 필드명은 라이브 구현 시 확인.
+테스트는 가짜 WS 서버(녹화 프레임)만 사용한다.
+
+[라이브 정합 v6.3] 실측 프레임 기준:
+- H1_/NH1 body: ``bidho1``/``offerho1``(1호가, 문자열), ``hotime``(HHMMSS), ``shcode``(종목코드).
+- JIF는 **시장 단위**(tr_key="0" 전체) — 종목코드로 구독하면 아무 프레임도 오지 않는다.
+  body = ``{jangubun(시장구분), jstatus(상태코드)}``. 해석은 SessionService.
+- 체결(SC0~SC4) 실필드는 미실측(주문 발생 시 확인) — placeholder 유지.
 """
 from __future__ import annotations
 
@@ -87,8 +93,9 @@ class LSWebSocketClient:
         for tr in sorted(FILL_TRS):
             self._add(tr, "")
 
-    def subscribe_market_status(self, underlying: Underlying) -> None:
-        self._add(STATUS_TR, underlying.krx_code)
+    def subscribe_market_status(self) -> None:
+        # JIF는 시장 단위 — tr_key "0"(전체). 종목코드 구독은 무응답(실측).
+        self._add(STATUS_TR, "0")
 
     def _add(self, tr_cd: str, tr_key: str) -> None:
         if (tr_cd, tr_key) not in self._subs:
@@ -153,17 +160,18 @@ class LSWebSocketClient:
         # 알 수 없는 tr_cd는 무시
 
     def _parse_quote(self, msg: dict[str, Any]) -> Quote | None:
-        code = msg.get("header", {}).get("tr_key", "")
+        body = msg["body"]
+        code = str(body.get("shcode") or msg.get("header", {}).get("tr_key", ""))
         underlying = Underlying.from_krx_code(code)
         if underlying is None:
             return None
-        body = msg["body"]
+        # 실측 필드: bidho1/offerho1(1호가), hotime(HHMMSS). 값은 문자열.
         return Quote(
             underlying=underlying,
             instrument=Instrument.KR_STOCK,  # H1_/NH1 모두 현물 호가
-            bid=float(body["bid"]),
-            ask=float(body["ask"]),
-            ts=float(body["ts"]),
+            bid=float(body["bidho1"]),
+            ask=float(body["offerho1"]),
+            ts=float(body["hotime"]),
         )
 
     def _parse_fill(self, msg: dict[str, Any]) -> Fill:

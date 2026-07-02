@@ -1,32 +1,33 @@
-"""SessionService 계약 테스트. 녹화 JIF 프레임/휴장일 입력 → 세션 맵 검증."""
+"""SessionService 계약 테스트. 실측 JIF 프레임(시장 단위) → 세션 맵 검증.
+
+[정합 v6.3] JIF는 시장 단위(tr_key="0", body={jangubun, jstatus})임이 라이브 실측으로
+확인되어, 종전의 '종목 단위(jang_cd)' 가정 테스트를 실제 계약으로 정정했다.
+"""
 from kp_arb.domain.enums import Instrument, SessionPhase, Underlying
 from kp_arb.gateways.ls_ws import MarketStatus
 from kp_arb.session import reference_instrument, tradeable_instruments
 from kp_arb.session_service import SessionService, phase_from_jif
 
 SAMSUNG = Underlying.SAMSUNG
-SAMSUNG_CODE = Underlying.SAMSUNG.krx_code
-HYNIX = Underlying.SK_HYNIX
-HYNIX_CODE = Underlying.SK_HYNIX.krx_code
 
 
-def jif(code: str, jang_cd: str) -> MarketStatus:
-    """녹화 JIF 프레임(파싱된 MarketStatus)."""
-    return MarketStatus(tr_key=code, body={"jang_cd": jang_cd})
+def jif(jstatus: str, *, jangubun: str = "1") -> MarketStatus:
+    """실측 JIF 프레임(파싱된 MarketStatus). 시장 단위 — tr_key는 '0'."""
+    return MarketStatus(tr_key="0", body={"jangubun": jangubun, "jstatus": jstatus})
 
 
-# --- JIF 코드 → phase 매핑 (순수 함수) ---
+# --- jstatus → phase 매핑 (순수 함수) ---
 
 
 def test_phase_from_jif_mapping() -> None:
-    assert phase_from_jif({"jang_cd": "10"}) is SessionPhase.PRE_OPEN
-    assert phase_from_jif({"jang_cd": "20"}) is SessionPhase.REGULAR
-    assert phase_from_jif({"jang_cd": "40"}) is SessionPhase.AFTER_MARKET
-    assert phase_from_jif({"jang_cd": "90"}) is SessionPhase.DEAD
+    assert phase_from_jif({"jangubun": "1", "jstatus": "11"}) is SessionPhase.PRE_OPEN
+    assert phase_from_jif({"jangubun": "1", "jstatus": "24"}) is SessionPhase.PRE_OPEN  # 실측
+    assert phase_from_jif({"jangubun": "1", "jstatus": "21"}) is SessionPhase.REGULAR
+    assert phase_from_jif({"jangubun": "1", "jstatus": "41"}) is SessionPhase.DEAD
 
 
 def test_phase_from_jif_unknown_is_dead() -> None:
-    assert phase_from_jif({"jang_cd": "99"}) is SessionPhase.DEAD
+    assert phase_from_jif({"jangubun": "1", "jstatus": "99"}) is SessionPhase.DEAD
     assert phase_from_jif({}) is SessionPhase.DEAD  # 누락도 보수적으로 DEAD
 
 
@@ -35,7 +36,7 @@ def test_phase_from_jif_unknown_is_dead() -> None:
 
 def test_regular_jif_yields_regular_session() -> None:
     svc = SessionService()
-    svc.on_market_status(jif(SAMSUNG_CODE, "20"))
+    svc.on_market_status(jif("21"))  # 장시작
     s = svc.session_for(SAMSUNG)
     assert svc.phase_for(SAMSUNG) is SessionPhase.REGULAR
     t = tradeable_instruments(s)
@@ -45,21 +46,22 @@ def test_regular_jif_yields_regular_session() -> None:
     assert reference_instrument(s) is Instrument.KR_STOCK
 
 
-def test_after_market_jif_yields_after_market_session() -> None:
+def test_preopen_countdown_is_auction_no_reference() -> None:
     svc = SessionService()
-    svc.on_market_status(jif(SAMSUNG_CODE, "40"))
-    s = svc.session_for(SAMSUNG)
-    assert tradeable_instruments(s) == {Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE}
-    assert reference_instrument(s) is Instrument.KR_STOCK
-
-
-def test_preopen_is_auction_no_reference() -> None:
-    svc = SessionService()
-    svc.on_market_status(jif(SAMSUNG_CODE, "10"))
+    svc.on_market_status(jif("24"))  # 장개시 5분전 (실측)
     s = svc.session_for(SAMSUNG)
     assert s[Instrument.KR_STOCK].tradeable is True
     assert s[Instrument.KR_STOCK].is_auction is True
     assert reference_instrument(s) is None  # 동시호가는 레퍼런스 아님
+
+
+def test_close_jif_yields_deadzone() -> None:
+    svc = SessionService()
+    svc.on_market_status(jif("21"))
+    svc.on_market_status(jif("41"))  # 장마감 → 데드존
+    s = svc.session_for(SAMSUNG)
+    assert tradeable_instruments(s) == set()
+    assert reference_instrument(s) is None
 
 
 def test_no_jif_is_deadzone() -> None:
@@ -72,33 +74,32 @@ def test_no_jif_is_deadzone() -> None:
 
 def test_holiday_overrides_regular() -> None:
     svc = SessionService()
-    svc.on_market_status(jif(SAMSUNG_CODE, "20"))
+    svc.on_market_status(jif("21"))
     svc.set_holiday(True)
     s = svc.session_for(SAMSUNG)
     assert tradeable_instruments(s) == set()
     assert reference_instrument(s) is None
 
 
-def test_unknown_issue_code_ignored() -> None:
+def test_other_market_does_not_affect_stock_phase() -> None:
+    # 다른 시장(예: jangubun "6")의 상태는 주식 시장 phase에 영향 없음.
     svc = SessionService()
-    svc.on_market_status(MarketStatus(tr_key="999999", body={"jang_cd": "20"}))
+    svc.on_market_status(jif("21"))
+    svc.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "6", "jstatus": "C3"}))
+    assert svc.phase_for(SAMSUNG) is SessionPhase.REGULAR
+
+
+def test_missing_jangubun_ignored() -> None:
+    svc = SessionService()
+    svc.on_market_status(MarketStatus(tr_key="0", body={"jstatus": "21"}))
     assert svc.phase_for(SAMSUNG) is SessionPhase.DEAD  # 갱신되지 않음
 
 
-def test_per_underlying_independent() -> None:
-    svc = SessionService()
-    svc.on_market_status(jif(SAMSUNG_CODE, "20"))  # 삼성 정규장
-    svc.on_market_status(jif(HYNIX_CODE, "40"))    # 하이닉스 애프터마켓
-    # 정규장은 ETF 거래 가능, 애프터마켓은 불가 → 종목별 독립 산출 확인.
-    assert Instrument.KR_ETF in tradeable_instruments(svc.session_for(SAMSUNG))
-    assert Instrument.KR_ETF not in tradeable_instruments(svc.session_for(HYNIX))
-    assert reference_instrument(svc.session_for(HYNIX)) is Instrument.KR_STOCK
-
-
 def test_sessions_covers_all_underlyings() -> None:
+    # 3종 모두 KOSPI 주식 → 시장 phase 공유.
     svc = SessionService()
-    svc.on_market_status(jif(SAMSUNG_CODE, "20"))
+    svc.on_market_status(jif("21"))
     all_sessions = svc.sessions()
     assert set(all_sessions) == set(Underlying)
-    # JIF 미수신 종목은 데드존
-    assert tradeable_instruments(all_sessions[Underlying.HYUNDAI]) == set()
+    for session_map in all_sessions.values():
+        assert reference_instrument(session_map) is Instrument.KR_STOCK

@@ -50,7 +50,9 @@ async def test_dry_run_cycle_smoke(tmp_path: Path) -> None:
             reporter=reporter, store=store, risk=RiskManager(RiskLimits()),
         )
         # 녹화 시세/장운영 주입.
-        runner.feed_market_status(MarketStatus(tr_key=SAMSUNG_CODE, body={"jang_cd": "20"}))
+        runner.feed_market_status(
+            MarketStatus(tr_key="0", body={"jangubun": "1", "jstatus": "21"})
+        )
         runner.feed_quote(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
                                 bid=69_900, ask=70_100, ts=1.0))
         runner.feed_mark(Mark(underlying=SAMSUNG, price=52.0))

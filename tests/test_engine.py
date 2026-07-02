@@ -53,7 +53,7 @@ def test_build_market_state_assembles_inputs() -> None:
     from kp_arb.gateways.ls_ws import MarketStatus
 
     session = SessionService()
-    session.on_market_status(MarketStatus(tr_key=SAMSUNG_CODE, body={"jang_cd": "20"}))
+    session.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "1", "jstatus": "21"}))
     engine = ArbEngine(
         session=session, strategy=NoopStrategy(), ls=MockLSGateway(), hl=MockHLGateway()
     )

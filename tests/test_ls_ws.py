@@ -12,8 +12,17 @@ SAMSUNG_CODE = Underlying.SAMSUNG.krx_code
 
 
 def quote_frame(code: str = SAMSUNG_CODE, *, bid: float = 69_900, ask: float = 70_000) -> str:
+    # 실측 shape: 값은 문자열, 1호가 bidho1/offerho1, hotime(HHMMSS), body에 shcode.
     return json.dumps(
-        {"header": {"tr_cd": "H1_", "tr_key": code}, "body": {"bid": bid, "ask": ask, "ts": 1.0}}
+        {
+            "header": {"tr_cd": "H1_", "tr_key": code},
+            "body": {
+                "shcode": code,
+                "bidho1": str(bid),
+                "offerho1": str(ask),
+                "hotime": "085224",
+            },
+        }
     )
 
 
@@ -26,9 +35,10 @@ def fill_frame() -> str:
     )
 
 
-def status_frame(code: str = SAMSUNG_CODE) -> str:
+def status_frame(*, jstatus: str = "21") -> str:
+    # 실측 shape: JIF는 시장 단위(tr_key "0"), body={jangubun, jstatus}.
     return json.dumps(
-        {"header": {"tr_cd": "JIF", "tr_key": code}, "body": {"jang_cd": "20"}}
+        {"header": {"tr_cd": "JIF", "tr_key": "0"}, "body": {"jangubun": "1", "jstatus": jstatus}}
     )
 
 
@@ -75,7 +85,7 @@ async def test_replay_emits_all_event_types() -> None:
     client.on_market_status.append(statuses.append)
     client.subscribe_quotes(Underlying.SAMSUNG)
     client.subscribe_fills()
-    client.subscribe_market_status(Underlying.SAMSUNG)
+    client.subscribe_market_status()
 
     await client.run()
 
@@ -83,7 +93,7 @@ async def test_replay_emits_all_event_types() -> None:
     assert quotes[0].underlying is Underlying.SAMSUNG
     assert quotes[0].bid == 69_900 and quotes[0].ask == 70_000
     assert len(fills) == 1 and fills[0].order_id == "0000001"
-    assert len(statuses) == 1 and statuses[0].tr_key == SAMSUNG_CODE
+    assert len(statuses) == 1 and statuses[0].body["jstatus"] == "21"
 
 
 async def test_subscribe_sends_register_for_all_trs() -> None:
@@ -91,13 +101,16 @@ async def test_subscribe_sends_register_for_all_trs() -> None:
     client = LSWebSocketClient(FakeConnector([session]))
     client.subscribe_quotes(Underlying.SAMSUNG)
     client.subscribe_fills()
-    client.subscribe_market_status(Underlying.SAMSUNG)
+    client.subscribe_market_status()
 
     await client.run()
 
-    sent_trs = {json.loads(m)["body"]["tr_cd"] for m in session.sent}
+    sent = [json.loads(m)["body"] for m in session.sent]
+    sent_trs = {b["tr_cd"] for b in sent}
     assert {"H1_", "NH1", "JIF"} <= sent_trs
     assert {"SC0", "SC1", "SC2", "SC3", "SC4"} <= sent_trs
+    jif = next(b for b in sent if b["tr_cd"] == "JIF")
+    assert jif["tr_key"] == "0"  # JIF는 시장 단위 구독(실측)
 
 
 async def test_reconnect_resubscribes_and_recovers() -> None:
@@ -138,7 +151,7 @@ async def test_ack_frame_without_body_is_skipped() -> None:
     raws: list[str] = []
     client.on_market_status.append(statuses.append)
     client.on_raw.append(raws.append)
-    client.subscribe_market_status(Underlying.SAMSUNG)
+    client.subscribe_market_status()
 
     await client.run()  # 예외 없이 통과
 

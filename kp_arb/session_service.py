@@ -1,12 +1,14 @@
 """SessionService (DESIGN.md §5.3).
 
 LS 장운영데이터(JIF 실시간 + 휴장일)를 소비해 underlying별 instrument 상태 맵을 산출한다.
-- JIF body → SessionPhase 매핑(순수 함수 ``phase_from_jif``)만 새로 정의.
 - 맵 산출은 기존 ``session.build_session``을 **그대로 재사용**(수정 없음).
 - 미지 코드/JIF 미수신/휴장일은 보수적으로 데드존(신규 진입 금지) 처리.
 
-정확한 JIF 상태 코드/필드명은 라이브 구현 시 확인(여기선 녹화 프레임 기준 placeholder).
-``on_market_status``는 ``LSWebSocketClient.on_market_status`` 콜백에 바로 연결할 수 있다.
+[라이브 정합 v6.3] JIF는 **시장 단위** 이벤트다(tr_key="0" 구독, 실측):
+``body = {jangubun(시장구분), jstatus(상태코드)}``.
+- 실측: 개장 카운트다운 jstatus "24"→"23"→"22" (jangubun "1"=주식) — xingAPI 유래 코드표와 부합.
+- 매핑은 **실측/문서로 확인된 코드만** 채우고 미지 코드는 DEAD(보수).
+- 파생(선물) 시장 jangubun은 미실측 — 확인 전까지 주식 시장 phase를 공용 적용.
 """
 from __future__ import annotations
 
@@ -17,31 +19,34 @@ from .domain.models import InstrumentStatus
 from .gateways.ls_ws import MarketStatus
 from .session import build_session
 
-# JIF 장운영 상태 코드 → SessionPhase (라이브 구현 시 실제 코드 확인).
-_JIF_PHASE: dict[str, SessionPhase] = {
-    "10": SessionPhase.PRE_OPEN,     # 장개시전 동시호가
-    "20": SessionPhase.REGULAR,      # 정규장
-    "30": SessionPhase.NXT,          # 시간외/NXT
-    "40": SessionPhase.AFTER_MARKET,  # 애프터마켓 ~20:00
-    "90": SessionPhase.DEAD,         # 장마감
+# 시장구분(jangubun). 실측: "1"=주식(KOSPI). 파생 시장 코드는 실측 후 추가.
+STOCK_MARKET = "1"
+
+# jstatus → SessionPhase. 실측(개장 카운트다운) + xingAPI 코드표 부합분만. 미지는 DEAD.
+_JSTATUS_PHASE: dict[str, SessionPhase] = {
+    "11": SessionPhase.PRE_OPEN,  # 장전동시호가 개시
+    "22": SessionPhase.PRE_OPEN,  # 장개시 10초전 (실측)
+    "23": SessionPhase.PRE_OPEN,  # 장개시 1분전 (실측)
+    "24": SessionPhase.PRE_OPEN,  # 장개시 5분전 (실측)
+    "25": SessionPhase.PRE_OPEN,  # 장개시 10분전
+    "21": SessionPhase.REGULAR,   # 장시작
+    "41": SessionPhase.DEAD,      # 장마감
 }
 
-JIF_PHASE_FIELD = "jang_cd"
 
-
-def phase_from_jif(body: dict[str, Any], *, field: str = JIF_PHASE_FIELD) -> SessionPhase:
-    """JIF body의 상태 코드를 SessionPhase로 매핑. 미지/누락은 보수적으로 DEAD."""
-    code = str(body.get(field, ""))
-    return _JIF_PHASE.get(code, SessionPhase.DEAD)
+def phase_from_jif(body: dict[str, Any]) -> SessionPhase:
+    """JIF body(jstatus)를 SessionPhase로 매핑. 미지/누락은 보수적으로 DEAD."""
+    code = str(body.get("jstatus", ""))
+    return _JSTATUS_PHASE.get(code, SessionPhase.DEAD)
 
 
 class SessionService:
-    """underlying별 최신 SessionPhase를 보존하고 instrument 상태 맵을 산출."""
+    """시장(jangubun)별 최신 SessionPhase를 보존하고 instrument 상태 맵을 산출."""
 
     DEFAULT_PHASE = SessionPhase.DEAD  # JIF 미수신 시 보수적 기본값
 
     def __init__(self) -> None:
-        self._phase: dict[Underlying, SessionPhase] = {}
+        self._market_phase: dict[str, SessionPhase] = {}
         self._is_holiday = False
 
     def set_holiday(self, is_holiday: bool) -> None:
@@ -49,14 +54,15 @@ class SessionService:
         self._is_holiday = is_holiday
 
     def on_market_status(self, status: MarketStatus) -> None:
-        """LS JIF 이벤트 수신 → 해당 underlying의 phase 갱신. 미지 종목은 무시."""
-        underlying = Underlying.from_krx_code(status.tr_key)
-        if underlying is None:
+        """LS JIF 이벤트 수신 → 해당 시장(jangubun)의 phase 갱신."""
+        market = str(status.body.get("jangubun", ""))
+        if not market:
             return
-        self._phase[underlying] = phase_from_jif(status.body)
+        self._market_phase[market] = phase_from_jif(status.body)
 
     def phase_for(self, underlying: Underlying) -> SessionPhase:
-        return self._phase.get(underlying, self.DEFAULT_PHASE)
+        # 3종 모두 KOSPI 주식 — 주식 시장 phase 적용. (파생 시장 분리는 실측 후.)
+        return self._market_phase.get(STOCK_MARKET, self.DEFAULT_PHASE)
 
     def session_for(self, underlying: Underlying) -> dict[Instrument, InstrumentStatus]:
         return build_session(self.phase_for(underlying), is_holiday=self._is_holiday)
