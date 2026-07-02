@@ -52,7 +52,12 @@ class HLSdkGateway(HLGateway):
         self.connected = False
 
     @classmethod
-    def from_secrets(cls, secrets: SecretProvider | None = None) -> HLSdkGateway:
+    def from_secrets(
+        cls,
+        secrets: SecretProvider | None = None,
+        *,
+        symbols: Mapping[Underlying, str] | None = None,
+    ) -> HLSdkGateway:
         """keyring/env의 에이전트 키·메인 주소로 SDK 클라이언트 조립."""
         from eth_account import Account as EthAccount
         from hyperliquid.exchange import Exchange
@@ -70,7 +75,7 @@ class HLSdkGateway(HLGateway):
             account_address=address, perp_dexs=[HL_DEX],
         )
         info = Info(constants.MAINNET_API_URL, skip_ws=True)
-        return cls(exchange, info, account_address=address)
+        return cls(exchange, info, account_address=address, symbols=symbols)
 
     async def connect(self) -> None:
         # 연결 검증: xyz dex 계정 상태 1회 조회.

@@ -77,6 +77,7 @@ def _gateway(
     transport: Any,
     *,
     futures_symbols: dict[Underlying, str] | None = None,
+    etf_symbols: dict[Underlying, str] | None = None,
     accounts: LSAccounts | None = None,
 ) -> LSApiGateway:
     clock = _Clock()
@@ -87,6 +88,7 @@ def _gateway(
         {Account.KR_STOCK: rest, Account.KR_DERIV: rest},  # 테스트는 두 계좌 같은 mock
         accounts=accounts,
         futures_symbols=futures_symbols,
+        etf_symbols=etf_symbols,
     )
 
 
@@ -116,12 +118,19 @@ async def test_stock_routes_to_stock_account() -> None:
     assert blk["IsuNo"] == "A005930"  # 현물 주문은 A 접두(실측)
 
 
-async def test_etf_routes_to_stock_account() -> None:
+async def test_etf_routes_to_stock_account_with_etf_code() -> None:
     transport = OrderTransport()
-    gw = _gateway(transport)
+    gw = _gateway(transport, etf_symbols={Underlying.SAMSUNG: "0193W0"})
     await gw.place_order(_intent(Instrument.KR_ETF))
-    req = transport.requests[-1]
-    assert inblk(req, LSApiGateway.SPOT_ORDER_TR)["account"] == Account.KR_STOCK.value
+    blk = inblk(transport.requests[-1], LSApiGateway.SPOT_ORDER_TR)
+    assert blk["account"] == Account.KR_STOCK.value
+    assert blk["IsuNo"] == "A0193W0"  # ETF는 자기 종목코드(기초자산 코드 아님)
+
+
+async def test_etf_order_without_symbol_raises() -> None:
+    gw = _gateway(OrderTransport())  # etf_symbols 미설정 → ETF 미취급
+    with pytest.raises(RestError):
+        await gw.place_order(_intent(Instrument.KR_ETF))
 
 
 async def test_future_order_uses_cfoat_and_routes_to_deriv() -> None:

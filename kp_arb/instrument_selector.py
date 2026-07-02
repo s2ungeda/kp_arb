@@ -40,10 +40,13 @@ class InstrumentSelector:
         costs: Mapping[Instrument, float] | None = None,
         liquidity: Mapping[Instrument, float] | None = None,
         priority: tuple[Instrument, ...] | None = None,
+        etf_underlyings: frozenset[Underlying] | None = None,
     ) -> None:
         self._costs = dict(costs or {})
         self._liquidity = dict(liquidity or {})
         self._priority = tuple(priority or _DEFAULT_PRIORITY)
+        # ETF 상품이 존재하는 underlying 집합(config 주입). None이면 제한 없음(기존 동작).
+        self._etf_underlyings = etf_underlyings
 
     def select(
         self,
@@ -58,6 +61,7 @@ class InstrumentSelector:
             if status.tradeable
             and instrument is not Instrument.HL_PERP
             and self._direction_ok(instrument, side)
+            and self._product_exists(instrument, underlying)
         ]
         if not candidates:
             return None
@@ -67,6 +71,12 @@ class InstrumentSelector:
     def _direction_ok(self, instrument: Instrument, side: Side) -> bool:
         # 숏은 롱 전용 instrument 불가(공매도 금지).
         return not (side is Side.SELL and instrument in _LONG_ONLY)
+
+    def _product_exists(self, instrument: Instrument, underlying: Underlying) -> bool:
+        # ETF는 상품이 존재하는 underlying만 후보(예: 현대차는 레버리지 ETF 없음).
+        if instrument is Instrument.KR_ETF and self._etf_underlyings is not None:
+            return underlying in self._etf_underlyings
+        return True
 
     def _rank(self, instrument: Instrument) -> tuple[float, float, int]:
         cost = self._costs.get(instrument, 0.0)

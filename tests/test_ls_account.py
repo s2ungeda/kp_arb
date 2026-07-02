@@ -77,12 +77,13 @@ class AccountTransport:
         return RestResponse(status_code=200, body=FIXTURES[tr])
 
 
-def _gateway(transport: Any) -> LSApiGateway:
+def _gateway(transport: Any, *, etf_symbols: dict[Underlying, str] | None = None) -> LSApiGateway:
     clock = _Clock()
     tm = TokenManager("k", "s", _TokenStub(), now=clock)
     rl = RateLimiter(now=clock, default_per_second=100)
     rest = LSRestClient(BASE_URL, tm, transport, rl)
-    return LSApiGateway({Account.KR_STOCK: rest, Account.KR_DERIV: rest})
+    return LSApiGateway({Account.KR_STOCK: rest, Account.KR_DERIV: rest},
+                        etf_symbols=etf_symbols)
 
 
 # --- 잔고(예수금/증거금) ---
@@ -145,6 +146,23 @@ async def test_positions_route_to_different_trs() -> None:
     await gw.get_positions(Account.KR_STOCK)
     await gw.get_positions(Account.KR_DERIV)
     assert transport.seen_trs == ["CSPAQ12300", "CFOAQ50600"]
+
+
+async def test_etf_position_recognized() -> None:
+    # 잔고 행의 종목코드가 ETF면 KR_ETF + 기초자산으로 해석.
+    transport = AccountTransport()
+    FIXTURES["CSPAQ12300"]["CSPAQ12300OutBlock3"].append(
+        {"IsuNo": "0193W0", "BalQty": 10, "BnsBaseBalQty": 10, "AvrUprc": "17600.00"}
+    )
+    try:
+        gw = _gateway(transport, etf_symbols={Underlying.SAMSUNG: "0193W0"})
+        positions = await gw.get_positions(Account.KR_STOCK)
+        etf = [p for p in positions if p.instrument is Instrument.KR_ETF]
+        assert len(etf) == 1
+        assert etf[0].underlying is Underlying.SAMSUNG
+        assert etf[0].qty == 10 and etf[0].avg_price == 17_600
+    finally:
+        FIXTURES["CSPAQ12300"]["CSPAQ12300OutBlock3"].pop()
 
 
 # --- 미체결 주문 스냅샷 ---

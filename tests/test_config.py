@@ -108,6 +108,41 @@ def test_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert accounts.for_account(Account.KR_STOCK).appkey == "stock-ak"
 
 
+# --- 취급 종목 설정 (config.yaml) ---
+
+
+def test_load_config_real_file() -> None:
+    """저장소의 config.yaml이 실제로 로드·검증을 통과하는지 (오타 방지 스모크)."""
+    from kp_arb.config import load_config
+    from kp_arb.domain.enums import Underlying
+
+    config = load_config()
+    assert config.hl_symbols()[Underlying.SAMSUNG] == "xyz:SMSN"
+    assert config.etf_symbols() == {
+        Underlying.SAMSUNG: "0193W0",
+        Underlying.SK_HYNIX: "0193T0",
+    }  # 현대차는 ETF 없음
+    assert config.etf_leverage == 2.0
+
+
+def test_load_config_rejects_wrong_stock_code(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from kp_arb.config import load_config
+
+    bad = tmp_path / "config.yaml"
+    bad.write_text(
+        "symbols:\n  samsung: {stock: '999999', hl: 'xyz:SMSN'}\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError):
+        load_config(str(bad))  # 도메인 enum(005930)과 불일치 → 에러
+
+
+def test_load_config_missing_file() -> None:
+    from kp_arb.config import load_config
+
+    with pytest.raises(ConfigError):
+        load_config("no_such_config.yaml")
+
+
 # --- 비밀 비노출 ---
 
 

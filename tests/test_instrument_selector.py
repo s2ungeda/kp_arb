@@ -60,6 +60,20 @@ def test_after_market_selects_stock_future() -> None:
         assert sel == Selection(Instrument.KR_STOCK_FUTURE, Account.KR_DERIV)
 
 
+def test_etf_excluded_for_underlying_without_product() -> None:
+    # 현대차는 레버리지 ETF 상품이 없음 → ETF 후보에서 제외(config 주입).
+    session = build_session(SessionPhase.REGULAR)
+    selector = InstrumentSelector(
+        costs={Instrument.KR_ETF: 0.0, Instrument.KR_STOCK: 1.0,
+               Instrument.KR_STOCK_FUTURE: 1.0},  # ETF가 최저비용이어도
+        etf_underlyings=frozenset({Underlying.SAMSUNG, Underlying.SK_HYNIX}),
+    )
+    sel_samsung = selector.select(Underlying.SAMSUNG, Side.BUY, session)
+    sel_hyundai = selector.select(Underlying.HYUNDAI, Side.BUY, session)
+    assert sel_samsung is not None and sel_samsung.instrument is Instrument.KR_ETF
+    assert sel_hyundai is not None and sel_hyundai.instrument is not Instrument.KR_ETF
+
+
 # --- tiebreak / 가용성 ---
 
 

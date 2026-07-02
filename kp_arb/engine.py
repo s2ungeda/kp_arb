@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 
-from .domain.enums import Account, Underlying, Venue
+from .domain.enums import Account, Instrument, Underlying, Venue
 from .domain.models import MarketState, OrderIntent, Position, Quote
 from .gateways.base import HLGateway, LSGateway
 from .gateways.hl import Mark
@@ -25,10 +25,11 @@ from .strategy.base import Strategy
 
 
 class MarketData:
-    """엔진이 읽는 최신 시세 스냅샷. 게이트웨이 스트림 콜백이 갱신한다."""
+    """엔진이 읽는 최신 시세 저장소. 실시간 콜백이 갱신한다."""
 
     def __init__(self) -> None:
-        self.reference_price_krw: dict[Underlying, float] = {}
+        self.reference_price_krw: dict[Underlying, float] = {}  # 주식(레퍼런스) 중간가
+        self.etf_price_krw: dict[Underlying, float] = {}        # 레버리지 ETF 중간가
         self.hl_mark_usd: dict[Underlying, float] = {}
         self.usdkrw: float | None = None
 
@@ -62,7 +63,11 @@ class ArbEngine:
     # --- 시세 스냅샷 갱신(게이트웨이 콜백 연결용) ---
 
     def on_quote(self, quote: Quote) -> None:
-        self.market.reference_price_krw[quote.underlying] = quote.mid
+        # ETF 시세는 별도 보관 — 주식(레퍼런스) 가격을 덮어쓰지 않는다.
+        if quote.instrument is Instrument.KR_ETF:
+            self.market.etf_price_krw[quote.underlying] = quote.mid
+        else:
+            self.market.reference_price_krw[quote.underlying] = quote.mid
 
     def on_mark(self, mark: Mark) -> None:
         self.market.hl_mark_usd[mark.underlying] = mark.price

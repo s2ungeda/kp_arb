@@ -98,11 +98,15 @@ class LSWebSocketClient:
         connector: WSConnector,
         *,
         token: str = "",
+        etf_symbols: dict[Underlying, str] | None = None,
         max_reconnects: int = 3,
         reconnect_backoff_s: float = 0.0,
     ) -> None:
         self._connector = connector
         self._token = token
+        # ETF 종목코드(config.yaml 주입) — 호가 구독·해석에 사용.
+        self._etf_symbols = dict(etf_symbols or {})
+        self._etf_underlying = {v: k for k, v in self._etf_symbols.items()}
         self._max_reconnects = max_reconnects
         self._reconnect_backoff_s = reconnect_backoff_s
         self._subs: list[tuple[str, str, str]] = []  # (tr_cd, tr_key, tr_type) 희망 구독 상태
@@ -116,9 +120,13 @@ class LSWebSocketClient:
     # --- 구독 등록(희망 상태). 실제 전송은 connect 시 _resubscribe ---
 
     def subscribe_quotes(self, underlying: Underlying) -> None:
-        code = underlying.krx_code
-        self._add("H1_", code)
-        self._add("NH1", code)
+        codes = [underlying.krx_code]
+        etf = self._etf_symbols.get(underlying)
+        if etf is not None:
+            codes.append(etf)  # 단일종목 레버리지 ETF 호가도 함께 구독
+        for code in codes:
+            self._add("H1_", code)
+            self._add("NH1", code)
 
     def subscribe_fills(self) -> None:
         """주식+선물 체결통보 전부 구독(단일 연결용 — 계좌 통보는 해당 토큰 계좌 것만 온다)."""
@@ -208,13 +216,19 @@ class LSWebSocketClient:
     def _parse_quote(self, msg: dict[str, Any]) -> Quote | None:
         body = msg["body"]
         code = str(body.get("shcode") or msg.get("header", {}).get("tr_key", ""))
-        underlying = Underlying.from_krx_code(code)
-        if underlying is None:
-            return None
+        # 종목코드로 주식 vs ETF 판별(둘 다 아니면 무시).
+        etf_underlying = self._etf_underlying.get(code)
+        if etf_underlying is not None:
+            instrument, underlying = Instrument.KR_ETF, etf_underlying
+        else:
+            stock_underlying = Underlying.from_krx_code(code)
+            if stock_underlying is None:
+                return None
+            instrument, underlying = Instrument.KR_STOCK, stock_underlying
         # 실측 필드: bidho1/offerho1(1호가), hotime(HHMMSS). 값은 문자열.
         return Quote(
             underlying=underlying,
-            instrument=Instrument.KR_STOCK,  # H1_/NH1 모두 현물 호가
+            instrument=instrument,
             bid=float(body["bidho1"]),
             ask=float(body["offerho1"]),
             ts=float(body["hotime"]),

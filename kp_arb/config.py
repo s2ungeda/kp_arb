@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from .domain.enums import Account
+from pydantic import BaseModel
+
+from .domain.enums import Account, Underlying
 
 KEYRING_SERVICE = "kp-arb"
 
@@ -146,3 +148,47 @@ class LSAccounts:
 
     def __repr__(self) -> str:
         return f"LSAccounts({list(self._by_account)})"  # 자격값 비노출
+
+
+# --- 취급 종목 설정 (config.yaml — 비밀 아님, git 이력 관리. DESIGN §11) ---
+
+DEFAULT_CONFIG_PATH = "config.yaml"
+
+
+class SymbolConfig(BaseModel):
+    """underlying 1종의 취급 종목. etf가 없으면 그 underlying은 ETF 미취급."""
+
+    stock: str
+    hl: str
+    etf: str | None = None
+
+
+class AppConfig(BaseModel):
+    """config.yaml 전체. 종목 매핑 + ETF 승수."""
+
+    symbols: dict[Underlying, SymbolConfig]
+    etf_leverage: float = 2.0
+
+    def etf_symbols(self) -> dict[Underlying, str]:
+        return {u: s.etf for u, s in self.symbols.items() if s.etf is not None}
+
+    def hl_symbols(self) -> dict[Underlying, str]:
+        return {u: s.hl for u, s in self.symbols.items()}
+
+
+def load_config(path: str = DEFAULT_CONFIG_PATH) -> AppConfig:
+    """config.yaml 로드 + 검증. stock 코드가 도메인 enum과 다르면 에러(오타 방지)."""
+    import yaml
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+    except FileNotFoundError as exc:
+        raise ConfigError(f"config file not found: {path}") from exc
+    config = AppConfig.model_validate(raw)
+    for underlying, symbol in config.symbols.items():
+        if symbol.stock != underlying.krx_code:
+            raise ConfigError(
+                f"{underlying}: stock {symbol.stock!r} != krx_code {underlying.krx_code!r}"
+            )
+    return config

@@ -230,15 +230,22 @@ class LiveSystem:
         self._tasks = []
 
 
-async def bootstrap_live(session: object) -> LiveSystem:
-    """라이브(모의/실전) 조립 — LS + HL. HL 비밀 미등록 시 LS-only로 동작."""
-    from .config import ConfigError, current_mode, default_secrets
+async def bootstrap_live(
+    session: object, *, config_path: str | None = None
+) -> LiveSystem:
+    """라이브(모의/실전) 조립 — 취급 종목은 config.yaml, 비밀은 keyring/env.
+
+    HL 비밀 미등록 시 LS-only로 동작.
+    """
+    from .config import ConfigError, current_mode, default_secrets, load_config
     from .gateways.hl_live import HLSdkGateway
     from .gateways.hl_ws import HLWebSocketConnector
     from .gateways.ls import LIVE_BASE_URL
     from .gateways.ls_http import AiohttpRestTransport, AiohttpTokenTransport
     from .gateways.ls_ws_live import LSWebSocketConnector, ls_ws_url
 
+    config = load_config(config_path) if config_path else load_config()
+    etf_symbols = config.etf_symbols()
     accounts = LSAccounts.load()
     token_tx = AiohttpTokenTransport(session, LIVE_BASE_URL)
     gateway = LSApiGateway.from_accounts(
@@ -255,6 +262,7 @@ async def bootstrap_live(session: object) -> LiveSystem:
         rest_transport=AiohttpRestTransport(session),
         base_url=LIVE_BASE_URL,
         futures_symbols=futures_symbols,
+        etf_symbols=etf_symbols,
     )
 
     url = ls_ws_url(current_mode())
@@ -262,14 +270,16 @@ async def bootstrap_live(session: object) -> LiveSystem:
     async def ws_for(account: Account) -> LSWebSocketClient:
         cred = accounts.for_account(account)
         token = (await token_tx.fetch_token(cred.appkey, cred.appsecret)).access_token
-        return LSWebSocketClient(LSWebSocketConnector(url), token=token)
+        return LSWebSocketClient(
+            LSWebSocketConnector(url), token=token, etf_symbols=etf_symbols
+        )
 
     # HL 슬롯 — 비밀(HL_AGENT_KEY/HL_ACCOUNT_ADDRESS) 없으면 LS-only.
     hl_gateway = None
     hl_ws = None
     try:
-        hl_gateway = HLSdkGateway.from_secrets()
-        hl_ws = HLWebSocketClient(HLWebSocketConnector())
+        hl_gateway = HLSdkGateway.from_secrets(symbols=config.hl_symbols())
+        hl_ws = HLWebSocketClient(HLWebSocketConnector(), symbols=config.hl_symbols())
         hl_ws.subscribe_user_fills(str(default_secrets().get("HL_ACCOUNT_ADDRESS")))
     except ConfigError:
         pass

@@ -73,10 +73,14 @@ class LSApiGateway(LSGateway):
         *,
         accounts: LSAccounts | None = None,
         futures_symbols: Mapping[Underlying, str] | None = None,
+        etf_symbols: Mapping[Underlying, str] | None = None,
     ) -> None:
         self._rest_by_account = dict(rest_by_account)
         self._accounts = accounts
         self._futures_symbols: dict[Underlying, str] = dict(futures_symbols or {})
+        # 단일종목 레버리지 ETF 코드(config.yaml에서 주입). 없으면 ETF 미취급.
+        self._etf_symbols: dict[Underlying, str] = dict(etf_symbols or {})
+        self._etf_underlying = {v: k for k, v in self._etf_symbols.items()}
         self._orders: dict[str, OrderContext] = {}
         self.connected = False
 
@@ -89,6 +93,7 @@ class LSApiGateway(LSGateway):
         rest_transport: RestTransport,
         base_url: str = LIVE_BASE_URL,
         futures_symbols: Mapping[Underlying, str] | None = None,
+        etf_symbols: Mapping[Underlying, str] | None = None,
         now: Callable[[], float] = time.monotonic,
     ) -> LSApiGateway:
         """계좌별 키로 계좌별 토큰·REST 클라이언트를 조립. (레이트리밋은 계좌별 독립.)"""
@@ -98,7 +103,8 @@ class LSApiGateway(LSGateway):
             tokens = TokenManager(cred.appkey, cred.appsecret, token_transport, now=now)
             limiter = RateLimiter(now=now)
             rest_by_account[account] = LSRestClient(base_url, tokens, rest_transport, limiter)
-        return cls(rest_by_account, accounts=accounts, futures_symbols=futures_symbols)
+        return cls(rest_by_account, accounts=accounts,
+                   futures_symbols=futures_symbols, etf_symbols=etf_symbols)
 
     def _rest_for(self, account: Account) -> LSRestClient:
         return self._rest_by_account[account]
@@ -222,10 +228,11 @@ class LSApiGateway(LSGateway):
 
     def _open_order(self, row: dict[str, Any]) -> TrackedOrder:
         # 실측 행: IsuNo "A005930", BnsTpCode 1매도/2매수, OrdPrc 문자열, ExecQty 체결누계.
+        instrument, underlying = self._resolve_spot(str(row["IsuNo"]))
         intent = OrderIntent(
             venue=Venue.LS,
-            underlying=self._underlying(str(row["IsuNo"]).lstrip("A")),
-            instrument=Instrument.KR_STOCK,
+            underlying=underlying,
+            instrument=instrument,
             side=Side.BUY if str(row["BnsTpCode"]) == "2" else Side.SELL,
             qty=float(row["OrdQty"]),
             order_type=(
@@ -277,11 +284,12 @@ class LSApiGateway(LSGateway):
         return float(block[field])
 
     def _stock_position(self, row: dict[str, Any]) -> Position:
-        # 주식 잔고는 롱 전용(공매도 미사용).
+        # 주식/ETF 잔고는 롱 전용(공매도 미사용). 종목코드로 주식 vs ETF 판별.
+        instrument, underlying = self._resolve_spot(str(row["IsuNo"]))
         return Position(
             venue=Venue.LS,
-            instrument=Instrument.KR_STOCK,
-            underlying=self._underlying(str(row["IsuNo"])),
+            instrument=instrument,
+            underlying=underlying,
             side=Side.BUY,
             # 실측: 당일 매수는 T+2 미결제라 BalQty=0 → 매매기준잔고(BnsBaseBalQty) 사용.
             qty=float(row["BnsBaseBalQty"]),
@@ -307,20 +315,34 @@ class LSApiGateway(LSGateway):
             raise RestError(f"unknown issue code {code}")
         return underlying
 
+    def _resolve_spot(self, code: str) -> tuple[Instrument, Underlying]:
+        """현물 종목코드("A" 접두 유무 무관) → (주식|ETF, underlying) 판별."""
+        bare = code.lstrip("A")
+        etf_underlying = self._etf_underlying.get(bare)
+        if etf_underlying is not None:
+            return Instrument.KR_ETF, etf_underlying
+        return Instrument.KR_STOCK, self._underlying(bare)
+
     # --- 요청 본문 구성 ---
     # [라이브 정합 v6.4] 주문 TR은 `{tr}InBlock1` 래핑 필수(flat은 IGW50004 거부).
     # 현물 IsuNo는 "A"+종목코드, 비번 필드는 InptPwd.
     # 주문 성공 rsp_cd: 매수 00040 / 매도 00039 / 취소 00463.
 
-    @staticmethod
-    def _spot_isu(underlying: Underlying) -> str:
-        return f"A{underlying.krx_code}"  # 현물 주문 종목코드는 A 접두(실측)
+    def _spot_isu(self, intent: OrderIntent) -> str:
+        # 현물 주문 종목코드는 A 접두(주식 실측). ETF는 자기 종목코드 사용
+        # (A 접두 체계는 주식과 동일 가정 — 첫 ETF 라이브 주문 시 확인).
+        if intent.instrument is Instrument.KR_ETF:
+            try:
+                return f"A{self._etf_symbols[intent.underlying]}"
+            except KeyError as exc:
+                raise RestError(f"no ETF symbol for {intent.underlying}") from exc
+        return f"A{intent.underlying.krx_code}"
 
     def _spot_order_body(self, intent: OrderIntent, account: Account) -> dict[str, Any]:
         return {
             f"{self.SPOT_ORDER_TR}InBlock1": {
                 **self._order_account_fields(account),
-                "IsuNo": self._spot_isu(intent.underlying),
+                "IsuNo": self._spot_isu(intent),
                 "OrdQty": int(intent.qty),
                 "OrdPrc": int(intent.price) if intent.price is not None else 0,
                 "BnsTpCode": "2" if intent.side is Side.BUY else "1",  # 1매도 2매수
@@ -382,7 +404,7 @@ class LSApiGateway(LSGateway):
             f"{self.SPOT_AMEND_TR}InBlock1": {
                 **self._order_account_fields(ctx.account),
                 "OrgOrdNo": int(ctx.order_id),  # 원주문 보존
-                "IsuNo": self._spot_isu(ctx.intent.underlying),
+                "IsuNo": self._spot_isu(ctx.intent),
                 "OrdQty": int(qty if qty is not None else ctx.intent.qty),
                 "OrdPrc": int(price if price is not None else (ctx.intent.price or 0)),
                 "OrdprcPtnCode": "00",
@@ -395,7 +417,7 @@ class LSApiGateway(LSGateway):
             f"{self.SPOT_CANCEL_TR}InBlock1": {
                 **self._order_account_fields(ctx.account),
                 "OrgOrdNo": int(ctx.order_id),  # 원주문 보존
-                "IsuNo": self._spot_isu(ctx.intent.underlying),
+                "IsuNo": self._spot_isu(ctx.intent),
                 "OrdQty": int(ctx.intent.qty),
             }
         }

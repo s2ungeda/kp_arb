@@ -165,6 +165,32 @@ async def test_ack_frame_without_body_is_skipped() -> None:
     assert len(raws) == 1       # 원시 프레임은 관측됨
 
 
+async def test_etf_quote_subscribed_and_parsed() -> None:
+    # ETF 설정이 있으면 호가 구독에 ETF 코드가 추가되고, 프레임은 KR_ETF로 해석.
+    from kp_arb.domain.enums import Instrument
+
+    etf_frame = json.dumps({
+        "header": {"tr_cd": "H1_", "tr_key": "0193W0"},
+        "body": {"shcode": "0193W0", "bidho1": "17595", "offerho1": "17605",
+                 "hotime": "100000"},
+    })
+    session = FakeConnection([etf_frame])
+    client = LSWebSocketClient(FakeConnector([session]),
+                               etf_symbols={Underlying.SAMSUNG: "0193W0"})
+    quotes: list[Quote] = []
+    client.on_quote.append(quotes.append)
+    client.subscribe_quotes(Underlying.SAMSUNG)
+
+    await client.run()
+
+    subscribed = {json.loads(m)["body"]["tr_key"] for m in session.sent}
+    assert {"005930", "0193W0"} <= subscribed  # 주식 + ETF 둘 다 구독
+    assert len(quotes) == 1
+    assert quotes[0].instrument is Instrument.KR_ETF
+    assert quotes[0].underlying is Underlying.SAMSUNG
+    assert quotes[0].mid == 17_600
+
+
 async def test_order_events_dispatched_by_kind() -> None:
     # SC0=접수(ack) / SC3=취소(cancel, orgordno=원주문) → OrderEvent로 분화.
     ack = json.dumps({"header": {"tr_cd": "SC0"}, "body": {"ordno": "9852", "orgordno": "0"}})
