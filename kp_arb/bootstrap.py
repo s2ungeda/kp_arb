@@ -21,13 +21,17 @@ from collections.abc import Callable
 from .config import LSAccounts
 from .domain.enums import Account, Underlying, Venue
 from .domain.models import OrderIntent, Position, Quote
+from .engine import ArbEngine
 from .gateways.base import HLGateway
 from .gateways.hl import Mark
 from .gateways.hl_ws import HLWebSocketClient
 from .gateways.ls import LSApiGateway
 from .gateways.ls_ws import Fill, LSWebSocketClient, OrderEvent
 from .order_book import OrderBook, TrackedOrder
+from .risk import RiskManager, RiskState
+from .session import reference_instrument
 from .session_service import SessionService
+from .strategy.base import Strategy
 
 
 def select_near_month_futures(rows: list[dict[str, object]]) -> dict[Underlying, str]:
@@ -171,6 +175,51 @@ class LiveSystem:
         if self._hl_ws is not None:
             self._tasks.append(asyncio.create_task(self._hl_ws.run()))
 
+    # --- 엔진 연결 (실시간 시세·포지션·잔고 → 전략 판단) ---
+
+    def attach_engine(self, strategy: Strategy, *, risk: RiskManager | None = None) -> ArbEngine:
+        """전략 엔진을 실시간 데이터에 연결해 돌려준다.
+
+        - 포지션: OrderBook 실시간 값 (반복 조회 없음)
+        - 주문: self.place (주문 등록 포함, venue 라우팅)
+        - 시세: 국내 호가(on_quote)·HL 마크(on_mark)가 엔진 시장 상태로 흘러감
+        """
+        engine = ArbEngine(
+            session=self.session,
+            strategy=strategy,
+            risk=risk,
+            positions_provider=self.order_book.positions,
+            place_fn=self.place,
+        )
+        self.on_quote.append(engine.on_quote)
+        self.on_mark.append(engine.on_mark)
+        return engine
+
+    def _refresh_risk_state(self, engine: ArbEngine) -> None:
+        """리스크 판단 상태를 실시간 값으로 갱신(레퍼런스 유무·계좌 잔고)."""
+        engine.risk_state = RiskState(
+            reference_available={
+                u: reference_instrument(self.session.session_for(u)) is not None
+                for u in Underlying
+            },
+            account_available_funds={
+                a: self.order_book.balance(a)
+                for a in (Account.KR_STOCK, Account.KR_DERIV)
+            },
+            hl_margin_ratio=None,  # HL 마진비율 산출은 추후(§8)
+        )
+
+    async def run_strategy_loop(
+        self, engine: ArbEngine, *, interval_s: float = 1.0, max_cycles: int | None = None
+    ) -> None:
+        """전략을 주기적으로 실행. 매 주기: 리스크 상태 갱신 → 3종목 판단·주문."""
+        cycles = 0
+        while max_cycles is None or cycles < max_cycles:
+            self._refresh_risk_state(engine)
+            await engine.run_once()
+            cycles += 1
+            await asyncio.sleep(interval_s)
+
     async def wait(self) -> None:
         await asyncio.gather(*self._tasks)
 
@@ -252,21 +301,30 @@ def main() -> None:
         import aiohttp
 
         async with aiohttp.ClientSession() as http:
+            from .strategy.noop import NoopStrategy
+
             system = await bootstrap_live(http)
             quotes = {"n": 0}
             marks: dict[str, float] = {}
             system.on_quote.append(lambda q: quotes.__setitem__("n", quotes["n"] + 1))
             system.on_mark.append(lambda m: marks.__setitem__(m.underlying.value, m.price))
+            engine = system.attach_engine(NoopStrategy())
             await system.start()
             ob = system.order_book
             print(f"[snapshot] stock bal = {ob.balance(Account.KR_STOCK):,.0f}")
             print(f"[snapshot] deriv bal = {ob.balance(Account.KR_DERIV):,.0f}")
             print(f"[snapshot] positions = {ob.positions()}")
             print(f"[snapshot] open orders = {[o.order_id for o in ob.open_orders()]}")
-            print(f"[live] {seconds:.0f}s 실시간 수신 중 ...")
+            print(f"[live] {seconds:.0f}s 실시간 수신 + 전략 루프(Noop) ...")
+            loop_task = asyncio.create_task(
+                system.run_strategy_loop(engine, interval_s=1.0)
+            )
             await asyncio.sleep(seconds)
-            print(f"[live] quotes received = {quotes['n']}")
-            print(f"[live] hl marks = {marks}")
+            loop_task.cancel()
+            state = engine.build_market_state(Underlying.SAMSUNG, ob.positions())
+            print(f"[live] quotes received = {quotes['n']} / hl marks = {marks}")
+            print(f"[live] MarketState(samsung): ref={state.reference_instrument} "
+                  f"kr={state.reference_price_krw} hl={state.hl_mark_usd}")
             print(f"[live] session phase(samsung) = "
                   f"{system.session.phase_for(Underlying.SAMSUNG).value}")
             await system.stop()

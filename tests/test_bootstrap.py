@@ -215,6 +215,60 @@ async def test_place_routes_hl_to_hl_gateway() -> None:
     await system.wait()
 
 
+async def test_attach_engine_uses_realtime_positions_and_place() -> None:
+    # 엔진 연결: 포지션=OrderBook 실시간 값, 주문=place(등록 포함), 시세 콜백 연결.
+    from collections.abc import Sequence as _Seq
+
+    from kp_arb.domain.models import MarketState
+    from kp_arb.strategy.base import Strategy
+
+    captured: list[MarketState] = []
+
+    class OneShotBuy(Strategy):
+        """첫 호출에만 LS 매수 1건 — 이후 재주문 없음(중복 방지 확인용 아님, 단순화)."""
+
+        def __init__(self) -> None:
+            self.fired = False
+
+        def evaluate(self, state: MarketState) -> _Seq[OrderIntent]:
+            captured.append(state)
+            if self.fired or state.underlying is not SAMSUNG:
+                return []
+            self.fired = True
+            return [OrderIntent(venue=Venue.LS, underlying=SAMSUNG,
+                                instrument=Instrument.KR_STOCK, side=Side.BUY,
+                                qty=10, order_type=OrderType.MARKET)]
+
+    system, _, _ = _system([_fill_frame("LS-1")])
+    engine = system.attach_engine(OneShotBuy())
+    await system.start()          # 일괄 조회: 삼성 100주 → OrderBook
+    await system.place(OrderIntent(venue=Venue.LS, underlying=SAMSUNG,
+                                   instrument=Instrument.KR_STOCK, side=Side.BUY,
+                                   qty=10, order_type=OrderType.MARKET))  # "LS-1" 등록
+    await system.wait()           # 체결 프레임 반영 → 110주
+
+    await system.run_strategy_loop(engine, interval_s=0.0, max_cycles=1)
+
+    # 엔진이 받은 MarketState의 포지션 = OrderBook 실시간 값(110주)
+    samsung_states = [s for s in captured if s.underlying is SAMSUNG]
+    assert samsung_states and samsung_states[0].positions[0].qty == 110
+    # 전략 주문이 place 경유 → OrderBook에 자동 등록됨 ("LS-2")
+    assert system.order_book.order("LS-2") is not None
+    # 리스크 상태가 OrderBook의 "실시간" 잔고를 참조 — 체결(10주×70,000)이 즉시 차감됨
+    assert engine.risk_state.account_available_funds[Account.KR_STOCK] == 5_000_000 - 700_000
+
+
+async def test_strategy_loop_noop_places_nothing() -> None:
+    from kp_arb.strategy.noop import NoopStrategy
+
+    system, _, _ = _system([])
+    engine = system.attach_engine(NoopStrategy())
+    await system.start()
+    await system.wait()
+    await system.run_strategy_loop(engine, interval_s=0.0, max_cycles=3)
+    assert system.order_book.open_orders() == []  # 주문 0건
+
+
 async def test_deriv_ws_subscribes_futures_fills_only() -> None:
     system, _, deriv_connector = _system([], deriv_frames=[])
     await system.start()
