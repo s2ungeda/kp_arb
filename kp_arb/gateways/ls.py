@@ -100,11 +100,18 @@ class LSApiGateway(LSGateway):
         return self._rest_by_account[account]
 
     def _account_fields(self, account: Account) -> dict[str, Any]:
-        """주문/조회 요청에 넣을 계좌 식별 필드. 실 계좌번호·비번은 env(LSAccounts)."""
+        """조회 요청용 계좌 필드(실측: AcntNo+Pwd). 실 계좌번호·비번은 env(LSAccounts)."""
         if self._accounts is None:
             return {"account": account.value}  # 플레이스홀더(테스트/드라이런)
         acct = self._accounts.for_account(account)
-        return {"AcntNo": acct.number.replace("-", ""), "Pwd": acct.password}  # 라이브 확인필드
+        return {"AcntNo": acct.number.replace("-", ""), "Pwd": acct.password}
+
+    def _order_account_fields(self, account: Account) -> dict[str, Any]:
+        """주문 요청용 계좌 필드(실측: 주문 InBlock은 Pwd가 아니라 InptPwd)."""
+        if self._accounts is None:
+            return {"account": account.value}  # 플레이스홀더(테스트/드라이런)
+        acct = self._accounts.for_account(account)
+        return {"AcntNo": acct.number.replace("-", ""), "InptPwd": acct.password}
 
     async def connect(self) -> None:
         # 토큰은 LSRestClient.request 시점에 lazy 발급. 여기선 연결 플래그만.
@@ -215,8 +222,9 @@ class LSApiGateway(LSGateway):
             instrument=Instrument.KR_STOCK,
             underlying=self._underlying(str(row["IsuNo"])),
             side=Side.BUY,
-            qty=float(row["BalQty"]),
-            avg_price=float(row["AvrPrc"]),
+            # 실측: 당일 매수는 T+2 미결제라 BalQty=0 → 매매기준잔고(BnsBaseBalQty) 사용.
+            qty=float(row["BnsBaseBalQty"]),
+            avg_price=float(row["AvrUprc"]),  # 실측 필드(AvrPrc 아님)
             account=Account.KR_STOCK,
         )
 
@@ -238,46 +246,65 @@ class LSApiGateway(LSGateway):
             raise RestError(f"unknown issue code {code}")
         return underlying
 
-    # --- 요청 본문 구성 (TR 필드명/코드는 라이브 구현 시 확인) ---
+    # --- 요청 본문 구성 ---
+    # [라이브 정합 v6.4] 주문 TR은 `{tr}InBlock1` 래핑 필수(flat은 IGW50004 거부).
+    # 현물 IsuNo는 "A"+종목코드, 비번 필드는 InptPwd.
+    # 주문 성공 rsp_cd: 매수 00040 / 매도 00039 / 취소 00463.
+
+    @staticmethod
+    def _spot_isu(underlying: Underlying) -> str:
+        return f"A{underlying.krx_code}"  # 현물 주문 종목코드는 A 접두(실측)
 
     def _spot_order_body(self, intent: OrderIntent, account: Account) -> dict[str, Any]:
         return {
-            **self._account_fields(account),
-            "IsuNo": intent.underlying.krx_code,
-            "OrdQty": intent.qty,
-            "OrdPrc": intent.price if intent.price is not None else 0.0,
-            "BnsTpCode": "2" if intent.side is Side.BUY else "1",  # 1매도 2매수
-            "OrdprcPtnCode": "00" if intent.order_type is OrderType.LIMIT else "03",
+            f"{self.SPOT_ORDER_TR}InBlock1": {
+                **self._order_account_fields(account),
+                "IsuNo": self._spot_isu(intent.underlying),
+                "OrdQty": int(intent.qty),
+                "OrdPrc": int(intent.price) if intent.price is not None else 0,
+                "BnsTpCode": "2" if intent.side is Side.BUY else "1",  # 1매도 2매수
+                "OrdprcPtnCode": "00" if intent.order_type is OrderType.LIMIT else "03",
+                "MgntrnCode": "000",  # 신용거래 없음
+                "LoanDt": "",
+                "OrdCndiTpCode": "0",
+            }
         }
 
+    # 선물 주문 InBlock 필드는 카탈로그 기반(선물 주문 자체는 미실측 — 첫 라이브 주문 시 확인).
     def _future_order_body(self, intent: OrderIntent, account: Account) -> dict[str, Any]:
         return {
-            **self._account_fields(account),
-            "FnoIsuNo": self._futures_symbol(intent.underlying),  # 선물 종목코드(config)
-            "OrdQty": intent.qty,
-            "FnoOrdPrc": intent.price if intent.price is not None else 0.0,
-            "BnsTpCode": "2" if intent.side is Side.BUY else "1",  # 1매도 2매수
-            "FnoOrdprcPtnCode": "00" if intent.order_type is OrderType.LIMIT else "03",
+            f"{self.FUTURE_ORDER_TR}InBlock1": {
+                **self._order_account_fields(account),
+                "FnoIsuNo": self._futures_symbol(intent.underlying),  # 선물 종목코드(config)
+                "OrdQty": int(intent.qty),
+                "FnoOrdPrc": intent.price if intent.price is not None else 0.0,
+                "BnsTpCode": "2" if intent.side is Side.BUY else "1",  # 1매도 2매수
+                "FnoOrdprcPtnCode": "00" if intent.order_type is OrderType.LIMIT else "03",
+            }
         }
 
     def _future_amend_body(
         self, ctx: OrderContext, qty: float | None, price: float | None
     ) -> dict[str, Any]:
         return {
-            **self._account_fields(ctx.account),
-            "FnoIsuNo": self._futures_symbol(ctx.intent.underlying),
-            "OrgOrdNo": ctx.order_id,  # 원주문 보존
-            "MdfyQty": qty if qty is not None else ctx.intent.qty,
-            "FnoOrdPrc": price if price is not None else (ctx.intent.price or 0.0),
-            "FnoOrdprcPtnCode": "00",
+            f"{self.FUTURE_AMEND_TR}InBlock1": {
+                **self._order_account_fields(ctx.account),
+                "FnoIsuNo": self._futures_symbol(ctx.intent.underlying),
+                "OrgOrdNo": int(ctx.order_id),  # 원주문 보존
+                "MdfyQty": int(qty if qty is not None else ctx.intent.qty),
+                "FnoOrdPrc": price if price is not None else (ctx.intent.price or 0.0),
+                "FnoOrdprcPtnCode": "00",
+            }
         }
 
     def _future_cancel_body(self, ctx: OrderContext) -> dict[str, Any]:
         return {
-            **self._account_fields(ctx.account),
-            "FnoIsuNo": self._futures_symbol(ctx.intent.underlying),
-            "OrgOrdNo": ctx.order_id,  # 원주문 보존
-            "CancQty": ctx.intent.qty,
+            f"{self.FUTURE_CANCEL_TR}InBlock1": {
+                **self._order_account_fields(ctx.account),
+                "FnoIsuNo": self._futures_symbol(ctx.intent.underlying),
+                "OrgOrdNo": int(ctx.order_id),  # 원주문 보존
+                "CancQty": int(ctx.intent.qty),
+            }
         }
 
     def _futures_symbol(self, underlying: Underlying) -> str:
@@ -289,20 +316,27 @@ class LSApiGateway(LSGateway):
     def _amend_body(
         self, ctx: OrderContext, qty: float | None, price: float | None
     ) -> dict[str, Any]:
+        # 취소 실측과 동일한 래핑 패턴 + 카탈로그 필드(정정 자체는 미실측 — 첫 라이브 정정 시 확인).
         return {
-            **self._account_fields(ctx.account),
-            "OrgOrdNo": ctx.order_id,  # 원주문 보존
-            "IsuNo": ctx.intent.underlying.krx_code,
-            "OrdQty": qty if qty is not None else ctx.intent.qty,
-            "OrdPrc": price if price is not None else (ctx.intent.price or 0.0),
+            f"{self.SPOT_AMEND_TR}InBlock1": {
+                **self._order_account_fields(ctx.account),
+                "OrgOrdNo": int(ctx.order_id),  # 원주문 보존
+                "IsuNo": self._spot_isu(ctx.intent.underlying),
+                "OrdQty": int(qty if qty is not None else ctx.intent.qty),
+                "OrdPrc": int(price if price is not None else (ctx.intent.price or 0)),
+                "OrdprcPtnCode": "00",
+                "OrdCndiTpCode": "0",
+            }
         }
 
     def _cancel_body(self, ctx: OrderContext) -> dict[str, Any]:
         return {
-            **self._account_fields(ctx.account),
-            "OrgOrdNo": ctx.order_id,  # 원주문 보존
-            "IsuNo": ctx.intent.underlying.krx_code,
-            "OrdQty": ctx.intent.qty,
+            f"{self.SPOT_CANCEL_TR}InBlock1": {
+                **self._order_account_fields(ctx.account),
+                "OrgOrdNo": int(ctx.order_id),  # 원주문 보존
+                "IsuNo": self._spot_isu(ctx.intent.underlying),
+                "OrdQty": int(ctx.intent.qty),
+            }
         }
 
     # --- 응답 파싱 ---

@@ -28,7 +28,7 @@ class _TokenStub:
 
 
 class OrderTransport:
-    """녹화 픽스처: 모든 주문 TR에 대해 성공 + OutBlock2.OrdNo를 돌려준다."""
+    """녹화 픽스처: 모든 주문 TR에 대해 성공 + OutBlock2.OrdNo(실측: 숫자)를 돌려준다."""
 
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
@@ -46,12 +46,18 @@ class OrderTransport:
         tr = headers["tr_cd"]
         return RestResponse(
             status_code=200,
+            # 실측 shape: 성공 rsp_cd "00040"(매수), OrdNo는 int.
             body={
-                "rsp_cd": "00000",
-                "rsp_msg": "정상처리",
-                f"{tr}OutBlock2": {"OrdNo": f"{self.counter:07d}"},
+                "rsp_cd": "00040",
+                "rsp_msg": "모의투자 매수주문이 완료 되었습니다.",
+                f"{tr}OutBlock2": {"OrdNo": 2900 + self.counter},
             },
         )
+
+
+def inblk(req: dict[str, Any], tr_cd: str) -> dict[str, Any]:
+    """주문 요청 body의 InBlock1(실측: 주문 TR은 InBlock1 래핑 필수)."""
+    return req["body"][f"{tr_cd}InBlock1"]
 
 
 class RejectTransport:
@@ -105,14 +111,17 @@ async def test_stock_routes_to_stock_account() -> None:
     await gw.place_order(_intent(Instrument.KR_STOCK))
     req = transport.requests[-1]
     assert req["headers"]["tr_cd"] == LSApiGateway.SPOT_ORDER_TR
-    assert req["body"]["account"] == Account.KR_STOCK.value
+    blk = inblk(req, LSApiGateway.SPOT_ORDER_TR)
+    assert blk["account"] == Account.KR_STOCK.value
+    assert blk["IsuNo"] == "A005930"  # 현물 주문은 A 접두(실측)
 
 
 async def test_etf_routes_to_stock_account() -> None:
     transport = OrderTransport()
     gw = _gateway(transport)
     await gw.place_order(_intent(Instrument.KR_ETF))
-    assert transport.requests[-1]["body"]["account"] == Account.KR_STOCK.value
+    req = transport.requests[-1]
+    assert inblk(req, LSApiGateway.SPOT_ORDER_TR)["account"] == Account.KR_STOCK.value
 
 
 async def test_future_order_uses_cfoat_and_routes_to_deriv() -> None:
@@ -123,9 +132,10 @@ async def test_future_order_uses_cfoat_and_routes_to_deriv() -> None:
     oid = await gw.place_order(_intent(Instrument.KR_STOCK_FUTURE, side=Side.SELL))
     req = transport.requests[-1]
     assert req["headers"]["tr_cd"] == LSApiGateway.FUTURE_ORDER_TR
-    assert req["body"]["account"] == Account.KR_DERIV.value
-    assert req["body"]["FnoIsuNo"] == "1AB3000"
-    assert oid == "0000001"
+    blk = inblk(req, LSApiGateway.FUTURE_ORDER_TR)
+    assert blk["account"] == Account.KR_DERIV.value
+    assert blk["FnoIsuNo"] == "1AB3000"
+    assert oid == "2901"
 
 
 async def test_future_order_without_symbol_raises() -> None:
@@ -141,9 +151,10 @@ async def test_future_amend_uses_cfoat00200() -> None:
     new_id = await gw.amend_order(oid, qty=5, price=71_000.0)
     req = transport.requests[-1]
     assert req["headers"]["tr_cd"] == LSApiGateway.FUTURE_AMEND_TR
-    assert req["body"]["OrgOrdNo"] == oid  # 원주문 보존
-    assert req["body"]["FnoIsuNo"] == "1AB3000"
-    assert req["body"]["MdfyQty"] == 5
+    blk = inblk(req, LSApiGateway.FUTURE_AMEND_TR)
+    assert blk["OrgOrdNo"] == int(oid)  # 원주문 보존(실측: 숫자)
+    assert blk["FnoIsuNo"] == "1AB3000"
+    assert blk["MdfyQty"] == 5
     assert new_id != oid
 
 
@@ -154,8 +165,9 @@ async def test_future_cancel_uses_cfoat00300() -> None:
     await gw.cancel_order(oid)
     req = transport.requests[-1]
     assert req["headers"]["tr_cd"] == LSApiGateway.FUTURE_CANCEL_TR
-    assert req["body"]["OrgOrdNo"] == oid
-    assert req["body"]["CancQty"] == 10  # 원주문 수량
+    blk = inblk(req, LSApiGateway.FUTURE_CANCEL_TR)
+    assert blk["OrgOrdNo"] == int(oid)
+    assert blk["CancQty"] == 10  # 원주문 수량
 
 
 async def test_order_injects_account_number_and_password() -> None:
@@ -167,10 +179,10 @@ async def test_order_injects_account_number_and_password() -> None:
     transport = OrderTransport()
     gw = _gateway(transport, accounts=accounts)
     await gw.place_order(_intent(Instrument.KR_STOCK))
-    body = transport.requests[-1]["body"]
-    assert body["AcntNo"] == "STK1"  # 대시 제거됨
-    assert body["Pwd"] == "spw"
-    assert "account" not in body  # 플레이스홀더 대신 실 계좌필드
+    blk = inblk(transport.requests[-1], LSApiGateway.SPOT_ORDER_TR)
+    assert blk["AcntNo"] == "STK1"  # 대시 제거됨
+    assert blk["InptPwd"] == "spw"  # 주문은 InptPwd(실측 — 조회는 Pwd)
+    assert "account" not in blk  # 플레이스홀더 대신 실 계좌필드
 
 
 class _AppkeyTokenTransport:
@@ -198,7 +210,8 @@ async def test_from_accounts_uses_per_account_token() -> None:
     # 계좌별로 서로 다른 appkey→토큰으로 요청됨.
     assert rest_tx.requests[0]["headers"]["authorization"] == "Bearer tok-stock-ak"
     assert rest_tx.requests[1]["headers"]["authorization"] == "Bearer tok-deriv-ak"
-    assert rest_tx.requests[0]["body"]["AcntNo"] == "STK1"  # 계좌 자격 주입(대시 제거)
+    blk = inblk(rest_tx.requests[0], LSApiGateway.SPOT_ORDER_TR)
+    assert blk["AcntNo"] == "STK1"  # 계좌 자격 주입(대시 제거)
 
 
 async def test_routes_to_per_account_client() -> None:
@@ -242,7 +255,7 @@ async def test_rejects_hl_order() -> None:
 async def test_parses_order_id() -> None:
     gw = _gateway(OrderTransport())
     oid = await gw.place_order(_intent(Instrument.KR_STOCK))
-    assert oid == "0000001"
+    assert oid == "2901"  # 실측: OutBlock2.OrdNo(숫자) → str
 
 
 async def test_rejected_response_raises() -> None:
@@ -262,9 +275,10 @@ async def test_cancel_preserves_original_context() -> None:
     await gw.cancel_order(oid)
     cancel_req = transport.requests[-1]
     assert cancel_req["headers"]["tr_cd"] == LSApiGateway.SPOT_CANCEL_TR
-    assert cancel_req["body"]["OrgOrdNo"] == oid  # 원주문 참조
-    assert cancel_req["body"]["account"] == Account.KR_STOCK.value
-    assert cancel_req["body"]["IsuNo"] == Underlying.SAMSUNG.krx_code
+    blk = inblk(cancel_req, LSApiGateway.SPOT_CANCEL_TR)
+    assert blk["OrgOrdNo"] == int(oid)  # 원주문 참조(실측: 숫자)
+    assert blk["account"] == Account.KR_STOCK.value
+    assert blk["IsuNo"] == "A005930"  # 현물 주문 계열은 A 접두(실측)
 
 
 async def test_amend_links_to_original() -> None:
@@ -276,9 +290,10 @@ async def test_amend_links_to_original() -> None:
     assert new_id != oid
     amend_req = transport.requests[-1]
     assert amend_req["headers"]["tr_cd"] == LSApiGateway.SPOT_AMEND_TR
-    assert amend_req["body"]["OrgOrdNo"] == oid
-    assert amend_req["body"]["OrdQty"] == 5
-    assert amend_req["body"]["OrdPrc"] == 71_000.0
+    blk = inblk(amend_req, LSApiGateway.SPOT_AMEND_TR)
+    assert blk["OrgOrdNo"] == int(oid)
+    assert blk["OrdQty"] == 5
+    assert blk["OrdPrc"] == 71_000
 
 
 async def test_cancel_unknown_order_raises() -> None:

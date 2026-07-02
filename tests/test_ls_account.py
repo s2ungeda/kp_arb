@@ -15,10 +15,11 @@ FIXTURES: dict[str, dict[str, Any]] = {
     # 모의 성공코드 "00136"(운영 "00000"), 실필드 MnyOrdAbleAmt(현금주문가능).
     "CSPAQ22200": {"rsp_cd": "00136", "CSPAQ22200OutBlock2": {"MnyOrdAbleAmt": 5_000_000}},
     "CSPAQ12300": {
-        "rsp_cd": "00000",
+        "rsp_cd": "00136",
+        # 실측 행 필드: 잔고는 BnsBaseBalQty(당일 매수 T+2 미결제 포함), 평단은 AvrUprc(문자열).
         "CSPAQ12300OutBlock3": [
-            {"IsuNo": "005930", "BalQty": 100, "AvrPrc": 70_000},
-            {"IsuNo": "000660", "BalQty": 50, "AvrPrc": 180_000},
+            {"IsuNo": "005930", "BalQty": 0, "BnsBaseBalQty": 100, "AvrUprc": "70000.00"},
+            {"IsuNo": "000660", "BalQty": 50, "BnsBaseBalQty": 50, "AvrUprc": "180000.00"},
         ],
     },
     "CFOBQ10500": {"rsp_cd": "00136", "CFOBQ10500OutBlock2": {"MnyOrdAbleAmt": 3_000_000}},
