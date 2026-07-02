@@ -29,11 +29,13 @@ from pydantic import BaseModel
 from ..domain.enums import Instrument, Underlying
 from ..domain.models import Quote
 
-QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1"})
+QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1"})  # KRX/NXT 호가
 FUTURES_QUOTE_TR = "JH0"   # 주식선물 호가 (body 필드는 H1_와 동일 가정 — 장중 실확인 예정)
-STOCK_TRADE_TR = "S3_"     # 주식 체결 (현재가 — body 'price' 가정, 장중 실확인 예정)
+STOCK_TRADE_TRS: tuple[str, ...] = ("S3_", "NS3")  # 체결(현재가): KRX/NXT
 FUTURES_TRADE_TR = "JC0"   # 주식선물 체결 (동일 가정)
-EXPECTED_TR = "YS3"        # 예상체결 (실측: yeprice/shcode — 장전 동시호가에 흐름)
+EXPECTED_TRS: tuple[str, ...] = ("YS3", "NYS")     # 예상체결: KRX(실측)/NXT
+# 주의: 모의 서버(29443)는 NXT 계열(NH1/NS3/NYS) 실시간을 중계하지 않는 것으로
+# 실측됨(구독 ACK만 정상, 데이터 0) — NXT 시세는 실전 시세 접속에서 확인.
 FILL_TRS: frozenset[str] = frozenset({"SC1", "C01"})  # 체결: 주식 SC1 / 선물 C01
 ORDER_EVENT_TRS: dict[str, str] = {
     "SC0": "ack", "SC2": "amend", "SC3": "cancel", "SC4": "reject",  # 주식
@@ -161,9 +163,9 @@ class LSWebSocketClient:
             self._add(FUTURES_TRADE_TR, code)
 
     def subscribe_trades(self, underlying: Underlying) -> None:
-        """주식 체결(S3_, 현재가)과 예상체결(YS3) 구독."""
-        self._add(STOCK_TRADE_TR, underlying.krx_code)
-        self._add(EXPECTED_TR, underlying.krx_code)
+        """주식 체결(현재가)·예상체결 구독 — KRX(S3_/YS3) + NXT(NS3/NYS)."""
+        for tr in STOCK_TRADE_TRS + EXPECTED_TRS:
+            self._add(tr, underlying.krx_code)
 
     def subscribe_fills(self) -> None:
         """주식+선물 체결통보 전부 구독(단일 연결용 — 계좌 통보는 해당 토큰 계좌 것만 온다)."""
@@ -241,12 +243,12 @@ class LSWebSocketClient:
             if fut_quote is not None:
                 for handler in self.on_quote:
                     handler(fut_quote)
-        elif tr_cd in (STOCK_TRADE_TR, FUTURES_TRADE_TR):
+        elif tr_cd in STOCK_TRADE_TRS or tr_cd == FUTURES_TRADE_TR:
             tick = self._parse_trade(tr_cd, msg)
             if tick is not None:
                 for trade_handler in self.on_trade:
                     trade_handler(tick)
-        elif tr_cd == EXPECTED_TR:
+        elif tr_cd in EXPECTED_TRS:
             expected = self._parse_expected(msg)
             if expected is not None:
                 for expected_handler in self.on_expected:
