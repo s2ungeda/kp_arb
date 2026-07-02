@@ -27,10 +27,12 @@ def quote_frame(code: str = SAMSUNG_CODE, *, bid: float = 69_900, ask: float = 7
 
 
 def fill_frame() -> str:
+    # 실측 SC1 shape: 값은 문자열, ordno/execno/execqty/execprc/exectime.
     return json.dumps(
         {
             "header": {"tr_cd": "SC1"},
-            "body": {"fill_id": "F1", "order_id": "0000001", "qty": 10, "price": 70_000, "ts": 2.0},
+            "body": {"execno": "48086", "ordno": "9852", "execqty": "10",
+                     "execprc": "70000", "exectime": "100932000"},
         }
     )
 
@@ -92,7 +94,8 @@ async def test_replay_emits_all_event_types() -> None:
     assert len(quotes) == 1
     assert quotes[0].underlying is Underlying.SAMSUNG
     assert quotes[0].bid == 69_900 and quotes[0].ask == 70_000
-    assert len(fills) == 1 and fills[0].order_id == "0000001"
+    assert len(fills) == 1 and fills[0].order_id == "9852"
+    assert fills[0].qty == 10 and fills[0].price == 70_000
     assert len(statuses) == 1 and statuses[0].body["jstatus"] == "21"
 
 
@@ -105,12 +108,15 @@ async def test_subscribe_sends_register_for_all_trs() -> None:
 
     await client.run()
 
-    sent = [json.loads(m)["body"] for m in session.sent]
-    sent_trs = {b["tr_cd"] for b in sent}
+    sent = [json.loads(m) for m in session.sent]
+    sent_trs = {m["body"]["tr_cd"] for m in sent}
     assert {"H1_", "NH1", "JIF"} <= sent_trs
     assert {"SC0", "SC1", "SC2", "SC3", "SC4"} <= sent_trs
-    jif = next(b for b in sent if b["tr_cd"] == "JIF")
-    assert jif["tr_key"] == "0"  # JIF는 시장 단위 구독(실측)
+    jif = next(m for m in sent if m["body"]["tr_cd"] == "JIF")
+    assert jif["body"]["tr_key"] == "0"      # JIF는 시장 단위 구독(실측)
+    assert jif["header"]["tr_type"] == "3"   # 시세 등록
+    sc1 = next(m for m in sent if m["body"]["tr_cd"] == "SC1")
+    assert sc1["header"]["tr_type"] == "1"   # 계좌 이벤트 등록(실측 — "3"이면 미수신)
 
 
 async def test_reconnect_resubscribes_and_recovers() -> None:
@@ -157,6 +163,23 @@ async def test_ack_frame_without_body_is_skipped() -> None:
 
     assert statuses == []       # 데이터로 처리 안 함
     assert len(raws) == 1       # 원시 프레임은 관측됨
+
+
+async def test_order_events_dispatched_by_kind() -> None:
+    # SC0=접수(ack) / SC3=취소(cancel, orgordno=원주문) → OrderEvent로 분화.
+    ack = json.dumps({"header": {"tr_cd": "SC0"}, "body": {"ordno": "9852", "orgordno": "0"}})
+    cxl = json.dumps({"header": {"tr_cd": "SC3"}, "body": {"ordno": "9901", "orgordno": "9852"}})
+    session = FakeConnection([ack, cxl])
+    client = LSWebSocketClient(FakeConnector([session]))
+    events = []
+    client.on_order_event.append(events.append)
+    client.subscribe_fills()
+
+    await client.run()
+
+    assert [e.kind for e in events] == ["ack", "cancel"]
+    assert events[0].order_id == "9852" and events[0].org_order_id is None
+    assert events[1].order_id == "9901" and events[1].org_order_id == "9852"
 
 
 async def test_unknown_tr_is_ignored() -> None:

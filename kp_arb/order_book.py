@@ -14,7 +14,7 @@ from enum import StrEnum
 
 from .domain.enums import Account, Instrument, Side, Underlying
 from .domain.models import OrderIntent, Position
-from .gateways.ls_ws import Fill
+from .gateways.ls_ws import Fill, OrderEvent
 
 
 class OrderStatus(StrEnum):
@@ -128,6 +128,18 @@ class OrderBook:
         if order is not None and order.is_open:
             order.status = OrderStatus.REJECTED
         return order
+
+    def on_order_event(self, event: OrderEvent) -> TrackedOrder | None:
+        """WS 주문 이벤트(SC0/2/3/4) 디스패치. 결선: client.on_order_event.append(...)"""
+        if event.kind == "ack":
+            return self.on_ack(event.order_id)
+        # 취소/거부 통보는 새 통보의 원주문(orgordno)이 대상. 없으면 자기 자신.
+        target = event.org_order_id or event.order_id
+        if event.kind == "cancel":
+            return self.on_cancel(target)
+        if event.kind == "reject":
+            return self.on_reject(target)
+        return None  # amend(정정)는 새 주문 재등록이 필요 — 상위(게이트웨이 결선)에서 처리
 
     # --- 증분 계산 (순수) ---
 

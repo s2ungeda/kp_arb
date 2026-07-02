@@ -6,11 +6,13 @@
 라이브 없음: 실제 WS는 주입된 ``WSConnector``/``WSConnection``(Protocol) 뒤로 격리.
 테스트는 가짜 WS 서버(녹화 프레임)만 사용한다.
 
-[라이브 정합 v6.3] 실측 프레임 기준:
+[라이브 정합 v6.3/v6.6] 실측 프레임 기준:
 - H1_/NH1 body: ``bidho1``/``offerho1``(1호가, 문자열), ``hotime``(HHMMSS), ``shcode``(종목코드).
 - JIF는 **시장 단위**(tr_key="0" 전체) — 종목코드로 구독하면 아무 프레임도 오지 않는다.
   body = ``{jangubun(시장구분), jstatus(상태코드)}``. 해석은 SessionService.
-- 체결(SC0~SC4) 실필드는 미실측(주문 발생 시 확인) — placeholder 유지.
+- **체결통보(SC0~SC4)는 tr_type="1"(계좌 등록)** — "3"으로 보내면 ACK만 오고 등록되지 않는다.
+  SC1(체결) body 실필드: ``ordno``(주문번호)·``execno``(체결번호)·``execqty``·``execprc``·
+  ``exectime``(HHMMSSmmm). SC0=접수, SC2=정정, SC3=취소, SC4=거부 → ``OrderEvent``로 분화.
 """
 from __future__ import annotations
 
@@ -25,7 +27,9 @@ from ..domain.enums import Instrument, Underlying
 from ..domain.models import Quote
 
 QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1"})
-FILL_TRS: frozenset[str] = frozenset({"SC0", "SC1", "SC2", "SC3", "SC4"})
+FILL_TR = "SC1"  # 체결 통보만 Fill. 나머지 SC는 주문 이벤트.
+ORDER_EVENT_TRS: dict[str, str] = {"SC0": "ack", "SC2": "amend", "SC3": "cancel", "SC4": "reject"}
+ACCOUNT_TRS: tuple[str, ...] = ("SC0", "SC1", "SC2", "SC3", "SC4")
 STATUS_TR = "JIF"
 
 
@@ -44,6 +48,15 @@ class MarketStatus(BaseModel):
     """장운영(JIF) 이벤트. SessionService(블록 2-1)가 SessionPhase로 해석."""
 
     tr_key: str
+    body: dict[str, Any] = {}
+
+
+class OrderEvent(BaseModel):
+    """주문 이벤트(SC0 접수 / SC2 정정 / SC3 취소 / SC4 거부). OrderBook 상태 전이용."""
+
+    kind: str            # "ack" | "amend" | "cancel" | "reject"
+    order_id: str        # ordno
+    org_order_id: str | None = None  # 정정/취소 통보의 원주문(orgordno)
     body: dict[str, Any] = {}
 
 
@@ -75,10 +88,11 @@ class LSWebSocketClient:
         self._token = token
         self._max_reconnects = max_reconnects
         self._reconnect_backoff_s = reconnect_backoff_s
-        self._subs: list[tuple[str, str]] = []  # (tr_cd, tr_key) 희망 구독 상태
+        self._subs: list[tuple[str, str, str]] = []  # (tr_cd, tr_key, tr_type) 희망 구독 상태
         self._conn: WSConnection | None = None
         self.on_quote: list[Callable[[Quote], None]] = []
         self.on_fill: list[Callable[[Fill], None]] = []
+        self.on_order_event: list[Callable[[OrderEvent], None]] = []
         self.on_market_status: list[Callable[[MarketStatus], None]] = []
         self.on_raw: list[Callable[[str], None]] = []  # 진단: 모든 원시 프레임
 
@@ -90,16 +104,17 @@ class LSWebSocketClient:
         self._add("NH1", code)
 
     def subscribe_fills(self) -> None:
-        for tr in sorted(FILL_TRS):
-            self._add(tr, "")
+        # 계좌 이벤트(SC*)는 tr_type "1"로 등록해야 수신된다(실측 — "3"은 ACK만 옴).
+        for tr in ACCOUNT_TRS:
+            self._add(tr, "", tr_type="1")
 
     def subscribe_market_status(self) -> None:
         # JIF는 시장 단위 — tr_key "0"(전체). 종목코드 구독은 무응답(실측).
         self._add(STATUS_TR, "0")
 
-    def _add(self, tr_cd: str, tr_key: str) -> None:
-        if (tr_cd, tr_key) not in self._subs:
-            self._subs.append((tr_cd, tr_key))
+    def _add(self, tr_cd: str, tr_key: str, *, tr_type: str = "3") -> None:
+        if (tr_cd, tr_key, tr_type) not in self._subs:
+            self._subs.append((tr_cd, tr_key, tr_type))
 
     # --- 실행 루프 ---
 
@@ -124,13 +139,14 @@ class LSWebSocketClient:
                 return  # 스트림이 정상 종료됨
 
     async def _resubscribe(self, conn: WSConnection) -> None:
-        for tr_cd, tr_key in self._subs:
-            await conn.send(self._register_msg(tr_cd, tr_key))
+        for tr_cd, tr_key, tr_type in self._subs:
+            await conn.send(self._register_msg(tr_cd, tr_key, tr_type))
 
-    def _register_msg(self, tr_cd: str, tr_key: str) -> str:
+    def _register_msg(self, tr_cd: str, tr_key: str, tr_type: str) -> str:
+        # tr_type: 1=계좌 등록(SC*), 3=시세 등록(H1_/JIF 등)
         return json.dumps(
             {
-                "header": {"token": self._token, "tr_type": "3"},  # 3=등록
+                "header": {"token": self._token, "tr_type": tr_type},
                 "body": {"tr_cd": tr_cd, "tr_key": tr_key},
             }
         )
@@ -149,10 +165,14 @@ class LSWebSocketClient:
             if quote is not None:
                 for handler in self.on_quote:
                     handler(quote)
-        elif tr_cd in FILL_TRS:
+        elif tr_cd == FILL_TR:
             fill = self._parse_fill(msg)
             for fill_handler in self.on_fill:
                 fill_handler(fill)
+        elif tr_cd in ORDER_EVENT_TRS:
+            event = self._parse_order_event(tr_cd, msg)
+            for event_handler in self.on_order_event:
+                event_handler(event)
         elif tr_cd == STATUS_TR:
             status = self._parse_status(msg)
             for status_handler in self.on_market_status:
@@ -175,14 +195,25 @@ class LSWebSocketClient:
         )
 
     def _parse_fill(self, msg: dict[str, Any]) -> Fill:
+        # SC1 실측 필드: ordno/execno/execqty/execprc/exectime(HHMMSSmmm).
         body = msg["body"]
         return Fill(
-            fill_id=str(body["fill_id"]),
-            order_id=str(body["order_id"]),
-            qty=float(body["qty"]),
-            price=float(body["price"]),
-            fee=float(body.get("fee", 0.0)),
-            ts=float(body["ts"]),
+            fill_id=str(body["execno"]),
+            order_id=str(body["ordno"]),
+            qty=float(body["execqty"]),
+            price=float(body["execprc"]),
+            fee=0.0,  # 수수료 필드(cmsnamtexecamt)는 모의에서 공백 — 라이브 확정 시 반영
+            ts=float(body["exectime"]),
+        )
+
+    def _parse_order_event(self, tr_cd: str, msg: dict[str, Any]) -> OrderEvent:
+        body = msg["body"]
+        org = str(body.get("orgordno", "") or "").strip()
+        return OrderEvent(
+            kind=ORDER_EVENT_TRS[tr_cd],
+            order_id=str(body.get("ordno", "")),
+            org_order_id=org if org and org != "0" else None,
+            body=body,
         )
 
     def _parse_status(self, msg: dict[str, Any]) -> MarketStatus:

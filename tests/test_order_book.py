@@ -70,6 +70,19 @@ def test_cancel_and_reject() -> None:
     assert ob.open_orders() == []
 
 
+def test_ws_order_event_dispatch() -> None:
+    # WS OrderEvent(SC0 접수/SC3 취소)가 상태 전이로 연결됨 — 취소 통보는 원주문(orgordno) 대상.
+    from kp_arb.gateways.ls_ws import OrderEvent
+
+    ob = OrderBook()
+    ob.track("9852", intent())
+    ob.on_order_event(OrderEvent(kind="ack", order_id="9852"))
+    assert ob.order("9852").status is OrderStatus.ACCEPTED
+
+    ob.on_order_event(OrderEvent(kind="cancel", order_id="9901", org_order_id="9852"))
+    assert ob.order("9852").status is OrderStatus.CANCELLED
+
+
 def test_unknown_order_fill_ignored() -> None:
     ob = OrderBook()
     assert ob.on_fill(fill("999", qty=1, price=100)) is None
