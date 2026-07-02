@@ -3,9 +3,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from ..domain.enums import Account, Underlying
 from ..domain.models import OrderIntent, Position
+
+if TYPE_CHECKING:
+    from ..order_book import TrackedOrder
 
 
 class LSGateway(ABC):
@@ -25,6 +29,10 @@ class LSGateway(ABC):
 
     @abstractmethod
     async def get_balance(self, account: Account) -> float: ...
+
+    @abstractmethod
+    async def get_open_orders(self, account: Account) -> Sequence[TrackedOrder]:
+        """미체결 주문 스냅샷(최초 실행/온디맨드 조회용)."""
 
 
 class HLGateway(ABC):

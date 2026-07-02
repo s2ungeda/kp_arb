@@ -23,6 +23,18 @@ FIXTURES: dict[str, dict[str, Any]] = {
         ],
     },
     "CFOBQ10500": {"rsp_cd": "00136", "CFOBQ10500OutBlock2": {"MnyOrdAbleAmt": 3_000_000}},
+    # 실측 v6.5: 미체결 행 — IsuNo "A"접두, OrdPrc 문자열, MrcAbleQty=정정취소가능수량.
+    "CSPAQ13700": {
+        "rsp_cd": "00136",
+        "CSPAQ13700OutBlock3": [
+            {"OrdNo": 7267, "IsuNo": "A005930", "BnsTpCode": "2", "OrdQty": 1,
+             "OrdPrc": "265000.00", "ExecQty": 0, "ExecPrc": "0.00",
+             "MrcAbleQty": 1, "OrdprcPtnCode": "00"},
+            {"OrdNo": 7000, "IsuNo": "A005930", "BnsTpCode": "1", "OrdQty": 2,
+             "OrdPrc": "0.00", "ExecQty": 2, "ExecPrc": "292000.00",
+             "MrcAbleQty": 0, "OrdprcPtnCode": "03"},  # 전량 체결 → 제외 대상
+        ],
+    },
     "CFOAQ50600": {
         "rsp_cd": "00136",
         "CFOAQ50600OutBlock3": [
@@ -46,10 +58,11 @@ class _TokenStub:
 
 
 class AccountTransport:
-    """headers의 tr_cd로 녹화 픽스처를 골라 돌려준다. 사용된 tr_cd를 기록."""
+    """headers의 tr_cd로 녹화 픽스처를 골라 돌려준다. 사용된 tr_cd·요청 body를 기록."""
 
     def __init__(self) -> None:
         self.seen_trs: list[str] = []
+        self.bodies: list[dict[str, Any]] = []
 
     async def request(
         self,
@@ -60,6 +73,7 @@ class AccountTransport:
     ) -> RestResponse:
         tr = headers["tr_cd"]
         self.seen_trs.append(tr)
+        self.bodies.append(body or {})
         return RestResponse(status_code=200, body=FIXTURES[tr])
 
 
@@ -131,6 +145,35 @@ async def test_positions_route_to_different_trs() -> None:
     await gw.get_positions(Account.KR_STOCK)
     await gw.get_positions(Account.KR_DERIV)
     assert transport.seen_trs == ["CSPAQ12300", "CFOAQ50600"]
+
+
+# --- 미체결 주문 스냅샷 ---
+
+
+async def test_open_orders_parsed_and_filtered() -> None:
+    from kp_arb.order_book import OrderStatus
+
+    transport = AccountTransport()
+    gw = _gateway(transport)
+    orders = await gw.get_open_orders(Account.KR_STOCK)
+
+    assert transport.seen_trs == ["CSPAQ13700"]
+    # InBlock1 래핑 + ExecYn=2(미체결) 요청 확인
+    blk = transport.bodies[-1]["CSPAQ13700InBlock1"]
+    assert blk["ExecYn"] == "2"
+    # MrcAbleQty>0 만 미체결로 남김(전량 체결 행 제외)
+    assert len(orders) == 1
+    o = orders[0]
+    assert o.order_id == "7267"
+    assert o.status is OrderStatus.ACCEPTED
+    assert o.intent.underlying is Underlying.SAMSUNG  # "A005930" → 005930
+    assert o.intent.side is Side.BUY and o.intent.qty == 1
+    assert o.intent.price == 265_000.0
+
+
+async def test_open_orders_deriv_not_implemented_returns_empty() -> None:
+    gw = _gateway(AccountTransport())
+    assert await gw.get_open_orders(Account.KR_DERIV) == []  # 선물 미체결 TR 미확인
 
 
 # --- 응답 오류 ---

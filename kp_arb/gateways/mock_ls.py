@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from ..domain.enums import Account, Venue
 from ..domain.models import OrderIntent, Position
 from ..routing import account_for
 from .base import LSGateway
+
+if TYPE_CHECKING:
+    from ..order_book import TrackedOrder
 
 
 class MockLSGateway(LSGateway):
@@ -45,6 +49,9 @@ class MockLSGateway(LSGateway):
 
     async def get_balance(self, account: Account) -> float:
         return self._balances[account]
+
+    async def get_open_orders(self, account: Account) -> Sequence[TrackedOrder]:
+        return []  # mock: 미체결 없음 (필요 시 seed 헬퍼 추가)
 
     # --- 테스트 픽스처 주입 헬퍼 ---
     def seed_position(self, position: Position) -> None:

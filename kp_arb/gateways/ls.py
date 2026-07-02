@@ -19,6 +19,7 @@ from typing import Any
 from ..config import LSAccounts
 from ..domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from ..domain.models import OrderIntent, Position
+from ..order_book import OrderStatus, TrackedOrder
 from ..routing import account_for
 from .base import LSGateway
 from .ls_auth import TokenManager, TokenTransport
@@ -56,6 +57,7 @@ class LSApiGateway(LSGateway):
     # 잔고·예수금·증거금 조회 (계좌별). 정확한 TR 필드명은 라이브 구현 시 확인.
     STOCK_DEPOSIT_TR = "CSPAQ22200"     # 주식 예수금 (대안 주문가능 CDPCQ04700)
     STOCK_POSITIONS_TR = "CSPAQ12300"   # 주식 잔고 (대안 t0424)
+    STOCK_OPEN_ORDERS_TR = "CSPAQ13700" # 주식 체결/미체결 (InBlock1 래핑, 실측 v6.5)
     DERIV_DEPOSIT_TR = "CFOBQ10500"     # 선물옵션 예탁금·증거금 (get_balance)
     DERIV_POSITIONS_TR = "CFOAQ50600"   # 선물옵션 잔고·평가 (get_positions, 모의 미제공→빈결과)
     STOCK_ACC_PATH = "/stock/accno"
@@ -192,6 +194,52 @@ class LSApiGateway(LSGateway):
             self.DERIV_DEPOSIT_TR, self._account_fields(account), path=self.DERIV_ACC_PATH
         )
         return self._amount(resp, self.DERIV_DEPOSIT_TR, "MnyOrdAbleAmt")
+
+    async def get_open_orders(self, account: Account) -> Sequence[TrackedOrder]:
+        """미체결 주문 스냅샷(주식 CSPAQ13700). 선물 미체결 TR은 미확인 → 빈 결과."""
+        if account is not Account.KR_STOCK:
+            return []  # 선물 미체결 조회 TR 확인 후 구현
+        body = {
+            f"{self.STOCK_OPEN_ORDERS_TR}InBlock1": {
+                **self._order_account_fields(account),  # 실측: 13700도 InptPwd 스타일
+                "OrdMktCode": "00",
+                "BnsTpCode": "0",   # 전체
+                "IsuNo": "",
+                "ExecYn": "2",      # 미체결
+                "OrdDt": "",
+                "SrtOrdNo2": 999_999_999,
+                "BkseqTpCode": "0",
+                "OrdPtnCode": "00",
+            }
+        }
+        resp = await self._rest_for(account).request(
+            self.STOCK_OPEN_ORDERS_TR, body, path=self.STOCK_ACC_PATH
+        )
+        rows = self._rows(resp, self.STOCK_OPEN_ORDERS_TR)
+        return [self._open_order(row) for row in rows if float(row.get("MrcAbleQty", 0)) > 0]
+
+    def _open_order(self, row: dict[str, Any]) -> TrackedOrder:
+        # 실측 행: IsuNo "A005930", BnsTpCode 1매도/2매수, OrdPrc 문자열, ExecQty 체결누계.
+        intent = OrderIntent(
+            venue=Venue.LS,
+            underlying=self._underlying(str(row["IsuNo"]).lstrip("A")),
+            instrument=Instrument.KR_STOCK,
+            side=Side.BUY if str(row["BnsTpCode"]) == "2" else Side.SELL,
+            qty=float(row["OrdQty"]),
+            order_type=(
+                OrderType.LIMIT if str(row.get("OrdprcPtnCode", "00")) == "00"
+                else OrderType.MARKET
+            ),
+            price=float(row["OrdPrc"]) if float(row["OrdPrc"]) > 0 else None,
+        )
+        exec_qty = float(row.get("ExecQty", 0))
+        return TrackedOrder(
+            order_id=str(row["OrdNo"]),
+            intent=intent,
+            status=OrderStatus.PARTIAL if exec_qty > 0 else OrderStatus.ACCEPTED,
+            filled_qty=exec_qty,
+            avg_fill_price=float(row.get("ExecPrc", 0) or 0),
+        )
 
     async def raw_request(
         self, account: Account, tr_cd: str, path: str, *, method: str = "POST"
