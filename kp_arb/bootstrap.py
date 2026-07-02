@@ -93,6 +93,24 @@ class LiveSystem:
 
     # --- 시동 ---
 
+    def _seed_session_from_env(self) -> None:
+        """장중 재시작용 초기 세션(KP_SESSION_INIT=regular 등). JIF 수신 시 항상 JIF 우선.
+
+        LS REST에는 '현재 장상태' 조회 TR이 없다 — 표준 운영은 **개장 전 시동**
+        (JIF 카운트다운을 자연 수신). 미설정/미지 값이면 보수적 DEAD 유지.
+        """
+        import os
+
+        from .domain.enums import SessionPhase
+
+        raw = os.environ.get("KP_SESSION_INIT", "").strip().lower()
+        if not raw:
+            return
+        try:
+            self.session.seed_phase(SessionPhase(raw))
+        except ValueError:
+            pass  # 미지 값 → 시딩하지 않음(DEAD 유지)
+
     def _wire(self) -> None:
         def fan_quote(quote: Quote) -> None:
             for handler in self.on_quote:
@@ -118,8 +136,9 @@ class LiveSystem:
             self._deriv_ws.on_order_event.append(apply_event)
 
     async def start(self) -> None:
-        """최초 스냅샷 → WS 결선 → 실시간 수신 시작(재연결 포함)."""
+        """최초 스냅샷 → 세션 초기값(옵션) → WS 결선 → 실시간 수신 시작(재연결 포함)."""
         await self.refresh_snapshot()
+        self._seed_session_from_env()
         self._wire()
         self._tasks = [asyncio.create_task(self._stock_ws.run())]
         if self._deriv_ws is not None:

@@ -133,6 +133,26 @@ async def test_fill_frame_updates_order_book_realtime() -> None:
                                           Account.KR_STOCK) == 110  # 100(스냅샷)+10(체결)
 
 
+async def test_session_init_env_seeds_phase(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from kp_arb.domain.enums import SessionPhase
+
+    monkeypatch.setenv("KP_SESSION_INIT", "regular")
+    system, _, _ = _system([])
+    await system.start()
+    await system.wait()
+    assert system.session.phase_for(SAMSUNG) is SessionPhase.REGULAR
+
+
+async def test_session_init_invalid_stays_dead(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from kp_arb.domain.enums import SessionPhase
+
+    monkeypatch.setenv("KP_SESSION_INIT", "bogus")
+    system, _, _ = _system([])
+    await system.start()
+    await system.wait()
+    assert system.session.phase_for(SAMSUNG) is SessionPhase.DEAD  # 보수 유지
+
+
 async def test_deriv_ws_subscribes_futures_fills_only() -> None:
     system, _, deriv_connector = _system([], deriv_frames=[])
     await system.start()

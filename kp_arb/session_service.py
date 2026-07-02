@@ -53,6 +53,15 @@ class SessionService:
         """휴장일 조회 결과를 반영. 휴장이면 모든 instrument 비거래(데드존)."""
         self._is_holiday = is_holiday
 
+    def seed_phase(self, phase: SessionPhase, *, market: str = STOCK_MARKET) -> None:
+        """시작 시 초기 phase 시딩(운영자 명시 입력 — 장중 재시작용).
+
+        LS REST에는 '현재 장상태' 조회 TR이 없어(JIF는 변화 push만) 장중 재시작 시
+        운영자가 KP_SESSION_INIT으로 명시한다. **이미 JIF로 수신한 상태는 덮지 않으며**,
+        이후 JIF 이벤트가 오면 항상 그것이 우선한다.
+        """
+        self._market_phase.setdefault(market, phase)
+
     def on_market_status(self, status: MarketStatus) -> None:
         """LS JIF 이벤트 수신 → 해당 시장(jangubun)의 phase 갱신."""
         market = str(status.body.get("jangubun", ""))

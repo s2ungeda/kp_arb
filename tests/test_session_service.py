@@ -95,6 +95,22 @@ def test_missing_jangubun_ignored() -> None:
     assert svc.phase_for(SAMSUNG) is SessionPhase.DEAD  # 갱신되지 않음
 
 
+def test_seed_phase_initializes_but_jif_wins() -> None:
+    # 장중 재시작: 운영자 시딩으로 시작하되, JIF 이벤트가 오면 항상 우선.
+    svc = SessionService()
+    svc.seed_phase(SessionPhase.REGULAR)
+    assert svc.phase_for(SAMSUNG) is SessionPhase.REGULAR
+    svc.on_market_status(jif("41"))  # 장마감 JIF → 덮어씀
+    assert svc.phase_for(SAMSUNG) is SessionPhase.DEAD
+
+
+def test_seed_phase_does_not_override_received_jif() -> None:
+    svc = SessionService()
+    svc.on_market_status(jif("21"))
+    svc.seed_phase(SessionPhase.DEAD)  # 이미 JIF 수신 → 시딩 무시
+    assert svc.phase_for(SAMSUNG) is SessionPhase.REGULAR
+
+
 def test_sessions_covers_all_underlyings() -> None:
     # 3종 모두 KOSPI 주식 → 시장 phase 공유.
     svc = SessionService()
