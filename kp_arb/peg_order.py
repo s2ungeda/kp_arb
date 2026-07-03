@@ -5,8 +5,8 @@
 선택한 호가 단계(N호가)에 지정가를 걸고, 호가가 움직이면 따라 옮긴다:
 - LS(국내, 모의): **정정**으로 가격 변경
 - HL(해외, 실계정 주의!): **취소 후 신규**
-매수가 체결되면 그 수량만큼 **매도로 전환**해 계속 추적하고(왕복 테스트),
-매도까지 체결되면 Run이 자동 해제된다. Run을 끄면 미체결을 취소한다.
+체결되면 그 수량만큼 **반대 방향으로 전환**해 계속 추적한다
+(매수→매도→매수→… 무한 반복). Run을 끄면 미체결을 취소하고 멈춘다.
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ class PegController:
     order_id: str | None = None
     order_price: float | None = None
     busy: bool = False  # 주문/정정 진행 중 겹침 방지
-    flip_on_fill: bool = True  # 매수 체결 시 그 수량만큼 매도로 전환해 계속 추적
+    flip_on_fill: bool = True  # 체결 시 그 수량만큼 반대 방향으로 전환해 무한 반복
 
     def _instrument(self) -> Instrument:
         return Instrument.KR_STOCK if self.venue is Venue.LS else Instrument.HL_PERP
@@ -72,13 +72,14 @@ class PegController:
                 _log.info("전량 체결 #%s @ %s", self.order_id, self.order_price)
                 self.order_id = None
                 self.order_price = None
-                if self.side is Side.BUY and self.flip_on_fill:
-                    # 매수 체결 → 체결 수량만큼 매도로 전환해 계속 추적.
-                    self.side = Side.SELL
-                    self.qty = order.filled_qty
-                    _log.info("매도 전환: %s주, 계속 추적", order.filled_qty)
-                    return f"매수 체결 → 매도 {order.filled_qty:g}주 전환"
-                return "filled"  # 매도까지 끝 → 페깅 종료(창이 Run 해제)
+                if not self.flip_on_fill:
+                    return "filled"  # 전환 없이 종료(창이 Run 해제)
+                # 체결 수량만큼 반대 방향으로 전환 — Run을 끌 때까지 무한 반복.
+                self.side = Side.SELL if self.side is Side.BUY else Side.BUY
+                self.qty = order.filled_qty
+                label = "매도" if self.side is Side.SELL else "매수"
+                _log.info("%s 전환: %s주, 계속 추적", label, order.filled_qty)
+                return f"체결 → {label} {order.filled_qty:g}주 전환"
 
         target = target_price(self._quote(), self.side, self.level)
         decision = decide(venue=self.venue, current_price=self.order_price, target=target)
