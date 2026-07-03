@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from .bootstrap import LiveSystem
 from .domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
+from .gateways.ls_rest import RestError
 from .logs import setup_logging
 from .order_book import OrderStatus
 from .pegging import PegAction, decide, target_price
@@ -91,7 +92,13 @@ class PegController:
             self.order_id = await system.place(self._intent(decision.price))
         elif decision.action is PegAction.AMEND:
             assert self.order_id is not None
-            self.order_id = await system.amend_price(self.order_id, decision.price)
+            try:
+                self.order_id = await system.amend_price(self.order_id, decision.price)
+            except RestError as exc:
+                # 대부분 체결과의 경합(01433: 정정할 수량 없음) — 다음 점검에서
+                # 체결이 확인되면 매도 전환/종료로 이어진다. 주문 상태는 그대로 둔다.
+                _log.warning("정정 거부 #%s: %s", self.order_id, exc)
+                return "정정 거부 — 체결 확인 중"
         else:  # CANCEL_PLACE (HL)
             assert self.order_id is not None
             await system.cancel(self.order_id)

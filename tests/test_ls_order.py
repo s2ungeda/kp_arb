@@ -273,6 +273,29 @@ async def test_rejected_response_raises() -> None:
         await gw.place_order(_intent(Instrument.KR_STOCK))
 
 
+class Reject01xxxTransport:
+    """모의 거부 코드 "01xxx" 픽스처 (실측 v6.15: 01433 정정할 수량 없음)."""
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any] | None,
+    ) -> RestResponse:
+        return RestResponse(
+            status_code=200,
+            body={"rsp_cd": "01433", "rsp_msg": "모의투자 정정/취소할 수량이 없습니다."},
+        )
+
+
+async def test_rejected_01xxx_raises() -> None:
+    # 성공 판정은 "00" 시작 — "01433"을 성공으로 오판해 주문번호를 찾으면 안 된다.
+    gw = _gateway(Reject01xxxTransport())
+    with pytest.raises(RestError, match="01433"):
+        await gw.place_order(_intent(Instrument.KR_STOCK))
+
+
 # --- 정정/취소: 원주문 컨텍스트 보존 ---
 
 

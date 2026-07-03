@@ -477,9 +477,10 @@ class LSApiGateway(LSGateway):
         return ctx
 
     def _check_ok(self, resp: RestResponse, tr_cd: str) -> None:
-        # LS 성공 rsp_cd는 "0"으로 시작(운영 "00000", 모의 "00136" 등). 오류는 "4xxxx"/"IGW…".
+        # LS 성공 rsp_cd는 "00"으로 시작(운영 "00000", 모의 "00136" 등).
+        # "01xxx"(가격범위 01427, 정정할 수량 없음 01433 등)/"4xxxx"/"IGW…"는 거부 (v6.15).
         rsp_cd = resp.body.get("rsp_cd")
-        if rsp_cd is not None and not str(rsp_cd).startswith("0"):
+        if rsp_cd is not None and not str(rsp_cd).startswith("00"):
             raise RestError(f"{tr_cd} rejected ({rsp_cd}): {resp.body.get('rsp_msg')}")
 
     def _parse_order_id(self, resp: RestResponse, tr_cd: str) -> str:
