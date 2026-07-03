@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,8 +18,11 @@ from dataclasses import dataclass
 from .bootstrap import LiveSystem
 from .domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
+from .logs import setup_logging
 from .order_book import OrderStatus
 from .pegging import PegAction, decide, target_price
+
+_log = logging.getLogger("kp_arb.peg_order")
 
 _NAMES = {
     "삼성전자": Underlying.SAMSUNG,
@@ -61,6 +65,7 @@ class PegController:
         if self.order_id is not None:
             order = system.order_book.order(self.order_id)
             if order is not None and order.status is OrderStatus.FILLED:
+                _log.info("전량 체결 #%s @ %s", self.order_id, self.order_price)
                 self.order_id = None
                 return "filled"  # 전량 체결 → 페깅 종료(창이 Run 해제)
 
@@ -72,6 +77,7 @@ class PegController:
         if decision.action is PegAction.NONE:
             return f"유지 {self.order_price:,.0f}"
         assert decision.price is not None
+        old_id, old_price = self.order_id, self.order_price
         if decision.action is PegAction.PLACE:
             self.order_id = await system.place(self._intent(decision.price))
         elif decision.action is PegAction.AMEND:
@@ -82,6 +88,13 @@ class PegController:
             await system.cancel(self.order_id)
             self.order_id = await system.place(self._intent(decision.price))
         self.order_price = decision.price
+        _log.info(
+            "%s %s %s %s %d호가: %s @ %s → #%s @ %s",
+            decision.action.value, self.venue.value, self.underlying.value,
+            self.side.value, self.level,
+            old_id or "-", old_price if old_price is not None else "-",
+            self.order_id, decision.price,
+        )
         return f"{decision.action.value} @ {decision.price:,.2f} (#{self.order_id})"
 
     async def stop(self) -> str:
@@ -91,6 +104,7 @@ class PegController:
             return "정지"
         order = system.order_book.order(self.order_id)
         if order is not None and order.is_open:
+            _log.info("Run 해제 — 미체결 취소 #%s @ %s", self.order_id, self.order_price)
             await system.cancel(self.order_id)
         self.order_id = None
         self.order_price = None
@@ -112,6 +126,7 @@ def main() -> None:
 
     from .bootstrap import bootstrap_live
 
+    setup_logging("peg_order")  # logs/peg_order_YYYYMMDD.log
     system_ref: dict[str, object] = {}
 
     def run_live() -> None:
@@ -128,6 +143,7 @@ def main() -> None:
         try:
             asyncio.run(_run())
         except Exception as exc:  # noqa: BLE001 - 상태줄에 표시
+            _log.exception("연결 실패")
             system_ref["error"] = f"{type(exc).__name__}: {exc}"
 
     threading.Thread(target=run_live, daemon=True).start()
@@ -165,7 +181,7 @@ def main() -> None:
     row3.pack(fill="x", padx=8, pady=2)
     tk.Label(row3, text="주문가", font=font, width=6, anchor="w").pack(side="left")
     level_box = ttk.Combobox(row3, textvariable=level_var,
-                             values=["1호가", "2호가", "3호가"], width=7,
+                             values=[f"{i}호가" for i in range(1, 6)], width=7,
                              state="readonly")
     level_box.pack(side="left")
 
@@ -197,6 +213,7 @@ def main() -> None:
         try:
             result = await ctl.step()
         except Exception as exc:  # noqa: BLE001 - 표시 후 계속
+            _log.exception("페깅 스텝 실패")
             result = f"오류: {exc}"
         finally:
             ctl.busy = False
