@@ -47,6 +47,7 @@ class PegController:
     order_id: str | None = None
     order_price: float | None = None
     busy: bool = False  # 주문/정정 진행 중 겹침 방지
+    pending: bool = False  # 진행 중 새 호가 도착 — 끝나면 최신 호가로 즉시 한 번 더
     flip_on_fill: bool = True  # 체결 시 그 수량만큼 반대 방향으로 전환해 무한 반복
 
     def _instrument(self) -> Instrument:
@@ -235,21 +236,32 @@ def main() -> None:
 
     async def step_and_show(ctl: PegController) -> None:
         if ctl.busy:
-            return  # 이전 주문/정정이 아직 진행 중 — 겹쳐 내지 않는다
+            ctl.pending = True  # 진행 중 — 끝나는 즉시 최신 호가로 한 번 더
+            return
         ctl.busy = True
         try:
-            result = await ctl.step()
-        except Exception as exc:  # noqa: BLE001 - 표시 후 계속
-            _log.exception("페깅 스텝 실패")
-            result = f"오류: {exc}"
+            while True:
+                ctl.pending = False
+                try:
+                    result = await ctl.step()
+                except Exception as exc:  # noqa: BLE001 - 표시 후 계속
+                    _log.exception("페깅 스텝 실패")
+                    result = f"오류: {exc}"
+                status_var.set(result)
+                if result == "filled":
+                    status_var.set("전량 체결 — 정지")
+                    run_var.set(False)
+                    controller.clear()
+                    detach_quote_handler()
+                    return
+                if result == "요청 한도 대기":
+                    # 초당 한도 — 다음 호가를 기다리지 않고 잠시 후 바로 재시도.
+                    await asyncio.sleep(0.3)
+                    ctl.pending = True
+                if not ctl.pending or controller.get("active") is not ctl:
+                    return
         finally:
             ctl.busy = False
-        status_var.set(result)
-        if result == "filled":
-            status_var.set("전량 체결 — 정지")
-            run_var.set(False)
-            controller.clear()
-            detach_quote_handler()
 
     def on_run_toggle() -> None:
         if run_var.get():
