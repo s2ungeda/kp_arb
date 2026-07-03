@@ -94,6 +94,7 @@ class LiveSystem:
         self.on_trade: list[Callable[[TradeTick], None]] = []        # 체결(현재가)
         self.on_expected: list[Callable[[ExpectedPrice], None]] = []  # 예상체결가
         self.on_funding: list[Callable[[Underlying, float], None]] = []  # HL 예정 펀딩률
+        self.on_fill: list[Callable[[Fill], None]] = []  # 체결통보 (OrderBook 반영 후 호출)
         self._tasks: list[asyncio.Task[None]] = []
 
     # --- 스냅샷 (최초 실행 + 온디맨드/UI 조회 버튼) ---
@@ -190,6 +191,8 @@ class LiveSystem:
 
         def apply_fill(fill: Fill) -> None:
             self.order_book.on_fill(fill)
+            for handler in self.on_fill:  # OrderBook 반영 뒤라 상태 조회가 안전
+                handler(fill)
 
         def apply_event(event: OrderEvent) -> None:
             self.order_book.on_order_event(event)

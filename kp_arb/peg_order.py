@@ -21,6 +21,7 @@ from .domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .gateways.ls import OrderGoneError
 from .gateways.ls_rest import RateLimitError, RestError
+from .gateways.ls_ws import Fill
 from .logs import setup_logging
 from .order_book import OrderStatus
 from .pegging import PegAction, decide, target_price
@@ -67,6 +68,7 @@ class PegController:
     async def step(self) -> str:
         """한 번의 점검: 체결 확인 → 목표가 계산 → 신규/정정/취소후신규. 상태 문자열 반환."""
         system = self.system
+        note = ""
         if self.order_id is not None:
             order = system.order_book.order(self.order_id)
             if order is not None and order.status is OrderStatus.FILLED:
@@ -75,18 +77,19 @@ class PegController:
                 self.order_price = None
                 if not self.flip_on_fill:
                     return "filled"  # 전환 없이 종료(창이 Run 해제)
-                # 체결 수량만큼 반대 방향으로 전환 — Run을 끌 때까지 무한 반복.
+                # 체결 수량만큼 반대 방향으로 전환 — 기다리지 않고 같은 단계에서
+                # 바로 아래 신규 주문까지 이어간다 (Run을 끌 때까지 무한 반복).
                 self.side = Side.SELL if self.side is Side.BUY else Side.BUY
                 self.qty = order.filled_qty
                 label = "매도" if self.side is Side.SELL else "매수"
-                _log.info("%s 전환: %s주, 계속 추적", label, order.filled_qty)
-                return f"체결 → {label} {order.filled_qty:g}주 전환"
+                _log.info("%s 전환: %s주, 즉시 주문", label, order.filled_qty)
+                note = f"체결→{label} "
 
         target = target_price(self._quote(), self.side, self.level)
         decision = decide(venue=self.venue, current_price=self.order_price, target=target)
 
         if decision.action is PegAction.WAIT:
-            return "호가 대기"
+            return note + "호가 대기"
         if decision.action is PegAction.NONE:
             return f"유지 {self.order_price:,.0f}"
         assert decision.price is not None
@@ -120,7 +123,7 @@ class PegController:
             old_id or "-", old_price if old_price is not None else "-",
             self.order_id, decision.price,
         )
-        return f"{decision.action.value} @ {decision.price:,.2f} (#{self.order_id})"
+        return f"{note}{decision.action.value} @ {decision.price:,.2f} (#{self.order_id})"
 
     async def stop(self) -> str:
         """Run 해제: 미체결이면 취소."""
@@ -226,13 +229,18 @@ def main() -> None:
         if loop is not None:
             asyncio.run_coroutine_threadsafe(coro, loop)  # type: ignore[arg-type]
 
-    handlers: dict[str, Callable[[Quote], None]] = {}
+    quote_handlers: dict[str, Callable[[Quote], None]] = {}
+    fill_handlers: dict[str, Callable[[Fill], None]] = {}
 
-    def detach_quote_handler() -> None:
-        qh = handlers.pop("quote", None)
+    def detach_handlers() -> None:
         sys_obj = system_ref.get("system")
-        if qh is not None and isinstance(sys_obj, LiveSystem) and qh in sys_obj.on_quote:
-            sys_obj.on_quote.remove(qh)
+        qh = quote_handlers.pop("quote", None)
+        fh = fill_handlers.pop("fill", None)
+        if isinstance(sys_obj, LiveSystem):
+            if qh is not None and qh in sys_obj.on_quote:
+                sys_obj.on_quote.remove(qh)
+            if fh is not None and fh in sys_obj.on_fill:
+                sys_obj.on_fill.remove(fh)
 
     async def step_and_show(ctl: PegController) -> None:
         if ctl.busy:
@@ -252,7 +260,7 @@ def main() -> None:
                     status_var.set("전량 체결 — 정지")
                     run_var.set(False)
                     controller.clear()
-                    detach_quote_handler()
+                    detach_handlers()
                     return
                 if result == "요청 한도 대기":
                     # 초당 한도 — 다음 호가를 기다리지 않고 잠시 후 바로 재시도.
@@ -294,12 +302,20 @@ def main() -> None:
                     return
                 asyncio.ensure_future(step_and_show(ctl))  # noqa: RUF006
 
-            handlers["quote"] = quote_handler
+            def fill_handler(f: Fill) -> None:
+                # 체결통보 수신 즉시 반응 — 다음 호가를 기다리지 않고 전환 주문을 낸다.
+                if controller.get("active") is not ctl or f.order_id != ctl.order_id:
+                    return
+                asyncio.ensure_future(step_and_show(ctl))  # noqa: RUF006
+
+            quote_handlers["quote"] = quote_handler
+            fill_handlers["fill"] = fill_handler
             system.on_quote.append(quote_handler)
+            system.on_fill.append(fill_handler)
             if venue is Venue.HYPERLIQUID:
                 status_var.set("⚠ HL은 실계정입니다 — 시작")
         else:
-            detach_quote_handler()
+            detach_handlers()
             stopped = controller.get("active")
             controller.clear()
             if stopped is not None:
