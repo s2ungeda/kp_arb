@@ -37,6 +37,9 @@ class OrderGoneError(RestError):
 # "잔량 없음" 거부 코드 (모의 실측 01433. 운영 코드는 라이브 시 확인해 추가).
 _ORDER_GONE_RSP_CDS = frozenset({"01433"})
 
+# 모의 미제공 TR 거부 코드 (실측 01900: CFOAQ50600 선물잔고) — 조회는 빈 결과로 대체.
+_PAPER_UNSUPPORTED_RSP_CDS = frozenset({"01900"})
+
 
 @dataclass
 class OrderContext:
@@ -327,6 +330,8 @@ class LSApiGateway(LSGateway):
     # --- 잔고/포지션 파싱 ---
 
     def _rows(self, resp: RestResponse, tr_cd: str) -> list[dict[str, Any]]:
+        if str(resp.body.get("rsp_cd", "")) in _PAPER_UNSUPPORTED_RSP_CDS:
+            return []  # 모의 미제공 TR(01900) → 빈 결과 (v6.1)
         self._check_ok(resp, tr_cd)
         block = resp.body.get(f"{tr_cd}OutBlock3")
         return list(block) if isinstance(block, list) else []

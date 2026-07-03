@@ -211,3 +211,23 @@ async def test_rejected_balance_raises() -> None:
     gw = _gateway(RejectTransport())
     with pytest.raises(RestError):
         await gw.get_balance(Account.KR_STOCK)
+
+
+async def test_deriv_positions_paper_unsupported_returns_empty() -> None:
+    # 실측 v6.1: 모의는 CFOAQ50600 미제공(rsp_cd 01900) — 오류가 아니라 빈 결과.
+    class Unsupported(AccountTransport):
+        async def request(
+            self,
+            method: str,
+            url: str,
+            headers: dict[str, str],
+            body: dict[str, Any] | None,
+        ) -> RestResponse:
+            return RestResponse(
+                status_code=200,
+                body={"rsp_cd": "01900",
+                      "rsp_msg": "모의투자에서는 해당업무가 제공되지 않습니다."},
+            )
+
+    gw = _gateway(Unsupported())
+    assert await gw.get_positions(Account.KR_DERIV) == []
