@@ -14,6 +14,7 @@ class Quote(BaseModel):
     ts: float
     bid_qty: float | None = None  # 매수 1호가 잔량 (모니터/전략 참고용)
     ask_qty: float | None = None  # 매도 1호가 잔량
+    market: str = "krx"           # 가격 원천 시장: "krx" | "nxt" | "hl"
 
     @property
     def mid(self) -> float:

@@ -149,6 +149,7 @@ class HLWebSocketClient:
             ts=float(data.get("time", 0.0)),
             bid_qty=float(bid.get("sz", 0) or 0),
             ask_qty=float(ask.get("sz", 0) or 0),
+            market="hl",
         )
 
     def _parse_fills(self, data: dict[str, Any]) -> list[Fill]:

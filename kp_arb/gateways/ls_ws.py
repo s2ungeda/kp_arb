@@ -84,12 +84,13 @@ class OrderEvent(BaseModel):
 
 
 class TradeTick(BaseModel):
-    """체결(현재가) 이벤트 — 주식 S3_ / 선물 JC0."""
+    """체결(현재가) 이벤트 — 주식 S3_(KRX)/NS3(NXT), 선물 JC0."""
 
     underlying: Underlying
     instrument: Instrument
     price: float
     ts: float = 0.0
+    market: str = "krx"  # "krx" | "nxt"
 
 
 class ExpectedPrice(BaseModel):
@@ -280,6 +281,7 @@ class LSWebSocketClient:
                 return None
             instrument, underlying = Instrument.KR_STOCK, stock_underlying
         # 실측 필드: bidho1/offerho1(1호가), bidrem1/offerrem1(잔량), hotime(HHMMSS).
+        tr_cd = msg.get("header", {}).get("tr_cd", "")
         return Quote(
             underlying=underlying,
             instrument=instrument,
@@ -288,6 +290,7 @@ class LSWebSocketClient:
             ts=float(body["hotime"]),
             bid_qty=float(body.get("bidrem1", 0) or 0),
             ask_qty=float(body.get("offerrem1", 0) or 0),
+            market="nxt" if tr_cd == "NH1" else "krx",
         )
 
     def _parse_futures_quote(self, msg: dict[str, Any]) -> Quote | None:
@@ -326,7 +329,8 @@ class LSWebSocketClient:
         try:
             return TradeTick(underlying=underlying, instrument=instrument,
                              price=float(body["price"]),
-                             ts=float(body.get("chetime", 0) or 0))
+                             ts=float(body.get("chetime", 0) or 0),
+                             market="nxt" if tr_cd == "NS3" else "krx")
         except ValueError:
             return None
 

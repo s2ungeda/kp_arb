@@ -50,9 +50,13 @@ def funding_countdown(now_epoch: float) -> str:
 
 @dataclass
 class MonitorState:
-    """실시간 콜백이 채우고 화면이 읽는 최신값 저장소(읽기 전용 표시용)."""
+    """실시간 콜백이 채우고 화면이 읽는 최신값 저장소(읽기 전용 표시용).
 
-    quotes: dict[tuple[Underlying, Instrument], Quote] = field(default_factory=dict)
+    호가는 시장(KRX/NXT)별로 보관하고, 표시는 HTS처럼 **통합**(두 시장 중
+    더 좋은 호가 — 매수는 높은 쪽, 매도는 낮은 쪽)으로 계산한다.
+    """
+
+    quotes: dict[tuple[Underlying, Instrument, str], Quote] = field(default_factory=dict)
     trades: dict[tuple[Underlying, Instrument], float] = field(default_factory=dict)
     expected: dict[Underlying, float] = field(default_factory=dict)
     marks: dict[Underlying, float] = field(default_factory=dict)
@@ -63,8 +67,21 @@ class MonitorState:
     # --- 실시간 콜백 ---
 
     def on_quote(self, quote: Quote) -> None:
-        self.quotes[(quote.underlying, quote.instrument)] = quote
+        self.quotes[(quote.underlying, quote.instrument, quote.market)] = quote
         self.last_update = time.time()
+
+    def merged_quote(
+        self, underlying: Underlying, instrument: Instrument
+    ) -> tuple[float | None, float | None, float | None, float | None]:
+        """KRX+NXT 통합 최우선호가: (매도가, 매도잔량, 매수가, 매수잔량)."""
+        krx = self.quotes.get((underlying, instrument, "krx"))
+        nxt = self.quotes.get((underlying, instrument, "nxt"))
+        candidates = [q for q in (krx, nxt) if q is not None]
+        if not candidates:
+            return None, None, None, None
+        best_ask = min(candidates, key=lambda q: q.ask)   # 매도는 낮은 쪽이 우선
+        best_bid = max(candidates, key=lambda q: q.bid)   # 매수는 높은 쪽이 우선
+        return best_ask.ask, best_ask.ask_qty, best_bid.bid, best_bid.bid_qty
 
     def on_trade(self, tick: TradeTick) -> None:
         self.trades[(tick.underlying, tick.instrument)] = tick.price
@@ -89,16 +106,16 @@ class MonitorState:
         for u in Underlying:
             name = _NAMES[u]
             for inst in _LS_INSTRUMENTS:
-                quote = self.quotes.get((u, inst))
+                ask, ask_qty, bid, bid_qty = self.merged_quote(u, inst)  # KRX+NXT 통합
                 trade = self.trades.get((u, inst))
                 expected = self.expected.get(u) if inst is Instrument.KR_STOCK else None
                 rows.append((
                     f"{name} {_KIND[inst]}".strip(),
-                    _fmt(quote.ask_qty if quote else None),
-                    _fmt(quote.ask if quote else None),
+                    _fmt(ask_qty),
+                    _fmt(ask),
                     _fmt(trade),
-                    _fmt(quote.bid if quote else None),
-                    _fmt(quote.bid_qty if quote else None),
+                    _fmt(bid),
+                    _fmt(bid_qty),
                     _fmt(expected),
                 ))
                 name = ""  # 같은 종목은 첫 행에만 이름
@@ -110,7 +127,7 @@ class MonitorState:
         countdown = funding_countdown(now)
         rows: list[tuple[str, ...]] = []
         for u in Underlying:
-            quote = self.quotes.get((u, Instrument.HL_PERP))
+            quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
             prev = self.funding_prev.get(u)
             nxt = self.funding_next.get(u)
             rows.append((

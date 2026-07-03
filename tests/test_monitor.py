@@ -9,9 +9,9 @@ SAMSUNG = Underlying.SAMSUNG
 
 
 def q(instrument: Instrument, bid: float, ask: float, *,
-      bid_qty: float = 100, ask_qty: float = 50) -> Quote:
+      bid_qty: float = 100, ask_qty: float = 50, market: str = "krx") -> Quote:
     return Quote(underlying=SAMSUNG, instrument=instrument, bid=bid, ask=ask,
-                 ts=1.0, bid_qty=bid_qty, ask_qty=ask_qty)
+                 ts=1.0, bid_qty=bid_qty, ask_qty=ask_qty, market=market)
 
 
 def test_ls_rows_shape_and_values() -> None:
@@ -30,9 +30,24 @@ def test_ls_rows_shape_and_values() -> None:
     assert rows[1][0] == "선물" and rows[1][2] == "-"  # 미수신은 '-'
 
 
+def test_krx_nxt_quotes_merged_like_hts() -> None:
+    # 통합 시세: 매수는 높은 쪽(NXT), 매도는 낮은 쪽(KRX)을 선택.
+    state = MonitorState()
+    state.on_quote(q(Instrument.KR_STOCK, 292_500, 293_000, market="krx",
+                     bid_qty=100, ask_qty=50))
+    state.on_quote(q(Instrument.KR_STOCK, 292_550, 293_050, market="nxt",
+                     bid_qty=30, ask_qty=20))
+
+    stock = state.ls_rows()[0]
+    # (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상체결가)
+    assert stock[2] == "293,000" and stock[1] == "50"   # 매도: KRX가 더 낮음
+    assert stock[4] == "292,550" and stock[5] == "30"   # 매수: NXT가 더 높음
+
+
 def test_hl_rows_include_funding_and_countdown() -> None:
     state = MonitorState()
-    state.on_quote(q(Instrument.HL_PERP, 184.55, 184.65, bid_qty=12.5, ask_qty=3.2))
+    state.on_quote(q(Instrument.HL_PERP, 184.55, 184.65, bid_qty=12.5, ask_qty=3.2,
+                     market="hl"))
     state.on_mark(Mark(underlying=SAMSUNG, price=184.62))
     state.on_funding(SAMSUNG, 0.0001841)
     state.funding_prev[SAMSUNG] = 0.0001595
