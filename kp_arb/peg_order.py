@@ -305,6 +305,14 @@ def main() -> None:
                 status_var.set("수량이 숫자가 아닙니다")
                 run_var.set(False)
                 return
+            if qty <= 0:
+                status_var.set("수량은 0보다 커야 합니다")
+                run_var.set(False)
+                return
+            if venue is Venue.LS and qty != int(qty):
+                status_var.set("LS 수량은 정수만 됩니다 (소수점은 HL 전용)")
+                run_var.set(False)
+                return
             assert isinstance(system, LiveSystem)
             underlying = _NAMES[name_var.get()]
             if venue is Venue.LS:
