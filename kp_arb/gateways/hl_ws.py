@@ -43,6 +43,10 @@ class HLWebSocketClient:
         self._max_reconnects = max_reconnects
         self._reconnect_backoff_s = reconnect_backoff_s
         self._subs: list[dict[str, Any]] = []  # subscription payload 희망 상태
+        # 최근 호가창(l2Book) — bbo 프레임에 다단계를 붙일 때 사용.
+        self._depth: dict[
+            Underlying, tuple[list[tuple[float, float]], list[tuple[float, float]]]
+        ] = {}
         self.on_mark: list[Callable[[Mark], None]] = []
         self.on_quote: list[Callable[[Quote], None]] = []          # 최우선호가(bbo)
         self.on_trade: list[Callable[[TradeTick], None]] = []      # 체결(현재가, ~0.2s)
@@ -60,6 +64,11 @@ class HLWebSocketClient:
         """최우선호가(매수/매도 1호가 + 잔량) 구독 → on_quote(Quote[HL_PERP])."""
         for coin in self._symbols.values():
             self._add({"type": "bbo", "coin": coin})
+
+    def subscribe_l2book(self) -> None:
+        """호가창(다단계) 구독 → on_quote(Quote.bids/asks 포함). bbo보다 깊고 약간 느림."""
+        for coin in self._symbols.values():
+            self._add({"type": "l2Book", "coin": coin})
 
     def subscribe_trades(self) -> None:
         """공개 체결 구독 → on_trade(현재가). 마크(1초 주기)보다 빠르다(실측 ~0.2초)."""
@@ -122,6 +131,11 @@ class HLWebSocketClient:
             if quote is not None:
                 for quote_handler in self.on_quote:
                     quote_handler(quote)
+        elif channel == "l2Book":
+            quote = self._parse_l2book(data)
+            if quote is not None:
+                for quote_handler in self.on_quote:
+                    quote_handler(quote)
         elif channel == "userFills":
             if data.get("isSnapshot"):
                 return  # 과거 체결 일괄 — 이벤트 아님
@@ -154,15 +168,50 @@ class HLWebSocketClient:
         bid, ask = levels[0] or {}, levels[1] or {}
         if "px" not in bid or "px" not in ask:
             return None
+        top_bid = (float(bid["px"]), float(bid.get("sz", 0) or 0))
+        top_ask = (float(ask["px"]), float(ask.get("sz", 0) or 0))
+        # 1호가는 bbo(빠름)로 갱신하고, 2호가 아래는 최근 l2Book 것을 붙인다.
+        depth = self._depth.get(underlying)
+        bids = [top_bid] + depth[0][1:] if depth else None
+        asks = [top_ask] + depth[1][1:] if depth else None
         return Quote(
             underlying=underlying,
             instrument=Instrument.HL_PERP,
-            bid=float(bid["px"]),
-            ask=float(ask["px"]),
+            bid=top_bid[0],
+            ask=top_ask[0],
             ts=float(data.get("time", 0.0)),
-            bid_qty=float(bid.get("sz", 0) or 0),
-            ask_qty=float(ask.get("sz", 0) or 0),
+            bid_qty=top_bid[1],
+            ask_qty=top_ask[1],
             market="hl",
+            bids=bids,
+            asks=asks,
+        )
+
+    def _parse_l2book(self, data: dict[str, Any]) -> Quote | None:
+        # l2Book 프레임: {coin, time, levels: [[매수단계...], [매도단계...]]} — 각 {px, sz, n}.
+        underlying = self._by_symbol.get(str(data.get("coin", "")))
+        levels = data.get("levels")
+        if underlying is None or not isinstance(levels, list) or len(levels) != 2:
+            return None
+        # LS(10호가)와 맞춰 한쪽당 10단계까지만 보관.
+        bids = [(float(x["px"]), float(x.get("sz", 0) or 0))
+                for x in (levels[0] or [])[:10] if isinstance(x, dict) and "px" in x]
+        asks = [(float(x["px"]), float(x.get("sz", 0) or 0))
+                for x in (levels[1] or [])[:10] if isinstance(x, dict) and "px" in x]
+        if not bids or not asks:
+            return None
+        self._depth[underlying] = (bids, asks)
+        return Quote(
+            underlying=underlying,
+            instrument=Instrument.HL_PERP,
+            bid=bids[0][0],
+            ask=asks[0][0],
+            ts=float(data.get("time", 0.0)),
+            bid_qty=bids[0][1],
+            ask_qty=asks[0][1],
+            market="hl",
+            bids=bids,
+            asks=asks,
         )
 
     def _parse_trades(self, data: list[Any]) -> list[TradeTick]:

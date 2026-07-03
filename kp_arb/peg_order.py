@@ -232,7 +232,7 @@ def main() -> None:
     row3.pack(fill="x", padx=8, pady=2)
     tk.Label(row3, text="주문가", font=font, width=6, anchor="w").pack(side="left")
     level_box = ttk.Combobox(row3, textvariable=level_var,
-                             values=[f"{i}호가" for i in range(1, 6)], width=7,
+                             values=[f"{i}호가" for i in range(1, 11)], width=7,
                              state="readonly")
     level_box.pack(side="left")
 
@@ -333,7 +333,7 @@ def main() -> None:
                 system=system, venue=venue,
                 underlying=underlying, instrument=instrument,
                 side=Side.BUY if side_var.get() == "매수" else Side.SELL,
-                level=int(level_var.get()[0]), qty=qty,
+                level=int(level_var.get().removesuffix("호가")), qty=qty,
             )
             controller["active"] = ctl
 

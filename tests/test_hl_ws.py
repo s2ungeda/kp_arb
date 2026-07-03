@@ -115,3 +115,74 @@ async def test_subscription_ack_ignored() -> None:
                       "data": {"method": "subscribe"}})
     client = HLWebSocketClient(FakeConnector([ack]))
     await client.run()  # 예외 없이 통과
+
+
+def l2book_frame(coin: str = "xyz:SKHX", *, levels_per_side: int = 3) -> str:
+    # l2Book 프레임: levels=[[매수단계...],[매도단계...]] — 각 {px, sz, n}.
+    bids = [{"px": f"{183.5 - i * 0.1:.1f}", "sz": str((i + 1) * 10), "n": 1}
+            for i in range(levels_per_side)]
+    asks = [{"px": f"{183.6 + i * 0.1:.1f}", "sz": str((i + 1) * 5), "n": 1}
+            for i in range(levels_per_side)]
+    return json.dumps({
+        "channel": "l2Book",
+        "data": {"coin": coin, "time": 1000, "levels": [bids, asks]},
+    })
+
+
+def bbo_frame(coin: str = "xyz:SKHX", *, bid: str = "183.55", ask: str = "183.65") -> str:
+    return json.dumps({
+        "channel": "bbo",
+        "data": {"coin": coin, "time": 1001,
+                 "bbo": [{"px": bid, "sz": "7"}, {"px": ask, "sz": "8"}]},
+    })
+
+
+async def test_l2book_quote_carries_depth() -> None:
+    client = HLWebSocketClient(FakeConnector([l2book_frame()]))
+    quotes = []
+    client.on_quote.append(quotes.append)
+
+    await client.run()
+
+    q = quotes[0]
+    assert q.underlying is Underlying.SK_HYNIX
+    assert q.bid == 183.5 and q.ask == 183.6
+    assert q.bids is not None and q.bids[0] == (183.5, 10.0) and len(q.bids) == 3
+    assert q.asks is not None and q.asks[2] == (183.8, 15.0)
+
+
+async def test_l2book_depth_capped_at_10() -> None:
+    # HL은 한쪽당 최대 20단계를 주지만, LS(10호가)와 맞춰 10단계까지만 보관.
+    client = HLWebSocketClient(FakeConnector([l2book_frame(levels_per_side=20)]))
+    quotes = []
+    client.on_quote.append(quotes.append)
+
+    await client.run()
+
+    assert quotes[0].bids is not None and len(quotes[0].bids) == 10
+    assert quotes[0].asks is not None and len(quotes[0].asks) == 10
+
+
+async def test_bbo_merges_recent_l2book_depth() -> None:
+    # 1호가는 bbo(빠름) 값으로, 2호가 아래는 최근 l2Book 것으로 붙는다.
+    client = HLWebSocketClient(FakeConnector([l2book_frame(), bbo_frame()]))
+    quotes = []
+    client.on_quote.append(quotes.append)
+
+    await client.run()
+
+    q = quotes[-1]
+    assert q.bid == 183.55 and q.ask == 183.65             # bbo 최신값
+    assert q.bids is not None and q.bids[0] == (183.55, 7.0)
+    assert q.bids[1] == (183.4, 20.0)                      # l2Book 하위 단계
+    assert q.asks is not None and q.asks[1] == (183.7, 10.0)
+
+
+async def test_bbo_without_l2book_has_no_depth() -> None:
+    client = HLWebSocketClient(FakeConnector([bbo_frame()]))
+    quotes = []
+    client.on_quote.append(quotes.append)
+
+    await client.run()
+
+    assert quotes[0].bids is None and quotes[0].asks is None
