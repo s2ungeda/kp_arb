@@ -21,6 +21,7 @@ from ..domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from ..domain.models import OrderIntent, Position
 from .base import HLGateway
 from .hl import HLError
+from .ls import OrderGoneError
 
 HL_DEX = "xyz"
 
@@ -126,7 +127,14 @@ class HLSdkGateway(HLGateway):
             self._ex.modify_order, int(order_id), coin, is_buy, new_sz, new_px,
             {"limit": {"tif": "Gtc"}},
         )
-        oid = self._parse_oid(resp)
+        try:
+            oid = self._parse_oid(resp)
+        except HLError as exc:
+            # 실측: 이미 체결/취소된 주문 정정 → "Cannot modify canceled or filled
+            # order" — LS 01433과 같은 체결 경합. 정상 흐름의 거부로 구분한다.
+            if "cannot modify canceled or filled" in str(exc).lower():
+                raise OrderGoneError(str(exc)) from exc
+            raise
         self._order_coin[oid] = coin
         self._order_ctx[oid] = (coin, is_buy, new_sz, new_px)
         return oid
