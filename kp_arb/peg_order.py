@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .bootstrap import LiveSystem
@@ -38,6 +39,7 @@ class PegController:
     qty: float
     order_id: str | None = None
     order_price: float | None = None
+    busy: bool = False  # 주문/정정 진행 중 겹침 방지
 
     def _instrument(self) -> Instrument:
         return Instrument.KR_STOCK if self.venue is Venue.LS else Instrument.HL_PERP
@@ -180,6 +182,31 @@ def main() -> None:
         if loop is not None:
             asyncio.run_coroutine_threadsafe(coro, loop)  # type: ignore[arg-type]
 
+    handlers: dict[str, Callable[[Quote], None]] = {}
+
+    def detach_quote_handler() -> None:
+        qh = handlers.pop("quote", None)
+        sys_obj = system_ref.get("system")
+        if qh is not None and isinstance(sys_obj, LiveSystem) and qh in sys_obj.on_quote:
+            sys_obj.on_quote.remove(qh)
+
+    async def step_and_show(ctl: PegController) -> None:
+        if ctl.busy:
+            return  # 이전 주문/정정이 아직 진행 중 — 겹쳐 내지 않는다
+        ctl.busy = True
+        try:
+            result = await ctl.step()
+        except Exception as exc:  # noqa: BLE001 - 표시 후 계속
+            result = f"오류: {exc}"
+        finally:
+            ctl.busy = False
+        status_var.set(result)
+        if result == "filled":
+            status_var.set("전량 체결 — 정지")
+            run_var.set(False)
+            controller.clear()
+            detach_quote_handler()
+
     def on_run_toggle() -> None:
         if run_var.get():
             system = system_ref.get("system")
@@ -202,9 +229,21 @@ def main() -> None:
                 level=int(level_var.get()[0]), qty=qty,
             )
             controller["active"] = ctl
+
+            def quote_handler(q: Quote) -> None:
+                # 라이브 루프 스레드에서 호출 — 해당 종목 호가가 올 때마다 즉시 따라붙는다.
+                if controller.get("active") is not ctl:
+                    return
+                if q.underlying is not ctl.underlying or q.instrument is not ctl._instrument():
+                    return
+                asyncio.ensure_future(step_and_show(ctl))  # noqa: RUF006
+
+            handlers["quote"] = quote_handler
+            system.on_quote.append(quote_handler)
             if venue is Venue.HYPERLIQUID:
                 status_var.set("⚠ HL은 실계정입니다 — 시작")
         else:
+            detach_quote_handler()
             stopped = controller.get("active")
             controller.clear()
             if stopped is not None:
@@ -220,22 +259,12 @@ def main() -> None:
                 status_var.set(f"연결 실패: {system_ref['error']}")
             elif system_ref.get("system") is not None:
                 status_var.set("준비 완료 — Run 체크로 시작")
+        # 평소에는 호가 수신 즉시 반응(quote_handler). 여기는 1초 주기 예비 점검만
+        # (호가가 뜸한 시간대에도 체결 확인·최초 주문이 되도록).
         ctl = controller.get("active")
-        if run_var.get() and ctl is not None and time.time() - last_step["t"] >= 0.5:
+        if run_var.get() and ctl is not None and time.time() - last_step["t"] >= 1.0:
             last_step["t"] = time.time()
-
-            async def _step() -> None:
-                try:
-                    result = await ctl.step()
-                except Exception as exc:  # noqa: BLE001 - 표시 후 계속
-                    result = f"오류: {exc}"
-                status_var.set(result)
-                if result == "filled":
-                    status_var.set("전량 체결 — 정지")
-                    run_var.set(False)
-                    controller.clear()
-
-            submit(_step())
+            submit(step_and_show(ctl))
         root.after(150, tick)
 
     tick()
