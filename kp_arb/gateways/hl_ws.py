@@ -21,7 +21,7 @@ from ..domain.enums import Instrument, Underlying
 from ..domain.models import Quote
 from .hl import Mark
 from .hl_live import HL_SYMBOLS
-from .ls_ws import Fill, WSConnection, WSConnector
+from .ls_ws import Fill, TradeTick, WSConnection, WSConnector
 
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 
@@ -45,6 +45,7 @@ class HLWebSocketClient:
         self._subs: list[dict[str, Any]] = []  # subscription payload 희망 상태
         self.on_mark: list[Callable[[Mark], None]] = []
         self.on_quote: list[Callable[[Quote], None]] = []          # 최우선호가(bbo)
+        self.on_trade: list[Callable[[TradeTick], None]] = []      # 체결(현재가, ~0.2s)
         self.on_funding: list[Callable[[Underlying, float], None]] = []  # 예정 펀딩률
         self.on_fill: list[Callable[[Fill], None]] = []
         self.on_raw: list[Callable[[str], None]] = []
@@ -59,6 +60,11 @@ class HLWebSocketClient:
         """최우선호가(매수/매도 1호가 + 잔량) 구독 → on_quote(Quote[HL_PERP])."""
         for coin in self._symbols.values():
             self._add({"type": "bbo", "coin": coin})
+
+    def subscribe_trades(self) -> None:
+        """공개 체결 구독 → on_trade(현재가). 마크(1초 주기)보다 빠르다(실측 ~0.2초)."""
+        for coin in self._symbols.values():
+            self._add({"type": "trades", "coin": coin})
 
     def subscribe_user_fills(self, address: str) -> None:
         self._add({"type": "userFills", "user": address})
@@ -96,6 +102,13 @@ class HLWebSocketClient:
         msg = json.loads(raw)
         channel = msg.get("channel")
         data = msg.get("data")
+        if channel == "trades":
+            # trades의 data는 체결 목록(list).
+            if isinstance(data, list):
+                for tick in self._parse_trades(data):
+                    for trade_handler in self.on_trade:
+                        trade_handler(tick)
+            return
         if not isinstance(data, dict):
             return  # 구독 ACK("subscriptionResponse") 등
         if channel == "activeAssetCtx":
@@ -151,6 +164,24 @@ class HLWebSocketClient:
             ask_qty=float(ask.get("sz", 0) or 0),
             market="hl",
         )
+
+    def _parse_trades(self, data: list[Any]) -> list[TradeTick]:
+        # 공개 체결: [{coin, side, px, sz, time, tid, ...}]
+        ticks: list[TradeTick] = []
+        for t in data:
+            if not isinstance(t, dict):
+                continue
+            underlying = self._by_symbol.get(str(t.get("coin", "")))
+            if underlying is None or "px" not in t:
+                continue
+            ticks.append(TradeTick(
+                underlying=underlying,
+                instrument=Instrument.HL_PERP,
+                price=float(t["px"]),
+                ts=float(t.get("time", 0.0)),
+                market="hl",
+            ))
+        return ticks
 
     def _parse_fills(self, data: dict[str, Any]) -> list[Fill]:
         fills: list[Fill] = []

@@ -193,9 +193,11 @@ class LiveSystem:
                     handler(underlying, rate)
 
             self._hl_ws.subscribe_marks()
-            self._hl_ws.subscribe_bbo()  # 최우선호가+잔량 → on_quote(HL_PERP)
+            self._hl_ws.subscribe_bbo()     # 최우선호가+잔량 → on_quote(HL_PERP)
+            self._hl_ws.subscribe_trades()  # 공개 체결(현재가) — 마크(1초)보다 빠름
             self._hl_ws.on_mark.append(fan_mark)
             self._hl_ws.on_quote.append(fan_quote)
+            self._hl_ws.on_trade.append(fan_trade)
             self._hl_ws.on_funding.append(fan_funding)
             self._hl_ws.on_fill.append(apply_fill)  # HL 체결 → OrderBook (oid로 매칭)
 

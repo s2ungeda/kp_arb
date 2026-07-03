@@ -130,11 +130,13 @@ class MonitorState:
             quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
             prev = self.funding_prev.get(u)
             nxt = self.funding_next.get(u)
+            # 현재가 = 최근 체결(~0.2초, 실측) 우선. 체결 없으면 마크(1초 주기).
+            last = self.trades.get((u, Instrument.HL_PERP)) or self.marks.get(u)
             rows.append((
                 _NAMES[u],
                 _fmt(quote.ask_qty if quote else None, decimals=3),
                 _fmt(quote.ask if quote else None, decimals=2),
-                _fmt(self.marks.get(u), decimals=2),
+                _fmt(last, decimals=2),
                 _fmt(quote.bid if quote else None, decimals=2),
                 _fmt(quote.bid_qty if quote else None, decimals=3),
                 f"{prev * 100:.4f}%" if prev is not None else "-",

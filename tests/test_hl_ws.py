@@ -86,6 +86,22 @@ async def test_user_fill_parsed_and_filtered() -> None:
     assert f.price == 183.87 and f.fee == 0.008
 
 
+async def test_public_trades_parsed_as_ticks() -> None:
+    # 공개 체결(trades): data가 리스트 — 현재가(TradeTick)로 해석.
+    frame = json.dumps({"channel": "trades", "data": [
+        {"coin": "xyz:SKHX", "side": "B", "px": "1434.5", "sz": "0.2",
+         "time": 1751500000000, "tid": 9},
+        {"coin": "xyz:NVDA", "px": "1.0", "sz": "1", "time": 1, "tid": 10},  # 대상 외
+    ]})
+    client = HLWebSocketClient(FakeConnector([frame]))
+    ticks = []
+    client.on_trade.append(ticks.append)
+    await client.run()
+    assert len(ticks) == 1
+    assert ticks[0].underlying is Underlying.SK_HYNIX
+    assert ticks[0].price == 1434.5 and ticks[0].market == "hl"
+
+
 async def test_snapshot_fills_skipped() -> None:
     client = HLWebSocketClient(FakeConnector([fills_frame(snapshot=True)]))
     fills: list[Fill] = []
