@@ -122,7 +122,10 @@ class MonitorState:
         return rows
 
     def hl_rows(self, now_epoch: float | None = None) -> list[tuple[str, ...]]:
-        """HL 표: (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 펀딩전, 펀딩피, 남은시간)."""
+        """HL 표 행 — 현재가는 실제 체결가, 마크(청산·펀딩 기준가)는 별도 컬럼.
+
+        (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 마크, 펀딩전, 펀딩피, 남은시간)
+        """
         now = now_epoch if now_epoch is not None else time.time()
         countdown = funding_countdown(now)
         rows: list[tuple[str, ...]] = []
@@ -130,15 +133,14 @@ class MonitorState:
             quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
             prev = self.funding_prev.get(u)
             nxt = self.funding_next.get(u)
-            # 현재가 = 최근 체결(~0.2초, 실측) 우선. 체결 없으면 마크(1초 주기).
-            last = self.trades.get((u, Instrument.HL_PERP)) or self.marks.get(u)
             rows.append((
                 _NAMES[u],
                 _fmt(quote.ask_qty if quote else None, decimals=3),
                 _fmt(quote.ask if quote else None, decimals=2),
-                _fmt(last, decimals=2),
+                _fmt(self.trades.get((u, Instrument.HL_PERP)), decimals=2),  # 체결가만
                 _fmt(quote.bid if quote else None, decimals=2),
                 _fmt(quote.bid_qty if quote else None, decimals=3),
+                _fmt(self.marks.get(u), decimals=2),  # 마크(기준가) 별도 표시
                 f"{prev * 100:.4f}%" if prev is not None else "-",
                 f"{nxt * 100:.4f}%" if nxt is not None else "-",
                 countdown,
@@ -238,9 +240,10 @@ def main() -> None:
 
     tk.Label(root, text="HL (Hyperliquid)", anchor="w", font=font).pack(fill="x", padx=4)
     hl_tree = make_tree(root, [
-        ("name", "종목", 90), ("ask_qty", "매도잔량", 60), ("ask", "매도가", 70),
-        ("last", "현재가", 70), ("bid", "매수가", 70), ("bid_qty", "매수잔량", 60),
-        ("fprev", "펀딩전", 65), ("fnext", "펀딩피", 65), ("cd", "남은시간", 55),
+        ("name", "종목", 85), ("ask_qty", "매도잔량", 58), ("ask", "매도가", 62),
+        ("last", "현재가", 62), ("bid", "매수가", 62), ("bid_qty", "매수잔량", 58),
+        ("mark", "마크", 62), ("fprev", "펀딩전", 60), ("fnext", "펀딩피", 60),
+        ("cd", "남은시간", 52),
     ], height=3)
 
     status = tk.Label(root, text="연결 중 ...", anchor="w", font=font)
