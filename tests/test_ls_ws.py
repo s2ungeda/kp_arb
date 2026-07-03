@@ -278,3 +278,38 @@ async def test_unknown_tr_is_ignored() -> None:
 
     await client.run()  # 예외 없이 통과
     assert quotes == []
+
+
+def test_depth_extracts_levels_and_stops_at_zero() -> None:
+    # 주식 10호가·선물 5호가 다단계 추출: 가격 0/누락에서 멈춘다.
+    from kp_arb.gateways.ls_ws import _depth
+
+    body = {
+        "bidho1": "100000", "bidrem1": "10",
+        "bidho2": "99900", "bidrem2": "20",
+        "bidho3": "0",                      # 3단계부터 없음
+        "bidho4": "99700", "bidrem4": "40",  # 0 이후는 무시되어야 함
+    }
+    assert _depth(body, "bidho", "bidrem") == [(100_000.0, 10.0), (99_900.0, 20.0)]
+
+
+async def test_quote_carries_full_depth() -> None:
+    # H1_ 프레임의 bidho1~10/offerho1~10 이 Quote.bids/asks 로 전부 실린다.
+    body: dict[str, str] = {"shcode": SAMSUNG_CODE, "hotime": "085224"}
+    for i in range(1, 11):
+        body[f"bidho{i}"] = str(70_000 - i * 100)
+        body[f"bidrem{i}"] = str(i * 10)
+        body[f"offerho{i}"] = str(70_000 + i * 100)
+        body[f"offerrem{i}"] = str(i * 5)
+    frame = json.dumps({"header": {"tr_cd": "H1_", "tr_key": SAMSUNG_CODE}, "body": body})
+    session = FakeConnection([frame])
+    client = LSWebSocketClient(FakeConnector([session]))
+    quotes: list[Quote] = []
+    client.on_quote.append(quotes.append)
+
+    await client.run()
+
+    assert quotes[0].bids is not None and len(quotes[0].bids) == 10
+    assert quotes[0].asks is not None and len(quotes[0].asks) == 10
+    assert quotes[0].bids[0] == (69_900.0, 10.0)
+    assert quotes[0].asks[9] == (71_000.0, 50.0)

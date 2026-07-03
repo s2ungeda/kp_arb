@@ -15,6 +15,8 @@ class Quote(BaseModel):
     bid_qty: float | None = None  # 매수 1호가 잔량 (모니터/전략 참고용)
     ask_qty: float | None = None  # 매도 1호가 잔량
     market: str = "krx"           # 가격 원천 시장: "krx" | "nxt" | "hl"
+    bids: list[tuple[float, float]] | None = None  # 다단계 매수호가 [(가격, 잔량), ...]
+    asks: list[tuple[float, float]] | None = None  # 다단계 매도호가
 
     @property
     def mid(self) -> float:

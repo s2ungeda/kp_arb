@@ -86,6 +86,9 @@ class LiveSystem:
         self.session = session
         self._stock_ws = stock_ws
         self._deriv_ws = deriv_ws
+        # 최신 호가판 보관소 — 주식 10호가·선물 5호가 등 다단계 포함(Quote.bids/asks).
+        # 키: (underlying, instrument, market["krx"|"nxt"|"hl"]). 모니터·페깅·전략이 공유.
+        self.quotes: dict[tuple[Underlying, Instrument, str], Quote] = {}
         self.on_quote: list[Callable[[Quote], None]] = []  # 호가(LS 주식/선물/ETF + HL bbo)
         self.on_mark: list[Callable[[Mark], None]] = []    # HL 마크
         self.on_trade: list[Callable[[TradeTick], None]] = []        # 체결(현재가)
@@ -127,6 +130,29 @@ class LiveSystem:
         self.order_book.track(order_id, intent)
         return order_id
 
+    async def amend_price(self, order_id: str, price: float) -> str:
+        """LS 주문 가격 정정 — 새 주문번호를 등록하고 원주문은 취소 처리."""
+        order = self.order_book.order(order_id)
+        if order is None:
+            raise ValueError(f"unknown order {order_id}")
+        new_id = await self._gw.amend_order(order_id, price=price)
+        new_intent = order.intent.model_copy(update={"price": price})
+        self.order_book.track(new_id, new_intent)
+        self.order_book.on_cancel(order_id)  # 원주문은 정정으로 소멸
+        return new_id
+
+    async def cancel(self, order_id: str) -> None:
+        """venue 라우팅 취소. HL은 취소 통보 채널이 없어 로컬 상태도 갱신."""
+        order = self.order_book.order(order_id)
+        if order is None:
+            raise ValueError(f"unknown order {order_id}")
+        if order.intent.venue is Venue.LS:
+            await self._gw.cancel_order(order_id)  # 상태는 SC3/H01 통보로 전이
+        else:
+            assert self._hl is not None
+            await self._hl.cancel_order(order_id)
+            self.order_book.on_cancel(order_id)
+
     # --- 시동 ---
 
     def _seed_session_from_env(self) -> None:
@@ -149,6 +175,8 @@ class LiveSystem:
 
     def _wire(self) -> None:
         def fan_quote(quote: Quote) -> None:
+            # 최신 호가판 보관(다단계 포함) 후 콜백 전달.
+            self.quotes[(quote.underlying, quote.instrument, quote.market)] = quote
             for handler in self.on_quote:
                 handler(quote)
 

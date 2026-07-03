@@ -47,6 +47,22 @@ ACCOUNT_TRS: tuple[str, ...] = STOCK_FILL_TRS + FUTURES_FILL_TRS
 STATUS_TR = "JIF"
 
 
+def _depth(body: dict[str, Any], px_prefix: str, qty_prefix: str,
+           levels: int = 10) -> list[tuple[float, float]]:
+    """호가 다단계 추출 — 가격 0(빈 단계)은 제외. 실측: bidho1~10/offerho1~10."""
+    out: list[tuple[float, float]] = []
+    for i in range(1, levels + 1):
+        try:
+            px = float(body.get(f"{px_prefix}{i}", 0) or 0)
+        except (TypeError, ValueError):
+            break
+        if px <= 0:
+            break
+        qty = float(body.get(f"{qty_prefix}{i}", 0) or 0)
+        out.append((px, qty))
+    return out
+
+
 def _norm_ordno(raw: object) -> str:
     """주문번호 정규화 — 프레임마다 zero-pad가 달라("10963" vs "0000010996") 매칭용."""
     text = str(raw).strip()
@@ -280,7 +296,7 @@ class LSWebSocketClient:
             if stock_underlying is None:
                 return None
             instrument, underlying = Instrument.KR_STOCK, stock_underlying
-        # 실측 필드: bidho1/offerho1(1호가), bidrem1/offerrem1(잔량), hotime(HHMMSS).
+        # 실측 필드: bidho1~10/offerho1~10(호가), bidrem/offerrem(잔량), hotime(HHMMSS).
         tr_cd = msg.get("header", {}).get("tr_cd", "")
         return Quote(
             underlying=underlying,
@@ -291,6 +307,8 @@ class LSWebSocketClient:
             bid_qty=float(body.get("bidrem1", 0) or 0),
             ask_qty=float(body.get("offerrem1", 0) or 0),
             market="nxt" if tr_cd == "NH1" else "krx",
+            bids=_depth(body, "bidho", "bidrem"),
+            asks=_depth(body, "offerho", "offerrem"),
         )
 
     def _parse_futures_quote(self, msg: dict[str, Any]) -> Quote | None:
@@ -309,6 +327,8 @@ class LSWebSocketClient:
                 ts=float(body.get("hotime", 0) or 0),
                 bid_qty=float(body.get("bidrem1", 0) or 0),
                 ask_qty=float(body.get("offerrem1", 0) or 0),
+                bids=_depth(body, "bidho", "bidrem", levels=5),   # 선물은 5호가
+                asks=_depth(body, "offerho", "offerrem", levels=5),
             )
         except (KeyError, ValueError):
             return None  # 필드 가정이 다르면 조용히 무시(on_raw로 실프레임 확인)
