@@ -20,7 +20,7 @@ from .bootstrap import LiveSystem
 from .domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .gateways.ls import OrderGoneError
-from .gateways.ls_rest import RestError
+from .gateways.ls_rest import RateLimitError, RestError
 from .logs import setup_logging
 from .order_book import OrderStatus
 from .pegging import PegAction, decide, target_price
@@ -89,24 +89,27 @@ class PegController:
             return f"유지 {self.order_price:,.0f}"
         assert decision.price is not None
         old_id, old_price = self.order_id, self.order_price
-        if decision.action is PegAction.PLACE:
-            self.order_id = await system.place(self._intent(decision.price))
-        elif decision.action is PegAction.AMEND:
-            assert self.order_id is not None
-            try:
+        try:
+            if decision.action is PegAction.PLACE:
+                self.order_id = await system.place(self._intent(decision.price))
+            elif decision.action is PegAction.AMEND:
+                assert self.order_id is not None
                 self.order_id = await system.amend_price(self.order_id, decision.price)
-            except OrderGoneError:
-                # 잔량 없음 = 이미 체결(또는 취소)된 주문 — 체결과의 경합으로 종종
-                # 일어나는 정상 흐름. 다음 점검에서 체결이 확인되면 매도 전환/종료.
-                _log.info("정정 불필요(잔량 없음) #%s — 체결 확인으로 이어감", self.order_id)
-                return "체결 확인 중"
-            except RestError as exc:
-                _log.warning("정정 거부 #%s: %s", self.order_id, exc)
-                return "정정 거부 — 재시도"
-        else:  # CANCEL_PLACE (HL)
-            assert self.order_id is not None
-            await system.cancel(self.order_id)
-            self.order_id = await system.place(self._intent(decision.price))
+            else:  # CANCEL_PLACE (HL)
+                assert self.order_id is not None
+                await system.cancel(self.order_id)
+                self.order_id = await system.place(self._intent(decision.price))
+        except RateLimitError:
+            # 초당 요청 한도(주문 TR 2회/초) — 흔한 정상 흐름. 다음 호가에서 재시도.
+            return "요청 한도 대기"
+        except OrderGoneError:
+            # 잔량 없음 = 이미 체결(또는 취소)된 주문 — 체결과의 경합으로 종종
+            # 일어나는 정상 흐름. 다음 점검에서 체결이 확인되면 매도 전환/종료.
+            _log.info("정정 불필요(잔량 없음) #%s — 체결 확인으로 이어감", old_id)
+            return "체결 확인 중"
+        except RestError as exc:
+            _log.warning("주문 거부: %s", exc)
+            return "거부 — 재시도"
         self.order_price = decision.price
         _log.info(
             "%s %s %s %s %d호가: %s @ %s → #%s @ %s",
