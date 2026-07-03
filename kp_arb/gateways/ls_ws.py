@@ -327,8 +327,8 @@ class LSWebSocketClient:
                 ts=float(body.get("hotime", 0) or 0),
                 bid_qty=float(body.get("bidrem1", 0) or 0),
                 ask_qty=float(body.get("offerrem1", 0) or 0),
-                bids=_depth(body, "bidho", "bidrem", levels=5),   # 선물은 5호가
-                asks=_depth(body, "offerho", "offerrem", levels=5),
+                bids=_depth(body, "bidho", "bidrem"),   # JH0 문서상 10호가(빈 단계에서 멈춤)
+                asks=_depth(body, "offerho", "offerrem"),
             )
         except (KeyError, ValueError):
             return None  # 필드 가정이 다르면 조용히 무시(on_raw로 실프레임 확인)
