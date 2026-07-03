@@ -77,9 +77,12 @@ class LiveSystem:
         hl_gateway: HLGateway | None = None,
         hl_ws: HLWebSocketClient | None = None,
         futures_symbols: dict[Underlying, str] | None = None,
+        etf_symbols: dict[Underlying, str] | None = None,
     ) -> None:
         self._gw = gateway
-        self._futures_symbols = dict(futures_symbols or {})
+        # 취급 종목코드 (공개 — UI/도구가 상품 가용성 판단에 사용. 예: 현대차 ETF 없음)
+        self.futures_symbols = dict(futures_symbols or {})
+        self.etf_symbols = dict(etf_symbols or {})
         self._hl = hl_gateway
         self._hl_ws = hl_ws
         self.order_book = order_book
@@ -200,8 +203,8 @@ class LiveSystem:
         for underlying in Underlying:
             self._stock_ws.subscribe_quotes(underlying)
             self._stock_ws.subscribe_trades(underlying)  # 현재가(S3_) + 예상체결(YS3)
-        if self._futures_symbols:
-            self._stock_ws.subscribe_futures_quotes(self._futures_symbols)
+        if self.futures_symbols:
+            self._stock_ws.subscribe_futures_quotes(self.futures_symbols)
         self._stock_ws.subscribe_market_status()
         self._stock_ws.subscribe_stock_fills()
         self._stock_ws.on_quote.append(fan_quote)
@@ -361,6 +364,7 @@ async def bootstrap_live(
         hl_gateway=hl_gateway,
         hl_ws=hl_ws,
         futures_symbols=futures_symbols,
+        etf_symbols=etf_symbols,
     )
 
 

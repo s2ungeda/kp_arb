@@ -34,6 +34,13 @@ _NAMES = {
     "현대차": Underlying.HYUNDAI,
 }
 
+# LS 상품 선택(주식/ETF/선물). HL은 perp 고정.
+_LS_MARKETS = {
+    "주식": Instrument.KR_STOCK,
+    "ETF": Instrument.KR_ETF,
+    "선물": Instrument.KR_STOCK_FUTURE,
+}
+
 
 @dataclass
 class PegController:
@@ -42,6 +49,7 @@ class PegController:
     system: LiveSystem
     venue: Venue
     underlying: Underlying
+    instrument: Instrument  # LS: 주식/ETF/선물 중 선택, HL: HL_PERP
     side: Side
     level: int
     qty: float
@@ -51,17 +59,14 @@ class PegController:
     pending: bool = False  # 진행 중 새 호가 도착 — 끝나면 최신 호가로 즉시 한 번 더
     flip_on_fill: bool = True  # 체결 시 그 수량만큼 반대 방향으로 전환해 무한 반복
 
-    def _instrument(self) -> Instrument:
-        return Instrument.KR_STOCK if self.venue is Venue.LS else Instrument.HL_PERP
-
     def _quote(self) -> Quote | None:
         market = "krx" if self.venue is Venue.LS else "hl"
-        return self.system.quotes.get((self.underlying, self._instrument(), market))
+        return self.system.quotes.get((self.underlying, self.instrument, market))
 
     def _intent(self, price: float) -> OrderIntent:
         return OrderIntent(
             venue=self.venue, underlying=self.underlying,
-            instrument=self._instrument(), side=self.side, qty=self.qty,
+            instrument=self.instrument, side=self.side, qty=self.qty,
             order_type=OrderType.LIMIT, price=price,
         )
 
@@ -194,14 +199,29 @@ def main() -> None:
     status_var = tk.StringVar(value="연결 중 ...")
     controller: dict[str, PegController] = {}
 
+    market_var = tk.StringVar(value="주식")
+
     row1 = tk.Frame(root)
     row1.pack(fill="x", padx=8, pady=(10, 2))
-    ttk.Combobox(row1, textvariable=venue_var, values=["LS", "HL"],
-                 width=5, state="readonly").pack(side="left")
+    venue_box = ttk.Combobox(row1, textvariable=venue_var, values=["LS", "HL"],
+                             width=5, state="readonly")
+    venue_box.pack(side="left")
     ttk.Combobox(row1, textvariable=name_var, values=list(_NAMES),
                  width=10, state="readonly").pack(side="left", padx=6)
+    # LS일 때만 보이는 상품 콤보(주식/ETF/선물). HL은 perp 고정이라 숨김.
+    market_box = ttk.Combobox(row1, textvariable=market_var,
+                              values=list(_LS_MARKETS), width=5, state="readonly")
+    market_box.pack(side="left")
     tk.Checkbutton(row1, text="Run", variable=run_var, font=font,
                    command=lambda: on_run_toggle()).pack(side="right")
+
+    def on_venue_change(_event: object = None) -> None:
+        if venue_var.get() == "LS":
+            market_box.pack(side="left")
+        else:
+            market_box.pack_forget()
+
+    venue_box.bind("<<ComboboxSelected>>", on_venue_change)
 
     row2 = tk.Frame(root)
     row2.pack(fill="x", padx=8, pady=2)
@@ -286,9 +306,24 @@ def main() -> None:
                 run_var.set(False)
                 return
             assert isinstance(system, LiveSystem)
+            underlying = _NAMES[name_var.get()]
+            if venue is Venue.LS:
+                instrument = _LS_MARKETS[market_var.get()]
+            else:
+                instrument = Instrument.HL_PERP
+            # 상품 가용성 확인 (예: 현대차는 단일종목 ETF 없음)
+            if instrument is Instrument.KR_ETF and underlying not in system.etf_symbols:
+                status_var.set(f"{name_var.get()}: ETF 종목이 없습니다")
+                run_var.set(False)
+                return
+            if (instrument is Instrument.KR_STOCK_FUTURE
+                    and underlying not in system.futures_symbols):
+                status_var.set(f"{name_var.get()}: 선물 종목이 없습니다")
+                run_var.set(False)
+                return
             ctl = PegController(
                 system=system, venue=venue,
-                underlying=_NAMES[name_var.get()],
+                underlying=underlying, instrument=instrument,
                 side=Side.BUY if side_var.get() == "매수" else Side.SELL,
                 level=int(level_var.get()[0]), qty=qty,
             )
@@ -298,7 +333,7 @@ def main() -> None:
                 # 라이브 루프 스레드에서 호출 — 해당 종목 호가가 올 때마다 즉시 따라붙는다.
                 if controller.get("active") is not ctl:
                     return
-                if q.underlying is not ctl.underlying or q.instrument is not ctl._instrument():
+                if q.underlying is not ctl.underlying or q.instrument is not ctl.instrument:
                     return
                 asyncio.ensure_future(step_and_show(ctl))  # noqa: RUF006
 
