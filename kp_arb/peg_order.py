@@ -98,6 +98,7 @@ class PegController:
             return f"유지 {self.order_price:,.0f}"
         assert decision.price is not None
         old_id, old_price = self.order_id, self.order_price
+        t0 = time.perf_counter()
         try:
             if decision.action is PegAction.PLACE:
                 self.order_id = await system.place(self._intent(decision.price))
@@ -116,12 +117,13 @@ class PegController:
             _log.warning("주문 거부: %s", exc)
             return "거부 — 재시도"
         self.order_price = decision.price
+        elapsed_ms = (time.perf_counter() - t0) * 1000
         _log.info(
-            "%s %s %s %s %d호가: %s @ %s → #%s @ %s",
+            "%s %s %s %s %d호가: %s @ %s → #%s @ %s (%.0fms)",
             decision.action.value, self.venue.value, self.underlying.value,
             self.side.value, self.level,
             old_id or "-", old_price if old_price is not None else "-",
-            self.order_id, decision.price,
+            self.order_id, decision.price, elapsed_ms,
         )
         return f"{note}{decision.action.value} @ {decision.price:,.2f} (#{self.order_id})"
 
