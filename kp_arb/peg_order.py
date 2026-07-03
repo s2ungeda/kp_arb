@@ -123,7 +123,10 @@ def main() -> None:
                 await system.start()
                 await system.wait()
 
-        asyncio.run(_run())
+        try:
+            asyncio.run(_run())
+        except Exception as exc:  # noqa: BLE001 - 상태줄에 표시
+            system_ref["error"] = f"{type(exc).__name__}: {exc}"
 
     threading.Thread(target=run_live, daemon=True).start()
 
@@ -211,6 +214,12 @@ def main() -> None:
     last_step = {"t": 0.0}
 
     def tick() -> None:
+        # 준비 완료/실패 표시 (백그라운드 연결이 끝나면 한 번 갱신)
+        if status_var.get() == "연결 중 ...":
+            if system_ref.get("error") is not None:
+                status_var.set(f"연결 실패: {system_ref['error']}")
+            elif system_ref.get("system") is not None:
+                status_var.set("준비 완료 — Run 체크로 시작")
         ctl = controller.get("active")
         if run_var.get() and ctl is not None and time.time() - last_step["t"] >= 0.5:
             last_step["t"] = time.time()
