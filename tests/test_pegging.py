@@ -1,5 +1,5 @@
 """호가 추적(페깅) 판단 로직 테스트 — 순수 함수만."""
-from kp_arb.domain.enums import Instrument, Side, Underlying, Venue
+from kp_arb.domain.enums import Instrument, Side, Underlying
 from kp_arb.domain.models import Quote
 from kp_arb.pegging import PegAction, decide, target_price
 
@@ -47,28 +47,23 @@ def test_target_price_no_quote_or_bad_level() -> None:
 
 
 def test_decide_wait_when_no_target() -> None:
-    assert decide(venue=Venue.LS, current_price=None, target=None).action is PegAction.WAIT
+    assert decide(current_price=None, target=None).action is PegAction.WAIT
 
 
 def test_decide_place_when_no_order() -> None:
-    d = decide(venue=Venue.LS, current_price=None, target=99_900)
+    d = decide(current_price=None, target=99_900)
     assert d.action is PegAction.PLACE
     assert d.price == 99_900
 
 
 def test_decide_none_when_price_matches() -> None:
-    d = decide(venue=Venue.LS, current_price=99_900, target=99_900)
+    d = decide(current_price=99_900, target=99_900)
     assert d.action is PegAction.NONE
     assert d.price is None
 
 
-def test_decide_ls_amends() -> None:
-    d = decide(venue=Venue.LS, current_price=99_900, target=100_000)
+def test_decide_amends_when_target_moves() -> None:
+    # LS(정정 TR)·HL(modify) 모두 정정 한 번으로 처리한다.
+    d = decide(current_price=99_900, target=100_000)
     assert d.action is PegAction.AMEND
     assert d.price == 100_000
-
-
-def test_decide_hl_cancels_and_places() -> None:
-    d = decide(venue=Venue.HYPERLIQUID, current_price=183.5, target=183.6)
-    assert d.action is PegAction.CANCEL_PLACE
-    assert d.price == 183.6

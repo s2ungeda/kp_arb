@@ -47,6 +47,12 @@ class HLGateway(ABC):
     @abstractmethod
     async def cancel_order(self, order_id: str) -> None: ...
 
+    async def amend_order(
+        self, order_id: str, *, qty: float | None = None, price: float | None = None
+    ) -> str:
+        """정정(modify). 기본은 미지원 — 지원 게이트웨이(HLSdkGateway)가 재정의."""
+        raise NotImplementedError("이 게이트웨이는 정정을 지원하지 않는다")
+
     @abstractmethod
     async def get_positions(self) -> Sequence[Position]: ...
 

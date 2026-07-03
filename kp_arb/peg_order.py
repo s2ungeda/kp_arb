@@ -2,9 +2,8 @@
 
     python -m kp_arb.peg_order
 
-선택한 호가 단계(N호가)에 지정가를 걸고, 호가가 움직이면 따라 옮긴다:
-- LS(국내, 모의): **정정**으로 가격 변경
-- HL(해외, 실계정 주의!): **취소 후 신규**
+선택한 호가 단계(N호가)에 지정가를 걸고, 호가가 움직이면 **정정**으로 따라
+옮긴다 (LS는 정정 TR, HL[실계정 주의!]은 modify 액션 — 둘 다 요청 1회).
 체결되면 그 수량만큼 **반대 방향으로 전환**해 계속 추적한다
 (매수→매도→매수→… 무한 반복). Run을 끄면 미체결을 취소하고 멈춘다.
 """
@@ -91,7 +90,7 @@ class PegController:
                 note = f"체결→{label} "
 
         target = target_price(self._quote(), self.side, self.level)
-        decision = decide(venue=self.venue, current_price=self.order_price, target=target)
+        decision = decide(current_price=self.order_price, target=target)
 
         if decision.action is PegAction.WAIT:
             return note + "호가 대기"
@@ -102,13 +101,9 @@ class PegController:
         try:
             if decision.action is PegAction.PLACE:
                 self.order_id = await system.place(self._intent(decision.price))
-            elif decision.action is PegAction.AMEND:
+            else:  # AMEND (LS·HL 공통 — HL은 modify 액션)
                 assert self.order_id is not None
                 self.order_id = await system.amend_price(self.order_id, decision.price)
-            else:  # CANCEL_PLACE (HL)
-                assert self.order_id is not None
-                await system.cancel(self.order_id)
-                self.order_id = await system.place(self._intent(decision.price))
         except RateLimitError:
             # 초당 요청 한도(주문 TR 2회/초) — 흔한 정상 흐름. 다음 호가에서 재시도.
             return "요청 한도 대기"

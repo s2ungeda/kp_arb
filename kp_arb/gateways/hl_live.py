@@ -49,6 +49,8 @@ class HLSdkGateway(HLGateway):
         self._symbols: dict[Underlying, str] = dict(symbols or HL_SYMBOLS)
         self._by_symbol = {v: k for k, v in self._symbols.items()}
         self._order_coin: dict[str, str] = {}  # oid -> coin (취소에 필요)
+        # oid -> (coin, is_buy, sz, px) — 정정(modify)에 원주문 정보가 필요.
+        self._order_ctx: dict[str, tuple[str, bool, float, float]] = {}
         self.connected = False
 
     @classmethod
@@ -103,6 +105,30 @@ class HLSdkGateway(HLGateway):
         )
         oid = self._parse_oid(resp)
         self._order_coin[oid] = coin
+        self._order_ctx[oid] = (coin, is_buy, float(intent.qty), price)
+        return oid
+
+    async def amend_order(
+        self,
+        order_id: str,
+        *,
+        qty: float | None = None,
+        price: float | None = None,
+    ) -> str:
+        """정정(modify) — 서버가 취소+신규를 액션 한 번으로 처리. 새 oid 반환."""
+        ctx = self._order_ctx.get(order_id)
+        if ctx is None:
+            raise HLError(f"unknown order_id {order_id} (context required for modify)")
+        coin, is_buy, sz, px = ctx
+        new_sz = float(qty) if qty is not None else sz
+        new_px = float(price) if price is not None else px
+        resp = await asyncio.to_thread(
+            self._ex.modify_order, int(order_id), coin, is_buy, new_sz, new_px,
+            {"limit": {"tif": "Gtc"}},
+        )
+        oid = self._parse_oid(resp)
+        self._order_coin[oid] = coin
+        self._order_ctx[oid] = (coin, is_buy, new_sz, new_px)
         return oid
 
     async def cancel_order(self, order_id: str) -> None:
