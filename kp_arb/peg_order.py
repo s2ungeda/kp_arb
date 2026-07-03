@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from .bootstrap import LiveSystem
 from .domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
+from .gateways.ls import OrderGoneError
 from .gateways.ls_rest import RestError
 from .logs import setup_logging
 from .order_book import OrderStatus
@@ -94,11 +95,14 @@ class PegController:
             assert self.order_id is not None
             try:
                 self.order_id = await system.amend_price(self.order_id, decision.price)
+            except OrderGoneError:
+                # 잔량 없음 = 이미 체결(또는 취소)된 주문 — 체결과의 경합으로 종종
+                # 일어나는 정상 흐름. 다음 점검에서 체결이 확인되면 매도 전환/종료.
+                _log.info("정정 불필요(잔량 없음) #%s — 체결 확인으로 이어감", self.order_id)
+                return "체결 확인 중"
             except RestError as exc:
-                # 대부분 체결과의 경합(01433: 정정할 수량 없음) — 다음 점검에서
-                # 체결이 확인되면 매도 전환/종료로 이어진다. 주문 상태는 그대로 둔다.
                 _log.warning("정정 거부 #%s: %s", self.order_id, exc)
-                return "정정 거부 — 체결 확인 중"
+                return "정정 거부 — 재시도"
         else:  # CANCEL_PLACE (HL)
             assert self.order_id is not None
             await system.cancel(self.order_id)
@@ -121,7 +125,10 @@ class PegController:
         order = system.order_book.order(self.order_id)
         if order is not None and order.is_open:
             _log.info("Run 해제 — 미체결 취소 #%s @ %s", self.order_id, self.order_price)
-            await system.cancel(self.order_id)
+            try:
+                await system.cancel(self.order_id)
+            except OrderGoneError:
+                _log.info("취소 불필요(잔량 없음) #%s", self.order_id)
         self.order_id = None
         self.order_price = None
         return "취소·정지"

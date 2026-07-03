@@ -29,6 +29,15 @@ LIVE_BASE_URL = "https://openapi.ls-sec.co.kr:8080"
 _LS_ACCOUNTS: tuple[Account, ...] = (Account.KR_STOCK, Account.KR_DERIV)
 
 
+class OrderGoneError(RestError):
+    """정정/취소할 잔량이 없음(이미 체결·취소된 주문). 오류가 아니라 정상 흐름의 거부 —
+    체결과의 경합에서 종종 발생하므로 호출부는 체결 확인으로 이어가면 된다."""
+
+
+# "잔량 없음" 거부 코드 (모의 실측 01433. 운영 코드는 라이브 시 확인해 추가).
+_ORDER_GONE_RSP_CDS = frozenset({"01433"})
+
+
 @dataclass
 class OrderContext:
     """원주문 컨텍스트. 정정/취소가 원주문 정보(계좌·종목·요청본문)를 참조하도록 보존."""
@@ -481,7 +490,10 @@ class LSApiGateway(LSGateway):
         # "01xxx"(가격범위 01427, 정정할 수량 없음 01433 등)/"4xxxx"/"IGW…"는 거부 (v6.15).
         rsp_cd = resp.body.get("rsp_cd")
         if rsp_cd is not None and not str(rsp_cd).startswith("00"):
-            raise RestError(f"{tr_cd} rejected ({rsp_cd}): {resp.body.get('rsp_msg')}")
+            message = f"{tr_cd} rejected ({rsp_cd}): {resp.body.get('rsp_msg')}"
+            if str(rsp_cd) in _ORDER_GONE_RSP_CDS:
+                raise OrderGoneError(message)
+            raise RestError(message)
 
     def _parse_order_id(self, resp: RestResponse, tr_cd: str) -> str:
         self._check_ok(resp, tr_cd)

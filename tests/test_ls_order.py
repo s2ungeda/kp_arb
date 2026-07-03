@@ -6,7 +6,7 @@ import pytest
 from kp_arb.config import LSAccount, LSAccounts
 from kp_arb.domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent
-from kp_arb.gateways.ls import LSApiGateway
+from kp_arb.gateways.ls import LSApiGateway, OrderGoneError
 from kp_arb.gateways.ls_auth import TokenManager, TokenResponse
 from kp_arb.gateways.ls_rest import LSRestClient, RateLimiter, RestError, RestResponse
 from kp_arb.routing import account_for
@@ -291,8 +291,9 @@ class Reject01xxxTransport:
 
 async def test_rejected_01xxx_raises() -> None:
     # 성공 판정은 "00" 시작 — "01433"을 성공으로 오판해 주문번호를 찾으면 안 된다.
+    # 잔량 없음(01433)은 정상 흐름의 거부이므로 전용 유형(OrderGoneError)으로 구분된다.
     gw = _gateway(Reject01xxxTransport())
-    with pytest.raises(RestError, match="01433"):
+    with pytest.raises(OrderGoneError, match="01433"):
         await gw.place_order(_intent(Instrument.KR_STOCK))
 
 
