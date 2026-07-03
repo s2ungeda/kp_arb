@@ -488,4 +488,5 @@ class LSApiGateway(LSGateway):
             block = resp.body.get(key)
             if isinstance(block, dict) and "OrdNo" in block:
                 return str(block["OrdNo"])
-        raise RestError(f"order id missing in {tr_cd} response")
+        # 응답 형식 파악용으로 본문을 그대로 남긴다(정정 등 미실측 TR의 실제 형식 확인).
+        raise RestError(f"order id missing in {tr_cd} response: {resp.body}")
