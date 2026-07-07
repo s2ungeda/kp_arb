@@ -27,6 +27,7 @@ from .gateways.base import HLGateway
 from .gateways.hl import Mark
 from .gateways.hl_ws import HLWebSocketClient
 from .gateways.ls import LSApiGateway, OrderGoneError
+from .gateways.ls_rest import RestError
 from .gateways.ls_ws import (
     ExpectedPrice,
     Fill,
@@ -104,13 +105,23 @@ class LiveSystem:
     # --- 스냅샷 (최초 실행 + 온디맨드/UI 조회 버튼) ---
 
     async def refresh_snapshot(self) -> None:
+        import logging
+
         positions: list[Position] = []
         balances: dict[Account, float] = {}
         open_orders: list[TrackedOrder] = []
         for account in (Account.KR_STOCK, Account.KR_DERIV):
-            balances[account] = await self._gw.get_balance(account)
-            positions.extend(await self._gw.get_positions(account))
-            open_orders.extend(await self._gw.get_open_orders(account))
+            # 실계좌 환경 편차(선물 계좌 없음, 형식 거부 등)로 한 계좌 조회가
+            # 실패해도 시동을 멈추지 않는다 — 해당 계좌만 빼고 계속.
+            try:
+                balances[account] = await self._gw.get_balance(account)
+                positions.extend(await self._gw.get_positions(account))
+                open_orders.extend(await self._gw.get_open_orders(account))
+            except RestError:
+                logging.getLogger("kp_arb.bootstrap").warning(
+                    "%s 계좌 스냅샷 실패 — 이 계좌 없이 계속", account.value, exc_info=True
+                )
+                balances.setdefault(account, 0.0)
         if self._hl is not None:
             positions.extend(await self._hl.get_positions())
             open_orders.extend(await self._hl.get_open_orders())
