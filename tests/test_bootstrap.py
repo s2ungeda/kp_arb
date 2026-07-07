@@ -281,6 +281,7 @@ async def test_deriv_ws_subscribes_futures_fills_only() -> None:
 
 def test_disparity_board_computes_pairs() -> None:
     # DESIGN §6.1: HL 환산 disp vs 국내(SF/ETF) disp → 진입/청산 스프레드.
+    from kp_arb.domain.enums import SessionPhase
     from kp_arb.domain.models import Quote
     from kp_arb.etf_theory import EtfTheoryInputs
 
@@ -290,9 +291,9 @@ def test_disparity_board_computes_pairs() -> None:
     system.etf_symbols[SAMSUNG] = "0193W0"
     system.usdkrw_theory = 1_500.0
     system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] = 300_000.0  # 기초 현재가
-    system.etf_theory[SAMSUNG] = EtfTheoryInputs(
-        prev_nav=20_000.0, leverage=2.0, base_prev_close=300_000.0
-    )
+    system.stock_change_pct[(SAMSUNG, "krx")] = 0.0  # 기초 등락률(drate) 0%
+    system.session.seed_phase(SessionPhase.REGULAR)  # 정규장 공식 사용
+    system.etf_theory[SAMSUNG] = EtfTheoryInputs(prev_nav=20_000.0, leverage=2.0)
     system.quotes[(SAMSUNG, Instrument.HL_PERP, "hl")] = Quote(
         underlying=SAMSUNG, instrument=Instrument.HL_PERP,
         bid=201.0, ask=202.0, ts=0.0, market="hl",

@@ -349,10 +349,11 @@ class LSApiGateway(LSGateway):
     ETF_INFO_PATH = "/stock/etf"
 
     async def get_etf_refs(self, *, pause_s: float = 0.6) -> dict[Underlying, EtfTheoryInputs]:
-        """ETF 이론가 계산의 고정 입력 일괄 조회 — 시작 시 1회.
+        """ETF 이론가 계산의 고정 입력 일괄 조회 — 시작 시 1회, ETF별 t1901.
 
-        ETF별 t1901(전일NAV·배율·공식 iNAV) + 기초 종목 t1102(전일종가 jnilclose, KRX).
-        실패한 종목은 건너뛴다(모니터·전략은 없는 값이면 대체 순서로 동작).
+        전일NAV(jnilnav)·배율(leverage)·거래소 공식 iNAV(nav — 대체용). 기초 등락률은
+        실시간 체결(drate)로 받으므로 여기서 조회하지 않는다(ETF 이론가.md §2).
+        실패한 종목은 건너뛴다(모니터·전략은 없는 값이면 빈값 표시).
         """
         import asyncio as _asyncio
         import logging
@@ -368,25 +369,11 @@ class LSApiGateway(LSGateway):
                 )
                 self._check_ok(resp, self.ETF_INFO_TR)
                 etf = resp.body.get(f"{self.ETF_INFO_TR}OutBlock", {})
-                await _asyncio.sleep(pause_s)
-                resp = await self._request_paced(
-                    Account.KR_STOCK,
-                    self.STOCK_PRICE_TR,
-                    {f"{self.STOCK_PRICE_TR}InBlock": {
-                        "shcode": u.krx_code, "exchgubun": "K",  # 기초는 KRX 기준(문서 §4-1)
-                    }},
-                    self.STOCK_MARKET_PATH,
-                )
-                self._check_ok(resp, self.STOCK_PRICE_TR)
-                base = resp.body.get(f"{self.STOCK_PRICE_TR}OutBlock", {})
-                prev_close = self._prev_close(base)
-                if prev_close is None:
-                    raise RestError(f"{u.value} 기초 전일종가 계산 불가")
+                inav = float(etf.get("nav") or 0)
                 out[u] = EtfTheoryInputs(
                     prev_nav=float(etf["jnilnav"]),
                     leverage=float(etf["leverage"]),  # 취급 ETF는 +2배(인버스 없음)
-                    base_prev_close=prev_close,
-                    exchange_inav=float(etf["nav"]) if etf.get("nav") else None,
+                    exchange_inav=inav if inav > 0 else None,  # "0.00"이면 대체 불가
                 )
             except (RestError, KeyError, TypeError, ValueError):
                 # 이 ETF는 이론가 없이 표시 — 원인은 로그로 남김(운영 실측용)
@@ -397,23 +384,6 @@ class LSApiGateway(LSGateway):
             finally:
                 await _asyncio.sleep(pause_s)
         return out
-
-    @staticmethod
-    def _prev_close(block: dict[str, Any]) -> float | None:
-        """기초 전일종가 — t1102에 jnilclose가 없어(운영 실측) 현재가−전일대비로 역산.
-
-        sign 4(하락)/5(하한)는 change가 절대값이므로 음수로 보정.
-        """
-        if block.get("jnilclose"):
-            return float(block["jnilclose"])
-        try:
-            price = float(block.get("price") or 0)
-            change = float(block.get("change") or 0)
-        except (TypeError, ValueError):
-            return None
-        if str(block.get("sign") or "") in ("4", "5"):
-            change = -abs(change)
-        return price - change if price > 0 else None
 
     async def fetch_futures_master(self) -> list[dict[str, Any]]:
         """주식선물 마스터(t8401) 전 종목. 행: {hname, shcode, expcode, basecode}."""

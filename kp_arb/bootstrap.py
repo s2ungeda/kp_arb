@@ -24,7 +24,7 @@ from .disparity import PairBoard, SideDisp, pair_spread, side_disp
 from .domain.enums import Account, Instrument, Underlying, Venue
 from .domain.models import OrderIntent, Position, Quote
 from .engine import ArbEngine
-from .etf_theory import EtfTheoryInputs, theory_price
+from .etf_theory import EtfTheoryInputs, theory_after, theory_regular
 from .gateways.base import HLGateway
 from .gateways.hl import Mark
 from .gateways.hl_ws import HLWebSocketClient
@@ -118,8 +118,10 @@ class LiveSystem:
         # 최신 호가판 보관소 — 주식 10호가·선물 5호가 등 다단계 포함(Quote.bids/asks).
         # 키: (underlying, instrument, market["krx"|"nxt"|"hl"]). 모니터·페깅·전략이 공유.
         self.quotes: dict[tuple[Underlying, Instrument, str], Quote] = {}
-        # 최신 체결가 보관소 — 시장별(krx/nxt/hl). ETF 이론가의 기초가(KRX)에도 사용.
+        # 최신 체결가 보관소 — 시장별(krx/nxt/hl/uni). ETF 이론가의 기초가(KRX)에도 사용.
         self.trades: dict[tuple[Underlying, Instrument, str], float] = {}
+        # 기초 주식 등락률(%, drate) — ETF 이론가의 핵심 입력 (ETF 이론가.md §2).
+        self.stock_change_pct: dict[tuple[Underlying, str], float] = {}
         # ETF 이론가 고정 입력(전일NAV·배율·기초 전일종가) — 시동 시 1회 조회.
         self.etf_theory: dict[Underlying, EtfTheoryInputs] = {}
         self.on_quote: list[Callable[[Quote], None]] = []  # 호가(LS 주식/선물/ETF + HL bbo)
@@ -238,6 +240,8 @@ class LiveSystem:
 
         def fan_trade(tick: TradeTick) -> None:
             self.trades[(tick.underlying, tick.instrument, tick.market)] = tick.price
+            if tick.instrument is Instrument.KR_STOCK and tick.change_pct is not None:
+                self.stock_change_pct[(tick.underlying, tick.market)] = tick.change_pct
             for handler in self.on_trade:
                 handler(tick)
 
@@ -444,12 +448,22 @@ class LiveSystem:
             )
 
     def etf_theory_price(self, underlying: Underlying) -> float | None:
-        """ETF 이론가(정규장 공식, ETF 이론가.md) — 모니터·전략 공용.
+        """ETF 이론가(ETF 이론가.md §1) — 모니터·전략 공용. 시간대는 세션으로 판단.
 
-        기초가는 KRX 체결가만 사용(문서 §4-1). 기초가 없으면 대체 순서.
+        - 정규장/장전: 전일NAV × (1 + 배율 × 기초 KRX 등락률[drate, §2]) — KRX 기준(§4-1)
+        - 그 외(애프터·시간외): 당일종가NAV × (1 + 배율 × 애프터 등락률) —
+          애프터 현재가는 통합(uni, NXT) 체결, 당일종가는 KRX 마지막 체결.
         """
-        base = self.trades.get((underlying, Instrument.KR_STOCK, "krx"))
-        return theory_price(self.etf_theory.get(underlying), base)
+        from .domain.enums import SessionPhase
+
+        inputs = self.etf_theory.get(underlying)
+        rate_krx = self.stock_change_pct.get((underlying, "krx"))
+        phase = self.session.phase_for(underlying)
+        if phase in (SessionPhase.REGULAR, SessionPhase.PRE_OPEN):
+            return theory_regular(inputs, rate_krx)
+        base_close = self.trades.get((underlying, Instrument.KR_STOCK, "krx"))
+        base_after = self.trades.get((underlying, Instrument.KR_STOCK, "uni"))
+        return theory_after(inputs, rate_krx, base_close, base_after)
 
     @staticmethod
     async def _guarded_ws(name: str, run: Coroutine[Any, Any, None]) -> None:

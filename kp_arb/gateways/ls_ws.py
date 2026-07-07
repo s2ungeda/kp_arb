@@ -116,11 +116,12 @@ class OrderEvent(BaseModel):
 
 
 class TradeTick(BaseModel):
-    """체결(현재가) 이벤트 — 주식 S3_(KRX)/NS3(NXT), 선물 JC0."""
+    """체결(현재가) 이벤트 — 주식 S3_(KRX)/US3(통합), 선물 JC0."""
 
     underlying: Underlying
     instrument: Instrument
     price: float
+    change_pct: float | None = None  # 등락률(%, drate — ETF 이론가의 핵심 입력, 문서 §2)
     ts: float = 0.0
     market: str = "krx"  # "krx" | "nxt"
 
@@ -398,10 +399,12 @@ class LSWebSocketClient:
         if underlying is None or "price" not in body:
             return None
         try:
+            drate = body.get("drate")
             return TradeTick(underlying=underlying, instrument=instrument,
                              price=float(body["price"]),
                              ts=float(body.get("chetime", 0) or 0),
-                             market={"NS3": "nxt", "US3": "uni"}.get(tr_cd, "krx"))
+                             market={"NS3": "nxt", "US3": "uni"}.get(tr_cd, "krx"),
+                             change_pct=float(drate) if drate not in (None, "") else None)
         except ValueError:
             return None
 
