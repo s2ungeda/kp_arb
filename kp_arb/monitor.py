@@ -128,7 +128,7 @@ class MonitorState:
                     _fmt(bid),
                     _fmt(bid_qty),
                     _fmt(expected),
-                    _fmt(inst_theory),
+                    _fmt(inst_theory, decimals=2),  # 엑셀과 동일 소수 2자리
                     f"{disp:+.2f}" if disp is not None else "-",
                 ))
                 name = ""  # 같은 종목은 첫 행에만 이름
@@ -193,14 +193,6 @@ def main() -> None:
                         pass
                 await asyncio.sleep(FUNDING_INTERVAL_S / 4)
 
-        async def _initial_prices(system: LiveSystem) -> None:
-            # 창 오픈 시 최초 1회: LS 현재가(마감 후엔 종가) 조회로 표를 채운다.
-            try:
-                for key, price in (await system.price_snapshots()).items():
-                    state.trades.setdefault(key, price)  # 실시간 체결이 오면 그쪽 우선
-            except Exception:  # noqa: BLE001 - 표시용, 실패해도 실시간은 계속
-                pass
-
         async def _run() -> None:
             import aiohttp
 
@@ -212,14 +204,12 @@ def main() -> None:
                 system.on_expected.append(state.on_expected)
                 system.on_mark.append(state.on_mark)
                 system.on_funding.append(state.on_funding)
-                await system.start()
+                await system.start()  # 초기 가격 시딩은 LiveSystem이 담당(합성 체결로 수신)
                 funding_task = asyncio.create_task(_prev_funding_loop(system))
-                prices_task = asyncio.create_task(_initial_prices(system))
                 try:
                     await system.wait()
                 finally:
                     funding_task.cancel()
-                    prices_task.cancel()
 
         asyncio.run(_run())
 

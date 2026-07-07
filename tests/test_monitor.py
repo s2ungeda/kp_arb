@@ -40,9 +40,9 @@ def test_ls_rows_theory_and_disparity() -> None:
         (SAMSUNG, Instrument.KR_STOCK_FUTURE): 293_500.0,
     })
     assert rows[0][7] == "-"                     # 주식: 이론가 없음
-    assert rows[1][7] == "293,500"               # 선물 이론가 (현재가 없어 괴리율 '-')
-    assert rows[1][8] == "-"
-    assert rows[2][7] == "10,200"                # ETF 이론가
+    assert rows[1][7] == "293,500.00"            # 선물 이론가 (소수 2자리 — 엑셀과 동일)
+    assert rows[1][8] == "-"                     # 현재가 없어 괴리율 '-'
+    assert rows[2][7] == "10,200.00"             # ETF 이론가
     assert rows[2][8] == "+1.00"                 # (10302-10200)/10200 = +1.00%
 
 

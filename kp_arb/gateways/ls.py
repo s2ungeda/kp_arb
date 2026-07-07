@@ -24,7 +24,14 @@ from ..order_book import OrderStatus, TrackedOrder
 from ..routing import account_for
 from .base import LSGateway
 from .ls_auth import TokenManager, TokenTransport
-from .ls_rest import LSRestClient, RateLimiter, RestError, RestResponse, RestTransport
+from .ls_rest import (
+    LSRestClient,
+    RateLimiter,
+    RateLimitError,
+    RestError,
+    RestResponse,
+    RestTransport,
+)
 
 LIVE_BASE_URL = "https://openapi.ls-sec.co.kr:8080"
 _LS_ACCOUNTS: tuple[Account, ...] = (Account.KR_STOCK, Account.KR_DERIV)
@@ -279,6 +286,23 @@ class LSApiGateway(LSGateway):
     FUTURES_PRICE_TR = "t8402"  # 주식선물 현재가 (실측: OutBlock.price)
     STOCK_MARKET_PATH = "/stock/market-data"
 
+    async def _request_paced(
+        self, account: Account, tr_cd: str, body: dict[str, Any], path: str
+    ) -> RestResponse:
+        """초당 한도(RateLimitError)에 걸리면 잠깐 기다렸다 재시도 — 시동 일괄 조회용.
+
+        시동 시 ETF 입력·초기 가격 조회가 같은 TR(t1102)을 동시에 써서 한도에
+        걸리면 조용히 실패하던 문제의 해결책(운영 실측).
+        """
+        import asyncio as _asyncio
+
+        for _ in range(10):
+            try:
+                return await self._rest_for(account).request(tr_cd, body, path=path)
+            except RateLimitError:
+                await _asyncio.sleep(0.6)
+        raise RateLimitError(f"{tr_cd} 초당 한도 지속")
+
     async def get_last_price(self, code: str, *, futures: bool = False) -> float | None:
         """종목 1개의 현재가(마감 후엔 종가) 조회. 모니터 초기 표시용."""
         if futures:
@@ -287,8 +311,8 @@ class LSApiGateway(LSGateway):
         else:
             tr, path, key = self.STOCK_PRICE_TR, self.STOCK_MARKET_PATH, "shcode"
             account = Account.KR_STOCK
-        resp = await self._rest_for(account).request(
-            tr, {f"{tr}InBlock": {key: code}}, path=path
+        resp = await self._request_paced(
+            account, tr, {f"{tr}InBlock": {key: code}}, path
         )
         self._check_ok(resp, tr)
         block = resp.body.get(f"{tr}OutBlock", {})
@@ -331,38 +355,65 @@ class LSApiGateway(LSGateway):
         실패한 종목은 건너뛴다(모니터·전략은 없는 값이면 대체 순서로 동작).
         """
         import asyncio as _asyncio
+        import logging
 
         out: dict[Underlying, EtfTheoryInputs] = {}
         for u, etf_code in self._etf_symbols.items():
             try:
-                resp = await self._rest_for(Account.KR_STOCK).request(
+                resp = await self._request_paced(
+                    Account.KR_STOCK,
                     self.ETF_INFO_TR,
                     {f"{self.ETF_INFO_TR}InBlock": {"shcode": etf_code}},
-                    path=self.ETF_INFO_PATH,
+                    self.ETF_INFO_PATH,
                 )
                 self._check_ok(resp, self.ETF_INFO_TR)
                 etf = resp.body.get(f"{self.ETF_INFO_TR}OutBlock", {})
                 await _asyncio.sleep(pause_s)
-                resp = await self._rest_for(Account.KR_STOCK).request(
+                resp = await self._request_paced(
+                    Account.KR_STOCK,
                     self.STOCK_PRICE_TR,
                     {f"{self.STOCK_PRICE_TR}InBlock": {
                         "shcode": u.krx_code, "exchgubun": "K",  # 기초는 KRX 기준(문서 §4-1)
                     }},
-                    path=self.STOCK_MARKET_PATH,
+                    self.STOCK_MARKET_PATH,
                 )
                 self._check_ok(resp, self.STOCK_PRICE_TR)
                 base = resp.body.get(f"{self.STOCK_PRICE_TR}OutBlock", {})
+                prev_close = self._prev_close(base)
+                if prev_close is None:
+                    raise RestError(f"{u.value} 기초 전일종가 계산 불가")
                 out[u] = EtfTheoryInputs(
                     prev_nav=float(etf["jnilnav"]),
                     leverage=float(etf["leverage"]),  # 취급 ETF는 +2배(인버스 없음)
-                    base_prev_close=float(base["jnilclose"]),
+                    base_prev_close=prev_close,
                     exchange_inav=float(etf["nav"]) if etf.get("nav") else None,
                 )
             except (RestError, KeyError, TypeError, ValueError):
-                continue  # 이 ETF는 이론가 없이 표시(대체 순서도 불가)
+                # 이 ETF는 이론가 없이 표시 — 원인은 로그로 남김(운영 실측용)
+                logging.getLogger("kp_arb.ls").warning(
+                    "ETF 이론가 입력 조회 실패: %s(%s)", u.value, etf_code, exc_info=True
+                )
+                continue
             finally:
                 await _asyncio.sleep(pause_s)
         return out
+
+    @staticmethod
+    def _prev_close(block: dict[str, Any]) -> float | None:
+        """기초 전일종가 — t1102에 jnilclose가 없어(운영 실측) 현재가−전일대비로 역산.
+
+        sign 4(하락)/5(하한)는 change가 절대값이므로 음수로 보정.
+        """
+        if block.get("jnilclose"):
+            return float(block["jnilclose"])
+        try:
+            price = float(block.get("price") or 0)
+            change = float(block.get("change") or 0)
+        except (TypeError, ValueError):
+            return None
+        if str(block.get("sign") or "") in ("4", "5"):
+            change = -abs(change)
+        return price - change if price > 0 else None
 
     async def fetch_futures_master(self) -> list[dict[str, Any]]:
         """주식선물 마스터(t8401) 전 종목. 행: {hname, shcode, expcode, basecode}."""

@@ -299,6 +299,7 @@ class LiveSystem:
         self._seed_session_from_env()
         self._wire()
         self._tasks = [asyncio.create_task(self._load_etf_refs())]
+        self._tasks.append(asyncio.create_task(self._seed_prices()))
         self._tasks.append(asyncio.create_task(self._fx_loop()))
         self._tasks.append(asyncio.create_task(self._guarded_ws("주식", self._stock_ws.run())))
         if self._deriv_ws is not None:
@@ -352,10 +353,15 @@ class LiveSystem:
     # --- 괴리 보드 (DESIGN §6.1 — 모니터·전략 공용) ---
 
     def stock_futures_theory(self, underlying: Underlying) -> float | None:
-        """주식선물 이론가 = 기초 주식 현재가(KRX) × (1 + 3.5% × 잔존일/365)."""
+        """주식선물 이론가 = 기초 주식 현재가 × (1 + 3.5% × 잔존일/365).
+
+        기초가는 **통합(uni, NXT 포함) 우선, 없으면 KRX** — 엑셀(RTD)과 동일 기준.
+        (ETF 이론가의 기초는 KRX 전용 유지 — 거래소 iNAV 기준과 일치시키기 위함.)
+        """
         from datetime import date
 
-        base = self.trades.get((underlying, Instrument.KR_STOCK, "krx"))
+        base = (self.trades.get((underlying, Instrument.KR_STOCK, "uni"))
+                or self.trades.get((underlying, Instrument.KR_STOCK, "krx")))
         ym = self.futures_expiry.get(underlying)
         if base is None or ym is None:
             return None
@@ -399,6 +405,32 @@ class LiveSystem:
                 kr = side_disp(ask, bid, base)
                 board[(u, instrument)] = PairBoard(hl=hl, kr=kr, spread=pair_spread(hl, kr))
         return board
+
+    async def _seed_prices(self) -> None:
+        """장중 체결이 오기 전(개장 전·애프터·한산 종목) 현재가 초기값 — 스냅샷 1회.
+
+        합성 체결(market="krx")로 흘려서 모니터·이론가가 같은 경로로 받는다.
+        실시간 체결이 이미 온 종목은 덮지 않는다. (현대차처럼 체결이 뜸한 종목의
+        이론가 기초가 확보 — 운영 실측에서 나온 보강)
+        """
+        import logging
+
+        try:
+            snapshot = await self._gw.get_price_snapshots()
+        except Exception:  # noqa: BLE001 - 초기값 없이도 실시간은 정상
+            logging.getLogger("kp_arb.bootstrap").warning(
+                "초기 가격 스냅샷 실패 — 실시간 체결만 사용", exc_info=True
+            )
+            return
+        for (u, inst), price in snapshot.items():
+            key = (u, inst, "krx")
+            if key in self.trades:
+                continue  # 실시간이 먼저 왔으면 그쪽 우선
+            self.trades[key] = price
+            tick = TradeTick(underlying=u, instrument=inst, price=price,
+                             ts=0.0, market="krx")
+            for handler in self.on_trade:
+                handler(tick)
 
     async def _load_etf_refs(self) -> None:
         """ETF 이론가 고정 입력 조회(백그라운드 1회) — 실패해도 시스템은 계속."""
