@@ -7,7 +7,7 @@
   화면은 0.3초마다 최신값을 읽어 갱신(읽기 전용 — 주문 없음).
 
 표 구성(사용자 명세):
-- LS: 종목 | 매도잔량 | 매도가 | 현재가 | 매수가 | 매수잔량 | 예상가
+- LS: 종목 | 매도잔량 | 매도가 | 현재가 | 매수가 | 매수잔량 | 예상가 | 이론가(ETF)
 - HL: 종목 | 매도잔량 | 매도가 | 현재가(마크) | 매수가 | 매수잔량 | 펀딩전 | 펀딩피 | 남은시간
 - 하단: 장운영상태 · 계좌 잔고 · 마지막 수신 시각
 """
@@ -100,8 +100,13 @@ class MonitorState:
 
     # --- 화면 행 ---
 
-    def ls_rows(self) -> list[tuple[str, ...]]:
-        """LS 표: (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상가)."""
+    def ls_rows(
+        self, theory: dict[Underlying, float | None] | None = None
+    ) -> list[tuple[str, ...]]:
+        """LS 표: (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상가, 이론가).
+
+        이론가는 ETF 행에만 표시 (LiveSystem.etf_theory_price — 전략과 공용 계산).
+        """
         rows: list[tuple[str, ...]] = []
         for u in Underlying:
             name = _NAMES[u]
@@ -109,6 +114,9 @@ class MonitorState:
                 ask, ask_qty, bid, bid_qty = self.merged_quote(u, inst)  # KRX+NXT 통합
                 trade = self.trades.get((u, inst))
                 expected = self.expected.get(u) if inst is Instrument.KR_STOCK else None
+                etf_theory = (
+                    (theory or {}).get(u) if inst is Instrument.KR_ETF else None
+                )
                 rows.append((
                     f"{name} {_KIND[inst]}".strip(),
                     _fmt(ask_qty),
@@ -117,6 +125,7 @@ class MonitorState:
                     _fmt(bid),
                     _fmt(bid_qty),
                     _fmt(expected),
+                    _fmt(etf_theory),
                 ))
                 name = ""  # 같은 종목은 첫 행에만 이름
         return rows
@@ -214,7 +223,7 @@ def main() -> None:
 
     root = tk.Tk()
     root.title("kp-arb 시세")
-    root.geometry("620x420")
+    root.geometry("700x420")
     root.attributes("-topmost", True)  # 항상 위 (작은 시세창 용도)
     font = ("Malgun Gothic", 9)
 
@@ -235,7 +244,7 @@ def main() -> None:
     ls_tree = make_tree(root, [
         ("name", "종목", 110), ("ask_qty", "매도잔량", 70), ("ask", "매도가", 80),
         ("last", "현재가", 80), ("bid", "매수가", 80), ("bid_qty", "매수잔량", 70),
-        ("exp", "예상체결가", 85),
+        ("exp", "예상체결가", 85), ("theory", "이론가", 80),
     ], height=9)
 
     tk.Label(root, text="HL (Hyperliquid)", anchor="w", font=font).pack(fill="x", padx=4)
@@ -260,9 +269,13 @@ def main() -> None:
                 tree.item(item, values=row)
 
     def refresh() -> None:
-        fill_tree(ls_tree, state.ls_rows())
-        fill_tree(hl_tree, state.hl_rows())
         system = system_ref.get("system")
+        theory = (
+            {u: system.etf_theory_price(u) for u in Underlying}
+            if system is not None else None
+        )
+        fill_tree(ls_tree, state.ls_rows(theory))
+        fill_tree(hl_tree, state.hl_rows())
         if system is not None:
             phase = system.session.phase_for(Underlying.SAMSUNG).value
             stock = system.order_book.balance(Account.KR_STOCK)

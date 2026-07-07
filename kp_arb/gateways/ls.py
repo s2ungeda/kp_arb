@@ -19,6 +19,7 @@ from typing import Any
 from ..config import LSAccounts
 from ..domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from ..domain.models import OrderIntent, Position
+from ..etf_theory import EtfTheoryInputs
 from ..order_book import OrderStatus, TrackedOrder
 from ..routing import account_for
 from .base import LSGateway
@@ -313,6 +314,49 @@ class LSApiGateway(LSGateway):
             if price is not None and price > 0:
                 out[(u, instrument)] = price
             await _asyncio.sleep(pause_s)
+        return out
+
+    ETF_INFO_TR = "t1901"       # ETF 현재가/NAV/배율 (ETF 이론가.md §2)
+    ETF_INFO_PATH = "/stock/etf"
+
+    async def get_etf_refs(self, *, pause_s: float = 0.6) -> dict[Underlying, EtfTheoryInputs]:
+        """ETF 이론가 계산의 고정 입력 일괄 조회 — 시작 시 1회.
+
+        ETF별 t1901(전일NAV·배율·공식 iNAV) + 기초 종목 t1102(전일종가 jnilclose, KRX).
+        실패한 종목은 건너뛴다(모니터·전략은 없는 값이면 대체 순서로 동작).
+        """
+        import asyncio as _asyncio
+
+        out: dict[Underlying, EtfTheoryInputs] = {}
+        for u, etf_code in self._etf_symbols.items():
+            try:
+                resp = await self._rest_for(Account.KR_STOCK).request(
+                    self.ETF_INFO_TR,
+                    {f"{self.ETF_INFO_TR}InBlock": {"shcode": etf_code}},
+                    path=self.ETF_INFO_PATH,
+                )
+                self._check_ok(resp, self.ETF_INFO_TR)
+                etf = resp.body.get(f"{self.ETF_INFO_TR}OutBlock", {})
+                await _asyncio.sleep(pause_s)
+                resp = await self._rest_for(Account.KR_STOCK).request(
+                    self.STOCK_PRICE_TR,
+                    {f"{self.STOCK_PRICE_TR}InBlock": {
+                        "shcode": u.krx_code, "exchgubun": "K",  # 기초는 KRX 기준(문서 §4-1)
+                    }},
+                    path=self.STOCK_MARKET_PATH,
+                )
+                self._check_ok(resp, self.STOCK_PRICE_TR)
+                base = resp.body.get(f"{self.STOCK_PRICE_TR}OutBlock", {})
+                out[u] = EtfTheoryInputs(
+                    prev_nav=float(etf["jnilnav"]),
+                    leverage=float(etf["leverage"]),  # 취급 ETF는 +2배(인버스 없음)
+                    base_prev_close=float(base["jnilclose"]),
+                    exchange_inav=float(etf["nav"]) if etf.get("nav") else None,
+                )
+            except (RestError, KeyError, TypeError, ValueError):
+                continue  # 이 ETF는 이론가 없이 표시(대체 순서도 불가)
+            finally:
+                await _asyncio.sleep(pause_s)
         return out
 
     async def fetch_futures_master(self) -> list[dict[str, Any]]:

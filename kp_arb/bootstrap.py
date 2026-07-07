@@ -23,6 +23,7 @@ from .config import LSAccounts
 from .domain.enums import Account, Instrument, Underlying, Venue
 from .domain.models import OrderIntent, Position, Quote
 from .engine import ArbEngine
+from .etf_theory import EtfTheoryInputs, theory_price
 from .gateways.base import HLGateway
 from .gateways.hl import Mark
 from .gateways.hl_ws import HLWebSocketClient
@@ -94,6 +95,10 @@ class LiveSystem:
         # 최신 호가판 보관소 — 주식 10호가·선물 5호가 등 다단계 포함(Quote.bids/asks).
         # 키: (underlying, instrument, market["krx"|"nxt"|"hl"]). 모니터·페깅·전략이 공유.
         self.quotes: dict[tuple[Underlying, Instrument, str], Quote] = {}
+        # 최신 체결가 보관소 — 시장별(krx/nxt/hl). ETF 이론가의 기초가(KRX)에도 사용.
+        self.trades: dict[tuple[Underlying, Instrument, str], float] = {}
+        # ETF 이론가 고정 입력(전일NAV·배율·기초 전일종가) — 시동 시 1회 조회.
+        self.etf_theory: dict[Underlying, EtfTheoryInputs] = {}
         self.on_quote: list[Callable[[Quote], None]] = []  # 호가(LS 주식/선물/ETF + HL bbo)
         self.on_mark: list[Callable[[Mark], None]] = []    # HL 마크
         self.on_trade: list[Callable[[TradeTick], None]] = []        # 체결(현재가)
@@ -209,6 +214,7 @@ class LiveSystem:
                 handler(quote)
 
         def fan_trade(tick: TradeTick) -> None:
+            self.trades[(tick.underlying, tick.instrument, tick.market)] = tick.price
             for handler in self.on_trade:
                 handler(tick)
 
@@ -265,13 +271,33 @@ class LiveSystem:
         await self.refresh_snapshot()
         self._seed_session_from_env()
         self._wire()
-        self._tasks = [asyncio.create_task(self._guarded_ws("주식", self._stock_ws.run()))]
+        self._tasks = [asyncio.create_task(self._load_etf_refs())]
+        self._tasks.append(asyncio.create_task(self._guarded_ws("주식", self._stock_ws.run())))
         if self._deriv_ws is not None:
             self._tasks.append(
                 asyncio.create_task(self._guarded_ws("선물", self._deriv_ws.run()))
             )
         if self._hl_ws is not None:
             self._tasks.append(asyncio.create_task(self._guarded_ws("HL", self._hl_ws.run())))
+
+    async def _load_etf_refs(self) -> None:
+        """ETF 이론가 고정 입력 조회(백그라운드 1회) — 실패해도 시스템은 계속."""
+        import logging
+
+        try:
+            self.etf_theory = dict(await self._gw.get_etf_refs())
+        except Exception:  # noqa: BLE001 - 이론가 없이도 나머지는 정상
+            logging.getLogger("kp_arb.bootstrap").warning(
+                "ETF 이론가 입력 조회 실패 — 이론가 없이 계속", exc_info=True
+            )
+
+    def etf_theory_price(self, underlying: Underlying) -> float | None:
+        """ETF 이론가(정규장 공식, ETF 이론가.md) — 모니터·전략 공용.
+
+        기초가는 KRX 체결가만 사용(문서 §4-1). 기초가 없으면 대체 순서.
+        """
+        base = self.trades.get((underlying, Instrument.KR_STOCK, "krx"))
+        return theory_price(self.etf_theory.get(underlying), base)
 
     @staticmethod
     async def _guarded_ws(name: str, run: Coroutine[Any, Any, None]) -> None:

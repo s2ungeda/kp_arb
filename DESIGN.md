@@ -241,7 +241,7 @@
 - 전략: 플러그인 선택자(임계값 등 세부는 전략 확정 후).
 - 한도: LS 5,000/일 + TR별 초당, HL 마진비율 하한, 일일 손실 한도.
 - **실행 모드:** `KP_MODE`(env)로 사용자가 전환 — `paper`(모의, 기본·안전) | `live`(운영). 엔드포인트/안전 게이트 선택용 플래그.
-- **취급 종목(확정 v6.14):** `config.yaml`(커밋됨 — 비밀 아님, git 이력 관리). underlying별 `{stock, etf?, hl}` — stock은 도메인 enum과 일치 검증(오타 방지). **단일종목 레버리지 ETF(실확인): 삼성 `0193W0`(KODEX 삼성전자단일) / 하이닉스 `0193T0`(KODEX SK하이닉스단일) / 현대차 없음**(종목 선택기에서 후보 제외). 주식선물은 월물이라 파일에 없이 시동 시 t8401 자동 조회. ETF 주문은 주식 주문과 동일 경로(같은 TR·A 접두) — **별도 테스트 불요(사용자 확정 2026-07-07)**.
+- **취급 종목(확정 v6.14):** `config.yaml`(커밋됨 — 비밀 아님, git 이력 관리). underlying별 `{stock, etf?, hl}` — stock은 도메인 enum과 일치 검증(오타 방지). **단일종목 레버리지 ETF(실확인): 삼성 `0193W0`(KODEX 삼성전자단일) / 하이닉스 `0193T0`(KODEX SK하이닉스단일) / 현대차 없음**(종목 선택기에서 후보 제외). 주식선물은 월물이라 파일에 없이 시동 시 t8401 자동 조회. ETF 주문은 주식 주문과 동일 경로(같은 TR·A 접두) — **별도 테스트 불요(사용자 확정 2026-07-07)**. **ETF 이론가(iNAV)**: `ETF 이론가.md`가 계산 명세(공식·TR·시간대) — v1은 정규장 공식(`etf_theory.py` 순수 로직 + `LiveSystem.etf_theory_price`, 모니터·전략 공용, 기초가는 KRX만). t1901 필드(jnilnav/leverage/nav)는 첫 라이브 시 확인, 애프터·동시호가 공식은 전략(Phase 7)에서 확장.
 - 비밀값(평문 파일 저장 금지): **저장 = Windows 자격증명관리자(DPAPI, keyring), env는 오버라이드/폴백** (`SecretProvider`). 등록 `python -m kp_arb.secrets_cli set <NAME>`. 이름 — **LS 키는 계좌별**: 주식 `LS_STOCK_APPKEY/APPSECRET/ACCT/ACCT_PW`, 선물옵션 `LS_DERIV_APPKEY/APPSECRET/ACCT/ACCT_PW`. HL `HL_AGENT_KEY`.
 
 ---

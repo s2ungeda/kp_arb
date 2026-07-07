@@ -24,10 +24,19 @@ def test_ls_rows_shape_and_values() -> None:
     rows = state.ls_rows()
     assert len(rows) == 9  # 3종목 × (주식/선물/ETF)
     stock = rows[0]
-    # (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상가)
+    # (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상가, 이론가)
     assert stock == ("삼성전자 주식", "50", "293,000", "292,800",
-                     "292,500", "100", "292,700")
+                     "292,500", "100", "292,700", "-")
     assert rows[1][0] == "선물" and rows[1][2] == "-"  # 미수신은 '-'
+
+
+def test_ls_rows_theory_only_on_etf() -> None:
+    # 이론가는 ETF 행에만 표시된다 (주식/선물 행은 '-').
+    state = MonitorState()
+    rows = state.ls_rows({SAMSUNG: 10_200.0})
+    assert rows[0][-1] == "-"          # 주식
+    assert rows[1][-1] == "-"          # 선물
+    assert rows[2][-1] == "10,200"     # ETF
 
 
 def test_krx_nxt_quotes_merged_like_hts() -> None:
