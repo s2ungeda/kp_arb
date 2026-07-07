@@ -278,3 +278,45 @@ async def test_deriv_ws_subscribes_futures_fills_only() -> None:
     assert trs == {"O01", "C01", "H01"}  # 파생 WS는 선물 통보만
     types = {json.loads(m)["header"]["tr_type"] for m in deriv_connector.conn.sent}
     assert types == {"1"}  # 계좌 등록
+
+def test_disparity_board_computes_pairs() -> None:
+    # DESIGN §6.1: HL 환산 disp vs 국내(SF/ETF) disp → 진입/청산 스프레드.
+    from kp_arb.domain.models import Quote
+    from kp_arb.etf_theory import EtfTheoryInputs
+
+    system, _, _ = _system([])
+    system.futures_symbols[SAMSUNG] = "A1167000"
+    system.futures_expiry[SAMSUNG] = 202612  # 먼 만기 — 테스트 안정성
+    system.etf_symbols[SAMSUNG] = "0193W0"
+    system.usdkrw_theory = 1_500.0
+    system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] = 300_000.0  # 기초 현재가
+    system.etf_theory[SAMSUNG] = EtfTheoryInputs(
+        prev_nav=20_000.0, leverage=2.0, base_prev_close=300_000.0
+    )
+    system.quotes[(SAMSUNG, Instrument.HL_PERP, "hl")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.HL_PERP,
+        bid=201.0, ask=202.0, ts=0.0, market="hl",
+    )
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK_FUTURE, "krx")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        bid=301_000.0, ask=302_000.0, ts=0.0,
+    )
+    system.quotes[(SAMSUNG, Instrument.KR_ETF, "krx")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_ETF,
+        bid=20_000.0, ask=20_050.0, ts=0.0,
+    )
+
+    board = system.disparity_board()
+
+    sf = board[(SAMSUNG, Instrument.KR_STOCK_FUTURE)]
+    # HL 환산: bid 301,500 / ask 303,000, 기초 300,000 → disp +0.5% / +1.0%
+    assert sf.hl.bid is not None and abs(sf.hl.bid - 0.005) < 1e-9
+    assert sf.hl.ask is not None and abs(sf.hl.ask - 0.010) < 1e-9
+    # SF 이론가 = 300,000 × (1 + 3.5% × 잔존일/365) > 300,000 → disp는 그 대비
+    assert sf.kr.ask is not None and sf.spread.entry is not None
+    assert sf.spread.entry == sf.hl.bid - sf.kr.ask
+
+    etf = board[(SAMSUNG, Instrument.KR_ETF)]
+    # ETF 이론가 = 20,000(기초 등락률 0) → ask 20,050 disp +0.25%
+    assert etf.kr.ask is not None and abs(etf.kr.ask - 0.0025) < 1e-9
+    assert etf.spread.exit == (etf.hl.ask or 0) - (etf.kr.bid or 0)

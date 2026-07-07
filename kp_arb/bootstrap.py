@@ -20,6 +20,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from .config import LSAccounts
+from .disparity import PairBoard, SideDisp, pair_spread, side_disp
 from .domain.enums import Account, Instrument, Underlying, Venue
 from .domain.models import OrderIntent, Position, Quote
 from .engine import ArbEngine
@@ -41,13 +42,23 @@ from .risk import RiskManager, RiskState
 from .session import reference_instrument
 from .session_service import SessionService
 from .strategy.base import Strategy
+from .theory import (
+    EQ_CARRY_RATE,
+    FX_CARRY_RATE,
+    carry_theory,
+    days_to_expiry,
+    select_usd_futures,
+)
 
 
-def select_near_month_futures(rows: list[dict[str, object]]) -> dict[Underlying, str]:
-    """t8401 마스터 행에서 underlying별 **최근월물** 주식선물 코드를 고른다. 순수 로직.
+def select_near_month(
+    rows: list[dict[str, object]],
+) -> dict[Underlying, tuple[str, int]]:
+    """t8401 마스터 행에서 underlying별 **최근월물** (shcode, 만기 YYYYMM). 순수 로직.
 
     행: {hname: "삼성전자   F 202607", shcode: "A1167000", basecode: "A005930"}.
     스프레드(" SP ") 제외, hname 끝의 YYYYMM 최소(=최근월물) 선택.
+    만기는 캐리 이론가 잔존일 계산에 쓴다(DESIGN §6.1).
     """
     base_to_underlying = {f"A{u.krx_code}": u for u in Underlying}
     best: dict[Underlying, tuple[str, str]] = {}  # underlying -> (yyyymm, shcode)
@@ -63,7 +74,12 @@ def select_near_month_futures(rows: list[dict[str, object]]) -> dict[Underlying,
         shcode = str(row.get("shcode", ""))
         if underlying not in best or yyyymm < best[underlying][0]:
             best[underlying] = (yyyymm, shcode)
-    return {u: shcode for u, (_, shcode) in best.items()}
+    return {u: (shcode, int(ym)) for u, (ym, shcode) in best.items()}
+
+
+def select_near_month_futures(rows: list[dict[str, object]]) -> dict[Underlying, str]:
+    """underlying별 최근월물 주식선물 **코드만** (기존 호환)."""
+    return {u: shcode for u, (shcode, _) in select_near_month(rows).items()}
 
 
 class LiveSystem:
@@ -81,11 +97,15 @@ class LiveSystem:
         hl_ws: HLWebSocketClient | None = None,
         futures_symbols: dict[Underlying, str] | None = None,
         etf_symbols: dict[Underlying, str] | None = None,
+        futures_expiry: dict[Underlying, int] | None = None,
     ) -> None:
         self._gw = gateway
         # 취급 종목코드 (공개 — UI/도구가 상품 가용성 판단에 사용. 예: 현대차 ETF 없음)
         self.futures_symbols = dict(futures_symbols or {})
         self.etf_symbols = dict(etf_symbols or {})
+        self.futures_expiry = dict(futures_expiry or {})  # 만기 YYYYMM (캐리 잔존일용)
+        # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — _fx_loop가 주기 갱신.
+        self.usdkrw_theory: float | None = None
         self._hl = hl_gateway
         self._hl_ws = hl_ws
         self.order_book = order_book
@@ -272,6 +292,7 @@ class LiveSystem:
         self._seed_session_from_env()
         self._wire()
         self._tasks = [asyncio.create_task(self._load_etf_refs())]
+        self._tasks.append(asyncio.create_task(self._fx_loop()))
         self._tasks.append(asyncio.create_task(self._guarded_ws("주식", self._stock_ws.run())))
         if self._deriv_ws is not None:
             self._tasks.append(
@@ -279,6 +300,99 @@ class LiveSystem:
             )
         if self._hl_ws is not None:
             self._tasks.append(asyncio.create_task(self._guarded_ws("HL", self._hl_ws.run())))
+
+    async def _fx_loop(self) -> None:
+        """환율이론가 갱신 — 원달러선물(t8426 최근월물)을 주간에 t2111로 반복 조회.
+
+        통화선물은 주간 WS 시세가 없어(실측) 예외적으로 반복 조회를 쓴다(DESIGN §6.1).
+        야간·주말은 마지막 값 유지. 실패해도 시스템은 계속(환율 없으면 HL 괴리만 빈값).
+        """
+        import logging
+        from datetime import date, datetime
+
+        log = logging.getLogger("kp_arb.bootstrap")
+        try:
+            selected = select_usd_futures(
+                await self._gw.fetch_commodity_master(), datetime.now()
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("원달러선물 마스터(t8426) 조회 실패 — 환율이론가 없이 계속",
+                        exc_info=True)
+            return
+        if selected is None:
+            log.warning("원달러선물 월물을 찾지 못함 — 환율이론가 없이 계속")
+            return
+        code, ym = selected
+        log.info("원달러선물 최근월물: %s (만기 %s)", code, ym)
+        failures = 0
+        while True:
+            hour = datetime.now().hour
+            if not 8 <= hour < 16:  # 주간 세션 밖 — 마지막 값 유지
+                await asyncio.sleep(60.0)
+                continue
+            try:
+                price = await self._gw.get_fx_futures_price(code)
+                if price is not None:
+                    days = days_to_expiry(ym, "USD", date.today())
+                    self.usdkrw_theory = carry_theory(price, days, FX_CARRY_RATE)
+                failures = 0
+            except Exception:  # noqa: BLE001
+                failures += 1
+                if failures == 1:  # 반복 실패는 첫 번째만 기록
+                    log.warning("원달러선물 시세(t2111) 조회 실패 — 재시도 계속",
+                                exc_info=True)
+            await asyncio.sleep(2.0)
+
+    # --- 괴리 보드 (DESIGN §6.1 — 모니터·전략 공용) ---
+
+    def stock_futures_theory(self, underlying: Underlying) -> float | None:
+        """주식선물 이론가 = 기초 주식 현재가(KRX) × (1 + 3.5% × 잔존일/365)."""
+        from datetime import date
+
+        base = self.trades.get((underlying, Instrument.KR_STOCK, "krx"))
+        ym = self.futures_expiry.get(underlying)
+        if base is None or ym is None:
+            return None
+        return carry_theory(base, days_to_expiry(ym, "EQ", date.today()), EQ_CARRY_RATE)
+
+    def _best_quote(
+        self, underlying: Underlying, instrument: Instrument
+    ) -> tuple[float | None, float | None]:
+        """KRX+NXT 통합 최우선호가 (매도가, 매수가) — 실제 체결 가능한 호가."""
+        candidates = [
+            q for m in ("krx", "nxt")
+            if (q := self.quotes.get((underlying, instrument, m))) is not None
+        ]
+        if not candidates:
+            return None, None
+        return (min(q.ask for q in candidates), max(q.bid for q in candidates))
+
+    def _hl_disp(self, underlying: Underlying) -> SideDisp:
+        """HL 호가를 환율이론가로 원화 환산 → 국내 주식 현재가 대비 괴리."""
+        quote = self.quotes.get((underlying, Instrument.HL_PERP, "hl"))
+        fx = self.usdkrw_theory
+        base = self.trades.get((underlying, Instrument.KR_STOCK, "krx"))
+        if quote is None or fx is None:
+            return side_disp(None, None, base)
+        return side_disp(quote.ask * fx, quote.bid * fx, base)
+
+    def disparity_board(self) -> dict[tuple[Underlying, Instrument], PairBoard]:
+        """HL vs 국내 상대(주식선물/ETF)별 괴리·진입/청산 스프레드 (DESIGN §6.1)."""
+        board: dict[tuple[Underlying, Instrument], PairBoard] = {}
+        for u in Underlying:
+            hl = self._hl_disp(u)
+            targets: list[tuple[Instrument, float | None]] = []
+            if u in self.futures_symbols:
+                targets.append(
+                    (Instrument.KR_STOCK_FUTURE, self.stock_futures_theory(u))
+                )
+            if u in self.etf_symbols:
+                targets.append((Instrument.KR_ETF, self.etf_theory_price(u)))
+            for instrument, base in targets:
+                ask, bid = self._best_quote(u, instrument)
+                kr = side_disp(ask, bid, base)
+                board[(u, instrument)] = PairBoard(hl=hl, kr=kr, spread=pair_spread(hl, kr))
+        return board
 
     async def _load_etf_refs(self) -> None:
         """ETF 이론가 고정 입력 조회(백그라운드 1회) — 실패해도 시스템은 계속."""
@@ -392,7 +506,9 @@ async def bootstrap_live(
         base_url=LIVE_BASE_URL,
     )
     # 선물 최근월물 자동 조회(만기 롤오버 대응) 후 게이트웨이 재조립
-    futures_symbols = select_near_month_futures(await gateway.fetch_futures_master())
+    near_month = select_near_month(await gateway.fetch_futures_master())
+    futures_symbols = {u: sh for u, (sh, _) in near_month.items()}
+    futures_expiry = {u: ym for u, (_, ym) in near_month.items()}
     gateway = LSApiGateway.from_accounts(
         accounts,
         token_transport=token_tx,
@@ -431,6 +547,7 @@ async def bootstrap_live(
         hl_ws=hl_ws,
         futures_symbols=futures_symbols,
         etf_symbols=etf_symbols,
+        futures_expiry=futures_expiry,
     )
 
 

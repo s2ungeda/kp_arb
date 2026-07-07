@@ -223,7 +223,7 @@ def main() -> None:
 
     root = tk.Tk()
     root.title("kp-arb 시세")
-    root.geometry("700x420")
+    root.geometry("700x600")
     root.attributes("-topmost", True)  # 항상 위 (작은 시세창 용도)
     font = ("Malgun Gothic", 9)
 
@@ -255,8 +255,74 @@ def main() -> None:
         ("cd", "남은시간", 52),
     ], height=3)
 
+    tk.Label(root, text="괴리 보드 (%, HL vs 국내 — 진입=HL매수d−국내매도d)",
+             anchor="w", font=font).pack(fill="x", padx=4)
+    board_tree = make_tree(root, [
+        ("name", "쌍", 130), ("hl_ask", "HL매도d", 70), ("hl_bid", "HL매수d", 70),
+        ("kr_ask", "국내매도d", 70), ("kr_bid", "국내매수d", 70),
+        ("entry", "진입", 70), ("exit", "청산", 70),
+    ], height=5)
+
     status = tk.Label(root, text="연결 중 ...", anchor="w", font=font)
     status.pack(fill="x", padx=4, pady=(0, 4))
+
+    def pct(value: float | None) -> str:
+        return f"{value * 100:.3f}" if value is not None else "-"
+
+    _PAIR_KIND = {Instrument.KR_STOCK_FUTURE: "SF", Instrument.KR_ETF: "ETF"}
+
+    def board_rows(system: object) -> list[tuple[str, ...]]:
+        from .bootstrap import LiveSystem
+
+        assert isinstance(system, LiveSystem)
+        rows: list[tuple[str, ...]] = []
+        for (u, inst), pair in sorted(
+            system.disparity_board().items(), key=lambda kv: (kv[0][0].value, kv[0][1].value)
+        ):
+            rows.append((
+                f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
+                pct(pair.hl.ask), pct(pair.hl.bid),
+                pct(pair.kr.ask), pct(pair.kr.bid),
+                pct(pair.spread.entry), pct(pair.spread.exit),
+            ))
+        return rows
+
+    last_csv = {"t": 0.0}
+
+    def record_spreads(system: object) -> None:
+        """1초 간격으로 스프레드를 CSV에 기록 — 임계값 결정용 분포 데이터."""
+        import csv
+        from pathlib import Path
+
+        from .bootstrap import LiveSystem
+
+        assert isinstance(system, LiveSystem)
+        now = time.time()
+        if now - last_csv["t"] < 1.0:
+            return
+        last_csv["t"] = now
+        board = system.disparity_board()
+        lines = [
+            (f"{time.strftime('%H:%M:%S', time.localtime(now))}",
+             u.value, _PAIR_KIND[inst],
+             pct(p.hl.ask), pct(p.hl.bid), pct(p.kr.ask), pct(p.kr.bid),
+             pct(p.spread.entry), pct(p.spread.exit))
+            for (u, inst), p in board.items()
+            if p.spread.entry is not None or p.spread.exit is not None
+        ]
+        if not lines:
+            return
+        log_dir = Path(__file__).resolve().parent.parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        path = log_dir / f"spread_{time.strftime('%Y%m%d')}.csv"
+        new_file = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if new_file:
+                writer.writerow(["time", "underlying", "pair",
+                                 "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
+                                 "entry", "exit"])
+            writer.writerows(lines)
 
     def fill_tree(tree: ttk.Treeview, rows: list[tuple[str, ...]]) -> None:
         existing = tree.get_children()
@@ -276,6 +342,9 @@ def main() -> None:
         )
         fill_tree(ls_tree, state.ls_rows(theory))
         fill_tree(hl_tree, state.hl_rows())
+        if system is not None:
+            fill_tree(board_tree, board_rows(system))
+            record_spreads(system)
         if system is not None:
             phase = system.session.phase_for(Underlying.SAMSUNG).value
             stock = system.order_book.balance(Account.KR_STOCK)

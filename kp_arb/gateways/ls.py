@@ -370,6 +370,35 @@ class LSApiGateway(LSGateway):
         rows = resp.body.get(f"{self.FUTURES_MASTER_TR}OutBlock")
         return list(rows) if isinstance(rows, list) else []
 
+    COMMODITY_MASTER_TR = "t8426"  # 상품선물 마스터 (미국달러선물 월물 — RTD 실측)
+    FX_PRICE_TR = "t2111"          # 선물옵션 현재가 (통화선물 주간은 WS 미제공 → 폴링)
+
+    async def fetch_commodity_master(self) -> list[dict[str, Any]]:
+        """상품선물 마스터(t8426) 전 종목. 행: {hname, shcode, ...} — 원달러선물 찾기용."""
+        resp = await self._rest_for(Account.KR_DERIV).request(
+            self.COMMODITY_MASTER_TR,
+            {f"{self.COMMODITY_MASTER_TR}InBlock": {"dummy": ""}},
+            path=self.FUTURES_MARKET_PATH,
+        )
+        self._check_ok(resp, self.COMMODITY_MASTER_TR)
+        rows = resp.body.get(f"{self.COMMODITY_MASTER_TR}OutBlock")
+        return list(rows) if isinstance(rows, list) else []
+
+    async def get_fx_futures_price(self, shcode: str) -> float | None:
+        """원달러선물 현재가(t2111). 주간엔 WS 미제공(실측)이라 이 조회를 주기 반복."""
+        resp = await self._rest_for(Account.KR_DERIV).request(
+            self.FX_PRICE_TR,
+            {f"{self.FX_PRICE_TR}InBlock": {"focode": shcode}},
+            path=self.FUTURES_MARKET_PATH,
+        )
+        self._check_ok(resp, self.FX_PRICE_TR)
+        block = resp.body.get(f"{self.FX_PRICE_TR}OutBlock", {})
+        try:
+            price = float(block["price"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return price if price > 0 else None
+
     async def raw_request(
         self, account: Account, tr_cd: str, path: str, *, method: str = "POST"
     ) -> RestResponse:
