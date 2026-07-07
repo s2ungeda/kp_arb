@@ -36,6 +36,9 @@ class AiohttpTokenTransport:
             f"{self._base}/oauth2/token", data=data, headers=headers
         ) as resp:
             body = await resp.json(content_type=None)
+        if "access_token" not in body:
+            # 서버 거부 사유를 그대로 노출 (appkey/시크릿 오류, 모의/운영 불일치 등)
+            raise RuntimeError(f"LS 토큰 발급 거부 (appkey …{appkey[-4:]}): {body}")
         return TokenResponse(
             access_token=str(body["access_token"]),
             token_type=str(body.get("token_type", "Bearer")),
