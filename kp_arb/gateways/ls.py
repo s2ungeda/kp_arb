@@ -196,12 +196,12 @@ class LSApiGateway(LSGateway):
                 self.STOCK_POSITIONS_TR, self._account_fields(account), path=self.STOCK_ACC_PATH
             )
             rows = self._rows(resp, self.STOCK_POSITIONS_TR)
-            return [self._stock_position(r) for r in rows]
+            return [p for r in rows if (p := self._stock_position(r)) is not None]
         resp = await self._rest_for(account).request(
             self.DERIV_POSITIONS_TR, self._account_fields(account), path=self.DERIV_ACC_PATH
         )
         rows = self._rows(resp, self.DERIV_POSITIONS_TR)
-        return [self._deriv_position(r) for r in rows]
+        return [p for r in rows if (p := self._deriv_position(r)) is not None]
 
     async def get_balance(self, account: Account) -> float:
         """계좌별 가용자금(현금주문가능). 주식 CSPAQ22200 / 선물 CFOBQ10500."""
@@ -236,11 +236,18 @@ class LSApiGateway(LSGateway):
             self.STOCK_OPEN_ORDERS_TR, body, path=self.STOCK_ACC_PATH
         )
         rows = self._rows(resp, self.STOCK_OPEN_ORDERS_TR)
-        return [self._open_order(row) for row in rows if float(row.get("MrcAbleQty", 0)) > 0]
+        return [
+            o for row in rows
+            if float(row.get("MrcAbleQty", 0)) > 0
+            and (o := self._open_order(row)) is not None
+        ]
 
-    def _open_order(self, row: dict[str, Any]) -> TrackedOrder:
+    def _open_order(self, row: dict[str, Any]) -> TrackedOrder | None:
         # 실측 행: IsuNo "A005930", BnsTpCode 1매도/2매수, OrdPrc 문자열, ExecQty 체결누계.
-        instrument, underlying = self._resolve_spot(str(row["IsuNo"]))
+        resolved = self._resolve_spot(str(row["IsuNo"]))
+        if resolved is None:
+            return None  # 취급 외 종목(실계좌의 다른 주문 등) — 추적 대상 아님
+        instrument, underlying = resolved
         intent = OrderIntent(
             venue=Venue.LS,
             underlying=underlying,
@@ -343,9 +350,13 @@ class LSApiGateway(LSGateway):
             raise RestError(f"{field} missing in {tr_cd} response")
         return float(block[field])
 
-    def _stock_position(self, row: dict[str, Any]) -> Position:
+    def _stock_position(self, row: dict[str, Any]) -> Position | None:
         # 주식/ETF 잔고는 롱 전용(공매도 미사용). 종목코드로 주식 vs ETF 판별.
-        instrument, underlying = self._resolve_spot(str(row["IsuNo"]))
+        # 취급 외 종목(실계좌의 기존 보유 등)은 건너뛴다 — 시스템 추적 대상 아님.
+        resolved = self._resolve_spot(str(row["IsuNo"]))
+        if resolved is None:
+            return None
+        instrument, underlying = resolved
         return Position(
             venue=Venue.LS,
             instrument=instrument,
@@ -357,31 +368,31 @@ class LSApiGateway(LSGateway):
             account=Account.KR_STOCK,
         )
 
-    def _deriv_position(self, row: dict[str, Any]) -> Position:
+    def _deriv_position(self, row: dict[str, Any]) -> Position | None:
+        underlying = Underlying.from_krx_code(str(row["IsuNo"]))
+        if underlying is None:
+            return None  # 취급 외 종목 — 추적 대상 아님
         side = Side.BUY if str(row["BnsTpCode"]) == "2" else Side.SELL  # 1매도 2매수
         return Position(
             venue=Venue.LS,
             instrument=Instrument.KR_STOCK_FUTURE,
-            underlying=self._underlying(str(row["IsuNo"])),
+            underlying=underlying,
             side=side,
             qty=float(row["BalQty"]),
             avg_price=float(row["AvrPrc"]),
             account=Account.KR_DERIV,
         )
 
-    def _underlying(self, code: str) -> Underlying:
-        underlying = Underlying.from_krx_code(code)
-        if underlying is None:
-            raise RestError(f"unknown issue code {code}")
-        return underlying
-
-    def _resolve_spot(self, code: str) -> tuple[Instrument, Underlying]:
-        """현물 종목코드("A" 접두 유무 무관) → (주식|ETF, underlying) 판별."""
+    def _resolve_spot(self, code: str) -> tuple[Instrument, Underlying] | None:
+        """현물 종목코드("A" 접두 유무 무관) → (주식|ETF, underlying). 취급 외면 None."""
         bare = code.lstrip("A")
         etf_underlying = self._etf_underlying.get(bare)
         if etf_underlying is not None:
             return Instrument.KR_ETF, etf_underlying
-        return Instrument.KR_STOCK, self._underlying(bare)
+        underlying = Underlying.from_krx_code(bare)
+        if underlying is None:
+            return None
+        return Instrument.KR_STOCK, underlying
 
     # --- 요청 본문 구성 ---
     # [라이브 정합 v6.4] 주문 TR은 `{tr}InBlock1` 래핑 필수(flat은 IGW50004 거부).

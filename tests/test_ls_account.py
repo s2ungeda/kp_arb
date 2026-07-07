@@ -231,3 +231,29 @@ async def test_deriv_positions_paper_unsupported_returns_empty() -> None:
 
     gw = _gateway(Unsupported())
     assert await gw.get_positions(Account.KR_DERIV) == []
+
+
+async def test_positions_skip_untracked_symbols() -> None:
+    # 실계좌엔 취급 외 보유 종목이 있을 수 있다(실측: 252670) — 건너뛰고 계속.
+    class MixedHoldings(AccountTransport):
+        async def request(
+            self,
+            method: str,
+            url: str,
+            headers: dict[str, str],
+            body: dict[str, Any] | None,
+        ) -> RestResponse:
+            return RestResponse(status_code=200, body={
+                "rsp_cd": "00136",
+                "CSPAQ12300OutBlock3": [
+                    {"IsuNo": "252670", "BalQty": 10, "BnsBaseBalQty": 10,
+                     "AvrUprc": "3500.00"},   # 취급 외 → 무시
+                    {"IsuNo": "005930", "BalQty": 0, "BnsBaseBalQty": 100,
+                     "AvrUprc": "70000.00"},  # 삼성전자 → 추적
+                ],
+            })
+
+    gw = _gateway(MixedHoldings())
+    positions = await gw.get_positions(Account.KR_STOCK)
+    assert len(positions) == 1
+    assert positions[0].underlying is Underlying.SAMSUNG
