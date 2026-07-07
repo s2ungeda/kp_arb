@@ -198,8 +198,13 @@ class LSApiGateway(LSGateway):
             )
             rows = self._rows(resp, self.STOCK_POSITIONS_TR)
             return [p for r in rows if (p := self._stock_position(r)) is not None]
+        # 운영 실측: flat 본문은 09604(입력 포맷) 거부 → InBlock1 래핑 (모의는 01900 미제공).
         resp = await self._rest_for(account).request(
-            self.DERIV_POSITIONS_TR, self._account_fields(account), path=self.DERIV_ACC_PATH
+            self.DERIV_POSITIONS_TR,
+            {f"{self.DERIV_POSITIONS_TR}InBlock1": {
+                "RecCnt": 1, **self._account_fields(account),
+            }},
+            path=self.DERIV_ACC_PATH,
         )
         rows = self._rows(resp, self.DERIV_POSITIONS_TR)
         return [p for r in rows if (p := self._deriv_position(r)) is not None]

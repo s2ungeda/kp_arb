@@ -110,7 +110,7 @@ async def test_subscribe_sends_register_for_all_trs() -> None:
 
     sent = [json.loads(m) for m in session.sent]
     sent_trs = {m["body"]["tr_cd"] for m in sent}
-    assert {"H1_", "NH1", "JIF"} <= sent_trs
+    assert {"H1_", "UH1", "JIF"} <= sent_trs  # NXT는 통합(UH1)로 수신
     assert {"SC0", "SC1", "SC2", "SC3", "SC4"} <= sent_trs
     jif = next(m for m in sent if m["body"]["tr_cd"] == "JIF")
     assert jif["body"]["tr_key"] == "0"      # JIF는 시장 단위 구독(실측)
@@ -331,3 +331,29 @@ async def test_fx_trade_updates_price() -> None:
 
     assert prices == [1530.1]  # 다른 월물은 무시
     assert any('"FC0"' in msg and '"175W07"' in msg for msg in session.sent)  # 구독 전송
+
+
+async def test_unified_quote_and_trade_parse() -> None:
+    # 통합 TR: UH1(호가)/US3(체결), tr_key "U"+코드+공백3, market="uni".
+    uh1 = json.dumps({"header": {"tr_cd": "UH1", "tr_key": f"U{SAMSUNG_CODE}   "},
+                      "body": {"shcode": SAMSUNG_CODE, "bidho1": "70100",
+                               "offerho1": "70200", "hotime": "090001"}})
+    us3 = json.dumps({"header": {"tr_cd": "US3", "tr_key": f"U{SAMSUNG_CODE}   "},
+                      "body": {"shcode": f"U{SAMSUNG_CODE}   ", "price": "70150",
+                               "chetime": "090001"}})
+    session = FakeConnection([uh1, us3])
+    client = LSWebSocketClient(FakeConnector([session]))
+    client.subscribe_quotes(Underlying.SAMSUNG)
+    client.subscribe_trades(Underlying.SAMSUNG)
+    quotes: list[Quote] = []
+    trades = []
+    client.on_quote.append(quotes.append)
+    client.on_trade.append(trades.append)
+
+    await client.run()
+
+    assert quotes[0].market == "uni" and quotes[0].bid == 70_100
+    assert trades[0].market == "uni" and trades[0].price == 70_150
+    # 구독에 통합 키("U"+코드+공백3)가 포함돼야 한다
+    assert any(f"U{SAMSUNG_CODE}   " in m and '"UH1"' in m for m in session.sent)
+    assert any(f"U{SAMSUNG_CODE}   " in m and '"US3"' in m for m in session.sent)

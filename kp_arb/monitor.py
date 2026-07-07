@@ -73,10 +73,11 @@ class MonitorState:
     def merged_quote(
         self, underlying: Underlying, instrument: Instrument
     ) -> tuple[float | None, float | None, float | None, float | None]:
-        """KRX+NXT 통합 최우선호가: (매도가, 매도잔량, 매수가, 매수잔량)."""
-        krx = self.quotes.get((underlying, instrument, "krx"))
-        nxt = self.quotes.get((underlying, instrument, "nxt"))
-        candidates = [q for q in (krx, nxt) if q is not None]
+        """통합(uni)·KRX·NXT 중 최우선호가: (매도가, 매도잔량, 매수가, 매수잔량)."""
+        candidates = [
+            q for m in ("uni", "krx", "nxt")
+            if (q := self.quotes.get((underlying, instrument, m))) is not None
+        ]
         if not candidates:
             return None, None, None, None
         best_ask = min(candidates, key=lambda q: q.ask)   # 매도는 낮은 쪽이 우선

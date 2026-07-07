@@ -364,9 +364,9 @@ class LiveSystem:
     def _best_quote(
         self, underlying: Underlying, instrument: Instrument
     ) -> tuple[float | None, float | None]:
-        """KRX+NXT 통합 최우선호가 (매도가, 매수가) — 실제 체결 가능한 호가."""
+        """통합(uni)·KRX·NXT 중 최우선호가 (매도가, 매수가) — 실제 체결 가능한 호가."""
         candidates = [
-            q for m in ("krx", "nxt")
+            q for m in ("uni", "krx", "nxt")
             if (q := self.quotes.get((underlying, instrument, m))) is not None
         ]
         if not candidates:

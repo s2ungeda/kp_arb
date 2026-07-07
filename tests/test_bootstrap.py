@@ -114,7 +114,7 @@ async def test_start_loads_snapshot_then_streams() -> None:
 
     # 구독 등록 확인: 시세(3종)+JIF+주식 체결통보 (선물 통보는 파생 WS 몫)
     trs = {json.loads(m)["body"]["tr_cd"] for m in connector.conn.sent}
-    assert {"H1_", "NH1", "JIF", "SC0", "SC1"} <= trs
+    assert {"H1_", "UH1", "JIF", "SC0", "SC1"} <= trs  # NXT는 통합(UH1)로 수신
     assert "O01" not in trs
 
 
