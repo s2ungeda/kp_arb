@@ -25,7 +25,7 @@ from .engine import ArbEngine
 from .gateways.base import HLGateway
 from .gateways.hl import Mark
 from .gateways.hl_ws import HLWebSocketClient
-from .gateways.ls import LSApiGateway
+from .gateways.ls import LSApiGateway, OrderGoneError
 from .gateways.ls_ws import (
     ExpectedPrice,
     Fill,
@@ -138,16 +138,20 @@ class LiveSystem:
         """가격 정정 (venue 라우팅) — 새 주문번호를 등록하고 원주문은 취소 처리.
 
         LS는 CSPAT00701/CFOAT00200, HL은 modify 액션(취소+신규를 서버에서 한 번에).
+        수량은 **잔량 기준**으로 보낸다 — 부분체결 후 원수량 정정은 거부됨(실측 01442).
         """
         order = self.order_book.order(order_id)
         if order is None:
             raise ValueError(f"unknown order {order_id}")
+        qty = order.remaining_qty
+        if qty <= 0:
+            raise OrderGoneError(f"order {order_id} has no remaining qty")
         if order.intent.venue is Venue.LS:
-            new_id = await self._gw.amend_order(order_id, price=price)
+            new_id = await self._gw.amend_order(order_id, qty=qty, price=price)
         else:
             assert self._hl is not None
-            new_id = await self._hl.amend_order(order_id, price=price)
-        new_intent = order.intent.model_copy(update={"price": price})
+            new_id = await self._hl.amend_order(order_id, qty=qty, price=price)
+        new_intent = order.intent.model_copy(update={"price": price, "qty": qty})
         self.order_book.track(new_id, new_intent)
         if new_id != order_id:
             self.order_book.on_cancel(order_id)  # 원주문은 정정으로 소멸
