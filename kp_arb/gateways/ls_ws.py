@@ -203,12 +203,17 @@ class LSWebSocketClient:
         self._add(FX_TRADE_TR, code)
 
     def subscribe_trades(self, underlying: Underlying) -> None:
-        """주식 체결(현재가)·예상체결 구독 — KRX(S3_/YS3) + 통합(US3/UYS, NXT 포함)."""
+        """주식·ETF 체결(현재가)·예상체결 구독 — KRX(S3_/YS3) + 통합(US3/UYS, NXT 포함)."""
         code = underlying.krx_code
         self._add("S3_", code)   # KRX 전용 체결 — 이론가 기준가용(항상 필요)
         self._add("YS3", code)
         self._add("US3", _unified_key(code))  # 통합 체결(NXT 포함) — 운영 전용
         self._add("UYS", _unified_key(code))
+        etf = self._etf_symbols.get(underlying)
+        if etf is not None:
+            # ETF 자신의 체결(현재가) — 괴리율의 분자 (예상체결은 주식만)
+            self._add("S3_", etf)
+            self._add("US3", _unified_key(etf))
 
     def subscribe_fills(self) -> None:
         """주식+선물 체결통보 전부 구독(단일 연결용 — 계좌 통보는 해당 토큰 계좌 것만 온다)."""
@@ -341,18 +346,20 @@ class LSWebSocketClient:
                 return None
             instrument, underlying = Instrument.KR_STOCK, stock_underlying
         # 실측 필드: bidho1~10/offerho1~10(호가), bidrem/offerrem(잔량), hotime(HHMMSS).
+        # 통합(UH1)의 잔량은 unt_bidrem/unt_offerrem (RTD 실측 이관).
         tr_cd = msg.get("header", {}).get("tr_cd", "")
+        rem = "unt_" if tr_cd == "UH1" else ""
         return Quote(
             underlying=underlying,
             instrument=instrument,
             bid=float(body["bidho1"]),
             ask=float(body["offerho1"]),
             ts=float(body["hotime"]),
-            bid_qty=float(body.get("bidrem1", 0) or 0),
-            ask_qty=float(body.get("offerrem1", 0) or 0),
+            bid_qty=float(body.get(f"{rem}bidrem1", 0) or 0),
+            ask_qty=float(body.get(f"{rem}offerrem1", 0) or 0),
             market={"NH1": "nxt", "UH1": "uni"}.get(tr_cd, "krx"),
-            bids=_depth(body, "bidho", "bidrem"),
-            asks=_depth(body, "offerho", "offerrem"),
+            bids=_depth(body, "bidho", f"{rem}bidrem"),
+            asks=_depth(body, "offerho", f"{rem}offerrem"),
         )
 
     def _parse_futures_quote(self, msg: dict[str, Any]) -> Quote | None:

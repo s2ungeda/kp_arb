@@ -337,7 +337,8 @@ async def test_unified_quote_and_trade_parse() -> None:
     # 통합 TR: UH1(호가)/US3(체결), tr_key "U"+코드+공백3, market="uni".
     uh1 = json.dumps({"header": {"tr_cd": "UH1", "tr_key": f"U{SAMSUNG_CODE}   "},
                       "body": {"shcode": SAMSUNG_CODE, "bidho1": "70100",
-                               "offerho1": "70200", "hotime": "090001"}})
+                               "offerho1": "70200", "hotime": "090001",
+                               "unt_bidrem1": "150", "unt_offerrem1": "80"}})
     us3 = json.dumps({"header": {"tr_cd": "US3", "tr_key": f"U{SAMSUNG_CODE}   "},
                       "body": {"shcode": f"U{SAMSUNG_CODE}   ", "price": "70150",
                                "chetime": "090001"}})
@@ -353,6 +354,7 @@ async def test_unified_quote_and_trade_parse() -> None:
     await client.run()
 
     assert quotes[0].market == "uni" and quotes[0].bid == 70_100
+    assert quotes[0].bid_qty == 150 and quotes[0].ask_qty == 80  # 통합 잔량은 unt_* 필드
     assert trades[0].market == "uni" and trades[0].price == 70_150
     # 구독에 통합 키("U"+코드+공백3)가 포함돼야 한다
     assert any(f"U{SAMSUNG_CODE}   " in m and '"UH1"' in m for m in session.sent)

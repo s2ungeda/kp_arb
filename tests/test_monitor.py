@@ -24,19 +24,26 @@ def test_ls_rows_shape_and_values() -> None:
     rows = state.ls_rows()
     assert len(rows) == 9  # 3종목 × (주식/선물/ETF)
     stock = rows[0]
-    # (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상가, 이론가)
+    # (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상가, 이론가, 괴리율%)
     assert stock == ("삼성전자 주식", "50", "293,000", "292,800",
-                     "292,500", "100", "292,700", "-")
+                     "292,500", "100", "292,700", "-", "-")
     assert rows[1][0] == "선물" and rows[1][2] == "-"  # 미수신은 '-'
 
 
-def test_ls_rows_theory_only_on_etf() -> None:
-    # 이론가는 ETF 행에만 표시된다 (주식/선물 행은 '-').
+def test_ls_rows_theory_and_disparity() -> None:
+    # 이론가는 선물·ETF 행에 표시, 괴리율 = (현재가-이론가)/이론가×100.
     state = MonitorState()
-    rows = state.ls_rows({SAMSUNG: 10_200.0})
-    assert rows[0][-1] == "-"          # 주식
-    assert rows[1][-1] == "-"          # 선물
-    assert rows[2][-1] == "10,200"     # ETF
+    state.on_trade(TradeTick(underlying=SAMSUNG, instrument=Instrument.KR_ETF,
+                             price=10_302))
+    rows = state.ls_rows({
+        (SAMSUNG, Instrument.KR_ETF): 10_200.0,
+        (SAMSUNG, Instrument.KR_STOCK_FUTURE): 293_500.0,
+    })
+    assert rows[0][7] == "-"                     # 주식: 이론가 없음
+    assert rows[1][7] == "293,500"               # 선물 이론가 (현재가 없어 괴리율 '-')
+    assert rows[1][8] == "-"
+    assert rows[2][7] == "10,200"                # ETF 이론가
+    assert rows[2][8] == "+1.00"                 # (10302-10200)/10200 = +1.00%
 
 
 def test_krx_nxt_quotes_merged_like_hts() -> None:
