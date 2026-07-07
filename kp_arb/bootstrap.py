@@ -16,7 +16,8 @@ HL 게이트웨이는 슬롯만 예비(라이브 결선 시 추가).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 from .config import LSAccounts
 from .domain.enums import Account, Instrument, Underlying, Venue
@@ -253,11 +254,26 @@ class LiveSystem:
         await self.refresh_snapshot()
         self._seed_session_from_env()
         self._wire()
-        self._tasks = [asyncio.create_task(self._stock_ws.run())]
+        self._tasks = [asyncio.create_task(self._guarded_ws("주식", self._stock_ws.run()))]
         if self._deriv_ws is not None:
-            self._tasks.append(asyncio.create_task(self._deriv_ws.run()))
+            self._tasks.append(
+                asyncio.create_task(self._guarded_ws("선물", self._deriv_ws.run()))
+            )
         if self._hl_ws is not None:
-            self._tasks.append(asyncio.create_task(self._hl_ws.run()))
+            self._tasks.append(asyncio.create_task(self._guarded_ws("HL", self._hl_ws.run())))
+
+    @staticmethod
+    async def _guarded_ws(name: str, run: Coroutine[Any, Any, None]) -> None:
+        """WS 하나가 죽어도 전체를 멈추지 않는다 — 예: KP_MODE=live인데 선물 키가
+        모의뿐이면 선물 WS만 실패(토큰 불일치). 경고만 남기고 그 채널 없이 계속."""
+        import logging
+
+        try:
+            await run
+        except Exception:  # noqa: BLE001 - 채널 단위 격리
+            logging.getLogger("kp_arb.bootstrap").exception(
+                "%s WS 중단 — 해당 채널 없이 계속", name
+            )
 
     # --- 엔진 연결 (실시간 시세·포지션·잔고 → 전략 판단) ---
 
