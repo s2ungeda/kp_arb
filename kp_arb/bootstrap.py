@@ -98,13 +98,16 @@ class LiveSystem:
         futures_symbols: dict[Underlying, str] | None = None,
         etf_symbols: dict[Underlying, str] | None = None,
         futures_expiry: dict[Underlying, int] | None = None,
+        fx_futures: tuple[str, int] | None = None,
     ) -> None:
         self._gw = gateway
         # 취급 종목코드 (공개 — UI/도구가 상품 가용성 판단에 사용. 예: 현대차 ETF 없음)
         self.futures_symbols = dict(futures_symbols or {})
         self.etf_symbols = dict(etf_symbols or {})
         self.futures_expiry = dict(futures_expiry or {})  # 만기 YYYYMM (캐리 잔존일용)
-        # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — _fx_loop가 주기 갱신.
+        # 원달러선물 (shcode, 만기YYYYMM) — t8426 최근월물 (bootstrap_live에서 조회).
+        self._fx_futures = fx_futures
+        # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — WS(FC0) 실시간 + 예비 조회 갱신.
         self.usdkrw_theory: float | None = None
         self._hl = hl_gateway
         self._hl_ws = hl_ws
@@ -257,6 +260,10 @@ class LiveSystem:
             self._stock_ws.subscribe_futures_quotes(self.futures_symbols)
         self._stock_ws.subscribe_market_status()
         self._stock_ws.subscribe_stock_fills()
+        if self._fx_futures is not None:
+            # 원달러선물 체결(FC0) 실시간 → 환율이론가 (예비는 _fx_loop 30초 조회)
+            self._stock_ws.subscribe_fx(self._fx_futures[0])
+            self._stock_ws.on_fx_price.append(self._apply_fx_price)
         self._stock_ws.on_quote.append(fan_quote)
         self._stock_ws.on_trade.append(fan_trade)
         self._stock_ws.on_expected.append(fan_expected)
@@ -301,29 +308,29 @@ class LiveSystem:
         if self._hl_ws is not None:
             self._tasks.append(asyncio.create_task(self._guarded_ws("HL", self._hl_ws.run())))
 
-    async def _fx_loop(self) -> None:
-        """환율이론가 갱신 — 원달러선물(t8426 최근월물)을 주간에 t2111로 반복 조회.
+    def _apply_fx_price(self, price: float) -> None:
+        """원달러선물 현재가 → 환율이론가(현물환산) 갱신. WS(FC0)·예비 조회 공용."""
+        from datetime import date
 
-        통화선물은 주간 WS 시세가 없어(실측) 예외적으로 반복 조회를 쓴다(DESIGN §6.1).
-        야간·주말은 마지막 값 유지. 실패해도 시스템은 계속(환율 없으면 HL 괴리만 빈값).
+        if self._fx_futures is None or price <= 0:
+            return
+        _, ym = self._fx_futures
+        days = days_to_expiry(ym, "USD", date.today())
+        self.usdkrw_theory = carry_theory(price, days, FX_CARRY_RATE)
+
+    async def _fx_loop(self) -> None:
+        """환율 예비 갱신 — 시동 직후 초기값 + 30초 간격 확인 조회(t2111).
+
+        본선은 WS(FC0, K200선물 계열 TR — 사용자 확인) 실시간이고, 이 루프는
+        WS가 조용할 때(체결 없음·미실측 필드 불일치)의 안전망이다. 주간(08~16시)만.
         """
         import logging
-        from datetime import date, datetime
+        from datetime import datetime
 
+        if self._fx_futures is None:
+            return
+        code, _ = self._fx_futures
         log = logging.getLogger("kp_arb.bootstrap")
-        try:
-            selected = select_usd_futures(
-                await self._gw.fetch_commodity_master(), datetime.now()
-            )
-        except Exception:  # noqa: BLE001
-            log.warning("원달러선물 마스터(t8426) 조회 실패 — 환율이론가 없이 계속",
-                        exc_info=True)
-            return
-        if selected is None:
-            log.warning("원달러선물 월물을 찾지 못함 — 환율이론가 없이 계속")
-            return
-        code, ym = selected
-        log.info("원달러선물 최근월물: %s (만기 %s)", code, ym)
         failures = 0
         while True:
             hour = datetime.now().hour
@@ -333,15 +340,14 @@ class LiveSystem:
             try:
                 price = await self._gw.get_fx_futures_price(code)
                 if price is not None:
-                    days = days_to_expiry(ym, "USD", date.today())
-                    self.usdkrw_theory = carry_theory(price, days, FX_CARRY_RATE)
+                    self._apply_fx_price(price)
                 failures = 0
             except Exception:  # noqa: BLE001
                 failures += 1
                 if failures == 1:  # 반복 실패는 첫 번째만 기록
                     log.warning("원달러선물 시세(t2111) 조회 실패 — 재시도 계속",
                                 exc_info=True)
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(30.0)
 
     # --- 괴리 보드 (DESIGN §6.1 — 모니터·전략 공용) ---
 
@@ -509,6 +515,16 @@ async def bootstrap_live(
     near_month = select_near_month(await gateway.fetch_futures_master())
     futures_symbols = {u: sh for u, (sh, _) in near_month.items()}
     futures_expiry = {u: ym for u, (_, ym) in near_month.items()}
+    # 원달러선물 최근월물 (환율이론가용, DESIGN §6.1) — 실패해도 시동 계속
+    fx_futures = None
+    try:
+        from datetime import datetime
+
+        fx_futures = select_usd_futures(
+            await gateway.fetch_commodity_master(), datetime.now()
+        )
+    except Exception:  # noqa: BLE001
+        pass  # 환율이론가 없이 계속 (HL 괴리만 빈값)
     gateway = LSApiGateway.from_accounts(
         accounts,
         token_transport=token_tx,
@@ -548,6 +564,7 @@ async def bootstrap_live(
         futures_symbols=futures_symbols,
         etf_symbols=etf_symbols,
         futures_expiry=futures_expiry,
+        fx_futures=fx_futures,
     )
 
 

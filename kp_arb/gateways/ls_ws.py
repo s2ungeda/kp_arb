@@ -33,6 +33,7 @@ QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1"})  # KRX/NXT 호가
 FUTURES_QUOTE_TR = "JH0"   # 주식선물 호가 (body 필드는 H1_와 동일 가정 — 장중 실확인 예정)
 STOCK_TRADE_TRS: tuple[str, ...] = ("S3_", "NS3")  # 체결(현재가): KRX/NXT
 FUTURES_TRADE_TR = "JC0"   # 주식선물 체결 (동일 가정)
+FX_TRADE_TR = "FC0"        # 통화선물 체결 — K200선물 계열 TR로 수신 가능(사용자 확인, 실측 예정)
 EXPECTED_TRS: tuple[str, ...] = ("YS3", "NYS")     # 예상체결: KRX(실측)/NXT
 # 주의: 모의 서버(29443)는 NXT 계열(NH1/NS3/NYS) 실시간을 중계하지 않는 것으로
 # 실측됨(구독 ACK만 정상, 데이터 0) — NXT 시세는 실전 시세 접속에서 확인.
@@ -159,6 +160,8 @@ class LSWebSocketClient:
         self.on_fill: list[Callable[[Fill], None]] = []
         self.on_order_event: list[Callable[[OrderEvent], None]] = []
         self.on_market_status: list[Callable[[MarketStatus], None]] = []
+        self.on_fx_price: list[Callable[[float], None]] = []  # 통화선물 체결가 (FC0)
+        self._fx_codes: set[str] = set()
         self.on_raw: list[Callable[[str], None]] = []  # 진단: 모든 원시 프레임
 
     # --- 구독 등록(희망 상태). 실제 전송은 connect 시 _resubscribe ---
@@ -178,6 +181,11 @@ class LSWebSocketClient:
             self._futures_underlying[code] = underlying
             self._add(FUTURES_QUOTE_TR, code)
             self._add(FUTURES_TRADE_TR, code)
+
+    def subscribe_fx(self, code: str) -> None:
+        """통화선물(원달러) 체결 구독 → on_fx_price. 환율이론가 계산용 (DESIGN §6.1)."""
+        self._fx_codes.add(code)
+        self._add(FX_TRADE_TR, code)
 
     def subscribe_trades(self, underlying: Underlying) -> None:
         """주식 체결(현재가)·예상체결 구독 — KRX(S3_/YS3) + NXT(NS3/NYS)."""
@@ -282,7 +290,25 @@ class LSWebSocketClient:
             status = self._parse_status(msg)
             for status_handler in self.on_market_status:
                 status_handler(status)
+        elif tr_cd == FX_TRADE_TR:
+            fx_price = self._parse_fx(msg)
+            if fx_price is not None:
+                for fx_handler in self.on_fx_price:
+                    fx_handler(fx_price)
         # 알 수 없는 tr_cd는 무시
+
+    def _parse_fx(self, msg: dict[str, Any]) -> float | None:
+        # FC0 체결가 필드는 'price' 가정(실측 예정 — 다르면 on_raw로 확인).
+        body = msg["body"]
+        code = str(body.get("focode") or body.get("shcode")
+                   or msg.get("header", {}).get("tr_key", ""))
+        if self._fx_codes and code not in self._fx_codes:
+            return None
+        try:
+            price = float(body["price"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return price if price > 0 else None
 
     def _parse_quote(self, msg: dict[str, Any]) -> Quote | None:
         body = msg["body"]

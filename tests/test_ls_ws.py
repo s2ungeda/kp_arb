@@ -313,3 +313,21 @@ async def test_quote_carries_full_depth() -> None:
     assert quotes[0].asks is not None and len(quotes[0].asks) == 10
     assert quotes[0].bids[0] == (69_900.0, 10.0)
     assert quotes[0].asks[9] == (71_000.0, 50.0)
+
+
+async def test_fx_trade_updates_price() -> None:
+    # FC0(통화선물 체결, K200 계열 TR) → on_fx_price. 구독한 종목코드만.
+    frame = json.dumps({"header": {"tr_cd": "FC0", "tr_key": "175W07"},
+                        "body": {"focode": "175W07", "price": "1530.1"}})
+    other = json.dumps({"header": {"tr_cd": "FC0", "tr_key": "175W08"},
+                        "body": {"focode": "175W08", "price": "1999.0"}})
+    session = FakeConnection([other, frame])
+    client = LSWebSocketClient(FakeConnector([session]))
+    client.subscribe_fx("175W07")
+    prices: list[float] = []
+    client.on_fx_price.append(prices.append)
+
+    await client.run()
+
+    assert prices == [1530.1]  # 다른 월물은 무시
+    assert any('"FC0"' in msg and '"175W07"' in msg for msg in session.sent)  # 구독 전송
