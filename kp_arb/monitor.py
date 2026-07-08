@@ -137,10 +137,13 @@ class MonitorState:
                 name = ""  # 같은 종목은 첫 행에만 이름
         return rows
 
-    def hl_rows(self, now_epoch: float | None = None) -> list[tuple[str, ...]]:
+    def hl_rows(
+        self, now_epoch: float | None = None, fx: float | None = None
+    ) -> list[tuple[str, ...]]:
         """HL 표 행 — 현재가는 실제 체결가, 마크(청산·펀딩 기준가)는 별도 컬럼.
 
-        (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 마크, 펀딩전, 펀딩피, 남은시간)
+        (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 마크, 원화환산, 오라클,
+         펀딩전, 펀딩피, 남은시간). 원화환산 = HL 현재가 × 환율이론가 (엑셀 AA7).
         """
         now = now_epoch if now_epoch is not None else time.time()
         countdown = funding_countdown(now)
@@ -149,14 +152,17 @@ class MonitorState:
             quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
             prev = self.funding_prev.get(u)
             nxt = self.funding_next.get(u)
+            last = self.trades.get((u, Instrument.HL_PERP))
+            krw = last * fx if last is not None and fx is not None else None
             rows.append((
                 _NAMES[u],
                 _fmt(quote.ask_qty if quote else None, decimals=3),
                 _fmt(quote.ask if quote else None, decimals=2),
-                _fmt(self.trades.get((u, Instrument.HL_PERP)), decimals=2),  # 체결가만
+                _fmt(last, decimals=2),               # 현재가 = 체결가만
                 _fmt(quote.bid if quote else None, decimals=2),
                 _fmt(quote.bid_qty if quote else None, decimals=3),
                 _fmt(self.marks.get(u), decimals=2),  # 마크(기준가) 별도 표시
+                _fmt(krw),                            # 원화환산 (엑셀 AA7)
                 _fmt(self.oracles.get(u), decimals=2),  # 오라클(지수가, 엑셀 C7)
                 f"{prev * 100:.4f}%" if prev is not None else "-",
                 f"{nxt * 100:.4f}%" if nxt is not None else "-",
@@ -249,7 +255,7 @@ def main() -> None:
     hl_tree = make_tree(root, [
         ("name", "종목", 85), ("ask_qty", "매도잔량", 58), ("ask", "매도가", 62),
         ("last", "현재가", 62), ("bid", "매수가", 62), ("bid_qty", "매수잔량", 58),
-        ("mark", "마크", 62), ("oracle", "오라클", 62),
+        ("mark", "마크", 62), ("krw", "원화환산", 76), ("oracle", "오라클", 62),
         ("fprev", "펀딩전", 60), ("fnext", "펀딩피", 60),
         ("cd", "남은시간", 52),
     ], height=3)
@@ -353,7 +359,8 @@ def main() -> None:
                 theory[(u, Instrument.KR_ETF)] = system.etf_theory_price(u)
                 theory[(u, Instrument.KR_STOCK_FUTURE)] = system.stock_futures_theory(u)
         fill_tree(ls_tree, state.ls_rows(theory))
-        fill_tree(hl_tree, state.hl_rows())
+        fill_tree(hl_tree, state.hl_rows(
+            fx=system.usdkrw_theory if system is not None else None))
         if system is not None:
             fill_tree(board_tree, board_rows(system))
             record_spreads(system)
