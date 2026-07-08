@@ -35,10 +35,12 @@ FIXTURES: dict[str, dict[str, Any]] = {
              "MrcAbleQty": 0, "OrdprcPtnCode": "03"},  # 전량 체결 → 제외 대상
         ],
     },
-    "CFOAQ50600": {
-        "rsp_cd": "00136",
-        "CFOAQ50600OutBlock3": [
-            {"IsuNo": "005930", "BalQty": 2, "AvrPrc": 71_000, "BnsTpCode": "1"},
+    # t0441 실측 행(운영): expcode(선물코드)/medocd(1매도 2매수)/jqty/pamt.
+    "t0441": {
+        "rsp_cd": "00000",
+        "t0441OutBlock1": [
+            {"expcode": "A1167000", "medocd": "1", "jqty": 2, "pamt": "71000.00",
+             "price": "71500.00", "cqty": 2},
         ],
     },
 }
@@ -77,13 +79,20 @@ class AccountTransport:
         return RestResponse(status_code=200, body=FIXTURES[tr])
 
 
-def _gateway(transport: Any, *, etf_symbols: dict[Underlying, str] | None = None) -> LSApiGateway:
+def _gateway(
+    transport: Any,
+    *,
+    etf_symbols: dict[Underlying, str] | None = None,
+    futures_symbols: dict[Underlying, str] | None = None,
+) -> LSApiGateway:
     clock = _Clock()
     tm = TokenManager("k", "s", _TokenStub(), now=clock)
     rl = RateLimiter(now=clock, default_per_second=100)
     rest = LSRestClient(BASE_URL, tm, transport, rl)
     return LSApiGateway({Account.KR_STOCK: rest, Account.KR_DERIV: rest},
-                        etf_symbols=etf_symbols)
+                        etf_symbols=etf_symbols,
+                        futures_symbols=futures_symbols
+                        or {Underlying.SAMSUNG: "A1167000"})
 
 
 # --- 잔고(예수금/증거금) ---
@@ -135,8 +144,8 @@ async def test_deriv_positions_parsed_to_deriv_account() -> None:
     pos = positions[0]
     assert pos.account is Account.KR_DERIV
     assert pos.instrument is Instrument.KR_STOCK_FUTURE
-    assert pos.side is Side.SELL  # BnsTpCode "1" = 매도
-    assert pos.underlying is Underlying.SAMSUNG
+    assert pos.side is Side.SELL  # medocd "1" = 매도 (t0441 실측)
+    assert pos.underlying is Underlying.SAMSUNG  # expcode A1167000 → 삼성 선물
     assert pos.qty == 2 and pos.avg_price == 71_000
 
 
@@ -145,7 +154,7 @@ async def test_positions_route_to_different_trs() -> None:
     gw = _gateway(transport)
     await gw.get_positions(Account.KR_STOCK)
     await gw.get_positions(Account.KR_DERIV)
-    assert transport.seen_trs == ["CSPAQ12300", "CFOAQ50600"]
+    assert transport.seen_trs == ["CSPAQ12300", "t0441"]
 
 
 async def test_etf_position_recognized() -> None:
@@ -214,7 +223,7 @@ async def test_rejected_balance_raises() -> None:
 
 
 async def test_deriv_positions_paper_unsupported_returns_empty() -> None:
-    # 실측 v6.1: 모의는 CFOAQ50600 미제공(rsp_cd 01900) — 오류가 아니라 빈 결과.
+    # 실측 v6.1: 모의 미제공 TR(rsp_cd 01900)은 오류가 아니라 빈 결과.
     class Unsupported(AccountTransport):
         async def request(
             self,

@@ -79,7 +79,7 @@ class LSApiGateway(LSGateway):
     STOCK_POSITIONS_TR = "CSPAQ12300"   # 주식 잔고 (대안 t0424)
     STOCK_OPEN_ORDERS_TR = "CSPAQ13700" # 주식 체결/미체결 (InBlock1 래핑, 실측 v6.5)
     DERIV_DEPOSIT_TR = "CFOBQ10500"     # 선물옵션 예탁금·증거금 (get_balance)
-    DERIV_POSITIONS_TR = "CFOAQ50600"   # 선물옵션 잔고·평가 (get_positions, 모의 미제공→빈결과)
+    DERIV_POSITIONS_TR = "t0441"        # 선물옵션 잔고평가 (운영 실측 — CFOAQ50600은 거부)
     STOCK_ACC_PATH = "/stock/accno"
     DERIV_ACC_PATH = "/futureoption/accno"
     FUTURES_MASTER_TR = "t8401"         # 주식선물 마스터 (종목코드 조회, 실측 v6.7)
@@ -198,22 +198,27 @@ class LSApiGateway(LSGateway):
         self._check_ok(resp, tr_cd)
 
     async def get_positions(self, account: Account) -> Sequence[Position]:
-        """계좌별 잔고(포지션) 조회. 주식 CSPAQ12300 / 선물 FOCCQ33600."""
+        """계좌별 잔고(포지션) 조회. 주식 CSPAQ12300 / 선물 t0441(운영 실측)."""
         if account is Account.KR_STOCK:
             resp = await self._rest_for(account).request(
                 self.STOCK_POSITIONS_TR, self._account_fields(account), path=self.STOCK_ACC_PATH
             )
             rows = self._rows(resp, self.STOCK_POSITIONS_TR)
             return [p for r in rows if (p := self._stock_position(r)) is not None]
-        # 운영 실측: flat 본문은 09604(입력 포맷) 거부 → InBlock1 래핑 (모의는 01900 미제공).
+        # 운영 실측: CFOAQ50600은 형식을 맞춰도 거부(09604/08001) → t0441 사용.
+        fields = self._account_fields(account)
         resp = await self._rest_for(account).request(
             self.DERIV_POSITIONS_TR,
-            {f"{self.DERIV_POSITIONS_TR}InBlock1": {
-                "RecCnt": 1, **self._account_fields(account),
+            {f"{self.DERIV_POSITIONS_TR}InBlock": {
+                "accno": fields.get("AcntNo", ""), "passwd": fields.get("Pwd", ""),
             }},
             path=self.DERIV_ACC_PATH,
         )
-        rows = self._rows(resp, self.DERIV_POSITIONS_TR)
+        if str(resp.body.get("rsp_cd", "")) in _PAPER_UNSUPPORTED_RSP_CDS:
+            return []  # 모의 미제공이면 빈 결과
+        self._check_ok(resp, self.DERIV_POSITIONS_TR)
+        raw_rows = resp.body.get(f"{self.DERIV_POSITIONS_TR}OutBlock1")
+        rows = list(raw_rows) if isinstance(raw_rows, list) else []
         return [p for r in rows if (p := self._deriv_position(r)) is not None]
 
     async def get_balance(self, account: Account) -> float:
@@ -468,17 +473,25 @@ class LSApiGateway(LSGateway):
         )
 
     def _deriv_position(self, row: dict[str, Any]) -> Position | None:
-        underlying = Underlying.from_krx_code(str(row["IsuNo"]))
+        # t0441 실측 행: expcode(선물코드 "A5067000"), medocd(1매도/2매수),
+        # jqty(잔고수량), pamt(평균단가 문자열). 취급 외 종목(실계좌 보유)은 건너뜀.
+        code = str(row.get("expcode", ""))
+        underlying = next(
+            (u for u, sh in self._futures_symbols.items() if sh == code), None
+        )
         if underlying is None:
-            return None  # 취급 외 종목 — 추적 대상 아님
-        side = Side.BUY if str(row["BnsTpCode"]) == "2" else Side.SELL  # 1매도 2매수
+            return None  # 취급 외 종목(예: 원달러선물 보유분) — 추적 대상 아님
+        qty = float(row.get("jqty") or 0)
+        if qty <= 0:
+            return None
+        side = Side.BUY if str(row.get("medocd")) == "2" else Side.SELL  # 1매도 2매수
         return Position(
             venue=Venue.LS,
             instrument=Instrument.KR_STOCK_FUTURE,
             underlying=underlying,
             side=side,
-            qty=float(row["BalQty"]),
-            avg_price=float(row["AvrPrc"]),
+            qty=qty,
+            avg_price=float(row.get("pamt") or 0),
             account=Account.KR_DERIV,
         )
 
