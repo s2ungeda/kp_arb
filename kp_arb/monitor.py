@@ -252,11 +252,12 @@ def main() -> None:
     tk.Label(root, text="괴리 보드 (%, HL vs 국내 — 진입=HL매수d−국내매도d)",
              anchor="w", font=font).pack(fill="x", padx=4)
     board_tree = make_tree(root, [
-        ("name", "쌍", 120), ("hl_cur", "HL현재d", 64),               # 엑셀 메인 I22
-        ("hl_ask", "HL매도d", 64), ("hl_bid", "HL매수d", 64),
-        ("kr_cur", "국내현재d", 64),                                  # 엑셀 메인 K19/M19
-        ("kr_ask", "국내매도d", 66), ("kr_bid", "국내매수d", 66),
+        ("name", "쌍", 120),
+        ("hl_cur", "HL현재d", 64),   # 엑셀 메인 I22
+        ("kr_cur", "국내현재d", 64),  # 엑셀 메인 K19/M19
         ("entry", "진입", 60), ("exit", "청산", 60),
+        ("hl_ask", "HL매도d", 64), ("hl_bid", "HL매수d", 64),
+        ("kr_ask", "국내매도d", 66), ("kr_bid", "국내매수d", 66),
     ], height=5)
 
     status = tk.Label(root, text="연결 중 ...", anchor="w", font=font)
@@ -277,11 +278,11 @@ def main() -> None:
         ):
             rows.append((
                 f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
-                pct(pair.hl_last),
+                pct(pair.hl_last),                              # I22
+                pct(pair.kr_last),                              # K19/M19
+                pct(pair.spread.entry), pct(pair.spread.exit),  # K22/K24
                 pct(pair.hl.ask), pct(pair.hl.bid),
-                pct(pair.kr_last),
                 pct(pair.kr.ask), pct(pair.kr.bid),
-                pct(pair.spread.entry), pct(pair.spread.exit),
             ))
         return rows
 
