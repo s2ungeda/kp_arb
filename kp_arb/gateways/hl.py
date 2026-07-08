@@ -27,11 +27,12 @@ class HLError(RuntimeError):
 
 
 class Mark(BaseModel):
-    """perp 마크 가격 이벤트."""
+    """perp 마크 가격 이벤트 (+ 오라클 — 외부 지수가, 엑셀 '오라클' 대응)."""
 
     underlying: Underlying
     price: float
     ts: float = 0.0
+    oracle: float | None = None  # activeAssetCtx.oraclePx
 
 
 class HLTransport(Protocol):

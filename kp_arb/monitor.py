@@ -61,6 +61,7 @@ class MonitorState:
     trades: dict[tuple[Underlying, Instrument], float] = field(default_factory=dict)
     expected: dict[tuple[Underlying, Instrument], float] = field(default_factory=dict)
     marks: dict[Underlying, float] = field(default_factory=dict)
+    oracles: dict[Underlying, float] = field(default_factory=dict)  # HL 오라클(지수가)
     funding_next: dict[Underlying, float] = field(default_factory=dict)  # 예정(펀딩피)
     funding_prev: dict[Underlying, float] = field(default_factory=dict)  # 직전
     last_update: float = 0.0
@@ -95,6 +96,8 @@ class MonitorState:
 
     def on_mark(self, mark: Mark) -> None:
         self.marks[mark.underlying] = mark.price
+        if mark.oracle is not None:
+            self.oracles[mark.underlying] = mark.oracle
         self.last_update = time.time()
 
     def on_funding(self, underlying: Underlying, rate: float) -> None:
@@ -154,6 +157,7 @@ class MonitorState:
                 _fmt(quote.bid if quote else None, decimals=2),
                 _fmt(quote.bid_qty if quote else None, decimals=3),
                 _fmt(self.marks.get(u), decimals=2),  # 마크(기준가) 별도 표시
+                _fmt(self.oracles.get(u), decimals=2),  # 오라클(지수가, 엑셀 C7)
                 f"{prev * 100:.4f}%" if prev is not None else "-",
                 f"{nxt * 100:.4f}%" if nxt is not None else "-",
                 countdown,
@@ -245,7 +249,8 @@ def main() -> None:
     hl_tree = make_tree(root, [
         ("name", "종목", 85), ("ask_qty", "매도잔량", 58), ("ask", "매도가", 62),
         ("last", "현재가", 62), ("bid", "매수가", 62), ("bid_qty", "매수잔량", 58),
-        ("mark", "마크", 62), ("fprev", "펀딩전", 60), ("fnext", "펀딩피", 60),
+        ("mark", "마크", 62), ("oracle", "오라클", 62),
+        ("fprev", "펀딩전", 60), ("fnext", "펀딩피", 60),
         ("cd", "남은시간", 52),
     ], height=3)
 

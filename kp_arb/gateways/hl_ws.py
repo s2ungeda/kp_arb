@@ -148,8 +148,10 @@ class HLWebSocketClient:
         ctx = data.get("ctx", {})
         if underlying is None or "markPx" not in ctx:
             return None
+        oracle_raw = ctx.get("oraclePx")
         return Mark(underlying=underlying, price=float(ctx["markPx"]),
-                    ts=float(ctx.get("time", 0.0)))
+                    ts=float(ctx.get("time", 0.0)),
+                    oracle=float(oracle_raw) if oracle_raw not in (None, "") else None)
 
     def _emit_funding(self, data: dict[str, Any]) -> None:
         underlying = self._by_symbol.get(str(data.get("coin", "")))
