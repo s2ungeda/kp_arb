@@ -281,6 +281,7 @@ def main() -> None:
         ("주선차", 8, "black"),   # 엑셀 메인 K19/M19 (국내 현재가 괴리)
         ("진입", 8, "red"),
         ("청산", 8, "blue"),
+        ("스프레드", 8, "black"),  # 진입 − 청산 (= 양쪽 호가 스프레드 합, 왕복 비용)
         ("HL매도d", 8, "black"), ("HL매수d", 8, "black"),
         ("국내매도d", 9, "black"), ("국내매수d", 9, "black"),
     ])
@@ -301,11 +302,15 @@ def main() -> None:
         for (u, inst), pair in sorted(
             system.disparity_board().items(), key=lambda kv: (kv[0][0].value, kv[0][1].value)
         ):
+            gap = (pair.spread.entry - pair.spread.exit
+                   if pair.spread.entry is not None and pair.spread.exit is not None
+                   else None)
             rows.append((
                 f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
                 pct(pair.hl_last),                              # I22
                 pct(pair.kr_last),                              # K19/M19
                 pct(pair.spread.entry), pct(pair.spread.exit),  # K22/K24
+                pct(gap),                                       # 진입-청산 (왕복 비용)
                 pct(pair.hl.ask), pct(pair.hl.bid),
                 pct(pair.kr.ask), pct(pair.kr.bid),
             ))
