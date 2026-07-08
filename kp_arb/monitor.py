@@ -137,13 +137,11 @@ class MonitorState:
                 name = ""  # 같은 종목은 첫 행에만 이름
         return rows
 
-    def hl_rows(
-        self, now_epoch: float | None = None, fx: float | None = None
-    ) -> list[tuple[str, ...]]:
+    def hl_rows(self, now_epoch: float | None = None) -> list[tuple[str, ...]]:
         """HL 표 행 — 현재가는 실제 체결가, 마크(청산·펀딩 기준가)는 별도 컬럼.
 
-        (종목, 매도잔량, 매도가, 현재가, 오라클, 매수가, 매수잔량, 마크, 원화환산,
-         펀딩전, 펀딩피, 남은시간). 원화환산 = HL 현재가 × 환율이론가 (엑셀 AA7).
+        (종목, 매도잔량, 매도가, 현재가, 오라클, 매수가, 매수잔량, 마크,
+         펀딩전, 펀딩피, 남은시간)
         """
         now = now_epoch if now_epoch is not None else time.time()
         countdown = funding_countdown(now)
@@ -152,18 +150,15 @@ class MonitorState:
             quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
             prev = self.funding_prev.get(u)
             nxt = self.funding_next.get(u)
-            last = self.trades.get((u, Instrument.HL_PERP))
-            krw = last * fx if last is not None and fx is not None else None
             rows.append((
                 _NAMES[u],
                 _fmt(quote.ask_qty if quote else None, decimals=3),
                 _fmt(quote.ask if quote else None, decimals=2),
-                _fmt(last, decimals=2),               # 현재가 = 체결가만
+                _fmt(self.trades.get((u, Instrument.HL_PERP)), decimals=2),  # 체결가만
                 _fmt(self.oracles.get(u), decimals=2),  # 오라클(지수가, 엑셀 C7)
                 _fmt(quote.bid if quote else None, decimals=2),
                 _fmt(quote.bid_qty if quote else None, decimals=3),
                 _fmt(self.marks.get(u), decimals=2),  # 마크(기준가) 별도 표시
-                _fmt(krw),                            # 원화환산 (엑셀 AA7)
                 f"{prev * 100:.4f}%" if prev is not None else "-",
                 f"{nxt * 100:.4f}%" if nxt is not None else "-",
                 countdown,
@@ -277,8 +272,7 @@ def main() -> None:
     fill_hl = make_grid("HL (Hyperliquid)", [
         ("종목", 9, "black"), ("매도잔량", 7, "black"), ("매도가", 8, "black"),
         ("현재가", 8, "black"), ("오라클", 8, "black"),
-        ("매수가", 8, "black"), ("매수잔량", 7, "black"),
-        ("마크", 8, "black"), ("원화환산", 9, "black"),
+        ("매수가", 8, "black"), ("매수잔량", 7, "black"), ("마크", 8, "black"),
         ("펀딩전", 8, "black"), ("펀딩피", 8, "black"), ("남은시간", 7, "black"),
     ])
     fill_board = make_grid("괴리 보드 (%, HL vs 국내 — 진입=HL매수d−국내매도d)", [
@@ -369,8 +363,7 @@ def main() -> None:
                 theory[(u, Instrument.KR_ETF)] = system.etf_theory_price(u)
                 theory[(u, Instrument.KR_STOCK_FUTURE)] = system.stock_futures_theory(u)
         fill_ls(state.ls_rows(theory))
-        fill_hl(state.hl_rows(
-            fx=system.usdkrw_theory if system is not None else None))
+        fill_hl(state.hl_rows())
         if system is not None:
             fill_board(board_rows(system))
             record_spreads(system)
