@@ -109,6 +109,7 @@ class LiveSystem:
         self._fx_futures = fx_futures
         # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — WS(FC0) 실시간 + 예비 조회 갱신.
         self.usdkrw_theory: float | None = None
+        self.usdkrw_futures: float | None = None  # 원달러선물 현재가 원값(표시용)
         self._hl = hl_gateway
         self._hl_ws = hl_ws
         self.order_book = order_book
@@ -328,6 +329,7 @@ class LiveSystem:
             return
         _, ym = self._fx_futures
         days = days_to_expiry(ym, "USD", date.today())
+        self.usdkrw_futures = price
         self.usdkrw_theory = carry_theory(price, days, FX_CARRY_RATE)
 
     async def _fx_loop(self) -> None:

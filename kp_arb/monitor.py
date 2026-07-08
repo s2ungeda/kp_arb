@@ -357,7 +357,11 @@ def main() -> None:
             deriv = system.order_book.balance(Account.KR_DERIV)
             age = time.time() - state.last_update if state.last_update else -1
             fresh = f"{age:.0f}s 전" if age >= 0 else "-"
-            status.config(text=f"장운영: {phase} | 주식 {stock:,.0f} | "
+            fx_fut = system.usdkrw_futures
+            fx_theory = system.usdkrw_theory
+            fx_text = (f"환율 {fx_fut:,.1f} (이론 {fx_theory:,.2f})"
+                       if fx_fut is not None and fx_theory is not None else "환율 -")
+            status.config(text=f"장운영: {phase} | {fx_text} | 주식 {stock:,.0f} | "
                                f"선물 {deriv:,.0f} | 수신 {fresh}")
         root.after(300, refresh)
 
