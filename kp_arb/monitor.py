@@ -273,10 +273,10 @@ def main() -> None:
         ("HL매도d", 8, "black"), ("HL매수d", 8, "black"),
         ("국내매도d", 9, "black"), ("국내매수d", 9, "black"),
     ]
-    board_frame = tk.Frame(root)
+    board_frame = tk.Frame(root, bg="white")
     board_frame.pack(fill="x", padx=6, pady=(2, 4))
     for col, (title, width, _) in enumerate(BOARD_COLS):
-        tk.Label(board_frame, text=title, font=font, width=width,
+        tk.Label(board_frame, text=title, font=font, width=width, bg="white",
                  anchor="w" if col == 0 else "e").grid(row=0, column=col, sticky="ew")
     board_labels: list[list[tk.Label]] = []
 
@@ -290,7 +290,7 @@ def main() -> None:
                 row_labels = []
                 for col, (_, width, color) in enumerate(BOARD_COLS):
                     label = tk.Label(board_frame, font=font, width=width, fg=color,
-                                     anchor="w" if col == 0 else "e")
+                                     bg="white", anchor="w" if col == 0 else "e")
                     label.grid(row=r + 1, column=col, sticky="ew")
                     row_labels.append(label)
                 board_labels.append(row_labels)
