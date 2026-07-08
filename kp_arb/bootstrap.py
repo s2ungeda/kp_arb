@@ -20,7 +20,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from .config import LSAccounts
-from .disparity import PairBoard, SideDisp, pair_spread, side_disp
+from .disparity import PairBoard, SideDisp, disp, pair_spread, side_disp
 from .domain.enums import Account, Instrument, Underlying, Venue
 from .domain.models import OrderIntent, Position, Quote
 from .engine import ArbEngine
@@ -371,8 +371,7 @@ class LiveSystem:
         """
         from datetime import date
 
-        base = (self.trades.get((underlying, Instrument.KR_STOCK, "uni"))
-                or self.trades.get((underlying, Instrument.KR_STOCK, "krx")))
+        base = self.stock_last(underlying)
         ym = self.futures_expiry.get(underlying)
         if base is None or ym is None:
             return None
@@ -390,11 +389,16 @@ class LiveSystem:
             return None, None
         return (min(q.ask for q in candidates), max(q.bid for q in candidates))
 
+    def stock_last(self, underlying: Underlying) -> float | None:
+        """기초 주식 현재가 — 통합(uni, NXT 포함) 우선, 없으면 KRX. 엑셀(RTD 현재가)과 동일."""
+        return (self.trades.get((underlying, Instrument.KR_STOCK, "uni"))
+                or self.trades.get((underlying, Instrument.KR_STOCK, "krx")))
+
     def _hl_disp(self, underlying: Underlying) -> SideDisp:
-        """HL 호가를 환율이론가로 원화 환산 → 국내 주식 현재가 대비 괴리."""
+        """HL 호가를 환율이론가로 원화 환산 → 국내 주식 현재가(통합 우선) 대비 괴리."""
         quote = self.quotes.get((underlying, Instrument.HL_PERP, "hl"))
         fx = self.usdkrw_theory
-        base = self.trades.get((underlying, Instrument.KR_STOCK, "krx"))
+        base = self.stock_last(underlying)
         if quote is None or fx is None:
             return side_disp(None, None, base)
         return side_disp(quote.ask * fx, quote.bid * fx, base)
@@ -404,6 +408,13 @@ class LiveSystem:
         board: dict[tuple[Underlying, Instrument], PairBoard] = {}
         for u in Underlying:
             hl = self._hl_disp(u)
+            # HL 현재가(체결) 괴리 — 엑셀 시세!AD열(메인 I22)
+            hl_px = self.trades.get((u, Instrument.HL_PERP, "hl"))
+            fx = self.usdkrw_theory
+            hl_last = disp(
+                hl_px * fx if hl_px is not None and fx is not None else None,
+                self.stock_last(u),
+            )
             targets: list[tuple[Instrument, float | None]] = []
             if u in self.futures_symbols:
                 targets.append(
@@ -414,7 +425,10 @@ class LiveSystem:
             for instrument, base in targets:
                 ask, bid = self._best_quote(u, instrument)
                 kr = side_disp(ask, bid, base)
-                board[(u, instrument)] = PairBoard(hl=hl, kr=kr, spread=pair_spread(hl, kr))
+                board[(u, instrument)] = PairBoard(
+                    hl=hl, kr=kr, spread=pair_spread(hl, kr),
+                    hl_last=hl_last, kr_bid_price=bid, kr_ask_price=ask,
+                )
         return board
 
     async def _seed_prices(self) -> None:

@@ -53,3 +53,6 @@ class PairBoard:
     hl: SideDisp
     kr: SideDisp
     spread: PairSpread
+    hl_last: float | None = None     # HL 현재가(체결) 괴리 — 엑셀 시세!AD열(메인 I22)
+    kr_bid_price: float | None = None  # 국내 매수호가 원값 — 엑셀 시세!AC열(메인 K18)
+    kr_ask_price: float | None = None  # 국내 매도호가 원값

@@ -252,9 +252,11 @@ def main() -> None:
     tk.Label(root, text="괴리 보드 (%, HL vs 국내 — 진입=HL매수d−국내매도d)",
              anchor="w", font=font).pack(fill="x", padx=4)
     board_tree = make_tree(root, [
-        ("name", "쌍", 130), ("hl_ask", "HL매도d", 70), ("hl_bid", "HL매수d", 70),
-        ("kr_ask", "국내매도d", 70), ("kr_bid", "국내매수d", 70),
-        ("entry", "진입", 70), ("exit", "청산", 70),
+        ("name", "쌍", 120), ("hl_cur", "HL현재d", 64),               # 엑셀 메인 I22
+        ("hl_ask", "HL매도d", 64), ("hl_bid", "HL매수d", 64),
+        ("kr_ask", "국내매도d", 66), ("kr_bid", "국내매수d", 66),
+        ("kr_bid_px", "국내매수가", 80),                              # 엑셀 메인 K18
+        ("entry", "진입", 60), ("exit", "청산", 60),
     ], height=5)
 
     status = tk.Label(root, text="연결 중 ...", anchor="w", font=font)
@@ -275,8 +277,10 @@ def main() -> None:
         ):
             rows.append((
                 f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
+                pct(pair.hl_last),
                 pct(pair.hl.ask), pct(pair.hl.bid),
                 pct(pair.kr.ask), pct(pair.kr.bid),
+                _fmt(pair.kr_bid_price),
                 pct(pair.spread.entry), pct(pair.spread.exit),
             ))
         return rows
@@ -296,11 +300,16 @@ def main() -> None:
             return
         last_csv["t"] = now
         board = system.disparity_board()
+        fx = system.usdkrw_theory
         lines = [
             (f"{time.strftime('%H:%M:%S', time.localtime(now))}",
              u.value, _PAIR_KIND[inst],
              pct(p.hl.ask), pct(p.hl.bid), pct(p.kr.ask), pct(p.kr.bid),
-             pct(p.spread.entry), pct(p.spread.exit))
+             pct(p.spread.entry), pct(p.spread.exit),
+             f"{fx:.4f}" if fx is not None else "-",          # 환율이론가 (엑셀 I1 대응)
+             _fmt(system.stock_last(u), decimals=0),          # 기초 현재가 (엑셀 D60/D58)
+             pct(p.hl_last),                                  # HL 현재가 괴리 (메인 I22)
+             _fmt(p.kr_bid_price))                            # 국내 매수호가 (메인 K18)
             for (u, inst), p in board.items()
             if p.spread.entry is not None or p.spread.exit is not None
         ]
@@ -315,7 +324,8 @@ def main() -> None:
             if new_file:
                 writer.writerow(["time", "underlying", "pair",
                                  "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
-                                 "entry", "exit"])
+                                 "entry", "exit", "usdkrw_theory", "base_last",
+                                 "hl_last_d", "kr_bid_px"])
             writer.writerows(lines)
 
     def fill_tree(tree: ttk.Treeview, rows: list[tuple[str, ...]]) -> None:
