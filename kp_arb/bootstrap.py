@@ -425,9 +425,11 @@ class LiveSystem:
             for instrument, base in targets:
                 ask, bid = self._best_quote(u, instrument)
                 kr = side_disp(ask, bid, base)
+                kr_last_px = (self.trades.get((u, instrument, "uni"))
+                              or self.trades.get((u, instrument, "krx")))
                 board[(u, instrument)] = PairBoard(
                     hl=hl, kr=kr, spread=pair_spread(hl, kr),
-                    hl_last=hl_last, kr_bid_price=bid, kr_ask_price=ask,
+                    hl_last=hl_last, kr_last=disp(kr_last_px, base),
                 )
         return board
 

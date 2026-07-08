@@ -254,8 +254,8 @@ def main() -> None:
     board_tree = make_tree(root, [
         ("name", "쌍", 120), ("hl_cur", "HL현재d", 64),               # 엑셀 메인 I22
         ("hl_ask", "HL매도d", 64), ("hl_bid", "HL매수d", 64),
+        ("kr_cur", "국내현재d", 64),                                  # 엑셀 메인 K19/M19
         ("kr_ask", "국내매도d", 66), ("kr_bid", "국내매수d", 66),
-        ("kr_bid_px", "국내매수가", 80),                              # 엑셀 메인 K18
         ("entry", "진입", 60), ("exit", "청산", 60),
     ], height=5)
 
@@ -279,8 +279,8 @@ def main() -> None:
                 f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
                 pct(pair.hl_last),
                 pct(pair.hl.ask), pct(pair.hl.bid),
+                pct(pair.kr_last),
                 pct(pair.kr.ask), pct(pair.kr.bid),
-                _fmt(pair.kr_bid_price),
                 pct(pair.spread.entry), pct(pair.spread.exit),
             ))
         return rows
@@ -309,7 +309,7 @@ def main() -> None:
              f"{fx:.4f}" if fx is not None else "-",          # 환율이론가 (엑셀 I1 대응)
              _fmt(system.stock_last(u), decimals=0),          # 기초 현재가 (엑셀 D60/D58)
              pct(p.hl_last),                                  # HL 현재가 괴리 (메인 I22)
-             _fmt(p.kr_bid_price))                            # 국내 매수호가 (메인 K18)
+             pct(p.kr_last))                                  # 국내 현재가 괴리 (메인 K19/M19)
             for (u, inst), p in board.items()
             if p.spread.entry is not None or p.spread.exit is not None
         ]
@@ -325,7 +325,7 @@ def main() -> None:
                 writer.writerow(["time", "underlying", "pair",
                                  "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
                                  "entry", "exit", "usdkrw_theory", "base_last",
-                                 "hl_last_d", "kr_bid_px"])
+                                 "hl_last_d", "kr_last_d"])
             writer.writerows(lines)
 
     def fill_tree(tree: ttk.Treeview, rows: list[tuple[str, ...]]) -> None:
