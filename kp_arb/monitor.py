@@ -142,7 +142,7 @@ class MonitorState:
     ) -> list[tuple[str, ...]]:
         """HL 표 행 — 현재가는 실제 체결가, 마크(청산·펀딩 기준가)는 별도 컬럼.
 
-        (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 마크, 원화환산, 오라클,
+        (종목, 매도잔량, 매도가, 현재가, 오라클, 매수가, 매수잔량, 마크, 원화환산,
          펀딩전, 펀딩피, 남은시간). 원화환산 = HL 현재가 × 환율이론가 (엑셀 AA7).
         """
         now = now_epoch if now_epoch is not None else time.time()
@@ -159,11 +159,11 @@ class MonitorState:
                 _fmt(quote.ask_qty if quote else None, decimals=3),
                 _fmt(quote.ask if quote else None, decimals=2),
                 _fmt(last, decimals=2),               # 현재가 = 체결가만
+                _fmt(self.oracles.get(u), decimals=2),  # 오라클(지수가, 엑셀 C7)
                 _fmt(quote.bid if quote else None, decimals=2),
                 _fmt(quote.bid_qty if quote else None, decimals=3),
                 _fmt(self.marks.get(u), decimals=2),  # 마크(기준가) 별도 표시
                 _fmt(krw),                            # 원화환산 (엑셀 AA7)
-                _fmt(self.oracles.get(u), decimals=2),  # 오라클(지수가, 엑셀 C7)
                 f"{prev * 100:.4f}%" if prev is not None else "-",
                 f"{nxt * 100:.4f}%" if nxt is not None else "-",
                 countdown,
@@ -254,22 +254,49 @@ def main() -> None:
     tk.Label(root, text="HL (Hyperliquid)", anchor="w", font=font).pack(fill="x", padx=4)
     hl_tree = make_tree(root, [
         ("name", "종목", 85), ("ask_qty", "매도잔량", 58), ("ask", "매도가", 62),
-        ("last", "현재가", 62), ("bid", "매수가", 62), ("bid_qty", "매수잔량", 58),
-        ("mark", "마크", 62), ("krw", "원화환산", 76), ("oracle", "오라클", 62),
+        ("last", "현재가", 62), ("oracle", "오라클", 62),
+        ("bid", "매수가", 62), ("bid_qty", "매수잔량", 58),
+        ("mark", "마크", 62), ("krw", "원화환산", 76),
         ("fprev", "펀딩전", 60), ("fnext", "펀딩피", 60),
         ("cd", "남은시간", 52),
     ], height=3)
 
     tk.Label(root, text="괴리 보드 (%, HL vs 국내 — 진입=HL매수d−국내매도d)",
              anchor="w", font=font).pack(fill="x", padx=4)
-    board_tree = make_tree(root, [
-        ("name", "쌍", 120),
-        ("hl_cur", "HL현재d", 64),   # 엑셀 메인 I22
-        ("kr_cur", "국내현재d", 64),  # 엑셀 메인 K19/M19
-        ("entry", "진입", 60), ("exit", "청산", 60),
-        ("hl_ask", "HL매도d", 64), ("hl_bid", "HL매수d", 64),
-        ("kr_ask", "국내매도d", 66), ("kr_bid", "국내매수d", 66),
-    ], height=5)
+    # 열별 글자색이 필요해서(진입 빨강/청산 파랑) 표 대신 라벨 격자 사용.
+    BOARD_COLS: list[tuple[str, int, str]] = [  # (제목, 글자폭, 글자색)
+        ("쌍", 14, "black"),
+        ("주H차", 8, "black"),    # 엑셀 메인 I22 (HL 현재가 괴리)
+        ("주선차", 8, "black"),   # 엑셀 메인 K19/M19 (국내 현재가 괴리)
+        ("진입", 8, "red"),
+        ("청산", 8, "blue"),
+        ("HL매도d", 8, "black"), ("HL매수d", 8, "black"),
+        ("국내매도d", 9, "black"), ("국내매수d", 9, "black"),
+    ]
+    board_frame = tk.Frame(root)
+    board_frame.pack(fill="x", padx=6, pady=(2, 4))
+    for col, (title, width, _) in enumerate(BOARD_COLS):
+        tk.Label(board_frame, text=title, font=font, width=width,
+                 anchor="w" if col == 0 else "e").grid(row=0, column=col, sticky="ew")
+    board_labels: list[list[tk.Label]] = []
+
+    def fill_board(rows: list[tuple[str, ...]]) -> None:
+        if len(board_labels) != len(rows):  # 행 수 변화 시 격자 재구성
+            for row_labels in board_labels:
+                for label in row_labels:
+                    label.destroy()
+            board_labels.clear()
+            for r in range(len(rows)):
+                row_labels = []
+                for col, (_, width, color) in enumerate(BOARD_COLS):
+                    label = tk.Label(board_frame, font=font, width=width, fg=color,
+                                     anchor="w" if col == 0 else "e")
+                    label.grid(row=r + 1, column=col, sticky="ew")
+                    row_labels.append(label)
+                board_labels.append(row_labels)
+        for row_labels, row in zip(board_labels, rows, strict=True):
+            for label, value in zip(row_labels, row, strict=True):
+                label.config(text=value)
 
     status = tk.Label(root, text="연결 중 ...", anchor="w", font=font)
     status.pack(fill="x", padx=4, pady=(0, 4))
@@ -362,7 +389,7 @@ def main() -> None:
         fill_tree(hl_tree, state.hl_rows(
             fx=system.usdkrw_theory if system is not None else None))
         if system is not None:
-            fill_tree(board_tree, board_rows(system))
+            fill_board(board_rows(system))
             record_spreads(system)
         if system is not None:
             phase = system.session.phase_for(Underlying.SAMSUNG).value
