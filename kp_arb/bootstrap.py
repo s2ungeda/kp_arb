@@ -19,7 +19,7 @@ import asyncio
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from .config import LSAccounts
+from .config import CarryRates, LSAccounts
 from .disparity import PairBoard, SideDisp, disp, pair_spread, side_disp
 from .domain.enums import Account, Instrument, Underlying, Venue
 from .domain.models import OrderIntent, Position, Quote
@@ -43,8 +43,6 @@ from .session import reference_instrument
 from .session_service import SessionService
 from .strategy.base import Strategy
 from .theory import (
-    EQ_CARRY_RATE,
-    FX_CARRY_RATE,
     carry_theory,
     days_to_expiry,
     select_usd_futures,
@@ -99,6 +97,7 @@ class LiveSystem:
         etf_symbols: dict[Underlying, str] | None = None,
         futures_expiry: dict[Underlying, int] | None = None,
         fx_futures: tuple[str, int] | None = None,
+        carry_rates: CarryRates | None = None,
     ) -> None:
         self._gw = gateway
         # 취급 종목코드 (공개 — UI/도구가 상품 가용성 판단에 사용. 예: 현대차 ETF 없음)
@@ -107,6 +106,8 @@ class LiveSystem:
         self.futures_expiry = dict(futures_expiry or {})  # 만기 YYYYMM (캐리 잔존일용)
         # 원달러선물 (shcode, 만기YYYYMM) — t8426 최근월물 (bootstrap_live에서 조회).
         self._fx_futures = fx_futures
+        # 캐리 이론가 연이자율 — config.yaml 조정 대상 (전략 검증하며 바뀔 인자)
+        self._carry = carry_rates if carry_rates is not None else CarryRates()
         # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — WS(FC0) 실시간 + 예비 조회 갱신.
         self.usdkrw_theory: float | None = None
         self.usdkrw_futures: float | None = None  # 원달러선물 현재가 원값(표시용)
@@ -330,7 +331,7 @@ class LiveSystem:
         _, ym = self._fx_futures
         days = days_to_expiry(ym, "USD", date.today())
         self.usdkrw_futures = price
-        self.usdkrw_theory = carry_theory(price, days, FX_CARRY_RATE)
+        self.usdkrw_theory = carry_theory(price, days, self._carry.fx)
 
     async def _fx_loop(self) -> None:
         """환율 예비 갱신 — 시동 직후 초기값 + 30초 간격 확인 조회(t2111).
@@ -377,7 +378,9 @@ class LiveSystem:
         ym = self.futures_expiry.get(underlying)
         if base is None or ym is None:
             return None
-        return carry_theory(base, days_to_expiry(ym, "EQ", date.today()), EQ_CARRY_RATE)
+        return carry_theory(
+            base, days_to_expiry(ym, "EQ", date.today()), self._carry.stock_futures
+        )
 
     def _best_quote(
         self, underlying: Underlying, instrument: Instrument
@@ -640,6 +643,7 @@ async def bootstrap_live(
         etf_symbols=etf_symbols,
         futures_expiry=futures_expiry,
         fx_futures=fx_futures,
+        carry_rates=config.carry_rates,
     )
 
 
