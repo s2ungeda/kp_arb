@@ -176,7 +176,7 @@ def main() -> None:
     import asyncio
     import threading
     import tkinter as tk
-    from tkinter import ttk
+    from collections.abc import Callable
 
     try:
         from dotenv import load_dotenv
@@ -231,75 +231,65 @@ def main() -> None:
     root.attributes("-topmost", True)  # 항상 위 (작은 시세창 용도)
     font = ("Malgun Gothic", 9)
 
-    def make_tree(parent: tk.Misc, columns: list[tuple[str, str, int]],
-                  height: int) -> ttk.Treeview:
-        ids = [c[0] for c in columns]
-        tree = ttk.Treeview(parent, columns=ids, show="headings", height=height)
-        for cid, text, width in columns:
-            tree.heading(cid, text=text)
-            if cid == "name":
-                tree.column(cid, width=width, anchor="w", stretch=False)
-            else:
-                tree.column(cid, width=width, anchor="e", stretch=False)
-        tree.pack(fill="x", padx=4, pady=(2, 4))
-        return tree
+    def make_grid(
+        title: str, cols: list[tuple[str, int, str]]
+    ) -> Callable[[list[tuple[str, ...]]], None]:
+        """라벨 격자 표 하나 만들고 채우기 함수 반환 — (제목, 글자폭, 글자색) 열 정의.
 
-    tk.Label(root, text="LS (국내)", anchor="w", font=font).pack(fill="x", padx=4)
-    ls_tree = make_tree(root, [
-        ("name", "종목", 110), ("ask_qty", "매도잔량", 70), ("ask", "매도가", 80),
-        ("last", "현재가", 80), ("bid", "매수가", 80), ("bid_qty", "매수잔량", 70),
-        ("exp", "예상체결가", 85), ("theory", "이론가", 80), ("disp", "괴리율%", 58),
-    ], height=9)
+        셀 사이 1px 간격으로 배경(회색)이 비쳐 표 테두리처럼 보이고,
+        열별 글자색(예: 진입 빨강/청산 파랑)을 지원한다.
+        """
+        tk.Label(root, text=title, anchor="w", font=font).pack(fill="x", padx=4)
+        frame = tk.Frame(root, bg="#c8c8c8", bd=1, relief="solid")
+        frame.pack(fill="x", padx=6, pady=(2, 4))
+        for col, (head, width, _) in enumerate(cols):
+            tk.Label(frame, text=head, font=font, width=width, bg="#f0f0f0",
+                     anchor="w" if col == 0 else "e").grid(
+                row=0, column=col, sticky="ew", padx=(0, 1), pady=(0, 1))
+        grid_labels: list[list[tk.Label]] = []
 
-    tk.Label(root, text="HL (Hyperliquid)", anchor="w", font=font).pack(fill="x", padx=4)
-    hl_tree = make_tree(root, [
-        ("name", "종목", 85), ("ask_qty", "매도잔량", 58), ("ask", "매도가", 62),
-        ("last", "현재가", 62), ("oracle", "오라클", 62),
-        ("bid", "매수가", 62), ("bid_qty", "매수잔량", 58),
-        ("mark", "마크", 62), ("krw", "원화환산", 76),
-        ("fprev", "펀딩전", 60), ("fnext", "펀딩피", 60),
-        ("cd", "남은시간", 52),
-    ], height=3)
+        def fill(rows: list[tuple[str, ...]]) -> None:
+            if len(grid_labels) != len(rows):  # 행 수 변화 시 격자 재구성
+                for row_labels in grid_labels:
+                    for label in row_labels:
+                        label.destroy()
+                grid_labels.clear()
+                for r in range(len(rows)):
+                    row_labels = []
+                    for col, (_, width, color) in enumerate(cols):
+                        label = tk.Label(frame, font=font, width=width, fg=color,
+                                         bg="white", anchor="w" if col == 0 else "e")
+                        label.grid(row=r + 1, column=col, sticky="ew",
+                                   padx=(0, 1), pady=(0, 1))
+                        row_labels.append(label)
+                    grid_labels.append(row_labels)
+            for row_labels, row in zip(grid_labels, rows, strict=True):
+                for label, value in zip(row_labels, row, strict=True):
+                    label.config(text=value)
 
-    tk.Label(root, text="괴리 보드 (%, HL vs 국내 — 진입=HL매수d−국내매도d)",
-             anchor="w", font=font).pack(fill="x", padx=4)
-    # 열별 글자색이 필요해서(진입 빨강/청산 파랑) 표 대신 라벨 격자 사용.
-    BOARD_COLS: list[tuple[str, int, str]] = [  # (제목, 글자폭, 글자색)
-        ("쌍", 14, "black"),
+        return fill
+
+    fill_ls = make_grid("LS (국내)", [
+        ("종목", 13, "black"), ("매도잔량", 9, "black"), ("매도가", 10, "black"),
+        ("현재가", 10, "black"), ("매수가", 10, "black"), ("매수잔량", 9, "black"),
+        ("예상체결가", 10, "black"), ("이론가", 11, "black"), ("괴리율%", 7, "black"),
+    ])
+    fill_hl = make_grid("HL (Hyperliquid)", [
+        ("종목", 9, "black"), ("매도잔량", 7, "black"), ("매도가", 8, "black"),
+        ("현재가", 8, "black"), ("오라클", 8, "black"),
+        ("매수가", 8, "black"), ("매수잔량", 7, "black"),
+        ("마크", 8, "black"), ("원화환산", 9, "black"),
+        ("펀딩전", 8, "black"), ("펀딩피", 8, "black"), ("남은시간", 7, "black"),
+    ])
+    fill_board = make_grid("괴리 보드 (%, HL vs 국내 — 진입=HL매수d−국내매도d)", [
+        ("쌍", 13, "black"),
         ("주H차", 8, "black"),    # 엑셀 메인 I22 (HL 현재가 괴리)
         ("주선차", 8, "black"),   # 엑셀 메인 K19/M19 (국내 현재가 괴리)
         ("진입", 8, "red"),
         ("청산", 8, "blue"),
         ("HL매도d", 8, "black"), ("HL매수d", 8, "black"),
         ("국내매도d", 9, "black"), ("국내매수d", 9, "black"),
-    ]
-    # 셀 사이 1px 간격으로 배경(회색)이 비쳐 표 테두리처럼 보이게 한다.
-    board_frame = tk.Frame(root, bg="#c8c8c8", bd=1, relief="solid")
-    board_frame.pack(fill="x", padx=6, pady=(2, 4))
-    for col, (title, width, _) in enumerate(BOARD_COLS):
-        tk.Label(board_frame, text=title, font=font, width=width, bg="#f0f0f0",
-                 anchor="w" if col == 0 else "e").grid(
-            row=0, column=col, sticky="ew", padx=(0, 1), pady=(0, 1))
-    board_labels: list[list[tk.Label]] = []
-
-    def fill_board(rows: list[tuple[str, ...]]) -> None:
-        if len(board_labels) != len(rows):  # 행 수 변화 시 격자 재구성
-            for row_labels in board_labels:
-                for label in row_labels:
-                    label.destroy()
-            board_labels.clear()
-            for r in range(len(rows)):
-                row_labels = []
-                for col, (_, width, color) in enumerate(BOARD_COLS):
-                    label = tk.Label(board_frame, font=font, width=width, fg=color,
-                                     bg="white", anchor="w" if col == 0 else "e")
-                    label.grid(row=r + 1, column=col, sticky="ew",
-                               padx=(0, 1), pady=(0, 1))
-                    row_labels.append(label)
-                board_labels.append(row_labels)
-        for row_labels, row in zip(board_labels, rows, strict=True):
-            for label, value in zip(row_labels, row, strict=True):
-                label.config(text=value)
+    ])
 
     status = tk.Label(root, text="연결 중 ...", anchor="w", font=font)
     status.pack(fill="x", padx=4, pady=(0, 4))
@@ -370,16 +360,6 @@ def main() -> None:
                                  "hl_last_d", "kr_last_d"])
             writer.writerows(lines)
 
-    def fill_tree(tree: ttk.Treeview, rows: list[tuple[str, ...]]) -> None:
-        existing = tree.get_children()
-        if len(existing) != len(rows):
-            tree.delete(*existing)
-            for row in rows:
-                tree.insert("", "end", values=row)
-        else:
-            for item, row in zip(existing, rows, strict=True):
-                tree.item(item, values=row)
-
     def refresh() -> None:
         system = system_ref.get("system")
         theory = None
@@ -388,8 +368,8 @@ def main() -> None:
             for u in Underlying:
                 theory[(u, Instrument.KR_ETF)] = system.etf_theory_price(u)
                 theory[(u, Instrument.KR_STOCK_FUTURE)] = system.stock_futures_theory(u)
-        fill_tree(ls_tree, state.ls_rows(theory))
-        fill_tree(hl_tree, state.hl_rows(
+        fill_ls(state.ls_rows(theory))
+        fill_hl(state.hl_rows(
             fx=system.usdkrw_theory if system is not None else None))
         if system is not None:
             fill_board(board_rows(system))
