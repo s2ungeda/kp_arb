@@ -273,11 +273,13 @@ def main() -> None:
         ("HL매도d", 8, "black"), ("HL매수d", 8, "black"),
         ("국내매도d", 9, "black"), ("국내매수d", 9, "black"),
     ]
-    board_frame = tk.Frame(root, bg="white")
+    # 셀 사이 1px 간격으로 배경(회색)이 비쳐 표 테두리처럼 보이게 한다.
+    board_frame = tk.Frame(root, bg="#c8c8c8", bd=1, relief="solid")
     board_frame.pack(fill="x", padx=6, pady=(2, 4))
     for col, (title, width, _) in enumerate(BOARD_COLS):
-        tk.Label(board_frame, text=title, font=font, width=width, bg="white",
-                 anchor="w" if col == 0 else "e").grid(row=0, column=col, sticky="ew")
+        tk.Label(board_frame, text=title, font=font, width=width, bg="#f0f0f0",
+                 anchor="w" if col == 0 else "e").grid(
+            row=0, column=col, sticky="ew", padx=(0, 1), pady=(0, 1))
     board_labels: list[list[tk.Label]] = []
 
     def fill_board(rows: list[tuple[str, ...]]) -> None:
@@ -291,7 +293,8 @@ def main() -> None:
                 for col, (_, width, color) in enumerate(BOARD_COLS):
                     label = tk.Label(board_frame, font=font, width=width, fg=color,
                                      bg="white", anchor="w" if col == 0 else "e")
-                    label.grid(row=r + 1, column=col, sticky="ew")
+                    label.grid(row=r + 1, column=col, sticky="ew",
+                               padx=(0, 1), pady=(0, 1))
                     row_labels.append(label)
                 board_labels.append(row_labels)
         for row_labels, row in zip(board_labels, rows, strict=True):
