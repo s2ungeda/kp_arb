@@ -122,6 +122,9 @@ class LiveSystem:
         self.trades: dict[tuple[Underlying, Instrument, str], float] = {}
         # 기초 주식 등락률(%, drate) — ETF 이론가의 핵심 입력 (ETF 이론가.md §2).
         self.stock_change_pct: dict[tuple[Underlying, str], float] = {}
+        # 예상체결가(동시호가) — (underlying, instrument)별. 기초 주식의 예상등락률 포함.
+        self.expected_prices: dict[tuple[Underlying, Instrument], float] = {}
+        self.stock_exp_change_pct: dict[Underlying, float] = {}
         # ETF 이론가 고정 입력(전일NAV·배율·기초 전일종가) — 시동 시 1회 조회.
         self.etf_theory: dict[Underlying, EtfTheoryInputs] = {}
         self.on_quote: list[Callable[[Quote], None]] = []  # 호가(LS 주식/선물/ETF + HL bbo)
@@ -246,6 +249,10 @@ class LiveSystem:
                 handler(tick)
 
         def fan_expected(expected: ExpectedPrice) -> None:
+            self.expected_prices[(expected.underlying, expected.instrument)] = expected.price
+            if (expected.instrument is Instrument.KR_STOCK
+                    and expected.change_pct is not None):
+                self.stock_exp_change_pct[expected.underlying] = expected.change_pct
             for handler in self.on_expected:
                 handler(expected)
 
@@ -459,7 +466,11 @@ class LiveSystem:
         inputs = self.etf_theory.get(underlying)
         rate_krx = self.stock_change_pct.get((underlying, "krx"))
         phase = self.session.phase_for(underlying)
-        if phase in (SessionPhase.REGULAR, SessionPhase.PRE_OPEN):
+        if phase is SessionPhase.PRE_OPEN:
+            # 동시호가: 체결이 없으므로 기초 **예상등락률**(UYS) 우선 (문서 §1 동시이론가)
+            exp_rate = self.stock_exp_change_pct.get(underlying)
+            return theory_regular(inputs, exp_rate if exp_rate is not None else rate_krx)
+        if phase is SessionPhase.REGULAR:
             return theory_regular(inputs, rate_krx)
         base_close = self.trades.get((underlying, Instrument.KR_STOCK, "krx"))
         base_after = self.trades.get((underlying, Instrument.KR_STOCK, "uni"))

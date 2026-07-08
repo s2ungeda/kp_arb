@@ -359,3 +359,25 @@ async def test_unified_quote_and_trade_parse() -> None:
     # 구독에 통합 키("U"+코드+공백3)가 포함돼야 한다
     assert any(f"U{SAMSUNG_CODE}   " in m and '"UH1"' in m for m in session.sent)
     assert any(f"U{SAMSUNG_CODE}   " in m and '"US3"' in m for m in session.sent)
+
+
+async def test_expected_price_for_futures_and_etf() -> None:
+    # 예상체결: 선물 YJC(focode) + ETF UYS. 예상등락률 jnilydrate(부호 4/5=음수).
+    yjc = json.dumps({"header": {"tr_cd": "YJC", "tr_key": "A1167000"},
+                      "body": {"focode": "A1167000", "yeprice": "293500"}})
+    uys = json.dumps({"header": {"tr_cd": "UYS", "tr_key": f"U{SAMSUNG_CODE}   "},
+                      "body": {"shcode": SAMSUNG_CODE, "yeprice": "70100",
+                               "jnilydrate": "1.5", "jnilysign": "5"}})
+    session = FakeConnection([yjc, uys])
+    client = LSWebSocketClient(FakeConnector([session]))
+    client.subscribe_futures_quotes({Underlying.SAMSUNG: "A1167000"})
+    expected = []
+    client.on_expected.append(expected.append)
+
+    await client.run()
+
+    from kp_arb.domain.enums import Instrument
+    fut = next(e for e in expected if e.instrument is Instrument.KR_STOCK_FUTURE)
+    stock = next(e for e in expected if e.instrument is Instrument.KR_STOCK)
+    assert fut.price == 293_500
+    assert stock.price == 70_100 and stock.change_pct == -1.5  # 부호 5=하한 → 음수

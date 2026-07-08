@@ -59,7 +59,7 @@ class MonitorState:
 
     quotes: dict[tuple[Underlying, Instrument, str], Quote] = field(default_factory=dict)
     trades: dict[tuple[Underlying, Instrument], float] = field(default_factory=dict)
-    expected: dict[Underlying, float] = field(default_factory=dict)
+    expected: dict[tuple[Underlying, Instrument], float] = field(default_factory=dict)
     marks: dict[Underlying, float] = field(default_factory=dict)
     funding_next: dict[Underlying, float] = field(default_factory=dict)  # 예정(펀딩피)
     funding_prev: dict[Underlying, float] = field(default_factory=dict)  # 직전
@@ -90,7 +90,7 @@ class MonitorState:
         self.last_update = time.time()
 
     def on_expected(self, expected: ExpectedPrice) -> None:
-        self.expected[expected.underlying] = expected.price
+        self.expected[(expected.underlying, expected.instrument)] = expected.price
         self.last_update = time.time()
 
     def on_mark(self, mark: Mark) -> None:
@@ -117,7 +117,7 @@ class MonitorState:
             for inst in _LS_INSTRUMENTS:
                 ask, ask_qty, bid, bid_qty = self.merged_quote(u, inst)  # KRX+NXT 통합
                 trade = self.trades.get((u, inst))
-                expected = self.expected.get(u) if inst is Instrument.KR_STOCK else None
+                expected = self.expected.get((u, inst))  # 주식·선물·ETF 모두
                 inst_theory = (theory or {}).get((u, inst))
                 disp = disparity_pct(trade, inst_theory)
                 rows.append((
