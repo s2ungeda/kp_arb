@@ -20,7 +20,15 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from .config import CarryRates, FeeRates, LSAccounts
-from .disparity import PairBoard, SideDisp, disp, net_entry, pair_spread, side_disp
+from .disparity import (
+    PairBoard,
+    SideDisp,
+    disp,
+    net_entry,
+    net_exit,
+    pair_spread,
+    side_disp,
+)
 from .domain.enums import Account, Instrument, Underlying, Venue
 from .domain.models import OrderIntent, Position, Quote
 from .engine import ArbEngine
@@ -441,6 +449,7 @@ class LiveSystem:
                     hl=hl, kr=kr, spread=spread,
                     hl_last=hl_last, kr_last=disp(kr_last_px, base),
                     net_entry=net_entry(spread, fee),
+                    net_exit=net_exit(spread),
                 )
         return board
 

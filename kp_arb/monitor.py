@@ -275,17 +275,17 @@ def main() -> None:
         ("매수가", 8, "black"), ("매수잔량", 7, "black"), ("마크", 8, "black"),
         ("펀딩전", 8, "black"), ("펀딩피", 8, "black"), ("남은시간", 7, "black"),
     ])
-    fill_board = make_grid("괴리 보드 (%, HL vs 국내 — 진입=HL매수d−국내매도d)", [
-        ("쌍", 13, "black"),
-        ("주H차", 8, "black"),    # 엑셀 메인 I22 (HL 현재가 괴리)
-        ("주선차", 8, "black"),   # 엑셀 메인 K19/M19 (국내 현재가 괴리)
-        ("진입", 8, "red"),
-        ("청산", 8, "blue"),
-        ("순진입", 8, "darkred"),  # 진입 − 왕복호가비용/2 − 수수료 (완전 수렴 시 기대 %)
-        ("왕복비용", 8, "black"),  # 청산 − 진입 = 양쪽 호가폭 합 (즉시 왕복 시 비용)
-        ("HL매도d", 8, "black"), ("HL매수d", 8, "black"),
-        ("국내매도d", 9, "black"), ("국내매수d", 9, "black"),
-    ])
+    # 구성요소(HL/국내 매도·매수 disp, 왕복비용)는 화면에서 제외 — CSV에는 계속 기록.
+    fill_board = make_grid(
+        "괴리 보드 (%) — 순진입 ≥ 0 진입 / 순청산 ≤ 0 청산", [
+            ("쌍", 13, "black"),
+            ("주H차", 8, "black"),    # 엑셀 메인 I22 (HL 현재가 괴리)
+            ("주선차", 8, "black"),   # 엑셀 메인 K19/M19 (국내 현재가 괴리)
+            ("진입", 8, "red"),
+            ("청산", 8, "blue"),
+            ("순진입", 8, "darkred"),   # 진입 − 왕복호가비용/2 − 수수료 (수렴 시 기대 %)
+            ("순청산", 8, "darkblue"),  # 청산 − 왕복호가비용/2 (≤0 = 수렴 완료)
+        ])
 
     status = tk.Label(root, text="연결 중 ...", anchor="w", font=font)
     status.pack(fill="x", padx=4, pady=(0, 4))
@@ -303,18 +303,13 @@ def main() -> None:
         for (u, inst), pair in sorted(
             system.disparity_board().items(), key=lambda kv: (kv[0][0].value, kv[0][1].value)
         ):
-            cost = (pair.spread.exit - pair.spread.entry
-                    if pair.spread.entry is not None and pair.spread.exit is not None
-                    else None)
             rows.append((
                 f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
                 pct(pair.hl_last),                              # I22
                 pct(pair.kr_last),                              # K19/M19
                 pct(pair.spread.entry), pct(pair.spread.exit),  # K22/K24
                 pct(pair.net_entry),                            # 순진입 (수렴 시 기대 %)
-                pct(cost),                                      # 왕복 호가 비용
-                pct(pair.hl.ask), pct(pair.hl.bid),
-                pct(pair.kr.ask), pct(pair.kr.bid),
+                pct(pair.net_exit),                             # 순청산 (≤0 = 수렴 완료)
             ))
         return rows
 
@@ -343,7 +338,8 @@ def main() -> None:
              _fmt(system.stock_last(u), decimals=0),          # 기초 현재가 (엑셀 D60/D58)
              pct(p.hl_last),                                  # HL 현재가 괴리 (메인 I22)
              pct(p.kr_last),                                  # 국내 현재가 괴리 (메인 K19/M19)
-             pct(p.net_entry))                                # 순진입
+             pct(p.net_entry),                                # 순진입
+             pct(p.net_exit))                                 # 순청산
             for (u, inst), p in board.items()
             if p.spread.entry is not None or p.spread.exit is not None
         ]
@@ -360,7 +356,7 @@ def main() -> None:
                     writer.writerow(["time", "underlying", "pair",
                                      "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
                                      "entry", "exit", "usdkrw_theory", "base_last",
-                                     "hl_last_d", "kr_last_d", "net_entry"])
+                                     "hl_last_d", "kr_last_d", "net_entry", "net_exit"])
                 writer.writerows(lines)
         except OSError:
             pass  # 파일을 엑셀 등이 잠근 상태 — 이번 기록은 건너뛰고 풀리면 재개

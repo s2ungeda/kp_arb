@@ -41,3 +41,12 @@ def test_net_entry() -> None:
     s = PairSpread(entry=0.0050, exit=0.0060)
     assert net_entry(s, 0.00042) == pytest.approx(0.0050 - 0.0005 - 0.00042)
     assert net_entry(PairSpread(entry=None, exit=0.1), 0.0) is None
+
+
+def test_net_exit() -> None:
+    from kp_arb.disparity import net_exit
+
+    # 순청산 = 청산 − 왕복비용/2 = (진입+청산)/2. 수렴하면 0 이하.
+    assert net_exit(PairSpread(entry=0.0050, exit=0.0060)) == pytest.approx(0.0055)
+    assert net_exit(PairSpread(entry=-0.0007, exit=0.0003)) == pytest.approx(-0.0002)
+    assert net_exit(PairSpread(entry=None, exit=0.1)) is None

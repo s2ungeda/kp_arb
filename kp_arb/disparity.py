@@ -60,6 +60,17 @@ def net_entry(spread: PairSpread, fee_rate: float) -> float | None:
     return spread.entry - half_width - fee_rate
 
 
+def net_exit(spread: PairSpread) -> float | None:
+    """순청산 = 청산값 − 왕복호가비용/2 (= (진입+청산)/2 — 중간가 기준 괴리).
+
+    포지션 보유 중 **≤ 0이면 수렴 완료**로 보고 청산. 수수료는 진입 판단(순진입)에서
+    이미 차감했으므로 여기선 빼지 않는다.
+    """
+    if spread.entry is None or spread.exit is None:
+        return None
+    return (spread.entry + spread.exit) / 2.0
+
+
 @dataclass(frozen=True)
 class PairBoard:
     """모니터·기록용 한 쌍(HL vs 국내 상대)의 괴리 전체."""
@@ -70,3 +81,4 @@ class PairBoard:
     hl_last: float | None = None  # HL 현재가(체결) 괴리 — 엑셀 시세!AD7(메인 I22)
     kr_last: float | None = None  # 국내 상대 현재가 괴리 — 엑셀 시세!AD61/AD89(메인 K19/M19)
     net_entry: float | None = None  # 순진입 (완전 수렴 가정 기대 수익, 수수료 차감)
+    net_exit: float | None = None   # 순청산 (≤0이면 수렴 완료 — 청산 신호)
