@@ -363,31 +363,39 @@ def main() -> None:
             pass  # 파일을 엑셀 등이 잠근 상태 — 이번 기록은 건너뛰고 풀리면 재개
 
     def refresh() -> None:
-        system = system_ref.get("system")
-        theory = None
-        if system is not None:
-            theory = {}
-            for u in Underlying:
-                theory[(u, Instrument.KR_ETF)] = system.etf_theory_price(u)
-                theory[(u, Instrument.KR_STOCK_FUTURE)] = system.stock_futures_theory(u)
-        fill_ls(state.ls_rows(theory))
-        fill_hl(state.hl_rows())
-        if system is not None:
-            fill_board(board_rows(system))
-            record_spreads(system)
-        if system is not None:
-            phase = system.session.phase_for(Underlying.SAMSUNG).value
-            stock = system.order_book.balance(Account.KR_STOCK)
-            deriv = system.order_book.balance(Account.KR_DERIV)
-            age = time.time() - state.last_update if state.last_update else -1
-            fresh = f"{age:.0f}s 전" if age >= 0 else "-"
-            fx_fut = system.usdkrw_futures
-            fx_theory = system.usdkrw_theory
-            fx_text = (f"환율 {fx_fut:,.1f} (이론 {fx_theory:,.2f})"
-                       if fx_fut is not None and fx_theory is not None else "환율 -")
-            status.config(text=f"장운영: {phase} | {fx_text} | 주식 {stock:,.0f} | "
-                               f"선물 {deriv:,.0f} | 수신 {fresh}")
-        root.after(300, refresh)
+        # 어떤 예외가 나도 다음 갱신 예약(finally)은 반드시 실행 —
+        # 갱신 1회 실패로 화면이 통째로 멈추던 문제 방지.
+        try:
+            system = system_ref.get("system")
+            theory = None
+            if system is not None:
+                theory = {}
+                for u in Underlying:
+                    theory[(u, Instrument.KR_ETF)] = system.etf_theory_price(u)
+                    theory[(u, Instrument.KR_STOCK_FUTURE)] = (
+                        system.stock_futures_theory(u))
+            fill_ls(state.ls_rows(theory))
+            fill_hl(state.hl_rows())
+            if system is not None:
+                fill_board(board_rows(system))
+                record_spreads(system)
+                phase = system.session.phase_for(Underlying.SAMSUNG).value
+                stock = system.order_book.balance(Account.KR_STOCK)
+                deriv = system.order_book.balance(Account.KR_DERIV)
+                age = time.time() - state.last_update if state.last_update else -1
+                fresh = f"{age:.0f}s 전" if age >= 0 else "-"
+                fx_fut = system.usdkrw_futures
+                fx_theory = system.usdkrw_theory
+                fx_text = (f"환율 {fx_fut:,.1f} (이론 {fx_theory:,.2f})"
+                           if fx_fut is not None and fx_theory is not None else "환율 -")
+                status.config(text=f"장운영: {phase} | {fx_text} | 주식 {stock:,.0f} | "
+                                   f"선물 {deriv:,.0f} | 수신 {fresh}")
+        except Exception:  # noqa: BLE001 - 1회 실패는 기록만 하고 계속
+            import logging
+
+            logging.getLogger("kp_arb.monitor").exception("화면 갱신 실패 — 계속")
+        finally:
+            root.after(300, refresh)
 
     refresh()
     root.mainloop()
