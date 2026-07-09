@@ -170,12 +170,20 @@ class CarryRates(BaseModel):
     fx: float = 0.015             # 원달러선물 → 현물환율 환산 (금리차)
 
 
+class FeeRates(BaseModel):
+    """왕복 수수료·세금 (명목 대비 비율) — 순진입 계산용 (DESIGN §6.1)."""
+
+    etf: float = 0.0007            # HL+주식/ETF 쌍 왕복
+    stock_future: float = 0.00042  # HL+주식선물 쌍 왕복
+
+
 class AppConfig(BaseModel):
-    """config.yaml 전체. 종목 매핑 + ETF 승수 + 이론가 인자."""
+    """config.yaml 전체. 종목 매핑 + ETF 승수 + 이론가·수수료 인자."""
 
     symbols: dict[Underlying, SymbolConfig]
     etf_leverage: float = 2.0
     carry_rates: CarryRates = CarryRates()
+    fees: FeeRates = FeeRates()
 
     def etf_symbols(self) -> dict[Underlying, str]:
         return {u: s.etf for u, s in self.symbols.items() if s.etf is not None}

@@ -32,3 +32,12 @@ def test_pair_spread_none_propagates() -> None:
     hl = side_disp(None, None, 100.0)
     kr = side_disp(101.0, 99.0, 100.0)
     assert pair_spread(hl, kr) == PairSpread(entry=None, exit=None)
+
+
+def test_net_entry() -> None:
+    from kp_arb.disparity import net_entry
+
+    # 진입 0.50%, 청산 0.60% → 호가폭합 0.10% → 순진입 = 0.50% − 0.05% − 0.042%
+    s = PairSpread(entry=0.0050, exit=0.0060)
+    assert net_entry(s, 0.00042) == pytest.approx(0.0050 - 0.0005 - 0.00042)
+    assert net_entry(PairSpread(entry=None, exit=0.1), 0.0) is None

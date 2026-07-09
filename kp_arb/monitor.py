@@ -281,7 +281,8 @@ def main() -> None:
         ("주선차", 8, "black"),   # 엑셀 메인 K19/M19 (국내 현재가 괴리)
         ("진입", 8, "red"),
         ("청산", 8, "blue"),
-        ("스프레드", 8, "black"),  # 청산 − 진입 (왕복 시 먹을 수 있는 %)
+        ("순진입", 8, "darkred"),  # 진입 − 왕복호가비용/2 − 수수료 (완전 수렴 시 기대 %)
+        ("왕복비용", 8, "black"),  # 청산 − 진입 = 양쪽 호가폭 합 (즉시 왕복 시 비용)
         ("HL매도d", 8, "black"), ("HL매수d", 8, "black"),
         ("국내매도d", 9, "black"), ("국내매수d", 9, "black"),
     ])
@@ -302,15 +303,16 @@ def main() -> None:
         for (u, inst), pair in sorted(
             system.disparity_board().items(), key=lambda kv: (kv[0][0].value, kv[0][1].value)
         ):
-            gap = (pair.spread.exit - pair.spread.entry
-                   if pair.spread.entry is not None and pair.spread.exit is not None
-                   else None)
+            cost = (pair.spread.exit - pair.spread.entry
+                    if pair.spread.entry is not None and pair.spread.exit is not None
+                    else None)
             rows.append((
                 f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
                 pct(pair.hl_last),                              # I22
                 pct(pair.kr_last),                              # K19/M19
                 pct(pair.spread.entry), pct(pair.spread.exit),  # K22/K24
-                pct(gap),                                       # 청산-진입 (왕복 수익 %)
+                pct(pair.net_entry),                            # 순진입 (수렴 시 기대 %)
+                pct(cost),                                      # 왕복 호가 비용
                 pct(pair.hl.ask), pct(pair.hl.bid),
                 pct(pair.kr.ask), pct(pair.kr.bid),
             ))
@@ -340,7 +342,8 @@ def main() -> None:
              f"{fx:.4f}" if fx is not None else "-",          # 환율이론가 (엑셀 I1 대응)
              _fmt(system.stock_last(u), decimals=0),          # 기초 현재가 (엑셀 D60/D58)
              pct(p.hl_last),                                  # HL 현재가 괴리 (메인 I22)
-             pct(p.kr_last))                                  # 국내 현재가 괴리 (메인 K19/M19)
+             pct(p.kr_last),                                  # 국내 현재가 괴리 (메인 K19/M19)
+             pct(p.net_entry))                                # 순진입
             for (u, inst), p in board.items()
             if p.spread.entry is not None or p.spread.exit is not None
         ]
@@ -357,7 +360,7 @@ def main() -> None:
                     writer.writerow(["time", "underlying", "pair",
                                      "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
                                      "entry", "exit", "usdkrw_theory", "base_last",
-                                     "hl_last_d", "kr_last_d"])
+                                     "hl_last_d", "kr_last_d", "net_entry"])
                 writer.writerows(lines)
         except OSError:
             pass  # 파일을 엑셀 등이 잠근 상태 — 이번 기록은 건너뛰고 풀리면 재개

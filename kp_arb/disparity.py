@@ -46,6 +46,20 @@ def pair_spread(hl: SideDisp, kr: SideDisp) -> PairSpread:
     return PairSpread(entry=entry, exit=exit_)
 
 
+def net_entry(spread: PairSpread, fee_rate: float) -> float | None:
+    """순진입 = 진입값 − 왕복호가비용/2 − 왕복수수료.
+
+    "지금 진입해서 괴리가 0으로 완전 수렴했을 때 남는 기대 %".
+    유도: 실현수익 = 진입값(t0) − 청산값(수렴 시). 수렴 시 청산값 ≈ 호가폭합/2
+    (호가폭이 유지된다고 가정)이고, 호가폭합 = 청산−진입(같은 시점)이므로
+    순진입 = 진입 − (청산−진입)/2 − 수수료.
+    """
+    if spread.entry is None or spread.exit is None:
+        return None
+    half_width = (spread.exit - spread.entry) / 2.0
+    return spread.entry - half_width - fee_rate
+
+
 @dataclass(frozen=True)
 class PairBoard:
     """모니터·기록용 한 쌍(HL vs 국내 상대)의 괴리 전체."""
@@ -55,3 +69,4 @@ class PairBoard:
     spread: PairSpread
     hl_last: float | None = None  # HL 현재가(체결) 괴리 — 엑셀 시세!AD7(메인 I22)
     kr_last: float | None = None  # 국내 상대 현재가 괴리 — 엑셀 시세!AD61/AD89(메인 K19/M19)
+    net_entry: float | None = None  # 순진입 (완전 수렴 가정 기대 수익, 수수료 차감)

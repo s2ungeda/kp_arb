@@ -19,8 +19,8 @@ import asyncio
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from .config import CarryRates, LSAccounts
-from .disparity import PairBoard, SideDisp, disp, pair_spread, side_disp
+from .config import CarryRates, FeeRates, LSAccounts
+from .disparity import PairBoard, SideDisp, disp, net_entry, pair_spread, side_disp
 from .domain.enums import Account, Instrument, Underlying, Venue
 from .domain.models import OrderIntent, Position, Quote
 from .engine import ArbEngine
@@ -98,6 +98,7 @@ class LiveSystem:
         futures_expiry: dict[Underlying, int] | None = None,
         fx_futures: tuple[str, int] | None = None,
         carry_rates: CarryRates | None = None,
+        fees: FeeRates | None = None,
     ) -> None:
         self._gw = gateway
         # 취급 종목코드 (공개 — UI/도구가 상품 가용성 판단에 사용. 예: 현대차 ETF 없음)
@@ -106,8 +107,9 @@ class LiveSystem:
         self.futures_expiry = dict(futures_expiry or {})  # 만기 YYYYMM (캐리 잔존일용)
         # 원달러선물 (shcode, 만기YYYYMM) — t8426 최근월물 (bootstrap_live에서 조회).
         self._fx_futures = fx_futures
-        # 캐리 이론가 연이자율 — config.yaml 조정 대상 (전략 검증하며 바뀔 인자)
+        # 캐리 이론가 연이자율·왕복 수수료 — config.yaml 조정 대상
         self._carry = carry_rates if carry_rates is not None else CarryRates()
+        self._fees = fees if fees is not None else FeeRates()
         # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — WS(FC0) 실시간 + 예비 조회 갱신.
         self.usdkrw_theory: float | None = None
         self.usdkrw_futures: float | None = None  # 원달러선물 현재가 원값(표시용)
@@ -432,9 +434,13 @@ class LiveSystem:
                 kr = side_disp(ask, bid, base)
                 kr_last_px = (self.trades.get((u, instrument, "uni"))
                               or self.trades.get((u, instrument, "krx")))
+                spread = pair_spread(hl, kr)
+                fee = (self._fees.stock_future
+                       if instrument is Instrument.KR_STOCK_FUTURE else self._fees.etf)
                 board[(u, instrument)] = PairBoard(
-                    hl=hl, kr=kr, spread=pair_spread(hl, kr),
+                    hl=hl, kr=kr, spread=spread,
                     hl_last=hl_last, kr_last=disp(kr_last_px, base),
+                    net_entry=net_entry(spread, fee),
                 )
         return board
 
@@ -650,6 +656,7 @@ async def bootstrap_live(
         futures_expiry=futures_expiry,
         fx_futures=fx_futures,
         carry_rates=config.carry_rates,
+        fees=config.fees,
     )
 
 
