@@ -311,9 +311,9 @@ class LiveSystem:
         await self.refresh_snapshot()
         self._seed_session_from_env()
         self._wire()
-        self._tasks = [asyncio.create_task(self._load_etf_refs())]
-        self._tasks.append(asyncio.create_task(self._seed_prices()))
-        self._tasks.append(asyncio.create_task(self._fx_loop()))
+        # 시동 REST 조회들은 **순차 실행** — 동시에 나가면 서버 계정당 초당 한도에
+        # 걸려 일부(t1901 등)가 실패한다(운영 실측). 환율 폴링은 그 뒤에 시작.
+        self._tasks = [asyncio.create_task(self._startup_queries())]
         self._tasks.append(asyncio.create_task(self._guarded_ws("주식", self._stock_ws.run())))
         if self._deriv_ws is not None:
             self._tasks.append(
@@ -496,6 +496,12 @@ class LiveSystem:
         base_close = self.trades.get((underlying, Instrument.KR_STOCK, "krx"))
         base_after = self.trades.get((underlying, Instrument.KR_STOCK, "uni"))
         return theory_after(inputs, rate_krx, base_close, base_after)
+
+    async def _startup_queries(self) -> None:
+        """시동 일괄 조회를 순서대로 — ETF 이론가 입력 → 초기 가격 → 환율 폴링."""
+        await self._load_etf_refs()
+        await self._seed_prices()
+        await self._fx_loop()
 
     @staticmethod
     async def _guarded_ws(name: str, run: Coroutine[Any, Any, None]) -> None:
