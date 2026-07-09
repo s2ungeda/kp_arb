@@ -350,14 +350,17 @@ def main() -> None:
         log_dir.mkdir(exist_ok=True)
         path = log_dir / f"spread_{time.strftime('%Y%m%d')}.csv"
         new_file = not path.exists()
-        with path.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            if new_file:
-                writer.writerow(["time", "underlying", "pair",
-                                 "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
-                                 "entry", "exit", "usdkrw_theory", "base_last",
-                                 "hl_last_d", "kr_last_d"])
-            writer.writerows(lines)
+        try:
+            with path.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if new_file:
+                    writer.writerow(["time", "underlying", "pair",
+                                     "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
+                                     "entry", "exit", "usdkrw_theory", "base_last",
+                                     "hl_last_d", "kr_last_d"])
+                writer.writerows(lines)
+        except OSError:
+            pass  # 파일을 엑셀 등이 잠근 상태 — 이번 기록은 건너뛰고 풀리면 재개
 
     def refresh() -> None:
         system = system_ref.get("system")
