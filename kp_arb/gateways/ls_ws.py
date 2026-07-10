@@ -246,16 +246,23 @@ class LSWebSocketClient:
     # --- 실행 루프 ---
 
     async def run(self) -> None:
-        """연결 → 재구독 → 프레임 디스패치. 끊기면 재연결, 깨끗이 끝나면 종료."""
+        """연결 → 재구독 → 프레임 디스패치. 끊기면 재연결, 깨끗이 끝나면 종료.
+
+        데이터가 한 프레임이라도 흐르면 재시도 카운터를 초기화 — 장시간 운영 중
+        간헐적 끊김이 여러 번 나도 평생 누적 한도에 걸리지 않는다. 한도는
+        '연속' 실패(접속 폭풍·서버 점검)에만 적용된다. 접속 자체 실패(OSError)도
+        재연결 대상.
+        """
         attempts = 0
         while True:
-            conn = await self._connector.connect()
-            self._conn = conn
-            await self._resubscribe(conn)
             try:
+                conn = await self._connector.connect()
+                self._conn = conn
+                await self._resubscribe(conn)
                 async for raw in conn:
+                    attempts = 0  # 데이터 수신 = 정상 연결 — 연속 실패 카운터 초기화
                     self._dispatch(raw)
-            except ConnectionError:
+            except (ConnectionError, OSError):
                 attempts += 1
                 if attempts > self._max_reconnects:
                     raise

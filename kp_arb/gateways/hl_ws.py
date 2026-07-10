@@ -85,15 +85,23 @@ class HLWebSocketClient:
     # --- 실행 루프 (LSWebSocketClient와 동일 패턴) ---
 
     async def run(self) -> None:
+        """연결 → 구독 → 디스패치. 끊기면 재연결(데이터 흐르면 카운터 초기화).
+
+        HL은 유지용 ping(50초 미만 간격 권장)을 보내지 않으면 서버가 유휴 연결을
+        끊을 수 있어 45초마다 ping을 보낸다(응답 pong은 무시).
+        """
         attempts = 0
         while True:
-            conn = await self._connector.connect()
-            for sub in self._subs:
-                await conn.send(json.dumps({"method": "subscribe", "subscription": sub}))
+            ping_task: asyncio.Task[None] | None = None
             try:
+                conn = await self._connector.connect()
+                for sub in self._subs:
+                    await conn.send(json.dumps({"method": "subscribe", "subscription": sub}))
+                ping_task = asyncio.create_task(self._ping_loop(conn))
                 async for raw in conn:
+                    attempts = 0  # 데이터 수신 = 정상 연결
                     self._dispatch(raw)
-            except ConnectionError:
+            except (ConnectionError, OSError):
                 attempts += 1
                 if attempts > self._max_reconnects:
                     raise
@@ -102,6 +110,18 @@ class HLWebSocketClient:
                 continue
             else:
                 return
+            finally:
+                if ping_task is not None:
+                    ping_task.cancel()
+
+    @staticmethod
+    async def _ping_loop(conn: WSConnection, interval_s: float = 45.0) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval_s)
+                await conn.send('{"method":"ping"}')
+        except Exception:  # noqa: BLE001 - 연결 종료 시 조용히 끝 (본선이 재연결)
+            return
 
     # --- 파싱/디스패치 ---
 

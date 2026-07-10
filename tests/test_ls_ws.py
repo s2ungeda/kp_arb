@@ -137,8 +137,10 @@ async def test_reconnect_resubscribes_and_recovers() -> None:
 
 
 async def test_reconnect_exhausted_raises() -> None:
-    s1 = FakeConnection([quote_frame(), quote_frame()], fail_after=1)
-    s2 = FakeConnection([quote_frame(), quote_frame()], fail_after=1)
+    # 한도는 **연속** 실패에만 적용된다(데이터가 흐르면 카운터 초기화) —
+    # 프레임 0개로 즉시 끊기는 세션(접속 폭풍 상황)으로 소진을 확인.
+    s1 = FakeConnection([quote_frame()], fail_after=0)
+    s2 = FakeConnection([quote_frame()], fail_after=0)
     connector = FakeConnector([s1, s2])
     client = LSWebSocketClient(connector, max_reconnects=1)
     client.subscribe_quotes(Underlying.SAMSUNG)
@@ -146,6 +148,22 @@ async def test_reconnect_exhausted_raises() -> None:
     with pytest.raises(ConnectionError):
         await client.run()
     assert connector.connects == 2
+
+
+async def test_reconnect_counter_resets_after_data() -> None:
+    # 데이터가 흐른 뒤의 끊김은 누적되지 않는다 — 장시간 운영 중 간헐 끊김 대응.
+    sessions = [FakeConnection([quote_frame(bid=i), quote_frame(bid=99)], fail_after=1)
+                for i in range(1, 5)]  # 각 세션: 1프레임 방출 후 끊김
+    sessions.append(FakeConnection([quote_frame(bid=9)]))  # 마지막은 정상 종료
+    connector = FakeConnector(sessions)
+    client = LSWebSocketClient(connector, max_reconnects=1)  # 한도 1이어도
+    quotes: list[Quote] = []
+    client.on_quote.append(quotes.append)
+    client.subscribe_quotes(Underlying.SAMSUNG)
+
+    await client.run()  # 예외 없이 5세션 모두 소화
+
+    assert [q.bid for q in quotes] == [1, 2, 3, 4, 9]
 
 
 async def test_ack_frame_without_body_is_skipped() -> None:

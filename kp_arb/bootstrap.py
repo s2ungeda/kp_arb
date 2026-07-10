@@ -639,7 +639,9 @@ async def bootstrap_live(
         cred = accounts.for_account(account)
         token = (await token_tx.fetch_token(cred.appkey, cred.appsecret)).access_token
         return LSWebSocketClient(
-            LSWebSocketConnector(url), token=token, etf_symbols=etf_symbols
+            LSWebSocketConnector(url), token=token, etf_symbols=etf_symbols,
+            # 장시간 운영: 사실상 무제한 재연결 + 2초 대기 (한도는 연속 실패에만)
+            max_reconnects=1_000_000, reconnect_backoff_s=2.0,
         )
 
     # HL 슬롯 — 비밀(HL_AGENT_KEY/HL_ACCOUNT_ADDRESS) 없으면 LS-only.
@@ -647,7 +649,10 @@ async def bootstrap_live(
     hl_ws = None
     try:
         hl_gateway = HLSdkGateway.from_secrets(symbols=config.hl_symbols())
-        hl_ws = HLWebSocketClient(HLWebSocketConnector(), symbols=config.hl_symbols())
+        hl_ws = HLWebSocketClient(
+            HLWebSocketConnector(), symbols=config.hl_symbols(),
+            max_reconnects=1_000_000, reconnect_backoff_s=2.0,
+        )
         hl_ws.subscribe_user_fills(str(default_secrets().get("HL_ACCOUNT_ADDRESS")))
     except ConfigError:
         pass
