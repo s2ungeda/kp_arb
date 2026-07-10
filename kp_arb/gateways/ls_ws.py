@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Protocol
 
 from pydantic import BaseModel
@@ -157,12 +157,16 @@ class LSWebSocketClient:
         connector: WSConnector,
         *,
         token: str = "",
+        token_provider: Callable[[], Awaitable[str]] | None = None,
         etf_symbols: dict[Underlying, str] | None = None,
         max_reconnects: int = 3,
         reconnect_backoff_s: float = 0.0,
     ) -> None:
         self._connector = connector
         self._token = token
+        # 재연결 시 새 토큰 발급용(옵션) — LS 토큰은 유효기간(약 1일)이 있어
+        # 자정 이후 재접속은 옛 토큰으로 거부된다. 없으면 고정 token 재사용.
+        self._token_provider = token_provider
         # ETF 종목코드(config.yaml 주입) — 호가 구독·해석에 사용.
         self._etf_symbols = dict(etf_symbols or {})
         self._etf_underlying = {v: k for k, v in self._etf_symbols.items()}
@@ -256,6 +260,8 @@ class LSWebSocketClient:
         attempts = 0
         while True:
             try:
+                if self._token_provider is not None:
+                    self._token = await self._token_provider()  # 만료 대비 새 토큰
                 conn = await self._connector.connect()
                 self._conn = conn
                 await self._resubscribe(conn)

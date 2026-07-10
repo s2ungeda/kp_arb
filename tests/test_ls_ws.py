@@ -399,3 +399,24 @@ async def test_expected_price_for_futures_and_etf() -> None:
     stock = next(e for e in expected if e.instrument is Instrument.KR_STOCK)
     assert fut.price == 293_500
     assert stock.price == 70_100 and stock.change_pct == -1.5  # 부호 5=하한 → 음수
+
+
+async def test_token_provider_refreshes_on_reconnect() -> None:
+    # 재연결마다 새 토큰으로 구독 — 토큰 만료(약 1일) 후 재접속 거부 방지.
+    s1 = FakeConnection([quote_frame(), quote_frame()], fail_after=1)
+    s2 = FakeConnection([quote_frame()])
+    connector = FakeConnector([s1, s2])
+    issued: list[str] = []
+
+    async def fresh_token() -> str:
+        issued.append(f"tok{len(issued) + 1}")
+        return issued[-1]
+
+    client = LSWebSocketClient(connector, token_provider=fresh_token)
+    client.subscribe_quotes(Underlying.SAMSUNG)
+
+    await client.run()
+
+    assert issued == ["tok1", "tok2"]              # 접속마다 발급
+    assert any('"tok1"' in m for m in s1.sent)     # 1차 연결은 tok1로 구독
+    assert any('"tok2"' in m for m in s2.sent)     # 재연결은 tok2로 구독

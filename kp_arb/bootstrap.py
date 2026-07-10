@@ -637,9 +637,14 @@ async def bootstrap_live(
 
     async def ws_for(account: Account) -> LSWebSocketClient:
         cred = accounts.for_account(account)
-        token = (await token_tx.fetch_token(cred.appkey, cred.appsecret)).access_token
+
+        async def fresh_token() -> str:
+            # 재연결 시마다 새 토큰 — LS 토큰 만료(약 1일) 후 재접속 거부 방지
+            return (await token_tx.fetch_token(cred.appkey, cred.appsecret)).access_token
+
         return LSWebSocketClient(
-            LSWebSocketConnector(url), token=token, etf_symbols=etf_symbols,
+            LSWebSocketConnector(url), token_provider=fresh_token,
+            etf_symbols=etf_symbols,
             # 장시간 운영: 사실상 무제한 재연결 + 2초 대기 (한도는 연속 실패에만)
             max_reconnects=1_000_000, reconnect_backoff_s=2.0,
         )
