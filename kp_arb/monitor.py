@@ -8,7 +8,7 @@
 
 표 구성(사용자 명세):
 - LS: 종목 | 매도잔량 | 매도가 | 현재가 | 매수가 | 매수잔량 | 예상가 | 이론가(선물·ETF) | 괴리율%
-- HL: 종목 | 매도잔량 | 매도가 | 현재가(마크) | 매수가 | 매수잔량 | 펀딩전 | 펀딩피 | 남은시간
+- HL: 종목 | 매도가 | 현재가 | 오라클 | 매수가 | 마크 | 현-오라클% | 마크-오라클% | 펀딩전 | 펀딩피 | 남은시간
 - 하단: 장운영상태 · 계좌 잔고 · 마지막 수신 시각
 """
 from __future__ import annotations
@@ -140,8 +140,8 @@ class MonitorState:
     def hl_rows(self, now_epoch: float | None = None) -> list[tuple[str, ...]]:
         """HL 표 행 — 현재가는 실제 체결가, 마크(청산·펀딩 기준가)는 별도 컬럼.
 
-        (종목, 매도잔량, 매도가, 현재가, 오라클, 매수가, 매수잔량, 마크,
-         펀딩전, 펀딩피, 남은시간)
+        (종목, 매도가, 현재가, 오라클, 매수가, 마크, 현-오라클%, 마크-오라클%,
+         펀딩전, 펀딩피, 남은시간). 오라클 대비 비율 = (값 − 오라클) ÷ 오라클 × 100.
         """
         now = now_epoch if now_epoch is not None else time.time()
         countdown = funding_countdown(now)
@@ -150,15 +150,20 @@ class MonitorState:
             quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
             prev = self.funding_prev.get(u)
             nxt = self.funding_next.get(u)
+            last = self.trades.get((u, Instrument.HL_PERP))
+            mark = self.marks.get(u)
+            oracle = self.oracles.get(u)
+            last_vs_oracle = disparity_pct(last, oracle)
+            mark_vs_oracle = disparity_pct(mark, oracle)
             rows.append((
                 _NAMES[u],
-                _fmt(quote.ask_qty if quote else None, decimals=3),
                 _fmt(quote.ask if quote else None, decimals=2),
-                _fmt(self.trades.get((u, Instrument.HL_PERP)), decimals=2),  # 체결가만
-                _fmt(self.oracles.get(u), decimals=2),  # 오라클(지수가, 엑셀 C7)
+                _fmt(last, decimals=2),               # 현재가 = 체결가만
+                _fmt(oracle, decimals=2),             # 오라클(지수가, 엑셀 C7)
                 _fmt(quote.bid if quote else None, decimals=2),
-                _fmt(quote.bid_qty if quote else None, decimals=3),
-                _fmt(self.marks.get(u), decimals=2),  # 마크(기준가) 별도 표시
+                _fmt(mark, decimals=2),               # 마크(기준가) 별도 표시
+                f"{last_vs_oracle:+.3f}" if last_vs_oracle is not None else "-",
+                f"{mark_vs_oracle:+.3f}" if mark_vs_oracle is not None else "-",
                 f"{prev * 100:.4f}%" if prev is not None else "-",
                 f"{nxt * 100:.4f}%" if nxt is not None else "-",
                 countdown,
@@ -276,9 +281,10 @@ def main() -> None:
         ("예상체결가", 10, "black"), ("이론가", 11, "black"), ("괴리율%", 7, "black"),
     ])
     fill_hl = make_grid("HL (Hyperliquid)", [
-        ("종목", 9, "black"), ("매도잔량", 7, "black"), ("매도가", 8, "black"),
+        ("종목", 9, "black"), ("매도가", 8, "black"),
         ("현재가", 8, "black"), ("오라클", 8, "black"),
-        ("매수가", 8, "black"), ("매수잔량", 7, "black"), ("마크", 8, "black"),
+        ("매수가", 8, "black"), ("마크", 8, "black"),
+        ("현-오라클%", 9, "black"), ("마크-오라클%", 10, "black"),
         ("펀딩전", 8, "black"), ("펀딩피", 8, "black"), ("남은시간", 7, "black"),
     ])
     # 구성요소(HL/국내 매도·매수 disp, 왕복비용)는 화면에서 제외 — CSV에는 계속 기록.

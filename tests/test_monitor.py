@@ -73,12 +73,14 @@ def test_hl_rows_include_funding_and_countdown() -> None:
     rows = state.hl_rows(now_epoch=3600 * 10 + 3540)  # 정각 60초 전
     assert len(rows) == 3
     samsung = rows[0]
-    # (종목,매도잔량,매도가,현재가,오라클,매수가,매수잔량,마크,펀딩전,펀딩피,남은시간)
+    # (종목,매도가,현재가,오라클,매수가,마크,현-오라클%,마크-오라클%,펀딩전,펀딩피,남은시간)
     assert samsung[0] == "삼성전자"
-    assert samsung[2] == "184.65" and samsung[5] == "184.55"  # 매도/매수
-    assert samsung[3] == "184.60"  # 현재가 = 체결가 (마크 아님)
-    assert samsung[4] == "184.70"  # 오라클(지수가) — 현재가 바로 오른쪽
-    assert samsung[7] == "184.62"  # 마크 = 기준가, 별도 컬럼
+    assert samsung[1] == "184.65" and samsung[4] == "184.55"  # 매도/매수
+    assert samsung[2] == "184.60"  # 현재가 = 체결가 (마크 아님)
+    assert samsung[3] == "184.70"  # 오라클(지수가) — 현재가 바로 오른쪽
+    assert samsung[5] == "184.62"  # 마크 = 기준가, 별도 컬럼
+    assert samsung[6] == "-0.054"  # 현-오라클% = (184.60-184.70)/184.70×100
+    assert samsung[7] == "-0.043"  # 마크-오라클% = (184.62-184.70)/184.70×100
     assert samsung[8] == "0.0159%" and samsung[9] == "0.0184%"  # 펀딩 직전/예정
     assert samsung[10] == "01:00"                             # 남은시간
 
@@ -88,7 +90,7 @@ def test_hl_last_price_empty_without_trades() -> None:
     state = MonitorState()
     state.on_mark(Mark(underlying=SAMSUNG, price=184.62))
     samsung = state.hl_rows()[0]
-    assert samsung[3] == "-" and samsung[7] == "184.62"  # 현재가 '-', 마크는 표시
+    assert samsung[2] == "-" and samsung[5] == "184.62"  # 현재가 '-', 마크는 표시
 
 
 def test_funding_countdown_wraps_hourly() -> None:
