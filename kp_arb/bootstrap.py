@@ -479,16 +479,33 @@ class LiveSystem:
             for handler in self.on_trade:
                 handler(tick)
 
-    async def _load_etf_refs(self) -> None:
-        """ETF 이론가 고정 입력 조회(백그라운드 1회) — 실패해도 시스템은 계속."""
+    async def _load_etf_refs(self) -> bool:
+        """ETF 이론가 고정 입력 조회 1회 시도. 전부 확보되면 True."""
         import logging
 
         try:
-            self.etf_theory = dict(await self._gw.get_etf_refs())
+            self.etf_theory.update(await self._gw.get_etf_refs())
         except Exception:  # noqa: BLE001 - 이론가 없이도 나머지는 정상
             logging.getLogger("kp_arb.bootstrap").warning(
-                "ETF 이론가 입력 조회 실패 — 이론가 없이 계속", exc_info=True
+                "ETF 이론가 입력 조회 실패", exc_info=True
             )
+        return not (set(self.etf_symbols) - set(self.etf_theory))
+
+    async def _etf_refs_retry_loop(self) -> None:
+        """미확보 ETF 이론가 입력을 30초 간격으로 재시도 — t1901 간헐 500 대응(실측).
+
+        시동 1차 시도에서 실패한 종목이 있으면 하루 종일 이론가가 비는 대신,
+        확보될 때까지(최대 약 10분) 다시 조회한다.
+        """
+        import logging
+
+        for attempt in range(1, 21):
+            await asyncio.sleep(30.0)
+            if await self._load_etf_refs():
+                logging.getLogger("kp_arb.bootstrap").info(
+                    "ETF 이론가 입력 확보 완료 (재시도 %d회째)", attempt
+                )
+                return
 
     def etf_theory_price(self, underlying: Underlying) -> float | None:
         """ETF 이론가(ETF 이론가.md §1) — 모니터·전략 공용. 시간대는 세션으로 판단.
@@ -513,10 +530,17 @@ class LiveSystem:
         return theory_after(inputs, rate_krx, base_close, base_after)
 
     async def _startup_queries(self) -> None:
-        """시동 일괄 조회를 순서대로 — ETF 이론가 입력 → 초기 가격 → 환율 폴링."""
-        await self._load_etf_refs()
+        """시동 일괄 조회를 순서대로 — ETF 이론가 입력 → 초기 가격 → 상시 루프.
+
+        순차 실행은 서버 계정당 초당 한도 충돌 방지(실측). 이후 환율 예비 조회와
+        미확보 ETF 재시도는 병행 루프로.
+        """
+        complete = await self._load_etf_refs()
         await self._seed_prices()
-        await self._fx_loop()
+        if complete:
+            await self._fx_loop()
+        else:
+            await asyncio.gather(self._fx_loop(), self._etf_refs_retry_loop())
 
     @staticmethod
     async def _guarded_ws(name: str, run: Coroutine[Any, Any, None]) -> None:
