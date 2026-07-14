@@ -2,7 +2,7 @@
 
     python -m kp_arb.monitor
 
-- 창은 tkinter(파이썬 기본 포함 — 추가 설치 없음), 항상 위 고정.
+- 창은 tkinter(파이썬 기본 포함 — 추가 설치 없음). '항상 위'는 체크박스로 선택.
 - 데이터는 LiveSystem(백그라운드 스레드의 asyncio)에서 실시간 수신,
   화면은 0.3초마다 최신값을 읽어 갱신(읽기 전용 — 주문 없음).
 
@@ -223,8 +223,14 @@ def main() -> None:
     root = tk.Tk()
     root.title("kp-arb 시세")
     root.geometry("760x600")
-    root.attributes("-topmost", True)  # 항상 위 (작은 시세창 용도)
     font = ("Malgun Gothic", 9)
+
+    # 항상 위 — 창이 커져서 기본은 해제, 필요할 때 체크로 켠다.
+    topmost_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(
+        root, text="항상 위", font=font, variable=topmost_var,
+        command=lambda: root.attributes("-topmost", topmost_var.get()),
+    ).pack(anchor="e", padx=6)
 
     def make_grid(
         title: str, cols: list[tuple[str, int, str]]
