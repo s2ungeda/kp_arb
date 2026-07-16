@@ -402,12 +402,17 @@ def main() -> None:
                            if fx_fut is not None and fx_theory is not None else "환율 -")
                 status.config(text=f"장운영: {phase} | {fx_text} | 주식 {stock:,.0f} | "
                                    f"선물 {deriv:,.0f} | 수신 {fresh}")
+        except tk.TclError:
+            return  # 창이 닫히는 중 — 다음 예약 없이 조용히 종료
         except Exception:  # noqa: BLE001 - 1회 실패는 기록만 하고 계속
             import logging
 
             logging.getLogger("kp_arb.monitor").exception("화면 갱신 실패 — 계속")
         finally:
-            root.after(300, refresh)
+            try:
+                root.after(300, refresh)
+            except tk.TclError:
+                pass  # 창 닫힘 — 갱신 루프 종료
 
     refresh()
     root.mainloop()
