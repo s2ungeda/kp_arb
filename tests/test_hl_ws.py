@@ -186,3 +186,20 @@ async def test_bbo_without_l2book_has_no_depth() -> None:
     await client.run()
 
     assert quotes[0].bids is None and quotes[0].asks is None
+
+
+async def test_bad_frame_does_not_kill_stream() -> None:
+    # 예상 밖 프레임(필드 누락 등)으로 파싱이 실패해도 스트림은 계속 — 채널 사망 방지.
+    bad_fill = json.dumps({"channel": "userFills",
+                           "data": {"fills": [{"coin": "xyz:SKHX"}]}})  # oid 없음
+    good = json.dumps({"channel": "bbo",
+                       "data": {"coin": "xyz:SKHX", "time": 1,
+                                "bbo": [{"px": "1500.0", "sz": "1"},
+                                        {"px": "1500.5", "sz": "1"}]}})
+    client = HLWebSocketClient(FakeConnector([bad_fill, good]))
+    quotes = []
+    client.on_quote.append(quotes.append)
+
+    await client.run()  # 예외 없이 끝까지
+
+    assert len(quotes) == 1 and quotes[0].bid == 1500.0  # 뒤 프레임은 정상 처리

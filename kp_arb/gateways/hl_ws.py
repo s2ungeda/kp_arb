@@ -100,7 +100,14 @@ class HLWebSocketClient:
                 ping_task = asyncio.create_task(self._ping_loop(conn))
                 async for raw in conn:
                     attempts = 0  # 데이터 수신 = 정상 연결
-                    self._dispatch(raw)
+                    try:
+                        self._dispatch(raw)
+                    except Exception:  # noqa: BLE001 - 프레임 1건 문제로 스트림을 죽이지 않음
+                        import logging
+
+                        logging.getLogger("kp_arb.hl_ws").warning(
+                            "프레임 처리 실패 — 건너뜀: %.300s", raw, exc_info=True
+                        )
             except (ConnectionError, OSError):
                 attempts += 1
                 if attempts > self._max_reconnects:
