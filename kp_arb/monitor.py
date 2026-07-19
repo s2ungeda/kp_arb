@@ -294,8 +294,8 @@ def main() -> None:
     fill_board = make_grid(
         "괴리 보드 (%) — 진입=HL매수d−국내매수d(국내 maker) · 순진입 ≥ 0 진입 / 순청산 ≤ 0 청산", [
             ("쌍", 13, "black"),
-            ("주H차", 8, "black"),    # 엑셀 메인 I22 (HL 현재가 괴리)
-            ("주선차", 8, "black"),   # 엑셀 메인 K19/M19 (국내 현재가 괴리)
+            # LH차 = 국내 다리 현재가 대비 HL 현재가 괴리차 (S행: 주H차, SF행: 주H차−주선차)
+            ("LH차", 8, "black"),
             ("진입", 8, "red"),
             ("청산", 8, "blue"),
             ("순진입", 8, "darkred"),   # 진입 − 왕복호가비용/2 − 수수료 (수렴 시 기대 %)
@@ -322,12 +322,13 @@ def main() -> None:
         for (u, inst), pair in sorted(
             system.disparity_board().items(), key=lambda kv: (kv[0][0].value, kv[0][1].value)
         ):
-            # 주식 쌍은 기준가=자기 현재가라 국내 괴리(주선차)가 항상 0 — 표시 생략
-            kr_last_cell = "-" if inst is Instrument.KR_STOCK else pct(pair.kr_last)
+            # LH차 = HL 현재가 disp − 국내 현재가 disp (진입/청산의 현재가 버전.
+            # 주식 쌍은 국내 disp가 정의상 0이라 HL 괴리 그대로)
+            lh = (pair.hl_last - pair.kr_last
+                  if pair.hl_last is not None and pair.kr_last is not None else None)
             rows.append((
                 f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
-                pct(pair.hl_last),                              # I22
-                kr_last_cell,                                   # K19/M19
+                pct(lh),
                 pct(pair.spread.entry), pct(pair.spread.exit),  # K22/K24
                 pct(pair.net_entry),                            # 순진입 (수렴 시 기대 %)
                 pct(pair.net_exit),                             # 순청산 (≤0 = 수렴 완료)
