@@ -22,7 +22,7 @@ def test_ls_rows_shape_and_values() -> None:
     state.on_expected(ExpectedPrice(underlying=SAMSUNG, price=292_700))
 
     rows = state.ls_rows()
-    assert len(rows) == 9  # 3종목 × (주식/선물/ETF)
+    assert len(rows) == 6  # 3종목 × (주식/선물) — ETF는 취급 제외
     stock = rows[0]
     # (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상가, 이론가, 괴리율%)
     assert stock == ("삼성전자 주식", "50", "293,000", "292,800",
@@ -31,19 +31,14 @@ def test_ls_rows_shape_and_values() -> None:
 
 
 def test_ls_rows_theory_and_disparity() -> None:
-    # 이론가는 선물·ETF 행에 표시, 괴리율 = (현재가-이론가)/이론가×100.
+    # 이론가는 선물 행에 표시, 괴리율 = (현재가-이론가)/이론가×100.
     state = MonitorState()
-    state.on_trade(TradeTick(underlying=SAMSUNG, instrument=Instrument.KR_ETF,
-                             price=10_302))
-    rows = state.ls_rows({
-        (SAMSUNG, Instrument.KR_ETF): 10_200.0,
-        (SAMSUNG, Instrument.KR_STOCK_FUTURE): 293_500.0,
-    })
+    state.on_trade(TradeTick(underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+                             price=296_435))
+    rows = state.ls_rows({(SAMSUNG, Instrument.KR_STOCK_FUTURE): 293_500.0})
     assert rows[0][7] == "-"                     # 주식: 이론가 없음
     assert rows[1][7] == "293,500.00"            # 선물 이론가 (소수 2자리 — 엑셀과 동일)
-    assert rows[1][8] == "-"                     # 현재가 없어 괴리율 '-'
-    assert rows[2][7] == "10,200.00"             # ETF 이론가
-    assert rows[2][8] == "+1.00"                 # (10302-10200)/10200 = +1.00%
+    assert rows[1][8] == "+1.00"                 # (296435-293500)/293500 = +1.00%
 
 
 def test_krx_nxt_quotes_merged_like_hts() -> None:

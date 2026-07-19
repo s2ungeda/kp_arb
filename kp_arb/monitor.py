@@ -7,7 +7,7 @@
   화면은 0.3초마다 최신값을 읽어 갱신(읽기 전용 — 주문 없음).
 
 표 구성(사용자 명세):
-- LS: 종목 | 매도잔량 | 매도가 | 현재가 | 매수가 | 매수잔량 | 예상가 | 이론가(선물·ETF) | 괴리율%
+- LS: 종목 | 매도잔량 | 매도가 | 현재가 | 매수가 | 매수잔량 | 예상가 | 이론가(선물) | 괴리율%
 - HL: 종목 | 매도가 | 현재가 | 오라클 | 매수가 | 마크 | 현-오라클% | 마크-오라클%
       | 펀딩전 | 펀딩피 | 남은시간
 - 하단: 장운영상태 · 계좌 잔고 · 마지막 수신 시각
@@ -33,7 +33,8 @@ _KIND = {
     Instrument.KR_STOCK_FUTURE: "선물",
     Instrument.KR_ETF: "ETF",
 }
-_LS_INSTRUMENTS = (Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE, Instrument.KR_ETF)
+# ETF는 취급 제외(2026-07-13) — 표시 기본은 주식+선물만.
+_LS_INSTRUMENTS = (Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE)
 
 FUNDING_INTERVAL_S = 3600  # HL 펀딩은 매시 정각
 
@@ -381,16 +382,12 @@ def main() -> None:
         try:
             system = system_ref.get("system")
             theory = None
-            instruments: tuple[Instrument, ...] = _LS_INSTRUMENTS
             if system is not None:
-                theory = {}
-                for u in Underlying:
-                    theory[(u, Instrument.KR_ETF)] = system.etf_theory_price(u)
-                    theory[(u, Instrument.KR_STOCK_FUTURE)] = (
-                        system.stock_futures_theory(u))
-                if not system.etf_symbols:  # ETF 미취급 — 행 숨김
-                    instruments = (Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE)
-            fill_ls(state.ls_rows(theory, instruments))
+                theory = {
+                    (u, Instrument.KR_STOCK_FUTURE): system.stock_futures_theory(u)
+                    for u in Underlying
+                }
+            fill_ls(state.ls_rows(theory))
             fill_hl(state.hl_rows())
             if system is not None:
                 fill_board(board_rows(system))
