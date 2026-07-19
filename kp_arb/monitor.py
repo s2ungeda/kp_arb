@@ -343,13 +343,13 @@ def main() -> None:
             return
         last_csv["t"] = now
         board = system.disparity_board()
-        fx = system.usdkrw_theory
+        fx, _ = system.usdkrw_effective()  # 환산에 실제 쓴 환율 (주간 현물/야간 이론)
         lines = [
             (f"{time.strftime('%H:%M:%S', time.localtime(now))}",
              u.value, _PAIR_KIND[inst],
              pct(p.hl.ask), pct(p.hl.bid), pct(p.kr.ask), pct(p.kr.bid),
              pct(p.spread.entry), pct(p.spread.exit),
-             f"{fx:.4f}" if fx is not None else "-",          # 환율이론가 (엑셀 I1 대응)
+             f"{fx:.4f}" if fx is not None else "-",          # 사용 환율 (주간 스팟=엑셀 D65)
              _fmt(system.stock_last(u), decimals=0),          # 기초 현재가 (엑셀 D60/D58)
              pct(p.hl_last),                                  # HL 현재가 괴리 (메인 I22)
              pct(p.kr_last),                                  # 국내 현재가 괴리 (메인 K19/M19)
@@ -370,7 +370,7 @@ def main() -> None:
                 if new_file:
                     writer.writerow(["time", "underlying", "pair",
                                      "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
-                                     "entry", "exit", "usdkrw_theory", "base_last",
+                                     "entry", "exit", "usdkrw_used", "base_last",
                                      "hl_last_d", "kr_last_d", "net_entry", "net_exit"])
                 writer.writerows(lines)
         except OSError:
@@ -397,10 +397,12 @@ def main() -> None:
                 deriv = system.order_book.balance(Account.KR_DERIV)
                 age = time.time() - state.last_update if state.last_update else -1
                 fresh = f"{age:.0f}s 전" if age >= 0 else "-"
+                fx_used, fx_src = system.usdkrw_effective()
                 fx_fut = system.usdkrw_futures
-                fx_theory = system.usdkrw_theory
-                fx_text = (f"환율 {fx_fut:,.1f} (이론 {fx_theory:,.2f})"
-                           if fx_fut is not None and fx_theory is not None else "환율 -")
+                fx_text = "환율 -"
+                if fx_used is not None:
+                    fut = f" (선물 {fx_fut:,.1f})" if fx_fut is not None else ""
+                    fx_text = f"환율[{fx_src}] {fx_used:,.2f}{fut}"
                 status.config(text=f"장운영: {phase} | {fx_text} | 주식 {stock:,.0f} | "
                                    f"선물 {deriv:,.0f} | 수신 {fresh}")
         except tk.TclError:

@@ -279,6 +279,20 @@ async def test_deriv_ws_subscribes_futures_fills_only() -> None:
     types = {json.loads(m)["header"]["tr_type"] for m in deriv_connector.conn.sent}
     assert types == {"1"}  # 계좌 등록
 
+def test_usdkrw_effective_spot_window() -> None:
+    # 주간 창(07:50~18:10) 안이고 외환현물이 있으면 현물, 아니면 선물이론가.
+    from datetime import datetime
+
+    system, _, _ = _system([])
+    system.usdkrw_theory = 1_500.0
+    day = datetime(2026, 7, 20, 10, 0)
+    assert system.usdkrw_effective(day) == (1_500.0, "선물이론")  # 현물 미수신 → 이론가
+    system.usdkrw_spot = 1_498.5
+    assert system.usdkrw_effective(datetime(2026, 7, 20, 7, 50)) == (1_498.5, "현물")
+    assert system.usdkrw_effective(day) == (1_498.5, "현물")
+    assert system.usdkrw_effective(datetime(2026, 7, 20, 18, 10)) == (1_500.0, "선물이론")
+
+
 def test_disparity_board_computes_pairs() -> None:
     # DESIGN §6.1: HL 환산 disp vs 국내(SF/ETF) disp → 진입/청산 스프레드.
     from kp_arb.domain.enums import SessionPhase

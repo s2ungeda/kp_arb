@@ -1,5 +1,5 @@
 """캐리 이론가·만기 계산 테스트 — 순수 로직."""
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 import pytest
 
@@ -7,10 +7,29 @@ from kp_arb.theory import (
     carry_theory,
     days_to_expiry,
     expiry_date,
+    in_time_window,
     is_rolled,
+    parse_hhmm,
     parse_ym,
     select_usd_futures,
 )
+
+
+def test_fx_spot_window_boundaries() -> None:
+    # 외환현물 창(07:50~18:10): 시작 포함, 끝 미포함.
+    start, end = parse_hhmm("07:50"), parse_hhmm("18:10")
+    assert not in_time_window(time(7, 49), start, end)
+    assert in_time_window(time(7, 50), start, end)
+    assert in_time_window(time(18, 9, 59), start, end)
+    assert not in_time_window(time(18, 10), start, end)
+
+
+def test_time_window_over_midnight() -> None:
+    # start > end면 자정을 넘는 창 (야간 세션 대비).
+    start, end = parse_hhmm("18:00"), parse_hhmm("02:00")
+    assert in_time_window(time(23, 0), start, end)
+    assert in_time_window(time(1, 0), start, end)
+    assert not in_time_window(time(10, 0), start, end)
 
 
 def test_expiry_eq_second_thursday() -> None:

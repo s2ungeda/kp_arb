@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 EQ_CARRY_RATE = 0.035   # 주식선물 캐리 연이자율 (config로 이동 가능)
 FX_CARRY_RATE = 0.015   # 환율(통화선물→현물) 환산 연이자율
@@ -40,6 +40,19 @@ def is_rolled(yyyymm: int, product: str, now: datetime) -> bool:
     if now.date() > exp:
         return True
     return now.date() == exp and (now.hour * 60 + now.minute) >= 15 * 60 + 45
+
+
+def parse_hhmm(text: str) -> time:
+    """"07:50" 같은 시:분 문자열 → time. 형식이 틀리면 ValueError."""
+    hh, mm = text.split(":")
+    return time(int(hh), int(mm))
+
+
+def in_time_window(now: time, start: time, end: time) -> bool:
+    """now가 [start, end) 창 안인가. start > end면 자정을 넘는 창으로 해석."""
+    if start <= end:
+        return start <= now < end
+    return now >= start or now < end
 
 
 def carry_theory(base_price: float, days: int, annual_rate: float) -> float:

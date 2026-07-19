@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
+from datetime import datetime
 from typing import Any
 
 from .config import CarryRates, FeeRates, LSAccounts
@@ -53,6 +54,8 @@ from .strategy.base import Strategy
 from .theory import (
     carry_theory,
     days_to_expiry,
+    in_time_window,
+    parse_hhmm,
     select_usd_futures,
 )
 
@@ -107,6 +110,7 @@ class LiveSystem:
         fx_futures: tuple[str, int] | None = None,
         carry_rates: CarryRates | None = None,
         fees: FeeRates | None = None,
+        fx_spot_window: tuple[str, str] = ("07:50", "18:10"),
     ) -> None:
         self._gw = gateway
         # 취급 종목코드 (공개 — UI/도구가 상품 가용성 판단에 사용. 예: 현대차 ETF 없음)
@@ -121,6 +125,9 @@ class LiveSystem:
         # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — WS(FC0) 실시간 + 예비 조회 갱신.
         self.usdkrw_theory: float | None = None
         self.usdkrw_futures: float | None = None  # 원달러선물 현재가 원값(표시용)
+        # 외환현물(주간 07:50~18:10 HL 환산용 — 사용자 확정 2026-07-20) + 사용 창
+        self.usdkrw_spot: float | None = None
+        self._fx_spot_window = (parse_hhmm(fx_spot_window[0]), parse_hhmm(fx_spot_window[1]))
         self._hl = hl_gateway
         self._hl_ws = hl_ws
         self.order_book = order_book
@@ -332,6 +339,16 @@ class LiveSystem:
         if self._hl_ws is not None:
             self._tasks.append(asyncio.create_task(self._guarded_ws("HL", self._hl_ws.run())))
 
+    def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]:
+        """HL 환산에 실제 쓰는 환율과 출처: 주간 창(fx_spot_window) 안이고 외환현물이
+        있으면 ("현물"), 아니면 환율이론가("선물이론"). (값, 출처) 반환."""
+        moment = now if now is not None else datetime.now()
+        if self.usdkrw_spot is not None and in_time_window(
+            moment.time(), *self._fx_spot_window
+        ):
+            return self.usdkrw_spot, "현물"
+        return self.usdkrw_theory, "선물이론"
+
     def _apply_fx_price(self, price: float) -> None:
         """원달러선물 현재가 → 환율이론가(현물환산) 갱신. WS(FC0)·예비 조회 공용."""
         from datetime import date
@@ -358,14 +375,22 @@ class LiveSystem:
         log = logging.getLogger("kp_arb.bootstrap")
         failures = 0
         while True:
-            hour = datetime.now().hour
-            if not 8 <= hour < 16:  # 주간 세션 밖 — 마지막 값 유지
+            now = datetime.now()
+            in_spot = in_time_window(now.time(), *self._fx_spot_window)
+            if not in_spot and not 8 <= now.hour < 16:  # 세션 밖 — 마지막 값 유지
                 await asyncio.sleep(60.0)
                 continue
             try:
-                price = await self._gw.get_fx_futures_price(code)
-                if price is not None:
-                    self._apply_fx_price(price)
+                if 8 <= now.hour < 16:  # 통화선물 주간장 — 이론가 예비 갱신
+                    price = await self._gw.get_fx_futures_price(code)
+                    if price is not None:
+                        self._apply_fx_price(price)
+                if in_spot:  # 외환현물 창 — HL 환산 본선 환율 (네이버 하나은행 고시)
+                    from .gateways.fx_spot import fetch_usdkrw_spot
+
+                    spot = await fetch_usdkrw_spot()
+                    if spot is not None:
+                        self.usdkrw_spot = spot
                 failures = 0
             except Exception:  # noqa: BLE001
                 failures += 1
@@ -410,9 +435,9 @@ class LiveSystem:
                 or self.trades.get((underlying, Instrument.KR_STOCK, "krx")))
 
     def _hl_disp(self, underlying: Underlying) -> SideDisp:
-        """HL 호가를 환율이론가로 원화 환산 → 국내 주식 현재가(통합 우선) 대비 괴리."""
+        """HL 호가를 환율(주간 현물/야간 선물이론가)로 원화 환산 → 주식 현재가 대비 괴리."""
         quote = self.quotes.get((underlying, Instrument.HL_PERP, "hl"))
-        fx = self.usdkrw_theory
+        fx, _ = self.usdkrw_effective()
         base = self.stock_last(underlying)
         if quote is None or fx is None:
             return side_disp(None, None, base)
@@ -425,7 +450,7 @@ class LiveSystem:
             hl = self._hl_disp(u)
             # HL 현재가(체결) 괴리 — 엑셀 시세!AD열(메인 I22)
             hl_px = self.trades.get((u, Instrument.HL_PERP, "hl"))
-            fx = self.usdkrw_theory
+            fx, _ = self.usdkrw_effective()
             hl_last = disp(
                 hl_px * fx if hl_px is not None and fx is not None else None,
                 self.stock_last(u),
@@ -707,6 +732,7 @@ async def bootstrap_live(
         fx_futures=fx_futures,
         carry_rates=config.carry_rates,
         fees=config.fees,
+        fx_spot_window=(config.fx_spot_window.start, config.fx_spot_window.end),
     )
 
 

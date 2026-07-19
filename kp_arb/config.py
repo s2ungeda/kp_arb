@@ -170,6 +170,13 @@ class CarryRates(BaseModel):
     fx: float = 0.015             # 원달러선물 → 현물환율 환산 (금리차)
 
 
+class FxSpotWindow(BaseModel):
+    """외환현물 사용 시간대 (DESIGN §6.1 — 창 안은 현물, 밖은 선물이론가로 HL 환산)."""
+
+    start: str = "07:50"
+    end: str = "18:10"
+
+
 class FeeRates(BaseModel):
     """왕복 수수료·세금 (명목 대비 비율) — 순진입 계산용 (DESIGN §6.1)."""
 
@@ -185,6 +192,7 @@ class AppConfig(BaseModel):
     etf_leverage: float = 2.0
     carry_rates: CarryRates = CarryRates()
     fees: FeeRates = FeeRates()
+    fx_spot_window: FxSpotWindow = FxSpotWindow()
 
     def etf_symbols(self) -> dict[Underlying, str]:
         return {u: s.etf for u, s in self.symbols.items() if s.etf is not None}
