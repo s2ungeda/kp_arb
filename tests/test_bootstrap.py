@@ -306,6 +306,10 @@ def test_disparity_board_computes_pairs() -> None:
         underlying=SAMSUNG, instrument=Instrument.KR_ETF,
         bid=20_000.0, ask=20_050.0, ts=0.0,
     )
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK, "krx")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
+        bid=299_500.0, ask=300_500.0, ts=0.0,
+    )
 
     board = system.disparity_board()
 
@@ -323,3 +327,10 @@ def test_disparity_board_computes_pairs() -> None:
     # ETF 이론가 = 20,000(기초 등락률 0) → ask 20,050 disp +0.25% (인프라 유지 확인용)
     assert etf.kr.ask is not None and abs(etf.kr.ask - 0.0025) < 1e-9
     assert etf.spread.exit == (etf.hl.ask or 0) - (etf.kr.ask or 0)
+
+    st = board[(SAMSUNG, Instrument.KR_STOCK)]
+    # 주식 쌍: 기준가 = 자기 현재가 300,000 (이론가 없음 — 옛 엑셀 현대차 AE62 패턴)
+    assert st.kr.bid is not None and abs(st.kr.bid - (-500 / 300_000)) < 1e-12
+    assert st.kr.ask is not None and abs(st.kr.ask - (500 / 300_000)) < 1e-12
+    assert st.spread.entry == st.hl.bid - st.kr.bid  # 진입 공식 동일 (maker 기준)
+    assert st.kr_last is not None and abs(st.kr_last) < 1e-12  # 현재가 괴리는 항상 0

@@ -173,7 +173,8 @@ class CarryRates(BaseModel):
 class FeeRates(BaseModel):
     """왕복 수수료·세금 (명목 대비 비율) — 순진입 계산용 (DESIGN §6.1)."""
 
-    etf: float = 0.0007            # HL+주식/ETF 쌍 왕복
+    stock: float = 0.0007          # HL+주식 쌍 왕복 (거래세 반영 여부는 계좌 기준 조정)
+    etf: float = 0.0007            # HL+ETF 쌍 왕복 (미취급 — 보존)
     stock_future: float = 0.00042  # HL+주식선물 쌍 왕복
 
 

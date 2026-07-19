@@ -430,25 +430,32 @@ class LiveSystem:
                 hl_px * fx if hl_px is not None and fx is not None else None,
                 self.stock_last(u),
             )
-            targets: list[tuple[Instrument, float | None]] = []
+            # 주식 쌍의 기준가 = 자기 현재가 (HL disp가 이미 주식 현재가 대비 —
+            # 옛 엑셀 현대차 행 AE62/AF62 패턴). 방향은 A(주식 매수+HL 숏) 전용(공매도 금지).
+            targets: list[tuple[Instrument, float | None]] = [
+                (Instrument.KR_STOCK, self.stock_last(u)),
+            ]
             if u in self.futures_symbols:
                 targets.append(
                     (Instrument.KR_STOCK_FUTURE, self.stock_futures_theory(u))
                 )
             if u in self.etf_symbols:
                 targets.append((Instrument.KR_ETF, self.etf_theory_price(u)))
+            fees = {
+                Instrument.KR_STOCK: self._fees.stock,
+                Instrument.KR_STOCK_FUTURE: self._fees.stock_future,
+                Instrument.KR_ETF: self._fees.etf,
+            }
             for instrument, base in targets:
                 ask, bid = self._best_quote(u, instrument)
                 kr = side_disp(ask, bid, base)
                 kr_last_px = (self.trades.get((u, instrument, "uni"))
                               or self.trades.get((u, instrument, "krx")))
                 spread = pair_spread(hl, kr)
-                fee = (self._fees.stock_future
-                       if instrument is Instrument.KR_STOCK_FUTURE else self._fees.etf)
                 board[(u, instrument)] = PairBoard(
                     hl=hl, kr=kr, spread=spread,
                     hl_last=hl_last, kr_last=disp(kr_last_px, base),
-                    net_entry=net_entry(spread, fee),
+                    net_entry=net_entry(spread, fees[instrument]),
                     net_exit=net_exit(spread),
                 )
         return board

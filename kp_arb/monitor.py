@@ -308,7 +308,11 @@ def main() -> None:
     def pct(value: float | None) -> str:
         return f"{value * 100:.3f}" if value is not None else "-"
 
-    _PAIR_KIND = {Instrument.KR_STOCK_FUTURE: "SF", Instrument.KR_ETF: "ETF"}
+    _PAIR_KIND = {
+        Instrument.KR_STOCK: "S",  # 주식 쌍 — 방향 A(주식 매수+HL 숏) 전용, 잔고 보유 시
+        Instrument.KR_STOCK_FUTURE: "SF",
+        Instrument.KR_ETF: "ETF",
+    }
 
     def board_rows(system: object) -> list[tuple[str, ...]]:
         from .bootstrap import LiveSystem
@@ -318,10 +322,12 @@ def main() -> None:
         for (u, inst), pair in sorted(
             system.disparity_board().items(), key=lambda kv: (kv[0][0].value, kv[0][1].value)
         ):
+            # 주식 쌍은 기준가=자기 현재가라 국내 괴리(주선차)가 항상 0 — 표시 생략
+            kr_last_cell = "-" if inst is Instrument.KR_STOCK else pct(pair.kr_last)
             rows.append((
                 f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
                 pct(pair.hl_last),                              # I22
-                pct(pair.kr_last),                              # K19/M19
+                kr_last_cell,                                   # K19/M19
                 pct(pair.spread.entry), pct(pair.spread.exit),  # K22/K24
                 pct(pair.net_entry),                            # 순진입 (수렴 시 기대 %)
                 pct(pair.net_exit),                             # 순청산 (≤0 = 수렴 완료)
