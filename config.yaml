@@ -3,17 +3,18 @@
 # - etf:   단일종목 레버리지 ETF (없으면 생략 — 해당 underlying은 ETF 미취급)
 # - hl:    Hyperliquid 빌더 perp 심볼 (dex 접두 포함)
 # 주식선물은 월물(만기 있음)이라 여기 적지 않고 시동 시 LS 마스터(t8401)에서 자동 조회.
+# ETF는 취급 제외 (사용자 확정 2026-07-13 — 주식·주식선물만. 복귀 시 etf: 줄만 살리면 됨)
 symbols:
   samsung:
     stock: "005930"
-    etf: "0193W0"      # KODEX 삼성전자단일종목 (2x)
+    # etf: "0193W0"    # KODEX 삼성전자단일종목 (2x) — 미취급
     hl: "xyz:SMSN"
   sk_hynix:
     stock: "000660"
-    etf: "0193T0"      # KODEX SK하이닉스단일 (2x)
+    # etf: "0193T0"    # KODEX SK하이닉스단일 (2x) — 미취급
     hl: "xyz:SKHX"
   hyundai:
-    stock: "005380"    # 레버리지 ETF 없음
+    stock: "005380"
     hl: "xyz:HYUNDAI"
 
 # ETF 명목 계산 승수 (외부 #2 노출 보고용, DESIGN §5.7)

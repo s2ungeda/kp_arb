@@ -1,9 +1,10 @@
-"""상대호가 괴리(disp)·진입/청산 스프레드 — 순수 로직 (DESIGN §6.1, 원본 IM.xlsx).
+"""상대호가 괴리(disp)·진입/청산 스프레드 — 순수 로직 (DESIGN §6.1, 원본 meme.xlsx).
 
 - disp = (환산가 − 기준가) ÷ 기준가. 매도호가/매수호가 각각.
-- 방향 A(국내 롱 + HL 숏) 기준:
-    진입 = HL 매수호가disp − 국내 매도호가disp   (HL bid에 팔고 국내 ask에 사는 taker 조합)
-    청산 = HL 매도호가disp − 국내 매수호가disp
+- 방향 A(국내 롱 + HL 숏), **국내 다리는 maker**(같은 방향 호가에 걸어 체결 대기 —
+  자동2 모드와 일치) 기준 (엑셀 개정판 메인!L12/L14, 2026-07-13):
+    진입(en) = HL 매수호가disp − 국내 매수호가disp   (국내 bid에 걸어 매수, HL bid에 매도)
+    청산(ex) = HL 매도호가disp − 국내 매도호가disp   (국내 ask에 걸어 매도, HL ask에 환매수)
   방향 B(국내 숏[선물만] + HL 롱)는 부호 반대(진입_B = −청산_A, 청산_B = −진입_A).
 """
 from __future__ import annotations
@@ -34,25 +35,25 @@ def side_disp(
 
 @dataclass(frozen=True)
 class PairSpread:
-    """HL vs 국내 상대(선물/ETF) 한 쌍의 진입/청산 스프레드 (방향 A 기준)."""
+    """HL vs 국내 상대(주식선물) 한 쌍의 진입/청산 스프레드 (방향 A, 국내 maker 기준)."""
 
-    entry: float | None  # HL bid disp − 국내 ask disp (벌어질수록 진입 매력)
-    exit: float | None   # HL ask disp − 국내 bid disp (좁혀지면/음수면 청산)
+    entry: float | None  # HL bid disp − 국내 bid disp (벌어질수록 진입 매력) — 메인!L12
+    exit: float | None   # HL ask disp − 국내 ask disp (좁혀지면/음수면 청산) — 메인!L14
 
 
 def pair_spread(hl: SideDisp, kr: SideDisp) -> PairSpread:
-    entry = hl.bid - kr.ask if hl.bid is not None and kr.ask is not None else None
-    exit_ = hl.ask - kr.bid if hl.ask is not None and kr.bid is not None else None
+    entry = hl.bid - kr.bid if hl.bid is not None and kr.bid is not None else None
+    exit_ = hl.ask - kr.ask if hl.ask is not None and kr.ask is not None else None
     return PairSpread(entry=entry, exit=exit_)
 
 
 def net_entry(spread: PairSpread, fee_rate: float) -> float | None:
-    """순진입 = 진입값 − 왕복호가비용/2 − 왕복수수료.
+    """순진입 = 진입값 − (청산−진입)/2 − 왕복수수료.
 
     "지금 진입해서 괴리가 0으로 완전 수렴했을 때 남는 기대 %".
-    유도: 실현수익 = 진입값(t0) − 청산값(수렴 시). 수렴 시 청산값 ≈ 호가폭합/2
-    (호가폭이 유지된다고 가정)이고, 호가폭합 = 청산−진입(같은 시점)이므로
-    순진입 = 진입 − (청산−진입)/2 − 수수료.
+    유도: 실현수익 = 진입값(t0) − 청산값(수렴 시). 중간가 괴리가 0으로 수렴하면
+    청산값 ≈ (청산−진입)/2 (같은 시점 청산−진입 = HL호가폭 − 국내호가폭 —
+    국내 다리는 maker라 국내 폭은 벌고 HL 폭은 낸다. 호가폭 유지 가정).
     """
     if spread.entry is None or spread.exit is None:
         return None
@@ -61,7 +62,7 @@ def net_entry(spread: PairSpread, fee_rate: float) -> float | None:
 
 
 def net_exit(spread: PairSpread) -> float | None:
-    """순청산 = 청산값 − 왕복호가비용/2 (= (진입+청산)/2 — 중간가 기준 괴리).
+    """순청산 = (진입+청산)/2 — 중간가 기준 괴리(호가폭 효과 제거).
 
     포지션 보유 중 **≤ 0이면 수렴 완료**로 보고 청산. 수수료는 진입 판단(순진입)에서
     이미 차감했으므로 여기선 빼지 않는다.

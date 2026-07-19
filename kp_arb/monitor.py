@@ -109,16 +109,17 @@ class MonitorState:
     def ls_rows(
         self,
         theory: dict[tuple[Underlying, Instrument], float | None] | None = None,
+        instruments: tuple[Instrument, ...] = _LS_INSTRUMENTS,
     ) -> list[tuple[str, ...]]:
         """LS 표: (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상가, 이론가, 괴리율%).
 
         이론가는 선물(캐리 합성)·ETF(iNAV) 행에 표시 — LiveSystem과 공용 계산.
-        괴리율 = (현재가 − 이론가) ÷ 이론가 × 100.
+        괴리율 = (현재가 − 이론가) ÷ 이론가 × 100. 미취급 상품은 instruments로 제외.
         """
         rows: list[tuple[str, ...]] = []
         for u in Underlying:
             name = _NAMES[u]
-            for inst in _LS_INSTRUMENTS:
+            for inst in instruments:
                 ask, ask_qty, bid, bid_qty = self.merged_quote(u, inst)  # KRX+NXT 통합
                 trade = self.trades.get((u, inst))
                 expected = self.expected.get((u, inst))  # 주식·선물·ETF 모두
@@ -290,7 +291,7 @@ def main() -> None:
     ])
     # 구성요소(HL/국내 매도·매수 disp, 왕복비용)는 화면에서 제외 — CSV에는 계속 기록.
     fill_board = make_grid(
-        "괴리 보드 (%) — 순진입 ≥ 0 진입 / 순청산 ≤ 0 청산", [
+        "괴리 보드 (%) — 진입=HL매수d−국내매수d(국내 maker) · 순진입 ≥ 0 진입 / 순청산 ≤ 0 청산", [
             ("쌍", 13, "black"),
             ("주H차", 8, "black"),    # 엑셀 메인 I22 (HL 현재가 괴리)
             ("주선차", 8, "black"),   # 엑셀 메인 K19/M19 (국내 현재가 괴리)
@@ -380,13 +381,16 @@ def main() -> None:
         try:
             system = system_ref.get("system")
             theory = None
+            instruments: tuple[Instrument, ...] = _LS_INSTRUMENTS
             if system is not None:
                 theory = {}
                 for u in Underlying:
                     theory[(u, Instrument.KR_ETF)] = system.etf_theory_price(u)
                     theory[(u, Instrument.KR_STOCK_FUTURE)] = (
                         system.stock_futures_theory(u))
-            fill_ls(state.ls_rows(theory))
+                if not system.etf_symbols:  # ETF 미취급 — 행 숨김
+                    instruments = (Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE)
+            fill_ls(state.ls_rows(theory, instruments))
             fill_hl(state.hl_rows())
             if system is not None:
                 fill_board(board_rows(system))

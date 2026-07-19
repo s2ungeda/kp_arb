@@ -1,7 +1,7 @@
 """상대호가 괴리·스프레드 테스트 — 순수 로직 (엑셀 IM.xlsx 수식 대조)."""
 import pytest
 
-from kp_arb.disparity import PairSpread, disp, pair_spread, side_disp
+from kp_arb.disparity import PairSpread, SideDisp, disp, pair_spread, side_disp
 
 
 def test_disp_basic() -> None:
@@ -19,13 +19,15 @@ def test_side_disp() -> None:
 
 
 def test_pair_spread_matches_excel() -> None:
-    # 엑셀 K22 = HL 매수호가disp − SF 매도호가disp (진입),
-    #      K24 = HL 매도호가disp − SF 매수호가disp (청산). 2026-07-03 실측값 대조.
-    hl = side_disp(2_429_199.577, 2_427_668.408, 2_436_000)        # AE7/AF7
-    sf = side_disp(2_446_000, 2_445_000, 2_437_401.53)             # AE61/AF61
+    # 엑셀 개정판(meme.xlsx, 국내 maker 기준):
+    #   메인!L12(en) = HL 매수호가disp − SF 매수호가disp (진입)
+    #   메인!L14(ex) = HL 매도호가disp − SF 매도호가disp (청산)
+    # 2026-07-13 실측 disp 값(시세!AE7/AF7·AE61/AF61)으로 대조.
+    hl = SideDisp(ask=-0.0011270167839740623, bid=-0.0019273957769356468)
+    sf = SideDisp(ask=2.2100920405295353e-05, bid=-0.002677742764585)
     s = pair_spread(hl, sf)
-    assert s.entry == pytest.approx(-0.0069479, abs=1e-6)          # 메인!K22
-    assert s.exit == pytest.approx(-0.0059091, abs=1e-6)           # 메인!K24
+    assert s.entry == pytest.approx(0.000750346987649353, abs=1e-9)   # 메인!L12
+    assert s.exit == pytest.approx(-0.0011491177043793576, abs=1e-9)  # 메인!L14
 
 
 def test_pair_spread_none_propagates() -> None:

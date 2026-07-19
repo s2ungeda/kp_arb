@@ -118,10 +118,7 @@ def test_load_config_real_file() -> None:
 
     config = load_config()
     assert config.hl_symbols()[Underlying.SAMSUNG] == "xyz:SMSN"
-    assert config.etf_symbols() == {
-        Underlying.SAMSUNG: "0193W0",
-        Underlying.SK_HYNIX: "0193T0",
-    }  # 현대차는 ETF 없음
+    assert config.etf_symbols() == {}  # ETF 미취급 (사용자 확정 2026-07-13)
     assert config.etf_leverage == 2.0
 
 

@@ -314,10 +314,12 @@ def test_disparity_board_computes_pairs() -> None:
     assert sf.hl.bid is not None and abs(sf.hl.bid - 0.005) < 1e-9
     assert sf.hl.ask is not None and abs(sf.hl.ask - 0.010) < 1e-9
     # SF 이론가 = 300,000 × (1 + 3.5% × 잔존일/365) > 300,000 → disp는 그 대비
-    assert sf.kr.ask is not None and sf.spread.entry is not None
-    assert sf.spread.entry == sf.hl.bid - sf.kr.ask
+    assert sf.kr.bid is not None and sf.spread.entry is not None
+    # 국내 maker 기준(meme.xlsx): 진입 = HL매수d − 국내매수d / 청산 = HL매도d − 국내매도d
+    assert sf.spread.entry == sf.hl.bid - sf.kr.bid
+    assert sf.spread.exit == (sf.hl.ask or 0) - (sf.kr.ask or 0)
 
     etf = board[(SAMSUNG, Instrument.KR_ETF)]
-    # ETF 이론가 = 20,000(기초 등락률 0) → ask 20,050 disp +0.25%
+    # ETF 이론가 = 20,000(기초 등락률 0) → ask 20,050 disp +0.25% (인프라 유지 확인용)
     assert etf.kr.ask is not None and abs(etf.kr.ask - 0.0025) < 1e-9
-    assert etf.spread.exit == (etf.hl.ask or 0) - (etf.kr.bid or 0)
+    assert etf.spread.exit == (etf.hl.ask or 0) - (etf.kr.ask or 0)
