@@ -77,11 +77,22 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             e = tk.Entry(win, width=8, justify="right")
             e.insert(0, default)
             e.grid(row=i, column=1, padx=6, pady=3)
+        tk.Label(win, text="주문 가능 시간", anchor="w").grid(
+            row=3, column=0, sticky="w", padx=6, pady=3)
+        time_frame = tk.Frame(win)
+        time_frame.grid(row=3, column=1, padx=6, pady=3)
+        ent_from = tk.Entry(time_frame, width=6, justify="center")
+        ent_from.insert(0, "09:00")
+        ent_from.pack(side="left")
+        tk.Label(time_frame, text="~").pack(side="left", padx=2)
+        ent_to = tk.Entry(time_frame, width=6, justify="center")
+        ent_to.insert(0, "15:30")
+        ent_to.pack(side="left")
         credit = tk.BooleanVar(value=False)
         tk.Checkbutton(win, text="주식 신용거래 사용", variable=credit).grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=6, pady=3)
+            row=4, column=0, columnspan=2, sticky="w", padx=6, pady=3)
         tk.Button(win, text="저장", width=8, command=win.destroy).grid(
-            row=4, column=0, columnspan=2, pady=(4, 6))
+            row=5, column=0, columnspan=2, pady=(4, 6))
         # 부모창 가운데 배치 + 모달(닫기 전까지 부모 조작 불가)
         win.update_idletasks()
         x = root.winfo_x() + (root.winfo_width() - win.winfo_width()) // 2
