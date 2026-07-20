@@ -418,7 +418,10 @@ def main() -> None:
                 pass  # 창 닫힘 — 갱신 루프 종료
 
     refresh()
-    root.mainloop()
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        pass  # 콘솔 Ctrl+C — 트레이스백 없이 조용히 종료
 
 
 if __name__ == "__main__":
