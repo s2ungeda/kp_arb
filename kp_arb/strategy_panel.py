@@ -137,7 +137,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def order_command(n: int, action: str) -> Callable[[], None]:
         return lambda: set_status(f"세트{n} {action} — (시안: 코어 미연결)")
 
-    set_rows: list[tuple[list[tk.Entry], tk.Checkbutton, tk.Button, tk.Button]] = []
+    set_rows: list[
+        tuple[list[tk.Entry], tk.Checkbutton, tk.Checkbutton, tk.Button, tk.Button]
+    ] = []
     for i in range(SET_COUNT):
         r = i + 1
         tk.Label(sets, text=f"세트{r}").grid(row=r, column=0, padx=(0, 4))
@@ -146,28 +148,26 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             e = tk.Entry(sets, width=7, justify="right")
             e.grid(row=r, column=1 + c, padx=2, pady=1)
             entries.append(e)
+        # 시작 해제 = 자동 프로세스 중지 + 미체결 취소 / PAUSE 체크 = 프로세스
+        # 유지(신호 계산 계속), 미체결 취소 + 신규 발주 중단 — 해제 시 즉시 재개 (§6.2)
         chk_start = tk.Checkbutton(sets, text="시작", variable=tk.BooleanVar(sets))
         chk_start.grid(row=r, column=5, padx=(10, 2))
+        chk_pause = tk.Checkbutton(sets, text="PAUSE", fg="#8b0000",
+                                   variable=tk.BooleanVar(sets))
+        chk_pause.grid(row=r, column=6, padx=(0, 2))
         btn_in = tk.Button(sets, text="진입주문", width=6,
                            command=order_command(r, "진입주문"))
-        btn_in.grid(row=r, column=6, padx=1)
+        btn_in.grid(row=r, column=7, padx=1)
         btn_out = tk.Button(sets, text="청산주문", width=6,
                             command=order_command(r, "청산주문"))
-        btn_out.grid(row=r, column=7, padx=1)
-        # 세트별 PAUSE — 해당 세트만 정지(진행 중 주문 취소). 모드와 무관하게 표시.
-        btn_pause = tk.Button(sets, text="PAUSE", width=5, fg="white", bg="#8b0000",
-                              command=order_command(r, "PAUSE"))
-        btn_pause.grid(row=r, column=8, padx=(1, 0))
-        set_rows.append((entries, chk_start, btn_in, btn_out))
+        btn_out.grid(row=r, column=8, padx=(1, 0))
+        set_rows.append((entries, chk_start, chk_pause, btn_in, btn_out))
 
     # --- 하단: 현재진입수량 + PAUSE ---
     row_bottom = tk.Frame(root)
     row_bottom.pack(fill="x", padx=4, pady=2)
     lbl_position = tk.Label(row_bottom, text="현재진입수량: - / -", anchor="w")
     lbl_position.pack(side="left")
-    tk.Button(row_bottom, text="전체 PAUSE", width=9, fg="white", bg="#8b0000",
-              command=lambda: set_status("전체 PAUSE — (시안: 코어 미연결)")
-              ).pack(side="right")
 
     # --- 상태줄 ---
     status = tk.Label(root, text="시안 — 코어 미연결", anchor="w", relief="groove")
@@ -175,18 +175,21 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     def apply_mode(_event: object = None) -> None:
         ui = mode_ui_state(cb_mode.get())
-        for entries, chk_start, btn_in, btn_out in set_rows:
+        for entries, chk_start, chk_pause, btn_in, btn_out in set_rows:
             if ui.threshold_enabled:
                 entries[2].config(state="normal")   # 진입 기준값
                 entries[3].config(state="normal")   # 청산 기준값
             else:
                 entries[2].config(state="disabled")
                 entries[3].config(state="disabled")
-            if ui.start_visible:
+            if ui.start_visible:  # 시작·PAUSE는 자동 모드 전용 (수동엔 불필요)
                 chk_start.grid()
+                chk_pause.grid()
             else:
                 chk_start.deselect()
                 chk_start.grid_remove()
+                chk_pause.deselect()
+                chk_pause.grid_remove()
             if ui.order_buttons_visible:
                 btn_in.grid()
                 btn_out.grid()
