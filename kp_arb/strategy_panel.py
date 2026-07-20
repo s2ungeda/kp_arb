@@ -82,6 +82,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             row=3, column=0, columnspan=2, sticky="w", padx=6, pady=3)
         tk.Button(win, text="저장", width=8, command=win.destroy).grid(
             row=4, column=0, columnspan=2, pady=(4, 6))
+        # 부모창 가운데 배치 + 모달(닫기 전까지 부모 조작 불가)
+        win.update_idletasks()
+        x = root.winfo_x() + (root.winfo_width() - win.winfo_width()) // 2
+        y = root.winfo_y() + (root.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+        win.focus_set()
 
     tk.Button(row1, text="옵션", command=open_options).pack(side="right")
 
