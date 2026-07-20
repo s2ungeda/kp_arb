@@ -107,16 +107,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     btn_pause.pack(side="right")
     # chk_start 는 모드에 따라 pack/pack_forget (아래 apply_mode)
 
-    # --- 4행: 순진입/순청산 패널 ---
+    # --- 4행: 진입/청산 패널 (estprice 기반, §6.2-1) ---
     row4 = tk.Frame(root)
     row4.pack(fill="x", padx=4, pady=2)
     panel_font = ("Malgun Gothic", 16, "bold")
-    lbl_net_entry = tk.Label(row4, text="순진입\n-", bg="red", fg="white",
-                             font=panel_font, width=10, height=2)
-    lbl_net_entry.pack(side="left", expand=True, fill="both", padx=(0, 2))
-    lbl_net_exit = tk.Label(row4, text="순청산\n-", bg="blue", fg="white",
-                            font=panel_font, width=10, height=2)
-    lbl_net_exit.pack(side="left", expand=True, fill="both", padx=(2, 0))
+    lbl_panel_entry = tk.Label(row4, text="진입\n-", bg="red", fg="white",
+                               font=panel_font, width=10, height=2)
+    lbl_panel_entry.pack(side="left", expand=True, fill="both", padx=(0, 2))
+    lbl_panel_exit = tk.Label(row4, text="청산\n-", bg="blue", fg="white",
+                              font=panel_font, width=10, height=2)
+    lbl_panel_exit.pack(side="left", expand=True, fill="both", padx=(2, 0))
 
     # --- 5행: 수동 주문 버튼 ---
     row5 = tk.Frame(root)
