@@ -148,12 +148,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             entries.append(e)
         chk_start = tk.Checkbutton(sets, text="시작", variable=tk.BooleanVar(sets))
         chk_start.grid(row=r, column=5, padx=(10, 2))
-        btn_in = tk.Button(sets, text="진입주문", width=8,
+        btn_in = tk.Button(sets, text="진입주문", width=6,
                            command=order_command(r, "진입주문"))
-        btn_in.grid(row=r, column=6, padx=2)
-        btn_out = tk.Button(sets, text="청산주문", width=8,
+        btn_in.grid(row=r, column=6, padx=1)
+        btn_out = tk.Button(sets, text="청산주문", width=6,
                             command=order_command(r, "청산주문"))
-        btn_out.grid(row=r, column=7, padx=(2, 0))
+        btn_out.grid(row=r, column=7, padx=1)
+        # 세트별 PAUSE — 해당 세트만 정지(진행 중 주문 취소). 모드와 무관하게 표시.
+        btn_pause = tk.Button(sets, text="PAUSE", width=5, fg="white", bg="#8b0000",
+                              command=order_command(r, "PAUSE"))
+        btn_pause.grid(row=r, column=8, padx=(1, 0))
         set_rows.append((entries, chk_start, btn_in, btn_out))
 
     # --- 하단: 현재진입수량 + PAUSE ---
@@ -161,8 +165,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     row_bottom.pack(fill="x", padx=4, pady=2)
     lbl_position = tk.Label(row_bottom, text="현재진입수량: - / -", anchor="w")
     lbl_position.pack(side="left")
-    tk.Button(row_bottom, text="PAUSE", width=8, fg="white", bg="#8b0000",
-              command=lambda: set_status("PAUSE — (시안: 코어 미연결)")
+    tk.Button(row_bottom, text="전체 PAUSE", width=9, fg="white", bg="#8b0000",
+              command=lambda: set_status("전체 PAUSE — (시안: 코어 미연결)")
               ).pack(side="right")
 
     # --- 상태줄 ---
