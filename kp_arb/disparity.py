@@ -9,7 +9,26 @@
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+
+
+def est_price(levels: Sequence[tuple[float, float]], qty: float) -> float | None:
+    """estprice — 주문수량을 다 받아줄 수 있는 첫 호가 (DESIGN §6.2-3).
+
+    levels는 **상대편** 호가 사다리 [(가격, 잔량), ...] 최우선부터 —
+    매수 주문이면 매도호가, 매도 주문이면 매수호가를 넣는다.
+    누적 잔량 ≥ 주문수량이 되는 호가의 가격. 사다리 전체로도 부족하면 None
+    (신호·주문 금지). 진입/청산 공식의 매수가/매도가 자리에 이 값을 쓴다.
+    """
+    if qty <= 0:
+        return None
+    cumulative = 0.0
+    for price, size in levels:
+        cumulative += size
+        if cumulative >= qty:
+            return price
+    return None
 
 
 def disp(price: float | None, base: float | None) -> float | None:

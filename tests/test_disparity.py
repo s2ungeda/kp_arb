@@ -1,7 +1,31 @@
 """상대호가 괴리·스프레드 테스트 — 순수 로직 (엑셀 IM.xlsx 수식 대조)."""
 import pytest
 
-from kp_arb.disparity import PairSpread, SideDisp, disp, pair_spread, side_disp
+from kp_arb.disparity import (
+    PairSpread,
+    SideDisp,
+    disp,
+    est_price,
+    pair_spread,
+    side_disp,
+)
+
+
+def test_est_price_walks_depth() -> None:
+    # DESIGN §6.2-3 (사용자 예시): 매수 주문 10, 매도1호가 잔량 5·매도2호가 잔량 10
+    # → 누적 15 ≥ 10 이 되는 매도2호가가 estprice.
+    assert est_price([(100.0, 5), (101.0, 10)], 10) == 101.0
+    # 매도1호가 잔량이 10이면 매도1호가.
+    assert est_price([(100.0, 10), (101.0, 10)], 10) == 100.0
+    # 경계: 누적합 == 주문수량도 충족.
+    assert est_price([(100.0, 4), (101.0, 6)], 10) == 101.0
+
+
+def test_est_price_insufficient_or_invalid() -> None:
+    assert est_price([(100.0, 5), (101.0, 3)], 10) is None  # 사다리 전체로도 부족
+    assert est_price([], 10) is None
+    assert est_price([(100.0, 5)], 0) is None   # 수량 0/음수는 무효
+    assert est_price([(100.0, 5)], -1) is None
 
 
 def test_disp_basic() -> None:
