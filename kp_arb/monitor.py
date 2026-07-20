@@ -418,10 +418,17 @@ def main() -> None:
                 pass  # 창 닫힘 — 갱신 루프 종료
 
     refresh()
-    try:
-        root.mainloop()
-    except KeyboardInterrupt:
-        pass  # 콘솔 Ctrl+C — 트레이스백 없이 조용히 종료
+    # 콘솔로 Ctrl-C 신호가 흘러들어도(직접 누르지 않아도 생김 — 콘솔 복사 시도,
+    # 창 닫기 과정 등) 화면을 죽이지 않는다. 종료는 창 닫기(X)로.
+    while True:
+        try:
+            root.mainloop()
+            break  # 창이 닫혀 정상 종료
+        except KeyboardInterrupt:
+            try:
+                root.winfo_exists()
+            except tk.TclError:
+                break  # 창도 이미 닫힘 — 종료
 
 
 if __name__ == "__main__":
