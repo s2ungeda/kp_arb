@@ -45,6 +45,7 @@ def main() -> None:
     # 코어 생존 확인은 HTTP 왕복(최대 1초)이라 화면 스레드에서 하면 창 끌기·
     # 메뉴가 그 순간 얼어붙는다 → 뒷단 스레드가 확인하고 화면은 결과만 읽는다.
     alive_box = {"alive": False}
+    closing = {"flag": False}
     launched: list[tuple[str, subprocess.Popen[bytes]]] = []
 
     def save_ui_state() -> None:
@@ -59,7 +60,8 @@ def main() -> None:
     def poll_core() -> None:
         while True:
             alive_box["alive"] = core_alive()
-            save_ui_state()
+            if not closing["flag"]:  # 종료 중엔 마지막 저장본을 덮지 않음
+                save_ui_state()
             time.sleep(2.0)
 
     threading.Thread(target=poll_core, daemon=True).start()
@@ -135,6 +137,17 @@ def main() -> None:
             for module in screens:
                 open_screen(module)
         root.after(1500, reopen)  # 코어가 뜰 시간을 살짝 준 뒤
+
+    def on_close() -> None:
+        """메인 종료 = 띄운 화면들도 함께 종료. 코어는 유지(안전종료 메뉴로만)."""
+        save_ui_state()  # 닫기 직전 화면 목록 저장 — 다음 실행 때 다시 열림
+        closing["flag"] = True
+        for _, proc in launched:
+            if proc.poll() is None:
+                proc.terminate()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
 
     refresh()
     # 콘솔로 Ctrl-C 신호가 흘러들어도 화면을 죽이지 않는다 (monitor와 동일)
