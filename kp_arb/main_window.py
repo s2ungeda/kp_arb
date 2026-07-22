@@ -8,10 +8,15 @@
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+from pathlib import Path
 
 from .core_client import core_request
+
+# 메인 화면 마지막 상태(코어 실행 여부·띄운 화면 목록) — gitignore
+UI_STATE_PATH = Path(__file__).resolve().parent.parent / "ui_state.json"
 
 
 def core_alive() -> bool:
@@ -19,10 +24,16 @@ def core_alive() -> bool:
     return core_request("/state") is not None
 
 
-def launch_module(module: str) -> None:
-    """파이썬 모듈을 별도 프로세스로 실행 (윈도우는 새 콘솔 — 로그 확인용)."""
-    flags = subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
-    subprocess.Popen([sys.executable, "-m", module], creationflags=flags)
+def launch_module(module: str, *, console: bool = False) -> subprocess.Popen[bytes]:
+    """파이썬 모듈을 별도 프로세스로 실행.
+
+    화면은 콘솔 숨김(CREATE_NO_WINDOW — cmd 창 안 뜸), 코어만 새 콘솔(로그 확인용).
+    """
+    flags = 0
+    if sys.platform == "win32":
+        flags = (subprocess.CREATE_NEW_CONSOLE if console
+                 else subprocess.CREATE_NO_WINDOW)
+    return subprocess.Popen([sys.executable, "-m", module], creationflags=flags)
 
 
 def main() -> None:
@@ -34,13 +45,27 @@ def main() -> None:
     # 코어 생존 확인은 HTTP 왕복(최대 1초)이라 화면 스레드에서 하면 창 끌기·
     # 메뉴가 그 순간 얼어붙는다 → 뒷단 스레드가 확인하고 화면은 결과만 읽는다.
     alive_box = {"alive": False}
+    launched: list[tuple[str, subprocess.Popen[bytes]]] = []
+
+    def save_ui_state() -> None:
+        """마지막 상태 저장 — 다음 실행 때 그대로 복원."""
+        data = {"core": alive_box["alive"],
+                "screens": [m for m, p in launched if p.poll() is None]}
+        try:
+            UI_STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
+        except OSError:
+            pass
 
     def poll_core() -> None:
         while True:
             alive_box["alive"] = core_alive()
+            save_ui_state()
             time.sleep(2.0)
 
     threading.Thread(target=poll_core, daemon=True).start()
+
+    def open_screen(module: str) -> None:
+        launched.append((module, launch_module(module)))
 
     root = tk.Tk()
     root.title("kp-arb 메인")
@@ -56,7 +81,7 @@ def main() -> None:
         if core_alive():
             status.config(text="코어가 이미 떠 있음")
             return
-        launch_module("kp_arb.core_server")
+        launch_module("kp_arb.core_server", console=True)
         status.config(text="코어 시작 중 ...")
 
     def stop_core() -> None:
@@ -71,9 +96,9 @@ def main() -> None:
     menubar = tk.Menu(root)
     m_screen = tk.Menu(menubar, tearoff=0)
     m_screen.add_command(label="전략 화면",
-                         command=lambda: launch_module("kp_arb.strategy_panel"))
+                         command=lambda: open_screen("kp_arb.strategy_panel"))
     m_screen.add_command(label="시세 모니터",
-                         command=lambda: launch_module("kp_arb.monitor"))
+                         command=lambda: open_screen("kp_arb.monitor"))
     menubar.add_cascade(label="화면", menu=m_screen)
     m_core = tk.Menu(menubar, tearoff=0)
     m_core.add_command(label="코어 시작", command=start_core)
@@ -93,6 +118,23 @@ def main() -> None:
                 root.after(500, refresh)
             except tk.TclError:
                 pass  # 창 닫힘
+
+    # --- 마지막 상태 복원: 코어가 떠 있었으면 재시동, 화면들도 다시 열기 ---
+    try:
+        saved_raw = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        saved_raw = {}
+    saved = saved_raw if isinstance(saved_raw, dict) else {}
+    if saved.get("core") and not core_alive():
+        launch_module("kp_arb.core_server", console=True)
+        status.config(text="마지막 상태 복원 — 코어 시작 중 ...")
+    screens = [m for m in saved.get("screens", [])
+               if isinstance(m, str) and m.startswith("kp_arb.")]
+    if screens:
+        def reopen() -> None:
+            for module in screens:
+                open_screen(module)
+        root.after(1500, reopen)  # 코어가 뜰 시간을 살짝 준 뒤
 
     refresh()
     # 콘솔로 Ctrl-C 신호가 흘러들어도 화면을 죽이지 않는다 (monitor와 동일)

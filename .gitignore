@@ -8,3 +8,5 @@ __pycache__/
 venv/
 .env
 logs/
+core_state.json
+ui_state.json

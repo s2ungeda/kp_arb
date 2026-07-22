@@ -109,6 +109,39 @@ async def test_http_roundtrip() -> None:
         await client.close()
 
 
+def test_state_persistence_roundtrip(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from kp_arb.core_server import load_state, save_state
+
+    assert isinstance(tmp_path, Path)
+    state = PanelState()
+    _auto_ready(state)
+    apply_command(state, {"cmd": "start", "set": 0, "value": True})
+    apply_command(state, {"cmd": "monitor_qty", "qty": 5})
+    path = tmp_path / "core_state.json"
+    save_state(path, state)
+
+    restored = load_state(path)
+    assert restored.mode is Mode.AUTO_T
+    assert restored.sets[0].inputs.total_qty == 100
+    assert restored.sets[0].inputs.entry_threshold == 0.15
+    assert restored.monitor_qty == 5
+    assert not restored.sets[0].started  # 자동 시작은 복원 안 함 (안전)
+
+
+def test_load_state_missing_or_corrupt(tmp_path: object) -> None:
+    from pathlib import Path
+
+    from kp_arb.core_server import load_state
+
+    assert isinstance(tmp_path, Path)
+    assert load_state(tmp_path / "none.json").mode is Mode.MANUAL
+    bad = tmp_path / "bad.json"
+    bad.write_text("{broken", encoding="utf-8")
+    assert load_state(bad).mode is Mode.MANUAL
+
+
 def test_snapshot_serializable() -> None:
     import json
 

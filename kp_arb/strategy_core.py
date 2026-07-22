@@ -111,6 +111,55 @@ class PanelState:
         self.sets[index].paused = value
 
 
+def state_from_dict(data: dict[str, object]) -> PanelState:
+    """저장된 스냅샷(JSON dict) → PanelState 복원 (§6.2-1 입력값 저장).
+
+    **안전**: started/paused는 복원하지 않는다 — 코어 재시동 시 자동 매매는
+    항상 꺼진 상태로 시작(사람이 다시 켠다). 값 오류는 해당 필드만 기본값.
+    """
+    state = PanelState()
+    try:
+        state.mode = Mode(str(data.get("mode", state.mode)))
+        state.underlying = Underlying(str(data.get("underlying", state.underlying)))
+        state.counterpart = Instrument(str(data.get("counterpart", state.counterpart)))
+    except ValueError:
+        pass  # 알 수 없는 값 — 기본 유지
+    state.ls_enabled = bool(data.get("ls_enabled", True))
+    state.hl_enabled = bool(data.get("hl_enabled", True))
+    try:
+        state.monitor_qty = int(data.get("monitor_qty", 0))  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        pass
+    raw_sets = data.get("sets")
+    if isinstance(raw_sets, list):
+        for target, raw in zip(state.sets, raw_sets, strict=False):
+            ins = raw.get("inputs", {}) if isinstance(raw, dict) else {}
+            try:
+                target.inputs.total_qty = int(ins.get("total_qty", 0))
+                target.inputs.per_order_qty = int(ins.get("per_order_qty", 0))
+                for key in ("entry_threshold", "exit_threshold"):
+                    value = ins.get(key)
+                    setattr(target.inputs, key,
+                            None if value is None else float(value))
+            except (TypeError, ValueError):
+                continue  # 이 세트만 기본값
+    raw_opts = data.get("options")
+    if isinstance(raw_opts, dict):
+        opts = state.options
+        try:
+            opts.max_retries = int(raw_opts.get("max_retries", opts.max_retries))
+            opts.retry_interval_s = float(
+                raw_opts.get("retry_interval_s", opts.retry_interval_s))
+            opts.wait_timer_s = float(raw_opts.get("wait_timer_s", opts.wait_timer_s))
+            window = raw_opts.get("order_window")
+            if isinstance(window, list | tuple) and len(window) == 2:
+                opts.order_window = (str(window[0]), str(window[1]))
+            opts.stock_credit = bool(raw_opts.get("stock_credit", opts.stock_credit))
+        except (TypeError, ValueError):
+            pass
+    return state
+
+
 def validate_inputs(inputs: SetInput, mode: Mode) -> list[str]:
     """세트 입력값 검증 — 위반 사유 목록(비면 통과). §6.2-4 주문 전 체크."""
     errors: list[str] = []

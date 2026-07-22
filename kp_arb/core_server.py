@@ -15,6 +15,7 @@ import dataclasses
 import json
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -25,10 +26,13 @@ from .strategy_core import (
     OrderAction,
     PanelState,
     plan_order,
+    state_from_dict,
 )
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
+# 입력값 저장 파일 (§6.2-1 "입력값은 저장") — gitignore, 명령마다 갱신
+STATE_PATH = Path(__file__).resolve().parent.parent / "core_state.json"
 
 
 def snapshot(state: PanelState) -> dict[str, Any]:
@@ -125,10 +129,29 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
     return {"ok": False, "errors": [f"알 수 없는 명령: {cmd!r}"]}
 
 
+def save_state(path: Path, state: PanelState) -> None:
+    """상태를 JSON 파일로 저장 — 실패(잠김 등)는 무시(다음 명령 때 재시도)."""
+    try:
+        path.write_text(_dumps(snapshot(state)), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_state(path: Path) -> PanelState:
+    """저장 파일에서 복원 — 없거나 깨졌으면 기본값. 자동 시작 상태는 복원 안 함."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return PanelState()
+    return state_from_dict(data) if isinstance(data, dict) else PanelState()
+
+
 def make_app(
-    state: PanelState, on_shutdown: Callable[[], None] | None = None
+    state: PanelState,
+    on_shutdown: Callable[[], None] | None = None,
+    save: Callable[[], None] | None = None,
 ) -> web.Application:
-    """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 프로세스 종료 훅."""
+    """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅."""
 
     async def get_state(_request: web.Request) -> web.Response:
         return web.json_response(snapshot(state), dumps=_dumps)
@@ -141,6 +164,8 @@ def make_app(
                 {"ok": False, "errors": ["JSON 본문 필요"]}, status=400, dumps=_dumps)
         payload = body if isinstance(body, dict) else {}
         result = apply_command(state, payload)
+        if result.get("ok") and save:
+            save()  # 입력값 저장 — 재시작 시 그대로 복원 (§6.2-1)
         if payload.get("cmd") == "shutdown" and result.get("ok") and on_shutdown:
             # 응답을 먼저 보내고 잠시 뒤 종료 (화면이 결과를 받을 시간)
             asyncio.get_running_loop().call_later(0.2, on_shutdown)
@@ -153,9 +178,10 @@ def make_app(
 
 
 async def _serve() -> None:
-    state = PanelState()
+    state = load_state(STATE_PATH)  # 마지막 입력값 복원 (자동 시작은 항상 꺼짐)
     stop = asyncio.Event()
-    runner = web.AppRunner(make_app(state, on_shutdown=stop.set))
+    runner = web.AppRunner(make_app(
+        state, on_shutdown=stop.set, save=lambda: save_state(STATE_PATH, state)))
     await runner.setup()
     site = web.TCPSite(runner, HOST, DEFAULT_PORT)
     await site.start()

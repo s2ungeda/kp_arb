@@ -118,11 +118,17 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         win.title("옵션")
         win.resizable(False, False)
         win.transient(root)
+        # 코어에 저장된 옵션값으로 채움 (미접속이면 기본값)
+        state_now = core_request("/state") or {}
+        saved_raw = state_now.get("options")
+        saved = saved_raw if isinstance(saved_raw, dict) else {}
+        window = saved.get("order_window") or ["09:00", "15:30"]
         entries: dict[str, tk.Entry] = {}
         for i, (key, label, default) in enumerate([
-            ("max_retries", "재시도 횟수", "3"),
-            ("retry_interval_s", "재시도 간격(초)", "1.0"),
-            ("wait_timer_s", "대기 타이머(초)", "5.0"),
+            ("max_retries", "재시도 횟수", str(saved.get("max_retries", 3))),
+            ("retry_interval_s", "재시도 간격(초)",
+             str(saved.get("retry_interval_s", 1.0))),
+            ("wait_timer_s", "대기 타이머(초)", str(saved.get("wait_timer_s", 5.0))),
         ]):
             tk.Label(win, text=label, anchor="w").grid(
                 row=i, column=0, sticky="w", padx=6, pady=3)
@@ -135,13 +141,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         time_frame = tk.Frame(win)
         time_frame.grid(row=3, column=1, padx=6, pady=3)
         ent_from = tk.Entry(time_frame, width=6, justify="center")
-        ent_from.insert(0, "09:00")
+        ent_from.insert(0, str(window[0]))
         ent_from.pack(side="left")
         tk.Label(time_frame, text="~").pack(side="left", padx=2)
         ent_to = tk.Entry(time_frame, width=6, justify="center")
-        ent_to.insert(0, "15:30")
+        ent_to.insert(0, str(window[1]))
         ent_to.pack(side="left")
-        credit = tk.BooleanVar(value=False)
+        credit = tk.BooleanVar(value=bool(saved.get("stock_credit", False)))
         tk.Checkbutton(win, text="주식 신용거래 사용", variable=credit).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=6, pady=3)
 
@@ -279,8 +285,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     status = tk.Label(root, text="…", anchor="w", relief="groove")
     status.pack(fill="x", padx=4, pady=(2, 4))
 
-    def apply_mode(_event: object = None) -> None:
-        send({"cmd": "set_mode", "mode": cb_mode.get()}, "모드 전환")
+    def apply_mode(_event: object = None, *, notify: bool = True) -> None:
+        if notify:  # 초기 표시는 명령 안 보냄 — 화면 재시작이 코어 자동 상태를 안 건드리게
+            send({"cmd": "set_mode", "mode": cb_mode.get()}, "모드 전환")
         ui = mode_ui_state(cb_mode.get())
         for row in set_rows:
             if ui.threshold_enabled:
@@ -305,11 +312,39 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 row.btn_out.grid_remove()
 
     cb_mode.bind("<<ComboboxSelected>>", apply_mode)
-    apply_mode()
-    if core_request("/state") is None:
-        set_status("코어 미접속 — core_server.bat 먼저 실행 (화면만 확인 가능)")
+
+    def fill_from_state(data: dict[str, Any]) -> None:
+        """코어 저장값 → 화면 채우기 (재시작 시 마지막 입력 그대로, §6.2-1)."""
+        rev_under = {v: k for k, v in UNDER_MAP.items()}
+        rev_counter = {v: k for k, v in COUNTER_MAP.items()}
+        cb_mode.set(str(data.get("mode", "수동")))
+        cb_under.set(rev_under.get(str(data.get("underlying")), "하이닉스"))
+        cb_counter.set(rev_counter.get(str(data.get("counterpart")), "주식선물"))
+        ls_on.set(bool(data.get("ls_enabled", True)))
+        hl_on.set(bool(data.get("hl_enabled", True)))
+        monitor_qty = data.get("monitor_qty")
+        if isinstance(monitor_qty, int) and monitor_qty > 0:
+            ent_mon_qty.delete(0, "end")
+            ent_mon_qty.insert(0, str(monitor_qty))
+        raw_sets = data.get("sets")
+        for row, raw in zip(set_rows, raw_sets if isinstance(raw_sets, list) else [],
+                            strict=False):
+            ins = raw.get("inputs", {}) if isinstance(raw, dict) else {}
+            values = (ins.get("total_qty"), ins.get("per_order_qty"),
+                      ins.get("entry_threshold"), ins.get("exit_threshold"))
+            for entry, value in zip(row.entries, values, strict=False):
+                entry.config(state="normal")  # disabled 상태면 못 채우므로 잠깐 해제
+                entry.delete(0, "end")
+                if value not in (None, 0, ""):
+                    entry.insert(0, str(value))
+
+    state_data = core_request("/state")
+    if state_data is not None:
+        fill_from_state(state_data)
+        set_status("코어 연결됨 — 마지막 입력값 복원")
     else:
-        set_status("코어 연결됨")
+        set_status("코어 미접속 — 메인 화면에서 코어를 먼저 시작 (화면만 확인 가능)")
+    apply_mode(notify=False)  # 복원된 모드로 위젯 정리 (명령 전송 없음)
 
     # 콘솔로 Ctrl-C 신호가 흘러들어도(직접 누르지 않아도 생김) 화면을 죽이지 않는다.
     while True:
