@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import time as dtime
 from enum import StrEnum
 
-from .domain.enums import Instrument, Side, Venue
+from .domain.enums import Instrument, Side, Underlying, Venue
 from .theory import in_time_window
 
 FUTURES_SHARES_PER_CONTRACT = 10  # 주식선물 1계약 = 10주 (§6.2-2)
@@ -72,6 +72,43 @@ class OrderPlan:
 
     action: OrderAction
     legs: tuple[Leg, ...]
+
+
+SET_COUNT = 3  # 입력 세트 수 (§6.2-1 — 추후 확장 가능)
+
+
+@dataclass
+class PanelState:
+    """전략 화면 1장의 전체 상태 — 코어가 단일 진실로 보관 (§12).
+
+    화면은 이 상태를 읽어 표시만 하고, 변경은 명령(core_server)으로만 한다.
+    """
+
+    mode: Mode = Mode.MANUAL
+    underlying: Underlying = Underlying.SK_HYNIX          # 콤보1 기본
+    counterpart: Instrument = Instrument.KR_STOCK_FUTURE  # 콤보2 기본
+    ls_enabled: bool = True
+    hl_enabled: bool = True
+    monitor_qty: int = 0  # 모니터링 전용 수량 — estprice 계산용 (§6.2-1)
+    sets: list[SetState] = field(default_factory=lambda: [SetState() for _ in range(SET_COUNT)])
+    options: RetryOptions = field(default_factory=RetryOptions)
+
+    def start_set(self, index: int, value: bool) -> list[str]:
+        """시작 체크/해제. 켤 때는 입력 검증 통과 필수 — 실패 사유 반환(켜지지 않음)."""
+        target = self.sets[index]
+        if value:
+            errors = validate_inputs(target.inputs, self.mode)
+            if self.mode is Mode.MANUAL:
+                errors.append("수동 모드에는 시작이 없음")
+            if errors:
+                return errors
+        target.started = value
+        if not value:
+            target.paused = False  # 중지 시 일시정지도 초기화
+        return []
+
+    def pause_set(self, index: int, value: bool) -> None:
+        self.sets[index].paused = value
 
 
 def validate_inputs(inputs: SetInput, mode: Mode) -> list[str]:
