@@ -348,9 +348,7 @@ def main() -> None:
              f"{fx:.4f}" if fx is not None else "-",          # 사용 환율 (주간 스팟=엑셀 D65)
              _fmt(system.stock_last(u), decimals=0),          # 기초 현재가 (엑셀 D60/D58)
              pct(p.hl_last),                                  # HL 현재가 괴리 (메인 I22)
-             pct(p.kr_last),                                  # 국내 현재가 괴리 (메인 K19/M19)
-             pct(p.net_entry),                                # 순진입
-             pct(p.net_exit))                                 # 순청산
+             pct(p.kr_last))                                  # 국내 현재가 괴리 (메인 K19/M19)
             for (u, inst), p in board.items()
             if p.spread.entry is not None or p.spread.exit is not None
         ]
@@ -367,7 +365,7 @@ def main() -> None:
                     writer.writerow(["time", "underlying", "pair",
                                      "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
                                      "entry", "exit", "usdkrw_used", "base_last",
-                                     "hl_last_d", "kr_last_d", "net_entry", "net_exit"])
+                                     "hl_last_d", "kr_last_d"])
                 writer.writerows(lines)
         except OSError:
             pass  # 파일을 엑셀 등이 잠근 상태 — 이번 기록은 건너뛰고 풀리면 재개
