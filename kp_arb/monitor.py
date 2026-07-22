@@ -290,14 +290,12 @@ def main() -> None:
         ("현-오라클%", 9, "black"), ("마크-오라클%", 10, "black"),
         ("펀딩전", 8, "black"), ("펀딩피", 8, "black"), ("남은시간", 7, "black"),
     ])
-    # 구성요소(HL/국내 매도·매수 disp, 왕복비용)는 화면에서 제외 — CSV에는 계속 기록.
+    # 구성요소(HL/국내 매도·매수 disp)·순진입/순청산은 화면 제외 — CSV에는 계속 기록.
     fill_board = make_grid(
-        "괴리 보드 (%) — 진입=HL매수d−국내매수d(국내 maker) · 순진입 ≥ 0 진입 / 순청산 ≤ 0 청산", [
+        "괴리 보드 (%) — 진입=HL매수d−국내매수d(국내 maker)", [
             ("쌍", 13, "black"),
             ("진입", 8, "red"),
             ("청산", 8, "blue"),
-            ("순진입", 8, "darkred"),   # 진입 − 왕복호가비용/2 − 수수료 (수렴 시 기대 %)
-            ("순청산", 8, "darkblue"),  # 청산 − 왕복호가비용/2 (≤0 = 수렴 완료)
         ])
 
     status = tk.Label(root, text="연결 중 ...", anchor="w", font=font)
@@ -323,8 +321,6 @@ def main() -> None:
             rows.append((
                 f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
                 pct(pair.spread.entry), pct(pair.spread.exit),  # K22/K24
-                pct(pair.net_entry),                            # 순진입 (수렴 시 기대 %)
-                pct(pair.net_exit),                             # 순청산 (≤0 = 수렴 완료)
             ))
         return rows
 
