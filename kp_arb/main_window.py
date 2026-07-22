@@ -27,7 +27,20 @@ def launch_module(module: str) -> None:
 
 def main() -> None:
     """메인 창 실행."""
+    import threading
+    import time
     import tkinter as tk
+
+    # 코어 생존 확인은 HTTP 왕복(최대 1초)이라 화면 스레드에서 하면 창 끌기·
+    # 메뉴가 그 순간 얼어붙는다 → 뒷단 스레드가 확인하고 화면은 결과만 읽는다.
+    alive_box = {"alive": False}
+
+    def poll_core() -> None:
+        while True:
+            alive_box["alive"] = core_alive()
+            time.sleep(2.0)
+
+    threading.Thread(target=poll_core, daemon=True).start()
 
     root = tk.Tk()
     root.title("kp-arb 메인")
@@ -69,15 +82,15 @@ def main() -> None:
     root.config(menu=menubar)
 
     def refresh() -> None:
-        try:
-            if core_alive():
+        try:  # 네트워크 호출 없음 — 뒷단 스레드 결과만 표시 (버벅임 방지)
+            if alive_box["alive"]:
                 lbl_core.config(text="코어: 연결됨 (127.0.0.1:8787)", fg="dark green")
             else:
                 lbl_core.config(text="코어: 미접속 — 메뉴 ▸ 코어 ▸ 코어 시작",
                                 fg="#8b0000")
         finally:
             try:
-                root.after(2000, refresh)
+                root.after(500, refresh)
             except tk.TclError:
                 pass  # 창 닫힘
 
