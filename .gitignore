@@ -10,3 +10,4 @@ venv/
 logs/
 core_state.json
 ui_state.json
+~$*.xlsx
