@@ -1,0 +1,307 @@
+"""주문 화면 (자동T=HL-주식 / 자동M=HL-주식선물) — 코어 클라이언트 (DESIGN §6.2 개정).
+
+    python -m kp_arb.order_panel autoT|autoM   (운영은 main.bat 메뉴에서)
+
+화면은 입력·버튼을 코어 명령(POST /command)으로 보내고 결과를 표시만 한다.
+판단(검증·한도·주문)은 전부 코어. 수치 갱신은 뒷단 스레드가 /state를 1초
+폴링하고 화면은 저장된 결과만 읽는다(화면 스레드 네트워크 금지 — CLAUDE.md).
+"""
+from __future__ import annotations
+
+import sys
+from typing import Any
+
+from .core_client import core_request
+from .strategy_core import OPERATING_WINDOWS, ScreenKind
+
+UNDERLYINGS = ("하이닉스", "삼성", "현대차")
+UNDER_MAP = {"하이닉스": "sk_hynix", "삼성": "samsung", "현대차": "hyundai"}
+TITLES = {
+    ScreenKind.AUTO_T: "자동T — HL-주식 (동시 taker)",
+    ScreenKind.AUTO_M: "자동M — HL-주식선물 (LS maker→HL taker)",
+}
+BLOCK_LABELS = (("entry", "entry (국내 매수 + HL 매도)", "red"),
+                ("exit", "exit (국내 매도 + HL 매수)", "blue"))
+
+
+def parse_qty(text: str) -> int:
+    """수량 에디트 값 → int. 빈칸/오타는 0 (코어 검증에서 걸러짐)."""
+    try:
+        return int(text.strip())
+    except ValueError:
+        return 0
+
+
+def parse_threshold(text: str) -> float | None:
+    """기준값 에디트 값 → float(소수 — 0.006=0.6%). 빈칸/오타는 None."""
+    try:
+        return float(text.strip())
+    except ValueError:
+        return None
+
+
+def operating_text(kind: ScreenKind) -> str:
+    """운영시간 표시 문자열 — 코어 규칙(OPERATING_WINDOWS)과 같은 원본."""
+    return " / ".join(f"{s}~{e}" for s, e in OPERATING_WINDOWS[kind])
+
+
+def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
+    """화면 실행. 인자: autoT(기본) | autoM."""
+    import threading
+    import time
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    kind = ScreenKind(sys.argv[1]) if len(sys.argv) > 1 else ScreenKind.AUTO_T
+    screen_key = kind.value
+
+    root = tk.Tk()
+    root.title(f"kp-arb {TITLES[kind]}")
+    root.resizable(False, False)
+    root.option_add("*Font", ("Malgun Gothic", 9))
+
+    def set_status(text: str) -> None:
+        status.config(text=text)
+
+    def send(payload: dict[str, Any], label: str) -> dict[str, Any] | None:
+        """명령 전송(+화면 식별) — 거부·경고·미접속을 상태줄에 그대로 표시."""
+        result = core_request("/command", {**payload, "screen": screen_key})
+        if result is None:
+            set_status(f"{label} 실패 — 코어 미접속 (메인 화면에서 코어 시작)")
+            return None
+        if not result.get("ok"):
+            set_status(f"{label} 거부 — {'; '.join(result.get('errors', []))}")
+            return result
+        warnings = result.get("warnings") or []
+        set_status(f"{label} 완료" + (f" (경고: {'; '.join(warnings)})" if warnings else ""))
+        return result
+
+    # --- 1행: 종목 + 1회주문수량 + 설정 ---
+    row1 = tk.Frame(root)
+    row1.pack(fill="x", padx=4, pady=2)
+    tk.Label(row1, text="종목").pack(side="left")
+    cb_under = ttk.Combobox(row1, values=UNDERLYINGS, width=8, state="readonly")
+    cb_under.set("하이닉스")
+    cb_under.pack(side="left", padx=(2, 10))
+    cb_under.bind("<<ComboboxSelected>>", lambda _e: send(
+        {"cmd": "select", "underlying": UNDER_MAP[cb_under.get()]}, "종목 선택"))
+    unit = "주" if kind is ScreenKind.AUTO_T else "계약"
+    tk.Label(row1, text=f"1회주문수량({unit})").pack(side="left")
+    ent_per = tk.Entry(row1, width=6, justify="right")
+    ent_per.pack(side="left", padx=(2, 10))
+    ent_per.bind("<Return>", lambda _e: send(
+        {"cmd": "per_qty", "qty": parse_qty(ent_per.get())}, "1회주문수량"))
+
+    def open_settings() -> None:
+        win = tk.Toplevel(root)
+        win.title(f"설정 — {kind.value}")
+        win.resizable(False, False)
+        win.transient(root)
+        data = core_request("/state") or {}
+        raw = ((data.get("screens") or {}).get(screen_key) or {}).get("settings")
+        saved = raw if isinstance(raw, dict) else {}
+        fields = [
+            ("kr_margin_ticks", "국내 주문가 여유(틱)", saved.get("kr_margin_ticks", 10)),
+            ("hl_margin_pct", "하리 주문가 여유(예 0.01=1%)",
+             saved.get("hl_margin_pct", 0.01)),
+            ("max_position", "종목보유최대수량", saved.get("max_position", 0)),
+            ("daily_limit_100m", "일거래한도(억, 0=미사용)",
+             saved.get("daily_limit_100m", 0.0)),
+        ]
+        if kind is ScreenKind.AUTO_M:
+            fields += [
+                ("delay_ms", "딜레이(ms)", saved.get("delay_ms", 500)),
+                ("pre_order_range_ticks", "선주문진입범위(틱)",
+                 saved.get("pre_order_range_ticks", 0)),
+            ]
+        entries: dict[str, tk.Entry] = {}
+        for i, (key, label, default) in enumerate(fields):
+            tk.Label(win, text=label, anchor="w").grid(
+                row=i, column=0, sticky="w", padx=6, pady=3)
+            e = tk.Entry(win, width=10, justify="right")
+            e.insert(0, str(default))
+            e.grid(row=i, column=1, padx=6, pady=3)
+            entries[key] = e
+
+        def save_settings() -> None:
+            payload: dict[str, Any] = {"cmd": "settings"}
+            for key, entry in entries.items():
+                value = parse_threshold(entry.get())
+                payload[key] = value if value is not None else 0
+            send(payload, "설정 저장")
+            win.destroy()
+
+        tk.Button(win, text="저장", width=8, command=save_settings).grid(
+            row=len(fields), column=0, columnspan=2, pady=(4, 6))
+        win.update_idletasks()
+        x = root.winfo_x() + (root.winfo_width() - win.winfo_width()) // 2
+        y = root.winfo_y() + (root.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+        win.focus_set()
+
+    tk.Button(row1, text="설정", command=open_settings).pack(side="right")
+
+    tk.Label(root, text=f"운영시간: {operating_text(kind)}", anchor="w",
+             fg="gray25").pack(fill="x", padx=4)
+
+    # --- entry/exit 블록: LS주문 체크 + 세트 3줄 ---
+    kr_tag = "S" if kind is ScreenKind.AUTO_T else "SF"
+    grid = tk.Frame(root)
+    grid.pack(fill="x", padx=4, pady=2)
+    headers = ("", "기준값", "목표진입량", "실행", "진입수량", "환율",
+               "avg HL", f"avg {kr_tag}")
+    row_no = 0
+    set_widgets: dict[tuple[str, int], dict[str, Any]] = {}
+    ls_vars: dict[str, tk.BooleanVar] = {}
+
+    def send_set_inputs(block: str, index: int) -> None:
+        w = set_widgets[(block, index)]
+        send({"cmd": "per_qty", "qty": parse_qty(ent_per.get())}, "1회주문수량")
+        send({"cmd": "set_threshold", "block": block, "set": index,
+              "value": parse_threshold(w["threshold"].get())}, "기준값")
+        send({"cmd": "set_target", "block": block, "set": index,
+              "value": parse_qty(w["target"].get())}, "목표진입량")
+
+    def ls_order_command(block: str, var: Any) -> Any:
+        return lambda: send({"cmd": "ls_order", "block": block, "value": var.get()},
+                            "LS주문 체크")
+
+    def run_command(block: str, index: int) -> Any:
+        return lambda: toggle_run(block, index)
+
+    def toggle_run(block: str, index: int) -> None:
+        w = set_widgets[(block, index)]
+        turning_on = not w["running"]
+        if turning_on:
+            send_set_inputs(block, index)
+            value = parse_threshold(w["threshold"].get())
+            if value is not None and (
+                (block == "entry" and value <= 0) or (block == "exit" and value >= 0)
+            ) and not messagebox.askokcancel(
+                "경고", ("낮은수치" if block == "entry" else "높은수치")
+                + " — 계속하시겠습니까?"):
+                return
+        result = send({"cmd": "run", "block": block, "set": index,
+                       "value": turning_on}, f"{block} {index + 1}세트 실행")
+        if result is not None and result.get("ok"):
+            w["running"] = turning_on
+            w["button"].config(text="중지" if turning_on else "실행",
+                               bg="#1a7a1a" if turning_on else "SystemButtonFace",
+                               fg="white" if turning_on else "black")
+
+    for block, block_label, color in BLOCK_LABELS:
+        head = tk.Frame(grid)
+        head.grid(row=row_no, column=0, columnspan=len(headers), sticky="w",
+                  pady=(6 if row_no else 0, 1))
+        tk.Label(head, text=block_label, fg=color,
+                 font=("Malgun Gothic", 9, "bold")).pack(side="left")
+        ls_var = tk.BooleanVar(value=True)
+        ls_vars[block] = ls_var
+        tk.Checkbutton(head, text="LS주문", variable=ls_var,
+                       command=ls_order_command(block, ls_var)).pack(
+            side="left", padx=(10, 0))
+        row_no += 1
+        for col, header in enumerate(headers):
+            tk.Label(grid, text=header, fg="gray25").grid(row=row_no, column=col)
+        row_no += 1
+        for i, name in enumerate(("1st", "2nd", "3rd")):
+            tk.Label(grid, text=name).grid(row=row_no, column=0, padx=(0, 4))
+            ent_threshold = tk.Entry(grid, width=8, justify="right")
+            ent_threshold.grid(row=row_no, column=1, padx=2, pady=1)
+            ent_target = tk.Entry(grid, width=8, justify="right")
+            ent_target.grid(row=row_no, column=2, padx=2, pady=1)
+            btn = tk.Button(grid, text="실행", width=6,
+                            command=run_command(block, i))
+            btn.grid(row=row_no, column=3, padx=4)
+            displays = []
+            for col in range(4, 8):
+                lbl = tk.Label(grid, text="-", width=8, anchor="e",
+                               bg="white", relief="solid", bd=1)
+                lbl.grid(row=row_no, column=col, padx=1, pady=1)
+                displays.append(lbl)
+            set_widgets[(block, i)] = {
+                "threshold": ent_threshold, "target": ent_target,
+                "button": btn, "running": False, "displays": displays,
+            }
+            row_no += 1
+
+    status = tk.Label(root, text="…", anchor="w", relief="groove")
+    status.pack(fill="x", padx=4, pady=(2, 4))
+
+    # --- 코어 상태 폴링(뒷단 스레드) → 화면은 결과만 표시 ---
+    state_box: dict[str, Any] = {"data": None}
+
+    def poll_state() -> None:
+        while True:
+            state_box["data"] = core_request("/state")
+            time.sleep(1.0)
+
+    threading.Thread(target=poll_state, daemon=True).start()
+
+    def fill_initial() -> None:
+        data = core_request("/state")
+        if data is None:
+            set_status("코어 미접속 — 메인 화면에서 코어를 먼저 시작")
+            return
+        raw = (data.get("screens") or {}).get(screen_key)
+        screen = raw if isinstance(raw, dict) else {}
+        rev = {v: k for k, v in UNDER_MAP.items()}
+        cb_under.set(rev.get(str(screen.get("underlying")), "하이닉스"))
+        per = screen.get("per_order_qty")
+        if isinstance(per, int) and per > 0:
+            ent_per.insert(0, str(per))
+        for block, sets_name in (("entry", "entry_sets"), ("exit", "exit_sets")):
+            ls_vars[block].set(bool(screen.get(f"ls_order_{block}", True)))
+            raw_sets = screen.get(sets_name)
+            for i, raw_set in enumerate(raw_sets if isinstance(raw_sets, list) else []):
+                if not isinstance(raw_set, dict) or i >= 3:
+                    continue
+                w = set_widgets[(block, i)]
+                if raw_set.get("threshold") is not None:
+                    w["threshold"].insert(0, str(raw_set["threshold"]))
+                if raw_set.get("target_qty"):
+                    w["target"].insert(0, str(raw_set["target_qty"]))
+        set_status("코어 연결됨 — 마지막 입력값 복원")
+
+    def refresh() -> None:
+        try:  # 네트워크 없음 — 뒷단 스레드 결과만 표시
+            data = state_box["data"]
+            if isinstance(data, dict):
+                raw = (data.get("screens") or {}).get(screen_key)
+                screen = raw if isinstance(raw, dict) else {}
+                for block, sets_name in (("entry", "entry_sets"),
+                                         ("exit", "exit_sets")):
+                    raw_sets = screen.get(sets_name)
+                    if not isinstance(raw_sets, list):
+                        continue
+                    for i, raw_set in enumerate(raw_sets[:3]):
+                        if not isinstance(raw_set, dict):
+                            continue
+                        w = set_widgets[(block, i)]
+                        w["displays"][0].config(text=str(raw_set.get("fired_qty", 0)))
+                        done = (raw_set.get("target_qty") or 0) > 0 and (
+                            raw_set.get("fired_qty", 0) >= raw_set["target_qty"])
+                        w["displays"][0].config(bg="#d0f0d0" if done else "white")
+        finally:
+            try:
+                root.after(1000, refresh)
+            except tk.TclError:
+                pass  # 창 닫힘
+
+    fill_initial()
+    refresh()
+    # 콘솔로 Ctrl-C 신호가 흘러들어도 화면을 죽이지 않는다
+    while True:
+        try:
+            root.mainloop()
+            break
+        except KeyboardInterrupt:
+            try:
+                root.winfo_exists()
+            except tk.TclError:
+                break
+
+
+if __name__ == "__main__":
+    main()

@@ -24,7 +24,7 @@ def core_alive() -> bool:
     return core_request("/state") is not None
 
 
-def launch_module(module: str, *, console: bool = False) -> subprocess.Popen[bytes]:
+def launch_module(module: str, *args: str, console: bool = False) -> subprocess.Popen[bytes]:
     """파이썬 모듈을 별도 프로세스로 실행.
 
     화면은 콘솔 숨김(CREATE_NO_WINDOW — cmd 창 안 뜸), 코어만 새 콘솔(로그 확인용).
@@ -33,7 +33,7 @@ def launch_module(module: str, *, console: bool = False) -> subprocess.Popen[byt
     if sys.platform == "win32":
         flags = (subprocess.CREATE_NEW_CONSOLE if console
                  else subprocess.CREATE_NO_WINDOW)
-    return subprocess.Popen([sys.executable, "-m", module], creationflags=flags)
+    return subprocess.Popen([sys.executable, "-m", module, *args], creationflags=flags)
 
 
 def main() -> None:
@@ -66,8 +66,9 @@ def main() -> None:
 
     threading.Thread(target=poll_core, daemon=True).start()
 
-    def open_screen(module: str) -> None:
-        launched.append((module, launch_module(module)))
+    def open_screen(module: str, *args: str) -> None:
+        token = " ".join([module, *args])  # ui_state 저장/복원용 식별자
+        launched.append((token, launch_module(module, *args)))
 
     root = tk.Tk()
     root.title("kp-arb 메인")
@@ -97,8 +98,10 @@ def main() -> None:
 
     menubar = tk.Menu(root)
     m_screen = tk.Menu(menubar, tearoff=0)
-    m_screen.add_command(label="전략 화면",
-                         command=lambda: open_screen("kp_arb.strategy_panel"))
+    m_screen.add_command(label="자동T 주문 (HL-주식)",
+                         command=lambda: open_screen("kp_arb.order_panel", "autoT"))
+    m_screen.add_command(label="자동M 주문 (HL-주식선물)",
+                         command=lambda: open_screen("kp_arb.order_panel", "autoM"))
     m_screen.add_command(label="시세 모니터",
                          command=lambda: open_screen("kp_arb.monitor"))
     menubar.add_cascade(label="화면", menu=m_screen)
@@ -134,8 +137,9 @@ def main() -> None:
                if isinstance(m, str) and m.startswith("kp_arb.")]
     if screens:
         def reopen() -> None:
-            for module in screens:
-                open_screen(module)
+            for token in screens:
+                module, *args = token.split()
+                open_screen(module, *args)
         root.after(1500, reopen)  # 코어가 뜰 시간을 살짝 준 뒤
 
     def on_close() -> None:

@@ -1,150 +1,139 @@
-"""코어 API 테스트 — 명령 적용(순수) + HTTP 왕복 (DESIGN §12)."""
-from datetime import datetime
+"""코어 API 테스트 — 명령 적용(순수) + HTTP 왕복 + 저장/복원 (DESIGN §12, §6.2)."""
+from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from kp_arb.core_server import apply_command, make_app, snapshot
-from kp_arb.strategy_core import Mode, PanelState
-
-NOON = datetime(2026, 7, 21, 12, 0)
-
-
-def _auto_ready(state: PanelState, index: int = 0) -> None:
-    apply_command(state, {"cmd": "set_mode", "mode": "자동T"})
-    apply_command(state, {"cmd": "set_inputs", "set": index,
-                          "total": 100, "per": 20, "entry": 0.15, "exit": 0.0})
+from kp_arb.core_server import (
+    apply_command,
+    load_state,
+    make_app,
+    save_state,
+    snapshot,
+)
+from kp_arb.strategy_core import CoreState, ScreenKind
 
 
-def test_set_inputs_and_start() -> None:
-    state = PanelState()
-    _auto_ready(state)
-    result = apply_command(state, {"cmd": "start", "set": 0, "value": True})
-    assert result["ok"] and state.sets[0].started
+def _ready(state: CoreState, screen: str = "autoM") -> None:
+    apply_command(state, {"cmd": "per_qty", "screen": screen, "qty": 5})
+    apply_command(state, {"cmd": "settings", "screen": screen, "max_position": 100})
+    apply_command(state, {"cmd": "set_threshold", "screen": screen,
+                          "block": "entry", "set": 0, "value": 0.006})
+    apply_command(state, {"cmd": "set_target", "screen": screen,
+                          "block": "entry", "set": 0, "value": 100})
 
 
-def test_start_rejected_on_bad_inputs() -> None:
-    state = PanelState()
-    apply_command(state, {"cmd": "set_mode", "mode": "자동T"})
-    apply_command(state, {"cmd": "set_inputs", "set": 0,
-                          "total": 100, "per": 20, "entry": 0.0, "exit": 0.1})
-    result = apply_command(state, {"cmd": "start", "set": 0, "value": True})
-    assert not result["ok"] and not state.sets[0].started
+def test_setup_and_run() -> None:
+    state = CoreState()
+    _ready(state)
+    result = apply_command(state, {"cmd": "run", "screen": "autoM",
+                                   "block": "entry", "set": 0, "value": True})
+    assert result["ok"]
+    assert state.screens[ScreenKind.AUTO_M].entry_sets[0].running
 
 
-def test_mode_switch_resets_auto_flags() -> None:
-    state = PanelState()
-    _auto_ready(state)
-    apply_command(state, {"cmd": "start", "set": 0, "value": True})
-    apply_command(state, {"cmd": "pause", "set": 0, "value": True})
-    apply_command(state, {"cmd": "set_mode", "mode": "수동"})
-    assert state.mode is Mode.MANUAL
-    assert not state.sets[0].started and not state.sets[0].paused
+def test_run_rejected_without_inputs() -> None:
+    state = CoreState()
+    result = apply_command(state, {"cmd": "run", "screen": "autoM",
+                                   "block": "entry", "set": 0, "value": True})
+    assert not result["ok"] and result["errors"]
+    assert not state.screens[ScreenKind.AUTO_M].entry_sets[0].running
 
 
-def test_manual_order_returns_plan() -> None:
-    state = PanelState()  # 수동 기본, 하이닉스/주식선물 기본
-    apply_command(state, {"cmd": "set_inputs", "set": 0, "total": 10, "per": 2})
-    result = apply_command(state, {"cmd": "manual_order", "set": 0, "action": "진입"},
-                           now=NOON)
-    assert result["ok"], result["errors"]
-    legs = result["plan"]["legs"]
-    assert len(legs) == 2 and legs[1]["qty"] == 20  # 선물 2계약 → HL 20주
-
-
-def test_manual_order_blocked_in_auto() -> None:
-    state = PanelState()
-    _auto_ready(state)
-    result = apply_command(state, {"cmd": "manual_order", "set": 0, "action": "진입"},
-                           now=NOON)
+def test_threshold_limit_and_warning() -> None:
+    state = CoreState()
+    # ±1% 한계는 입력 자체 거부
+    result = apply_command(state, {"cmd": "set_threshold", "screen": "autoT",
+                                   "block": "entry", "set": 0, "value": -0.02})
     assert not result["ok"]
+    assert state.screens[ScreenKind.AUTO_T].entry_sets[0].threshold is None
+    # 0 이하는 저장되지만 경고 반환 → 화면이 확인창
+    result = apply_command(state, {"cmd": "set_threshold", "screen": "autoT",
+                                   "block": "entry", "set": 0, "value": -0.001})
+    assert result["ok"] and result["warnings"] == ["낮은수치"]
 
 
-def test_unknown_and_bad_commands() -> None:
-    state = PanelState()
-    assert not apply_command(state, {"cmd": "nope"})["ok"]
-    assert not apply_command(state, {"cmd": "set_inputs", "set": 99, "total": 1})["ok"]
+def test_ls_order_checkbox_per_block() -> None:
+    state = CoreState()
+    apply_command(state, {"cmd": "ls_order", "screen": "autoT",
+                          "block": "exit", "value": False})
+    screen = state.screens[ScreenKind.AUTO_T]
+    assert screen.ls_order_entry and not screen.ls_order_exit
 
 
 def test_shutdown_stops_all_sets() -> None:
-    state = PanelState()
-    _auto_ready(state)
-    apply_command(state, {"cmd": "start", "set": 0, "value": True})
+    state = CoreState()
+    _ready(state)
+    apply_command(state, {"cmd": "run", "screen": "autoM",
+                          "block": "entry", "set": 0, "value": True})
     result = apply_command(state, {"cmd": "shutdown"})
     assert result["ok"]
-    assert not state.sets[0].started and not state.sets[0].paused
+    assert not state.screens[ScreenKind.AUTO_M].entry_sets[0].running
 
 
-async def test_http_shutdown_triggers_exit_hook() -> None:
+def test_unknown_and_bad_commands() -> None:
+    state = CoreState()
+    assert not apply_command(state, {"cmd": "nope"})["ok"]
+    assert not apply_command(state, {"cmd": "per_qty", "screen": "없는화면",
+                                     "qty": 1})["ok"]
+    assert not apply_command(state, {"cmd": "fx_month", "choice": "far"})["ok"]
+
+
+def test_state_persistence_roundtrip(tmp_path: Path) -> None:
+    state = CoreState()
+    _ready(state)
+    apply_command(state, {"cmd": "run", "screen": "autoM",
+                          "block": "entry", "set": 0, "value": True})
+    apply_command(state, {"cmd": "fx_month", "choice": "next"})
+    path = tmp_path / "core_state.json"
+    save_state(path, state)
+
+    restored = load_state(path)
+    screen = restored.screens[ScreenKind.AUTO_M]
+    assert screen.per_order_qty == 5
+    assert screen.settings.max_position == 100
+    assert screen.entry_sets[0].threshold == 0.006
+    assert screen.entry_sets[0].target_qty == 100
+    assert restored.fx_month == "next"
+    assert not screen.entry_sets[0].running  # 실행 상태는 복원 안 함 (안전)
+
+
+def test_load_state_missing_or_corrupt(tmp_path: Path) -> None:
+    assert load_state(tmp_path / "none.json").fx_month == "near"
+    bad = tmp_path / "bad.json"
+    bad.write_text("{broken", encoding="utf-8")
+    assert load_state(bad).fx_month == "near"
+
+
+async def test_http_roundtrip_and_shutdown_hook() -> None:
     import asyncio
 
-    state = PanelState()
+    state = CoreState()
     stop = asyncio.Event()
     client = TestClient(TestServer(make_app(state, on_shutdown=stop.set)))
-    await client.start_server()
-    try:
-        resp = await client.post("/command", json={"cmd": "shutdown"})
-        assert (await resp.json())["ok"]
-        await asyncio.wait_for(stop.wait(), timeout=1.0)  # 응답 후 종료 예약 확인
-    finally:
-        await client.close()
-
-
-async def test_http_roundtrip() -> None:
-    state = PanelState()
-    client = TestClient(TestServer(make_app(state)))
     await client.start_server()
     try:
         resp = await client.get("/state")
         assert resp.status == 200
         data = await resp.json()
-        assert data["mode"] == "수동" and len(data["sets"]) == 3
+        assert set(data["screens"]) == {"autoT", "autoM"}
 
-        resp = await client.post("/command", json={"cmd": "monitor_qty", "qty": 7})
+        resp = await client.post("/command", json={
+            "cmd": "per_qty", "screen": "autoT", "qty": 30})
         assert resp.status == 200 and (await resp.json())["ok"]
-        assert state.monitor_qty == 7
+        assert state.screens[ScreenKind.AUTO_T].per_order_qty == 30
 
         resp = await client.post("/command", data=b"not json")
         assert resp.status == 400
+
+        resp = await client.post("/command", json={"cmd": "shutdown"})
+        assert (await resp.json())["ok"]
+        await asyncio.wait_for(stop.wait(), timeout=1.0)
     finally:
         await client.close()
-
-
-def test_state_persistence_roundtrip(tmp_path: object) -> None:
-    from pathlib import Path
-
-    from kp_arb.core_server import load_state, save_state
-
-    assert isinstance(tmp_path, Path)
-    state = PanelState()
-    _auto_ready(state)
-    apply_command(state, {"cmd": "start", "set": 0, "value": True})
-    apply_command(state, {"cmd": "monitor_qty", "qty": 5})
-    path = tmp_path / "core_state.json"
-    save_state(path, state)
-
-    restored = load_state(path)
-    assert restored.mode is Mode.AUTO_T
-    assert restored.sets[0].inputs.total_qty == 100
-    assert restored.sets[0].inputs.entry_threshold == 0.15
-    assert restored.monitor_qty == 5
-    assert not restored.sets[0].started  # 자동 시작은 복원 안 함 (안전)
-
-
-def test_load_state_missing_or_corrupt(tmp_path: object) -> None:
-    from pathlib import Path
-
-    from kp_arb.core_server import load_state
-
-    assert isinstance(tmp_path, Path)
-    assert load_state(tmp_path / "none.json").mode is Mode.MANUAL
-    bad = tmp_path / "bad.json"
-    bad.write_text("{broken", encoding="utf-8")
-    assert load_state(bad).mode is Mode.MANUAL
 
 
 def test_snapshot_serializable() -> None:
     import json
 
-    state = PanelState()
-    text = json.dumps(snapshot(state), default=str, ensure_ascii=False)
-    assert "자동" not in text and "수동" in text  # mode 기본값 직렬화 확인
+    text = json.dumps(snapshot(CoreState()), default=str, ensure_ascii=False)
+    assert "autoT" in text and "autoM" in text

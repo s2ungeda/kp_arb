@@ -1,135 +1,139 @@
-"""전략 코어 테스트 — 검증·한도·환산·주문 계획 (DESIGN §6.2, 순수 로직)."""
+"""주문 화면 코어 테스트 — 검증·한도·환산·주문 계획 (DESIGN §6.2 개정 2026-07-22)."""
 from datetime import time
+
+import pytest
 
 from kp_arb.domain.enums import Instrument, Side, Venue
 from kp_arb.strategy_core import (
-    Mode,
-    OrderAction,
-    RetryOptions,
-    SetInput,
+    Block,
+    ScreenKind,
+    ScreenState,
     allowed_order_qty,
     hl_qty_for,
-    order_window_ok,
+    in_operating_window,
     plan_order,
-    validate_inputs,
+    taker_price,
+    threshold_check,
+    validate_run,
 )
 
 STOCK = Instrument.KR_STOCK
 SF = Instrument.KR_STOCK_FUTURE
 NOON = time(12, 0)
-OPTS = RetryOptions()  # 주문 가능 시간 기본 09:00~15:30
 
 
-def _inputs(total: int = 100, per: int = 20,
-            entry: float | None = 0.15, exit_: float | None = 0.0) -> SetInput:
-    return SetInput(total_qty=total, per_order_qty=per,
-                    entry_threshold=entry, exit_threshold=exit_)
+def _screen(kind: ScreenKind = ScreenKind.AUTO_M, *, per: int = 5,
+            max_pos: int = 100) -> ScreenState:
+    screen = ScreenState(kind=kind, per_order_qty=per)
+    screen.settings.max_position = max_pos
+    for i, value in enumerate((0.006, 0.008, 0.012)):
+        screen.entry_sets[i].threshold = value
+        screen.entry_sets[i].target_qty = 100
+    for i, value in enumerate((0.0, -0.003, -0.005)):
+        screen.exit_sets[i].threshold = value
+        screen.exit_sets[i].target_qty = 100
+    return screen
 
 
-# --- 입력 검증 (§6.2-4) ---
+# --- 기준값 가드 (§6.2-6) ---
 
-def test_validate_ok() -> None:
-    assert validate_inputs(_inputs(), Mode.AUTO_T) == []
-    # 수동은 기준값 없어도 됨 (에디트 disable)
-    assert validate_inputs(_inputs(entry=None, exit_=None), Mode.MANUAL) == []
-
-
-def test_validate_quantities() -> None:
-    assert validate_inputs(_inputs(total=0), Mode.MANUAL) != []
-    assert validate_inputs(_inputs(per=0), Mode.MANUAL) != []
-    assert validate_inputs(_inputs(total=10, per=20), Mode.MANUAL) != []
+def test_threshold_guards() -> None:
+    assert threshold_check(Block.ENTRY, 0.006) == ([], [])
+    assert threshold_check(Block.ENTRY, 0.0)[1] == ["낮은수치"]      # 경고만
+    assert threshold_check(Block.ENTRY, -0.01)[0] != []              # -1% 이하 불가
+    assert threshold_check(Block.EXIT, -0.003) == ([], [])
+    assert threshold_check(Block.EXIT, 0.0)[1] == ["높은수치"]
+    assert threshold_check(Block.EXIT, 0.01)[0] != []                # +1% 이상 불가
 
 
-def test_validate_auto_thresholds() -> None:
-    # 자동: 기준값 필수 + 진입 > 청산 (§6.2-1)
-    assert validate_inputs(_inputs(entry=None), Mode.AUTO_T) != []
-    assert validate_inputs(_inputs(entry=0.0, exit_=0.0), Mode.AUTO_M) != []
-    assert validate_inputs(_inputs(entry=0.1, exit_=0.2), Mode.AUTO_T) != []
+def test_validate_run() -> None:
+    screen = _screen()
+    assert validate_run(screen, Block.ENTRY, 0) == []
+    screen.per_order_qty = 0
+    assert validate_run(screen, Block.ENTRY, 0) != []
+    screen = _screen(max_pos=0)
+    assert any("보유최대" in e for e in validate_run(screen, Block.ENTRY, 0))
+    screen = _screen()
+    screen.entry_sets[0].threshold = None
+    assert any("기준값" in e for e in validate_run(screen, Block.ENTRY, 0))
 
 
-# --- 수량 환산 (§6.2-2) ---
+# --- 운영시간 (§6.2-1) ---
 
-def test_hl_qty_conversion() -> None:
-    assert hl_qty_for(STOCK, 7) == 7          # 주식 1:1
-    assert hl_qty_for(SF, 7) == 70            # 선물 1계약 = 10주
-
-
-# --- 한도 (§6.2-2) ---
-
-def test_stock_limits() -> None:
-    ins = _inputs(total=100, per=20)
-    assert allowed_order_qty(OrderAction.ENTER, STOCK, 0, ins) == 20
-    assert allowed_order_qty(OrderAction.ENTER, STOCK, 90, ins) == 10   # 한도 잔여만
-    assert allowed_order_qty(OrderAction.ENTER, STOCK, 100, ins) == 0
-    assert allowed_order_qty(OrderAction.EXIT, STOCK, 5, ins) == 5      # 보유분까지만
-    assert allowed_order_qty(OrderAction.EXIT, STOCK, 0, ins) == 0      # 공매도 금지
+def test_operating_windows() -> None:
+    # 자동T: 8:00~8:50 / 9:00~15:30 / 15:40~20:00
+    assert in_operating_window(ScreenKind.AUTO_T, time(8, 0))
+    assert not in_operating_window(ScreenKind.AUTO_T, time(8, 55))
+    assert in_operating_window(ScreenKind.AUTO_T, time(15, 40))
+    assert not in_operating_window(ScreenKind.AUTO_T, time(20, 0))
+    # 자동M: 8:45~15:35
+    assert in_operating_window(ScreenKind.AUTO_M, time(8, 45))
+    assert not in_operating_window(ScreenKind.AUTO_M, time(15, 35))
 
 
-def test_futures_two_way_limits() -> None:
-    # 주식선물: |포지션| ≤ 총진입 — 잔고 없어도 청산부터(숏 진입) 가능
-    ins = _inputs(total=100, per=30)
-    assert allowed_order_qty(OrderAction.EXIT, SF, 0, ins) == 30
-    assert allowed_order_qty(OrderAction.EXIT, SF, -90, ins) == 10      # -100까지만
-    assert allowed_order_qty(OrderAction.EXIT, SF, -100, ins) == 0
-    assert allowed_order_qty(OrderAction.ENTER, SF, -100, ins) == 30    # 숏 → 롱 방향 여유
-    assert allowed_order_qty(OrderAction.ENTER, SF, 100, ins) == 0
+# --- 수량 (§6.2-3) ---
+
+def test_hl_qty_ratio() -> None:
+    assert hl_qty_for(STOCK, 30) == 30    # 주식 1주 = HL 1계약
+    assert hl_qty_for(SF, 5) == 50        # SF 1계약 = HL 10계약
 
 
-# --- 주문 가능 시간 (§6.2 옵션) ---
+def test_limits_stock_and_futures() -> None:
+    # 주식: 0~최대 (공매도 금지), 선물: 양방향 |포지션| ≤ 최대
+    assert allowed_order_qty(Block.ENTRY, STOCK, 90, 30, 100) == 10
+    assert allowed_order_qty(Block.EXIT, STOCK, 0, 30, 100) == 0
+    assert allowed_order_qty(Block.EXIT, STOCK, 7, 30, 100) == 7
+    assert allowed_order_qty(Block.EXIT, SF, 0, 30, 100) == 30    # ex부터 = 숏 진입
+    assert allowed_order_qty(Block.EXIT, SF, -90, 30, 100) == 10
+    assert allowed_order_qty(Block.ENTRY, SF, -100, 30, 100) == 30
 
-def test_order_window() -> None:
-    assert order_window_ok(time(9, 0), OPTS)
-    assert not order_window_ok(time(8, 59), OPTS)
-    assert not order_window_ok(time(15, 30), OPTS)
 
+# --- 주문 계획 (§6.2-1·2) ---
 
-# --- 주문 계획 (§6.2-4) ---
-
-def test_plan_enter_stock_both_legs() -> None:
-    plan, errors = plan_order(
-        OrderAction.ENTER, STOCK, 0, _inputs(), mode=Mode.MANUAL,
-        ls_enabled=True, hl_enabled=True, now=NOON, options=OPTS)
+def test_plan_order_auto_m_legs() -> None:
+    # 자동M entry: LS SF 매수 5계약 + HL 매도 50계약
+    plan, errors = plan_order(_screen(), Block.ENTRY, 0, position_qty=0, now=NOON)
     assert errors == [] and plan is not None
     assert plan.legs[0].venue is Venue.LS and plan.legs[0].side is Side.BUY
+    assert plan.legs[0].qty == 5
     assert plan.legs[1].venue is Venue.HYPERLIQUID and plan.legs[1].side is Side.SELL
-    assert plan.legs[0].qty == 20 and plan.legs[1].qty == 20  # 주식 1:1
+    assert plan.legs[1].qty == 50
 
 
-def test_plan_exit_futures_converts_qty() -> None:
-    plan, errors = plan_order(
-        OrderAction.EXIT, SF, 0, _inputs(), mode=Mode.MANUAL,
-        ls_enabled=True, hl_enabled=True, now=NOON, options=OPTS)
+def test_plan_order_ls_unchecked_hl_only() -> None:
+    # LS주문 체크 해제 → HL 다리만 (§6.2-2)
+    screen = _screen()
+    screen.ls_order_entry = False
+    plan, errors = plan_order(screen, Block.ENTRY, 0, position_qty=0, now=NOON)
     assert errors == [] and plan is not None
-    assert plan.legs[0].side is Side.SELL and plan.legs[1].side is Side.BUY
-    assert plan.legs[0].qty == 20 and plan.legs[1].qty == 200  # 1계약=10주
+    assert len(plan.legs) == 1 and plan.legs[0].venue is Venue.HYPERLIQUID
 
 
-def test_plan_single_venue_manual_only() -> None:
-    # 수동: 단독 체크 허용(사용자 판단 주문) — 다리 1개만
-    plan, errors = plan_order(
-        OrderAction.ENTER, STOCK, 0, _inputs(), mode=Mode.MANUAL,
-        ls_enabled=True, hl_enabled=False, now=NOON, options=OPTS)
-    assert errors == [] and plan is not None and len(plan.legs) == 1
-    # 자동: 양쪽 필수
-    plan, errors = plan_order(
-        OrderAction.ENTER, STOCK, 0, _inputs(), mode=Mode.AUTO_T,
-        ls_enabled=True, hl_enabled=False, now=NOON, options=OPTS)
-    assert plan is None and any("모두 체크" in e for e in errors)
-
-
-def test_plan_rejections() -> None:
-    # 주문 가능 시간 밖
-    plan, errors = plan_order(
-        OrderAction.ENTER, STOCK, 0, _inputs(), mode=Mode.MANUAL,
-        ls_enabled=True, hl_enabled=True, now=time(8, 0), options=OPTS)
-    assert plan is None and any("시간" in e for e in errors)
-    # 한도 소진
-    plan, errors = plan_order(
-        OrderAction.ENTER, STOCK, 100, _inputs(), mode=Mode.MANUAL,
-        ls_enabled=True, hl_enabled=True, now=NOON, options=OPTS)
+def test_plan_order_rejections() -> None:
+    screen = _screen()
+    # 운영시간 밖 (자동M은 8:45~15:35)
+    plan, errors = plan_order(screen, Block.ENTRY, 0, position_qty=0, now=time(16, 0))
+    assert plan is None and any("운영시간" in e for e in errors)
+    # 목표 완료
+    screen.entry_sets[0].fired_qty = 100
+    plan, errors = plan_order(screen, Block.ENTRY, 0, position_qty=0, now=NOON)
+    assert plan is None and any("목표" in e for e in errors)
+    # 한도 소진 (보유최대수량 도달)
+    screen = _screen()
+    plan, errors = plan_order(screen, Block.ENTRY, 0, position_qty=100, now=NOON)
     assert plan is None and any("수량 없음" in e for e in errors)
-    # 거래소 전부 해제
-    plan, errors = plan_order(
-        OrderAction.ENTER, STOCK, 0, _inputs(), mode=Mode.MANUAL,
-        ls_enabled=False, hl_enabled=False, now=NOON, options=OPTS)
-    assert plan is None
+
+
+def test_plan_order_caps_to_remaining_target() -> None:
+    # 목표 잔여가 1회주문수량보다 작으면 잔여만 주문
+    screen = _screen(per=30)
+    screen.entry_sets[0].fired_qty = 90  # 목표 100 → 잔여 10
+    plan, errors = plan_order(screen, Block.ENTRY, 0, position_qty=0, now=NOON)
+    assert errors == [] and plan is not None
+    assert plan.legs[0].qty == 10
+
+
+def test_taker_price_margin() -> None:
+    # 매수 = est-pr 위로, 매도 = 아래로 (§6.2-4). 호가단위 반올림은 실행층.
+    assert taker_price(100.0, Side.BUY, 0.01) == pytest.approx(101.0)
+    assert taker_price(100.0, Side.SELL, 0.01) == pytest.approx(99.0)
