@@ -10,8 +10,10 @@
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -93,6 +95,14 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
                 opts.order_window = (str(start), str(end))
             opts.stock_credit = bool(body.get("stock_credit", opts.stock_credit))
             return {"ok": True, "errors": []}
+        if cmd == "shutdown":
+            # 안전종료 1단계: 전 세트 자동 정지. 미체결 전량 취소·기록 마무리는
+            # LiveSystem 결합(3단계 후반) 때 이 자리에 채운다. 강제 킬 없음(§6.2).
+            for s in state.sets:
+                s.started = False
+                s.paused = False
+            return {"ok": True, "errors": [],
+                    "note": "자동 정지 완료 — 프로세스 종료 예약"}
         if cmd == "manual_order":
             if state.mode is not Mode.MANUAL:
                 return {"ok": False, "errors": ["수동 주문은 수동 모드에서만"]}
@@ -115,8 +125,10 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
     return {"ok": False, "errors": [f"알 수 없는 명령: {cmd!r}"]}
 
 
-def make_app(state: PanelState) -> web.Application:
-    """API 앱 조립 — 화면이 붙는 유일한 창구."""
+def make_app(
+    state: PanelState, on_shutdown: Callable[[], None] | None = None
+) -> web.Application:
+    """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 프로세스 종료 훅."""
 
     async def get_state(_request: web.Request) -> web.Response:
         return web.json_response(snapshot(state), dumps=_dumps)
@@ -127,7 +139,11 @@ def make_app(state: PanelState) -> web.Application:
         except json.JSONDecodeError:
             return web.json_response(
                 {"ok": False, "errors": ["JSON 본문 필요"]}, status=400, dumps=_dumps)
-        result = apply_command(state, body if isinstance(body, dict) else {})
+        payload = body if isinstance(body, dict) else {}
+        result = apply_command(state, payload)
+        if payload.get("cmd") == "shutdown" and result.get("ok") and on_shutdown:
+            # 응답을 먼저 보내고 잠시 뒤 종료 (화면이 결과를 받을 시간)
+            asyncio.get_running_loop().call_later(0.2, on_shutdown)
         return web.json_response(result, dumps=_dumps)
 
     app = web.Application()
@@ -136,10 +152,25 @@ def make_app(state: PanelState) -> web.Application:
     return app
 
 
-def main() -> None:
-    """코어 단독 시동 (2단계: API만). 종료는 Ctrl+C."""
+async def _serve() -> None:
     state = PanelState()
-    web.run_app(make_app(state), host=HOST, port=DEFAULT_PORT)
+    stop = asyncio.Event()
+    runner = web.AppRunner(make_app(state, on_shutdown=stop.set))
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, DEFAULT_PORT)
+    await site.start()
+    print(f"코어 시동 — http://{HOST}:{DEFAULT_PORT} (안전종료는 메인 화면에서)")
+    await stop.wait()
+    await runner.cleanup()
+    print("코어 안전종료 완료")
+
+
+def main() -> None:
+    """코어 단독 시동. 종료는 메인 화면의 안전종료(또는 Ctrl+C)."""
+    try:
+        asyncio.run(_serve())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

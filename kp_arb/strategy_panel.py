@@ -9,14 +9,11 @@
 """
 from __future__ import annotations
 
-import json
-import urllib.error
-import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-CORE_URL = "http://127.0.0.1:8787"
+from .core_client import core_request
 
 MODES = ("수동", "자동T", "자동M")
 UNDERLYINGS = ("하이닉스", "삼성", "현대차")
@@ -59,24 +56,6 @@ def parse_threshold(text: str) -> float | None:
     try:
         return float(text.strip())
     except ValueError:
-        return None
-
-
-def core_request(path: str, payload: dict[str, Any] | None = None,
-                 timeout: float = 1.0) -> dict[str, Any] | None:
-    """코어 API 호출. 실패(미접속 등)는 None — 화면은 표시만 하고 판단하지 않는다."""
-    url = f"{CORE_URL}{path}"
-    try:
-        if payload is None:
-            req = urllib.request.Request(url)
-        else:
-            req = urllib.request.Request(
-                url, data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data if isinstance(data, dict) else None
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
         return None
 
 

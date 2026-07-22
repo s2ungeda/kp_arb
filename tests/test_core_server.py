@@ -65,6 +65,30 @@ def test_unknown_and_bad_commands() -> None:
     assert not apply_command(state, {"cmd": "set_inputs", "set": 99, "total": 1})["ok"]
 
 
+def test_shutdown_stops_all_sets() -> None:
+    state = PanelState()
+    _auto_ready(state)
+    apply_command(state, {"cmd": "start", "set": 0, "value": True})
+    result = apply_command(state, {"cmd": "shutdown"})
+    assert result["ok"]
+    assert not state.sets[0].started and not state.sets[0].paused
+
+
+async def test_http_shutdown_triggers_exit_hook() -> None:
+    import asyncio
+
+    state = PanelState()
+    stop = asyncio.Event()
+    client = TestClient(TestServer(make_app(state, on_shutdown=stop.set)))
+    await client.start_server()
+    try:
+        resp = await client.post("/command", json={"cmd": "shutdown"})
+        assert (await resp.json())["ok"]
+        await asyncio.wait_for(stop.wait(), timeout=1.0)  # 응답 후 종료 예약 확인
+    finally:
+        await client.close()
+
+
 async def test_http_roundtrip() -> None:
     state = PanelState()
     client = TestClient(TestServer(make_app(state)))
