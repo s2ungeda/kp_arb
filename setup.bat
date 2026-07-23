@@ -26,6 +26,6 @@ if errorlevel 1 (
 
 echo.
 echo setup complete. next steps:
-echo   1) copy .env from the original PC (API keys) into this folder
+echo   1) register API keys: run keys.bat (or copy .env from the original PC)
 echo   2) run main.bat
 pause

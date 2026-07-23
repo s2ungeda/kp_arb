@@ -157,3 +157,16 @@ def test_accounts_repr_has_no_secrets() -> None:
     )
     text = repr(accounts)
     assert all(s not in text for s in ("pw1", "pw2", "as1", "as2", "111-01"))
+
+
+def test_secret_names_cover_required() -> None:
+    # 키 등록 창(SECRET_NAMES)이 실제 사용하는 비밀 이름을 전부 포함해야 한다
+    from kp_arb.config import SECRET_NAMES
+
+    names = {name for name, _ in SECRET_NAMES}
+    required = {
+        "LS_STOCK_APPKEY", "LS_STOCK_APPSECRET", "LS_STOCK_ACCT", "LS_STOCK_ACCT_PW",
+        "LS_DERIV_APPKEY", "LS_DERIV_APPSECRET", "LS_DERIV_ACCT", "LS_DERIV_ACCT_PW",
+        "HL_AGENT_KEY", "HL_ACCOUNT_ADDRESS",
+    }
+    assert required <= names

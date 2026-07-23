@@ -22,6 +22,20 @@ from .domain.enums import Account, Underlying
 
 KEYRING_SERVICE = "kp-arb"
 
+# 전체 비밀 이름 목록 (메인 화면 '키 등록' 창·secrets_cli 공용)
+SECRET_NAMES: tuple[tuple[str, str], ...] = (
+    ("LS_STOCK_APPKEY", "LS 주식계좌 AppKey"),
+    ("LS_STOCK_APPSECRET", "LS 주식계좌 AppSecret"),
+    ("LS_STOCK_ACCT", "LS 주식계좌 번호"),
+    ("LS_STOCK_ACCT_PW", "LS 주식계좌 비밀번호"),
+    ("LS_DERIV_APPKEY", "LS 선물계좌 AppKey"),
+    ("LS_DERIV_APPSECRET", "LS 선물계좌 AppSecret"),
+    ("LS_DERIV_ACCT", "LS 선물계좌 번호"),
+    ("LS_DERIV_ACCT_PW", "LS 선물계좌 비밀번호"),
+    ("HL_AGENT_KEY", "HL 에이전트 키"),
+    ("HL_ACCOUNT_ADDRESS", "HL 메인 주소"),
+)
+
 
 class ConfigError(RuntimeError):
     """설정/비밀 누락."""
