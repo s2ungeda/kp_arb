@@ -14,21 +14,35 @@ from dataclasses import dataclass
 
 
 def est_price(levels: Sequence[tuple[float, float]], qty: float) -> float | None:
-    """estprice — 주문수량을 다 받아줄 수 있는 첫 호가 (DESIGN §6.2-3).
+    """estprice — 주문수량만큼 상대편 호가를 쓸어담을 때의 **평균 체결가**(수량가중).
 
-    levels는 **상대편** 호가 사다리 [(가격, 잔량), ...] 최우선부터 —
-    매수 주문이면 매도호가, 매도 주문이면 매수호가를 넣는다.
-    누적 잔량 ≥ 주문수량이 되는 호가의 가격. 사다리 전체로도 부족하면 None
-    (신호·주문 금지). 진입/청산 공식의 매수가/매도가 자리에 이 값을 쓴다.
+    델파이 원본 TSymbol.CalcEstPrice 이식 (개정 2026-07-23 — 이전의 "마지막 호가
+    가격" 방식 폐기). levels는 상대편 사다리 [(가격, 잔량), ...] 최우선부터 —
+    매수 주문이면 매도호가, 매도 주문이면 매수호가.
+
+    - 수량을 채우는 호가에선 필요한 만큼만 부분 사용(가중 평균).
+    - 잔량이 부족하면 확보 가능한 전량의 평균가(원본 동작).
+    - 사다리가 비거나 수량 0 이하면 None.
+    - 오차 보정: 평균가는 1호가보다 유리해질 수 없다(원본의 1호가 캡).
     """
-    if qty <= 0:
+    if qty <= 0 or not levels:
         return None
-    cumulative = 0.0
+    filled = 0.0
+    cost = 0.0
     for price, size in levels:
-        cumulative += size
-        if cumulative >= qty:
-            return price
-    return None
+        take = min(size, qty - filled)
+        if take > 0:
+            cost += price * take
+            filled += take
+        if filled >= qty - 1e-12:
+            break
+    if filled <= 0:
+        return None
+    average = cost / filled
+    best = levels[0][0]
+    if len(levels) > 1 and levels[1][0] < best:
+        return min(average, best)  # 매수호가 사다리(내림차순): 평균 > 1호가면 오차
+    return max(average, best)      # 매도호가 사다리(오름차순, 단일 호가 포함)
 
 
 def maker_price_for_spread(

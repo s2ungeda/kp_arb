@@ -340,8 +340,8 @@ def main() -> None:
             ("쌍", 13, "black"),
             ("진입", 8, "red"),
             ("청산", 8, "blue"),
-            ("진입 est", 9, "red"),     # HL est-pr (USD) — 진입: 매수호가 방향
-            ("청산 est", 9, "blue"),    # 청산: 매도호가 방향
+            ("진입 est", 10, "red"),    # HL est-pr 평균 체결가 (USD, 소수 4자리)
+            ("청산 est", 10, "blue"),   # 청산: 매도호가 방향
             ("진입 주문가", 10, "darkred"),   # 역산 LS maker 주문가 (원)
             ("청산 주문가", 10, "darkblue"),
         ])
@@ -385,7 +385,7 @@ def main() -> None:
             rows.append((
                 f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
                 pct(pair.spread.entry), pct(pair.spread.exit),  # K22/K24
-                _fmt(est_bid, decimals=2), _fmt(est_ask, decimals=2),
+                _fmt(est_bid, decimals=4), _fmt(est_ask, decimals=4),
                 _fmt(px_en, decimals=0), _fmt(px_ex, decimals=0),
             ))
         return rows

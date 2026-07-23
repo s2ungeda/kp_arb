@@ -20,18 +20,19 @@ def test_maker_price_for_spread() -> None:
     assert 0.001 - (price - 300_000.0) / 300_000.0 == pytest.approx(0.0006)
 
 
-def test_est_price_walks_depth() -> None:
-    # DESIGN §6.2-3 (사용자 예시): 매수 주문 10, 매도1호가 잔량 5·매도2호가 잔량 10
-    # → 누적 15 ≥ 10 이 되는 매도2호가가 estprice.
-    assert est_price([(100.0, 5), (101.0, 10)], 10) == 101.0
-    # 매도1호가 잔량이 10이면 매도1호가.
+def test_est_price_vwap() -> None:
+    # 델파이 CalcEstPrice 이식(2026-07-23): 주문수량을 쓸어담는 **평균 체결가**.
+    # 매수 10 = 매도1호가 100×5 + 매도2호가 101×5 → (500+505)/10 = 100.5
+    assert est_price([(100.0, 5), (101.0, 10)], 10) == pytest.approx(100.5)
+    # 1호가 잔량으로 충분하면 1호가 그대로
     assert est_price([(100.0, 10), (101.0, 10)], 10) == 100.0
-    # 경계: 누적합 == 주문수량도 충족.
-    assert est_price([(100.0, 4), (101.0, 6)], 10) == 101.0
+    # 매도(매수호가 사다리, 내림차순): 100×6 + 99×4 → 99.6
+    assert est_price([(100.0, 6), (99.0, 10)], 10) == pytest.approx(99.6)
 
 
-def test_est_price_insufficient_or_invalid() -> None:
-    assert est_price([(100.0, 5), (101.0, 3)], 10) is None  # 사다리 전체로도 부족
+def test_est_price_partial_and_invalid() -> None:
+    # 잔량 부족: 확보 가능한 전량(5+3=8)의 평균 — (500+303)/8 (원본 동작)
+    assert est_price([(100.0, 5), (101.0, 3)], 10) == pytest.approx(803 / 8)
     assert est_price([], 10) is None
     assert est_price([(100.0, 5)], 0) is None   # 수량 0/음수는 무효
     assert est_price([(100.0, 5)], -1) is None
