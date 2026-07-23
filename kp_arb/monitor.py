@@ -290,10 +290,10 @@ def main() -> None:
         ("현-오라클%", 9, "black"), ("마크-오라클%", 10, "black"),
         ("펀딩전", 8, "black"), ("펀딩피", 8, "black"), ("남은시간", 7, "black"),
     ])
-    # est-pr 계산 입력 — 수량(세트: 1세트=HL 10계약)·진입/청산 기준값(%) (DESIGN §6.2-4)
+    # est-pr 계산 입력 — 수량(국내: 주식 쌍=주 1:1, 선물 쌍=계약 1:10 환산)·기준값(%) (§6.2-4)
     est_input = tk.Frame(root)
     est_input.pack(fill="x", padx=4, pady=(4, 0))
-    tk.Label(est_input, text="수량(세트)", font=font).pack(side="left")
+    tk.Label(est_input, text="수량(주식=주·선물=계약)", font=font).pack(side="left")
     ent_sets = tk.Entry(est_input, width=4, justify="right", font=font)
     ent_sets.insert(0, "1")
     ent_sets.pack(side="left", padx=(2, 8))
@@ -333,7 +333,7 @@ def main() -> None:
     }
 
     def _est_inputs() -> tuple[int, float, float]:
-        """est 입력칸 읽기 — 오타는 기본값(1세트, 기준 0). %→소수 환산."""
+        """est 입력칸 읽기 — 수량은 국내 단위(주/계약), 오타는 기본값. %→소수 환산."""
         try:
             sets_count = max(0, int(ent_sets.get().strip() or 0))
         except ValueError:

@@ -450,20 +450,23 @@ class LiveSystem:
         self,
         u: Underlying,
         instrument: Instrument,
-        sets_count: int,
+        kr_qty: int,
         entry_threshold: float,
         exit_threshold: float,
     ) -> tuple[float | None, float | None, float | None, float | None]:
         """est-pr(HL taker가)와 역산 LS maker 주문가 — 보드 표시용 (DESIGN §6.2-4).
 
-        1세트 = HL 10계약. 진입은 HL 매도라 매수호가 사다리, 청산은 매도호가.
+        kr_qty는 **국내 수량**(주식 쌍=주, 선물 쌍=계약 — 주문 화면 1회주문수량과
+        같은 의미). HL 환산: 주식 1:1, 선물 1계약=10계약 (§6.2-3).
+        진입은 HL 매도라 매수호가 사다리, 청산은 매도호가.
         반환: (HL est 진입, HL est 청산 [USD], LS 주문가 진입, LS 주문가 청산 [원]).
-        기준값은 소수(0.0006 = 0.06%). 호가단위 반올림은 실행층에서.
+        기준값은 소수(0.0006 = 0.06%).
         """
         quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
-        if quote is None or sets_count <= 0:
+        if quote is None or kr_qty <= 0:
             return None, None, None, None
-        hl_qty = 10.0 * sets_count
+        hl_qty = float(kr_qty) * (
+            10.0 if instrument is Instrument.KR_STOCK_FUTURE else 1.0)
         est_bid = est_price(quote.bids or [], hl_qty)   # 진입: HL 매도 → 매수호가
         est_ask = est_price(quote.asks or [], hl_qty)   # 청산: HL 매수 → 매도호가
         fx, _ = self.usdkrw_effective()
