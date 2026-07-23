@@ -24,8 +24,22 @@ def core_alive() -> bool:
     return core_request("/state") is not None
 
 
+def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
+    """실행 명령 구성 — 개발(파이썬)과 배포판(exe, app.py 분기)을 모두 지원."""
+    if not getattr(sys, "frozen", False):
+        return [sys.executable, "-m", module, *args]
+    exe_dir = Path(sys.executable).parent
+    if module == "kp_arb.core_server":
+        return [str(exe_dir / "kp-arb-core.exe"), "core"]
+    if module == "kp_arb.monitor":
+        return [str(exe_dir / "kp-arb.exe"), "monitor"]
+    if module == "kp_arb.order_panel":
+        return [str(exe_dir / "kp-arb.exe"), *args]  # autoT | autoM
+    return [str(exe_dir / "kp-arb.exe")]
+
+
 def launch_module(module: str, *args: str, console: bool = False) -> subprocess.Popen[bytes]:
-    """파이썬 모듈을 별도 프로세스로 실행.
+    """모듈(또는 배포판 exe)을 별도 프로세스로 실행.
 
     화면은 콘솔 숨김(CREATE_NO_WINDOW — cmd 창 안 뜸), 코어만 새 콘솔(로그 확인용).
     """
@@ -33,7 +47,7 @@ def launch_module(module: str, *args: str, console: bool = False) -> subprocess.
     if sys.platform == "win32":
         flags = (subprocess.CREATE_NEW_CONSOLE if console
                  else subprocess.CREATE_NO_WINDOW)
-    return subprocess.Popen([sys.executable, "-m", module, *args], creationflags=flags)
+    return subprocess.Popen(launch_command(module, args), creationflags=flags)
 
 
 def main() -> None:

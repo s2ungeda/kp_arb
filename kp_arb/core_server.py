@@ -190,7 +190,7 @@ async def _serve() -> None:
     await runner.setup()
     site = web.TCPSite(runner, HOST, DEFAULT_PORT)
     await site.start()
-    print(f"코어 시동 — http://{HOST}:{DEFAULT_PORT} (안전종료는 메인 화면에서)")
+    print(f"코어 시동: http://{HOST}:{DEFAULT_PORT} (안전종료는 메인 화면에서)")
     await stop.wait()
     await runner.cleanup()
     print("코어 안전종료 완료")
