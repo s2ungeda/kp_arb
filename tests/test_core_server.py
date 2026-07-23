@@ -52,12 +52,13 @@ def test_threshold_limit_and_warning() -> None:
     assert result["ok"] and result["warnings"] == ["낮은수치"]
 
 
-def test_ls_order_checkbox_per_block() -> None:
+def test_ls_order_checkbox_per_set() -> None:
     state = CoreState()
     apply_command(state, {"cmd": "ls_order", "screen": "autoT",
-                          "block": "exit", "value": False})
+                          "block": "exit", "set": 1, "value": False})
     screen = state.screens[ScreenKind.AUTO_T]
-    assert screen.ls_order_entry and not screen.ls_order_exit
+    assert not screen.exit_sets[1].ls_order
+    assert screen.exit_sets[0].ls_order and screen.entry_sets[1].ls_order
 
 
 def test_shutdown_stops_all_sets() -> None:
@@ -84,12 +85,15 @@ def test_state_persistence_roundtrip(tmp_path: Path) -> None:
     apply_command(state, {"cmd": "run", "screen": "autoM",
                           "block": "entry", "set": 0, "value": True})
     apply_command(state, {"cmd": "fx_month", "choice": "next"})
+    apply_command(state, {"cmd": "ls_order", "screen": "autoM",
+                          "block": "entry", "set": 0, "value": False})
     path = tmp_path / "core_state.json"
     save_state(path, state)
 
     restored = load_state(path)
     screen = restored.screens[ScreenKind.AUTO_M]
     assert screen.per_order_qty == 5
+    assert not screen.entry_sets[0].ls_order  # 세트별 LS주문 체크 복원
     assert screen.settings.max_position == 100
     assert screen.entry_sets[0].threshold == 0.006
     assert screen.entry_sets[0].target_qty == 100

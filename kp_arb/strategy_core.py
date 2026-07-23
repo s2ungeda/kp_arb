@@ -58,6 +58,7 @@ class SpreadSet:
     target_qty: int = 0             # 목표진입량 (국내 단위)
     running: bool = False           # 실행 버튼(토글) — 저장 시 복원 안 함
     fired_qty: int = 0              # 발주 주문수량 누적 (체결수량 아님 — §6.2-2)
+    ls_order: bool = True           # LS주문 체크 — 해제 시 HL 주문만 (세트별)
 
 
 @dataclass
@@ -79,8 +80,6 @@ class ScreenState:
     kind: ScreenKind
     underlying: Underlying = Underlying.SK_HYNIX
     per_order_qty: int = 0           # 1회주문수량 (화면당 1개 — est-pr 공용)
-    ls_order_entry: bool = True      # entry 블록 LS주문 체크 (해제 = HL 주문만)
-    ls_order_exit: bool = True       # exit 블록 LS주문 체크
     entry_sets: list[SpreadSet] = field(
         default_factory=lambda: [SpreadSet() for _ in range(SET_COUNT)])
     exit_sets: list[SpreadSet] = field(
@@ -204,8 +203,7 @@ def plan_order(
     target = screen.sets_of(block)[index]
     remaining = max(0, target.target_qty - target.fired_qty)
     counterpart = screen.kind.counterpart
-    ls_enabled = (screen.ls_order_entry if block is Block.ENTRY
-                  else screen.ls_order_exit)
+    ls_enabled = target.ls_order  # 세트별 LS주문 체크 (해제 = HL 주문만)
     qty = min(
         allowed_order_qty(block, counterpart, position_qty,
                           screen.per_order_qty, screen.settings.max_position),
@@ -248,6 +246,7 @@ def _set_from_dict(target: SpreadSet, raw: object) -> None:
         target.threshold = None if value is None else float(value)
         target.target_qty = int(raw.get("target_qty", 0))
         target.fired_qty = int(raw.get("fired_qty", 0))
+        target.ls_order = bool(raw.get("ls_order", True))
         # running은 복원하지 않음 — 재시동 후 자동은 항상 꺼짐 (안전)
     except (TypeError, ValueError):
         pass
@@ -274,8 +273,6 @@ def state_from_dict(data: dict[str, object]) -> CoreState:
             screen.per_order_qty = int(raw.get("per_order_qty", 0))
         except (TypeError, ValueError):
             pass
-        screen.ls_order_entry = bool(raw.get("ls_order_entry", True))
-        screen.ls_order_exit = bool(raw.get("ls_order_exit", True))
         for name, sets in (("entry_sets", screen.entry_sets),
                            ("exit_sets", screen.exit_sets)):
             raw_sets = raw.get(name)

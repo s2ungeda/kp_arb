@@ -3,12 +3,18 @@
     python -m kp_arb.order_panel autoT|autoM   (운영은 main.bat 메뉴에서)
 
 화면은 입력·버튼을 코어 명령(POST /command)으로 보내고 결과를 표시만 한다.
-판단(검증·한도·주문)은 전부 코어. 수치 갱신은 뒷단 스레드가 /state를 1초
-폴링하고 화면은 저장된 결과만 읽는다(화면 스레드 네트워크 금지 — CLAUDE.md).
+판단(검증·한도·주문)은 전부 코어.
+
+**화면 스레드는 네트워크를 하지 않는다**(CLAUDE.md — 어기면 창이 얼어 버벅임):
+- 명령은 작업 큐에 넣고 뒷단 전송 스레드가 보낸다. 응답은 결과 큐로 돌아와
+  화면 루프(after)가 상태줄 갱신·버튼 되돌림 등을 처리한다.
+- 수치 갱신도 뒷단 폴링 스레드가 /state를 1초마다 받아두면 화면은 읽기만 한다.
 """
 from __future__ import annotations
 
+import queue
 import sys
+from collections.abc import Callable
 from typing import Any
 
 from .core_client import core_request
@@ -60,21 +66,47 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     root.resizable(False, False)
     root.option_add("*Font", ("Malgun Gothic", 9))
 
+    # --- 명령 전송: 작업 큐 → 전송 스레드 → 결과 큐 → 화면 루프 ---
+    Job = tuple[dict[str, Any], str, Callable[[dict[str, Any] | None], None] | None]
+    jobs: queue.Queue[Job] = queue.Queue()
+    results: queue.Queue[tuple[str, dict[str, Any] | None,
+                               Callable[[dict[str, Any] | None], None] | None]] = queue.Queue()
+
+    def sender() -> None:
+        while True:
+            payload, label, callback = jobs.get()
+            results.put((label, core_request("/command", payload), callback))
+
+    threading.Thread(target=sender, daemon=True).start()
+
+    def send(payload: dict[str, Any], label: str,
+             callback: Callable[[dict[str, Any] | None], None] | None = None) -> None:
+        """명령을 큐에만 넣는다 — 화면 스레드는 기다리지 않음."""
+        jobs.put(({**payload, "screen": screen_key}, label, callback))
+
     def set_status(text: str) -> None:
         status.config(text=text)
 
-    def send(payload: dict[str, Any], label: str) -> dict[str, Any] | None:
-        """명령 전송(+화면 식별) — 거부·경고·미접속을 상태줄에 그대로 표시."""
-        result = core_request("/command", {**payload, "screen": screen_key})
-        if result is None:
-            set_status(f"{label} 실패 — 코어 미접속 (메인 화면에서 코어 시작)")
-            return None
-        if not result.get("ok"):
-            set_status(f"{label} 거부 — {'; '.join(result.get('errors', []))}")
-            return result
-        warnings = result.get("warnings") or []
-        set_status(f"{label} 완료" + (f" (경고: {'; '.join(warnings)})" if warnings else ""))
-        return result
+    def drain_results() -> None:
+        try:
+            while True:
+                label, result, callback = results.get_nowait()
+                if result is None:
+                    set_status(f"{label} 실패 — 코어 미접속 (메인 화면에서 코어 시작)")
+                elif not result.get("ok"):
+                    set_status(f"{label} 거부 — {'; '.join(result.get('errors', []))}")
+                else:
+                    warnings = result.get("warnings") or []
+                    set_status(f"{label} 완료"
+                               + (f" (경고: {'; '.join(warnings)})" if warnings else ""))
+                if callback is not None:
+                    callback(result)
+        except queue.Empty:
+            pass
+        try:
+            root.after(200, drain_results)
+        except tk.TclError:
+            pass  # 창 닫힘
 
     # --- 1행: 종목 + 1회주문수량 + 설정 ---
     row1 = tk.Frame(root)
@@ -97,7 +129,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         win.title(f"설정 — {kind.value}")
         win.resizable(False, False)
         win.transient(root)
-        data = core_request("/state") or {}
+        # 뒷단 폴링이 받아둔 최신 상태에서 채움 (네트워크 호출 없음)
+        data = state_box["data"] or {}
         raw = ((data.get("screens") or {}).get(screen_key) or {}).get("settings")
         saved = raw if isinstance(raw, dict) else {}
         fields = [
@@ -145,15 +178,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(root, text=f"운영시간: {operating_text(kind)}", anchor="w",
              fg="gray25").pack(fill="x", padx=4)
 
-    # --- entry/exit 블록: LS주문 체크 + 세트 3줄 ---
+    # --- entry/exit 블록: 세트 3줄 (LS주문 체크는 세트별) ---
     kr_tag = "S" if kind is ScreenKind.AUTO_T else "SF"
     grid = tk.Frame(root)
     grid.pack(fill="x", padx=4, pady=2)
-    headers = ("", "기준값", "목표진입량", "실행", "진입수량", "환율",
+    headers = ("", "기준값", "목표진입량", "실행", "LS주문", "진입수량", "환율",
                "avg HL", f"avg {kr_tag}")
     row_no = 0
     set_widgets: dict[tuple[str, int], dict[str, Any]] = {}
-    ls_vars: dict[str, tk.BooleanVar] = {}
 
     def send_set_inputs(block: str, index: int) -> None:
         w = set_widgets[(block, index)]
@@ -163,18 +195,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         send({"cmd": "set_target", "block": block, "set": index,
               "value": parse_qty(w["target"].get())}, "목표진입량")
 
-    def ls_order_command(block: str, var: Any) -> Any:
-        return lambda: send({"cmd": "ls_order", "block": block, "value": var.get()},
-                            "LS주문 체크")
-
-    def run_command(block: str, index: int) -> Any:
-        return lambda: toggle_run(block, index)
-
     def toggle_run(block: str, index: int) -> None:
         w = set_widgets[(block, index)]
         turning_on = not w["running"]
         if turning_on:
-            send_set_inputs(block, index)
             value = parse_threshold(w["threshold"].get())
             if value is not None and (
                 (block == "entry" and value <= 0) or (block == "exit" and value >= 0)
@@ -182,25 +206,30 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 "경고", ("낮은수치" if block == "entry" else "높은수치")
                 + " — 계속하시겠습니까?"):
                 return
-        result = send({"cmd": "run", "block": block, "set": index,
-                       "value": turning_on}, f"{block} {index + 1}세트 실행")
-        if result is not None and result.get("ok"):
-            w["running"] = turning_on
-            w["button"].config(text="중지" if turning_on else "실행",
-                               bg="#1a7a1a" if turning_on else "SystemButtonFace",
-                               fg="white" if turning_on else "black")
+            send_set_inputs(block, index)
+
+        def on_result(result: dict[str, Any] | None) -> None:
+            if result is not None and result.get("ok"):
+                w["running"] = turning_on
+                w["button"].config(text="중지" if turning_on else "실행",
+                                   bg="#1a7a1a" if turning_on else "SystemButtonFace",
+                                   fg="white" if turning_on else "black")
+
+        send({"cmd": "run", "block": block, "set": index, "value": turning_on},
+             f"{block} {index + 1}세트 실행", on_result)
+
+    def run_command(block: str, index: int) -> Callable[[], None]:
+        return lambda: toggle_run(block, index)
+
+    def ls_order_command(block: str, index: int, var: Any) -> Callable[[], None]:
+        return lambda: send({"cmd": "ls_order", "block": block, "set": index,
+                             "value": var.get()}, "LS주문 체크")
 
     for block, block_label, color in BLOCK_LABELS:
-        head = tk.Frame(grid)
-        head.grid(row=row_no, column=0, columnspan=len(headers), sticky="w",
-                  pady=(6 if row_no else 0, 1))
-        tk.Label(head, text=block_label, fg=color,
-                 font=("Malgun Gothic", 9, "bold")).pack(side="left")
-        ls_var = tk.BooleanVar(value=True)
-        ls_vars[block] = ls_var
-        tk.Checkbutton(head, text="LS주문", variable=ls_var,
-                       command=ls_order_command(block, ls_var)).pack(
-            side="left", padx=(10, 0))
+        tk.Label(grid, text=block_label, fg=color,
+                 font=("Malgun Gothic", 9, "bold")).grid(
+            row=row_no, column=0, columnspan=len(headers), sticky="w",
+            pady=(6 if row_no else 0, 1))
         row_no += 1
         for col, header in enumerate(headers):
             tk.Label(grid, text=header, fg="gray25").grid(row=row_no, column=col)
@@ -211,26 +240,30 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             ent_threshold.grid(row=row_no, column=1, padx=2, pady=1)
             ent_target = tk.Entry(grid, width=8, justify="right")
             ent_target.grid(row=row_no, column=2, padx=2, pady=1)
-            btn = tk.Button(grid, text="실행", width=6,
-                            command=run_command(block, i))
+            btn = tk.Button(grid, text="실행", width=6, command=run_command(block, i))
             btn.grid(row=row_no, column=3, padx=4)
+            ls_var = tk.BooleanVar(value=True)
+            tk.Checkbutton(grid, variable=ls_var,
+                           command=ls_order_command(block, i, ls_var)).grid(
+                row=row_no, column=4)
             displays = []
-            for col in range(4, 8):
+            for col in range(5, 9):
                 lbl = tk.Label(grid, text="-", width=8, anchor="e",
                                bg="white", relief="solid", bd=1)
                 lbl.grid(row=row_no, column=col, padx=1, pady=1)
                 displays.append(lbl)
             set_widgets[(block, i)] = {
                 "threshold": ent_threshold, "target": ent_target,
-                "button": btn, "running": False, "displays": displays,
+                "button": btn, "running": False, "ls_var": ls_var,
+                "displays": displays,
             }
             row_no += 1
 
-    status = tk.Label(root, text="…", anchor="w", relief="groove")
+    status = tk.Label(root, text="코어 확인 중 ...", anchor="w", relief="groove")
     status.pack(fill="x", padx=4, pady=(2, 4))
 
     # --- 코어 상태 폴링(뒷단 스레드) → 화면은 결과만 표시 ---
-    state_box: dict[str, Any] = {"data": None}
+    state_box: dict[str, Any] = {"data": None, "filled": False}
 
     def poll_state() -> None:
         while True:
@@ -239,20 +272,27 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     threading.Thread(target=poll_state, daemon=True).start()
 
+    def my_screen(data: Any) -> dict[str, Any]:
+        raw = ((data or {}).get("screens") or {}).get(screen_key)
+        return raw if isinstance(raw, dict) else {}
+
     def fill_initial() -> None:
-        data = core_request("/state")
+        """첫 폴링 결과가 도착하면 입력칸 채움 — 화면 스레드는 기다리지 않는다."""
+        data = state_box["data"]
         if data is None:
-            set_status("코어 미접속 — 메인 화면에서 코어를 먼저 시작")
+            try:
+                root.after(300, fill_initial)  # 아직 응답 없음 — 다음에 다시
+            except tk.TclError:
+                pass
             return
-        raw = (data.get("screens") or {}).get(screen_key)
-        screen = raw if isinstance(raw, dict) else {}
+        state_box["filled"] = True
+        screen = my_screen(data)
         rev = {v: k for k, v in UNDER_MAP.items()}
         cb_under.set(rev.get(str(screen.get("underlying")), "하이닉스"))
         per = screen.get("per_order_qty")
         if isinstance(per, int) and per > 0:
             ent_per.insert(0, str(per))
         for block, sets_name in (("entry", "entry_sets"), ("exit", "exit_sets")):
-            ls_vars[block].set(bool(screen.get(f"ls_order_{block}", True)))
             raw_sets = screen.get(sets_name)
             for i, raw_set in enumerate(raw_sets if isinstance(raw_sets, list) else []):
                 if not isinstance(raw_set, dict) or i >= 3:
@@ -262,27 +302,24 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     w["threshold"].insert(0, str(raw_set["threshold"]))
                 if raw_set.get("target_qty"):
                     w["target"].insert(0, str(raw_set["target_qty"]))
+                w["ls_var"].set(bool(raw_set.get("ls_order", True)))
         set_status("코어 연결됨 — 마지막 입력값 복원")
 
     def refresh() -> None:
         try:  # 네트워크 없음 — 뒷단 스레드 결과만 표시
-            data = state_box["data"]
-            if isinstance(data, dict):
-                raw = (data.get("screens") or {}).get(screen_key)
-                screen = raw if isinstance(raw, dict) else {}
-                for block, sets_name in (("entry", "entry_sets"),
-                                         ("exit", "exit_sets")):
-                    raw_sets = screen.get(sets_name)
-                    if not isinstance(raw_sets, list):
+            screen = my_screen(state_box["data"])
+            for block, sets_name in (("entry", "entry_sets"), ("exit", "exit_sets")):
+                raw_sets = screen.get(sets_name)
+                if not isinstance(raw_sets, list):
+                    continue
+                for i, raw_set in enumerate(raw_sets[:3]):
+                    if not isinstance(raw_set, dict):
                         continue
-                    for i, raw_set in enumerate(raw_sets[:3]):
-                        if not isinstance(raw_set, dict):
-                            continue
-                        w = set_widgets[(block, i)]
-                        w["displays"][0].config(text=str(raw_set.get("fired_qty", 0)))
-                        done = (raw_set.get("target_qty") or 0) > 0 and (
-                            raw_set.get("fired_qty", 0) >= raw_set["target_qty"])
-                        w["displays"][0].config(bg="#d0f0d0" if done else "white")
+                    w = set_widgets[(block, i)]
+                    w["displays"][0].config(text=str(raw_set.get("fired_qty", 0)))
+                    done = (raw_set.get("target_qty") or 0) > 0 and (
+                        raw_set.get("fired_qty", 0) >= raw_set["target_qty"])
+                    w["displays"][0].config(bg="#d0f0d0" if done else "white")
         finally:
             try:
                 root.after(1000, refresh)
@@ -291,6 +328,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     fill_initial()
     refresh()
+    drain_results()
     # 콘솔로 Ctrl-C 신호가 흘러들어도 화면을 죽이지 않는다
     while True:
         try:

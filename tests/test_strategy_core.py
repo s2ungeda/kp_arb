@@ -101,12 +101,15 @@ def test_plan_order_auto_m_legs() -> None:
 
 
 def test_plan_order_ls_unchecked_hl_only() -> None:
-    # LS주문 체크 해제 → HL 다리만 (§6.2-2)
+    # 세트별 LS주문 체크 해제 → 그 세트만 HL 다리 (§6.2-2, 사용자 확정: 세트 단위)
     screen = _screen()
-    screen.ls_order_entry = False
+    screen.entry_sets[0].ls_order = False
     plan, errors = plan_order(screen, Block.ENTRY, 0, position_qty=0, now=NOON)
     assert errors == [] and plan is not None
     assert len(plan.legs) == 1 and plan.legs[0].venue is Venue.HYPERLIQUID
+    # 다른 세트는 영향 없음
+    plan, errors = plan_order(screen, Block.ENTRY, 1, position_qty=0, now=NOON)
+    assert plan is not None and len(plan.legs) == 2
 
 
 def test_plan_order_rejections() -> None:

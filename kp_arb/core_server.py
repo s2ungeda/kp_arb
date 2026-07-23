@@ -72,13 +72,10 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
         if cmd == "per_qty":
             _screen_of(state, body).per_order_qty = int(body["qty"])
             return _ok()
-        if cmd == "ls_order":  # 블록별 LS주문 체크 — 해제 시 HL 주문만 (§6.2-2)
+        if cmd == "ls_order":  # 세트별 LS주문 체크 — 해제 시 HL 주문만 (§6.2-2)
             screen = _screen_of(state, body)
-            value = bool(body["value"])
-            if Block(str(body["block"])) is Block.ENTRY:
-                screen.ls_order_entry = value
-            else:
-                screen.ls_order_exit = value
+            block = Block(str(body["block"]))
+            screen.sets_of(block)[int(body["set"])].ls_order = bool(body["value"])
             return _ok()
         if cmd == "set_threshold":
             screen = _screen_of(state, body)
