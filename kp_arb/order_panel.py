@@ -39,11 +39,34 @@ def parse_qty(text: str) -> int:
 
 
 def parse_threshold(text: str) -> float | None:
-    """기준값 에디트 값 → float(소수 — 0.006=0.6%). 빈칸/오타는 None."""
+    """기준값 에디트 값 → float(% 단위 그대로). 빈칸/오타는 None."""
     try:
         return float(text.strip())
     except ValueError:
         return None
+
+
+def threshold_to_fraction(text: str) -> float | None:
+    """기준값(%) 입력 → 코어 소수값. 괴리보드 표시와 같은 단위 — 0.075 = 0.075%."""
+    value = parse_threshold(text)
+    return None if value is None else value / 100.0
+
+
+def fraction_to_pct_text(value: float) -> str:
+    """코어 소수값 → 화면 %(입력칸 채움용). 0.00075 → '0.075'."""
+    return f"{value * 100:g}"
+
+
+def is_int_text(text: str) -> bool:
+    """정수 입력칸 허용 문자 검사 — 빈칸 또는 숫자만 (키 입력마다 호출)."""
+    return text == "" or text.isdigit()
+
+
+def is_decimal_text(text: str) -> bool:
+    """소수 입력칸 허용 검사 — 부호/소수점 포함 숫자 형태만 (입력 중간 상태 허용)."""
+    import re
+
+    return re.fullmatch(r"-?\d*\.?\d*", text) is not None
 
 
 def operating_text(kind: ScreenKind) -> str:
@@ -65,6 +88,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     root.title(f"kp-arb {TITLES[kind]}")
     root.resizable(False, False)
     root.option_add("*Font", ("Malgun Gothic", 9))
+    # 입력 제한 — 키 입력마다 검사해 글자·특수기호를 막는다
+    vcmd_int = (root.register(is_int_text), "%P")
+    vcmd_dec = (root.register(is_decimal_text), "%P")
 
     # --- 명령 전송: 작업 큐 → 전송 스레드 → 결과 큐 → 화면 루프 ---
     Job = tuple[dict[str, Any], str, Callable[[dict[str, Any] | None], None] | None]
@@ -119,7 +145,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         {"cmd": "select", "underlying": UNDER_MAP[cb_under.get()]}, "종목 선택"))
     unit = "주" if kind is ScreenKind.AUTO_T else "계약"
     tk.Label(row1, text=f"1회주문수량({unit})").pack(side="left")
-    ent_per = tk.Entry(row1, width=6, justify="right")
+    ent_per = tk.Entry(row1, width=6, justify="right",
+                       validate="key", validatecommand=vcmd_int)
     ent_per.pack(side="left", padx=(2, 10))
     ent_per.bind("<Return>", lambda _e: send(
         {"cmd": "per_qty", "qty": parse_qty(ent_per.get())}, "1회주문수량"))
@@ -133,25 +160,27 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         data = state_box["data"] or {}
         raw = ((data.get("screens") or {}).get(screen_key) or {}).get("settings")
         saved = raw if isinstance(raw, dict) else {}
-        fields = [
-            ("kr_margin_ticks", "국내 주문가 여유(틱)", saved.get("kr_margin_ticks", 10)),
+        fields = [  # (키, 라벨, 기본값, 정수 여부)
+            ("kr_margin_ticks", "국내 주문가 여유(틱)",
+             saved.get("kr_margin_ticks", 10), True),
             ("hl_margin_pct", "하리 주문가 여유(예 0.01=1%)",
-             saved.get("hl_margin_pct", 0.01)),
-            ("max_position", "종목보유최대수량", saved.get("max_position", 0)),
+             saved.get("hl_margin_pct", 0.01), False),
+            ("max_position", "종목보유최대수량", saved.get("max_position", 0), True),
             ("daily_limit_100m", "일거래한도(억, 0=미사용)",
-             saved.get("daily_limit_100m", 0.0)),
+             saved.get("daily_limit_100m", 0.0), False),
         ]
         if kind is ScreenKind.AUTO_M:
             fields += [
-                ("delay_ms", "딜레이(ms)", saved.get("delay_ms", 500)),
+                ("delay_ms", "딜레이(ms)", saved.get("delay_ms", 500), True),
                 ("pre_order_range_ticks", "선주문진입범위(틱)",
-                 saved.get("pre_order_range_ticks", 0)),
+                 saved.get("pre_order_range_ticks", 0), True),
             ]
         entries: dict[str, tk.Entry] = {}
-        for i, (key, label, default) in enumerate(fields):
+        for i, (key, label, default, integer) in enumerate(fields):
             tk.Label(win, text=label, anchor="w").grid(
                 row=i, column=0, sticky="w", padx=6, pady=3)
-            e = tk.Entry(win, width=10, justify="right")
+            e = tk.Entry(win, width=10, justify="right", validate="key",
+                         validatecommand=vcmd_int if integer else vcmd_dec)
             e.insert(0, str(default))
             e.grid(row=i, column=1, padx=6, pady=3)
             entries[key] = e
@@ -164,8 +193,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             send(payload, "설정 저장")
             win.destroy()
 
-        tk.Button(win, text="저장", width=8, command=save_settings).grid(
-            row=len(fields), column=0, columnspan=2, pady=(4, 6))
+        buttons = tk.Frame(win)
+        buttons.grid(row=len(fields), column=0, columnspan=2, pady=(4, 6))
+        tk.Button(buttons, text="저장", width=8, command=save_settings).pack(
+            side="left", padx=4)
+        tk.Button(buttons, text="취소", width=8, command=win.destroy).pack(
+            side="left", padx=4)
         win.update_idletasks()
         x = root.winfo_x() + (root.winfo_width() - win.winfo_width()) // 2
         y = root.winfo_y() + (root.winfo_height() - win.winfo_height()) // 2
@@ -182,7 +215,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     kr_tag = "S" if kind is ScreenKind.AUTO_T else "SF"
     grid = tk.Frame(root)
     grid.pack(fill="x", padx=4, pady=2)
-    headers = ("", "기준값", "목표진입량", "실행", "LS주문", "진입수량", "환율",
+    headers = ("", "기준값(%)", "목표진입량", "실행", "LS주문", "진입수량", "환율",
                "avg HL", f"avg {kr_tag}")
     row_no = 0
     set_widgets: dict[tuple[str, int], dict[str, Any]] = {}
@@ -191,7 +224,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         w = set_widgets[(block, index)]
         send({"cmd": "per_qty", "qty": parse_qty(ent_per.get())}, "1회주문수량")
         send({"cmd": "set_threshold", "block": block, "set": index,
-              "value": parse_threshold(w["threshold"].get())}, "기준값")
+              "value": threshold_to_fraction(w["threshold"].get())}, "기준값")
         send({"cmd": "set_target", "block": block, "set": index,
               "value": parse_qty(w["target"].get())}, "목표진입량")
 
@@ -236,9 +269,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         row_no += 1
         for i, name in enumerate(("1st", "2nd", "3rd")):
             tk.Label(grid, text=name).grid(row=row_no, column=0, padx=(0, 4))
-            ent_threshold = tk.Entry(grid, width=8, justify="right")
+            ent_threshold = tk.Entry(grid, width=8, justify="right",
+                                     validate="key", validatecommand=vcmd_dec)
             ent_threshold.grid(row=row_no, column=1, padx=2, pady=1)
-            ent_target = tk.Entry(grid, width=8, justify="right")
+            ent_target = tk.Entry(grid, width=8, justify="right",
+                                  validate="key", validatecommand=vcmd_int)
             ent_target.grid(row=row_no, column=2, padx=2, pady=1)
             btn = tk.Button(grid, text="실행", width=6, command=run_command(block, i))
             btn.grid(row=row_no, column=3, padx=4)
@@ -299,7 +334,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     continue
                 w = set_widgets[(block, i)]
                 if raw_set.get("threshold") is not None:
-                    w["threshold"].insert(0, str(raw_set["threshold"]))
+                    w["threshold"].insert(
+                        0, fraction_to_pct_text(float(raw_set["threshold"])))
                 if raw_set.get("target_qty"):
                     w["target"].insert(0, str(raw_set["target_qty"]))
                 w["ls_var"].set(bool(raw_set.get("ls_order", True)))

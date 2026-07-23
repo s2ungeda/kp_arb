@@ -2,11 +2,34 @@
 from kp_arb.domain.enums import Underlying
 from kp_arb.order_panel import (
     UNDER_MAP,
+    fraction_to_pct_text,
+    is_decimal_text,
+    is_int_text,
     operating_text,
     parse_qty,
     parse_threshold,
+    threshold_to_fraction,
 )
 from kp_arb.strategy_core import ScreenKind
+
+
+def test_input_filters() -> None:
+    # 정수칸: 숫자만 / 소수칸: 부호·소수점 포함 숫자 형태만 (입력 중간 상태 허용)
+    assert is_int_text("") and is_int_text("120")
+    assert not is_int_text("1.5") and not is_int_text("abc") and not is_int_text("-3")
+    assert is_decimal_text("") and is_decimal_text("-") and is_decimal_text("0.075")
+    assert is_decimal_text("-.3") and is_decimal_text("12.")
+    assert not is_decimal_text("1.2.3") and not is_decimal_text("1e3")
+    assert not is_decimal_text("abc") and not is_decimal_text("0.0%")
+
+
+def test_threshold_pct_conversion() -> None:
+    # 입력은 %(괴리보드와 동일 단위), 코어는 소수: 0.075(%) → 0.00075
+    assert threshold_to_fraction("0.075") == 0.00075
+    assert threshold_to_fraction("-0.3") == -0.003
+    assert threshold_to_fraction("") is None
+    assert fraction_to_pct_text(0.00075) == "0.075"
+    assert fraction_to_pct_text(-0.003) == "-0.3"
 
 
 def test_parse_qty() -> None:
