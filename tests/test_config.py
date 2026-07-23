@@ -170,3 +170,19 @@ def test_secret_names_cover_required() -> None:
         "HL_AGENT_KEY", "HL_ACCOUNT_ADDRESS",
     }
     assert required <= names
+
+
+def test_mode_falls_back_to_keyring(monkeypatch) -> None:
+    # KP_MODE 환경변수 없음 → 자격증명관리자(키 등록 창 저장값) → 기본 paper
+    import kp_arb.config as config
+
+    monkeypatch.delenv("KP_MODE", raising=False)
+    monkeypatch.setattr(config.KeyringSecrets, "get",
+                        lambda self, name: "live" if name == "KP_MODE" else None)
+    assert config.current_mode() is config.RunMode.LIVE
+    monkeypatch.setattr(config.KeyringSecrets, "get", lambda self, name: None)
+    assert config.current_mode() is config.RunMode.PAPER
+    monkeypatch.setenv("KP_MODE", "paper")  # 환경변수가 항상 우선
+    monkeypatch.setattr(config.KeyringSecrets, "get",
+                        lambda self, name: "live" if name == "KP_MODE" else None)
+    assert config.current_mode() is config.RunMode.PAPER

@@ -47,8 +47,12 @@ class RunMode(StrEnum):
 
 
 def current_mode() -> RunMode:
-    """실행 모드. ``KP_MODE`` 미설정 시 안전 기본값 paper(모의)."""
-    raw = os.environ.get("KP_MODE", RunMode.PAPER.value).lower()
+    """실행 모드. 환경변수 ``KP_MODE`` 우선 → 자격증명관리자(키 등록 창에서 저장)
+    → 안전 기본값 paper(모의)."""
+    raw = os.environ.get("KP_MODE")
+    if not raw:
+        raw = KeyringSecrets().get("KP_MODE") or RunMode.PAPER.value
+    raw = raw.lower()
     try:
         return RunMode(raw)
     except ValueError as exc:
