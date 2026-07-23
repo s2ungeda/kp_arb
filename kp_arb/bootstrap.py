@@ -446,6 +446,16 @@ class LiveSystem:
             return side_disp(None, None, base)
         return side_disp(quote.ask * fx, quote.bid * fx, base)
 
+    def set_hl_aggregation(
+        self, u: Underlying, n_sig_figs: int | None, mantissa: int | None = None
+    ) -> None:
+        """HL 호가단위 머지 변경 — WS 구독 취소 후 재구독 (시세 화면 콤보에서 호출).
+
+        머지 중엔 est-pr·사다리가 머지 호가 기준이 된다(1호가 표시는 bbo 원시 유지).
+        """
+        if self._hl_ws is not None:
+            self._hl_ws.set_l2_aggregation(u, n_sig_figs, mantissa)
+
     def est_pair_prices(
         self,
         u: Underlying,

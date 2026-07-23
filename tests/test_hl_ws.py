@@ -151,16 +151,16 @@ async def test_l2book_quote_carries_depth() -> None:
     assert q.asks is not None and q.asks[2] == (183.8, 15.0)
 
 
-async def test_l2book_depth_capped_at_10() -> None:
-    # HL은 한쪽당 최대 20단계를 주지만, LS(10호가)와 맞춰 10단계까지만 보관.
-    client = HLWebSocketClient(FakeConnector([l2book_frame(levels_per_side=20)]))
+async def test_l2book_depth_max_20() -> None:
+    # 서버 최대인 한쪽당 20단계까지 전부 보관 (est-pr·머지 표시용).
+    client = HLWebSocketClient(FakeConnector([l2book_frame(levels_per_side=25)]))
     quotes = []
     client.on_quote.append(quotes.append)
 
     await client.run()
 
-    assert quotes[0].bids is not None and len(quotes[0].bids) == 10
-    assert quotes[0].asks is not None and len(quotes[0].asks) == 10
+    assert quotes[0].bids is not None and len(quotes[0].bids) == 20
+    assert quotes[0].asks is not None and len(quotes[0].asks) == 20
 
 
 async def test_bbo_merges_recent_l2book_depth() -> None:
@@ -203,3 +203,39 @@ async def test_bad_frame_does_not_kill_stream() -> None:
     await client.run()  # 예외 없이 끝까지
 
     assert len(quotes) == 1 and quotes[0].bid == 1500.0  # 뒤 프레임은 정상 처리
+
+
+def test_l2_aggregation_resubscribe() -> None:
+    # 머지 변경 = 구독 취소 + 재구독 (사용자 확정). 희망 상태도 갱신(재연결 대비).
+    client = HLWebSocketClient(connector=None)  # type: ignore[arg-type]
+    client.subscribe_l2book()
+    coin = client._symbols[Underlying.SK_HYNIX]
+
+    client.set_l2_aggregation(Underlying.SK_HYNIX, 5, 5)
+    target = next(s for s in client._subs
+                  if s.get("type") == "l2Book" and s.get("coin") == coin)
+    assert target["nSigFigs"] == 5 and target["mantissa"] == 5
+    first, second = list(client._control)
+    assert first["method"] == "unsubscribe"
+    assert "nSigFigs" not in first["subscription"]  # 옛 구독 그대로 취소
+    assert second["method"] == "subscribe"
+    assert second["subscription"]["mantissa"] == 5
+
+    client.set_l2_aggregation(Underlying.SK_HYNIX, None)  # 원시 복귀
+    assert "nSigFigs" not in target and "mantissa" not in target
+
+
+def test_bbo_keeps_merged_ladder_intact() -> None:
+    # 머지 구독 중엔 원시 1호가(bbo)를 머지 사다리에 섞지 않는다 (단위가 다름).
+    client = HLWebSocketClient(connector=None)  # type: ignore[arg-type]
+    coin = client._symbols[Underlying.SK_HYNIX]
+    client._l2_extra[coin] = {"nSigFigs": 5, "mantissa": 5}
+    client._parse_l2book({"coin": coin, "time": 1, "levels": [
+        [{"px": "184.1", "sz": "5"}], [{"px": "184.15", "sz": "7"}]]})
+
+    quote = client._parse_bbo({"coin": coin, "time": 2, "bbo": [
+        {"px": "184.12", "sz": "1"}, {"px": "184.13", "sz": "2"}]})
+    assert quote is not None
+    assert quote.bid == 184.12                 # 1호가 표시는 bbo 원시
+    assert quote.bids == [(184.1, 5.0)]        # 사다리는 머지 그대로 (스플라이스 없음)
+    assert quote.asks == [(184.15, 7.0)]

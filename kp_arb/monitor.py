@@ -180,6 +180,7 @@ def main() -> None:
     import threading
     import tkinter as tk
     from collections.abc import Callable
+    from tkinter import ttk
 
     try:
         from dotenv import load_dotenv
@@ -290,6 +291,31 @@ def main() -> None:
         ("현-오라클%", 9, "black"), ("마크-오라클%", 10, "black"),
         ("펀딩전", 8, "black"), ("펀딩피", 8, "black"), ("남은시간", 7, "black"),
     ])
+    # HL 호가단위 머지(종목별) — 서버 재구독. est·사다리에 적용, 1호가 표시는 원시 유지.
+    # 배수는 최소 호가단위 기준(184달러대: 원시 0.01 → 2배 0.02, 5배 0.05, 10배 0.1, 100배 1)
+    agg_choices = {"원시": (None, None), "2배": (5, 2), "5배": (5, 5),
+                   "10배": (4, None), "100배": (3, None)}
+    agg_row = tk.Frame(root)
+    agg_row.pack(fill="x", padx=4, pady=(2, 0))
+    tk.Label(agg_row, text="HL 호가단위:", font=font).pack(side="left")
+
+    def agg_handler(u: Underlying, combo: ttk.Combobox) -> Callable[[object], None]:
+        def _apply(_event: object) -> None:
+            system = system_ref.get("system")
+            if system is None:
+                return
+            n_sig_figs, mantissa = agg_choices[combo.get()]
+            system.set_hl_aggregation(u, n_sig_figs, mantissa)
+        return _apply
+
+    for agg_u in Underlying:
+        tk.Label(agg_row, text=_NAMES[agg_u], font=font).pack(side="left", padx=(8, 2))
+        agg_combo = ttk.Combobox(agg_row, values=list(agg_choices), width=5,
+                                 state="readonly", font=font)
+        agg_combo.set("원시")
+        agg_combo.pack(side="left")
+        agg_combo.bind("<<ComboboxSelected>>", agg_handler(agg_u, agg_combo))
+
     # est-pr 계산 입력 — 수량(국내: 주식 쌍=주 1:1, 선물 쌍=계약 1:10 환산)·기준값(%) (§6.2-4)
     est_input = tk.Frame(root)
     est_input.pack(fill="x", padx=4, pady=(4, 0))

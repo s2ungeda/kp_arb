@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -47,6 +48,9 @@ class HLWebSocketClient:
         self._depth: dict[
             Underlying, tuple[list[tuple[float, float]], list[tuple[float, float]]]
         ] = {}
+        # l2Book 호가단위 머지 상태(coin별 nSigFigs/mantissa — 비면 원시) + 제어 큐
+        self._l2_extra: dict[str, dict[str, int]] = {}
+        self._control: deque[dict[str, Any]] = deque()  # 활성 연결로 보낼 (un)subscribe
         self.on_mark: list[Callable[[Mark], None]] = []
         self.on_quote: list[Callable[[Quote], None]] = []          # 최우선호가(bbo)
         self.on_trade: list[Callable[[TradeTick], None]] = []      # 체결(현재가, ~0.2s)
@@ -82,6 +86,36 @@ class HLWebSocketClient:
         if subscription not in self._subs:
             self._subs.append(subscription)
 
+    def set_l2_aggregation(
+        self,
+        underlying: Underlying,
+        n_sig_figs: int | None,
+        mantissa: int | None = None,
+    ) -> None:
+        """l2Book 호가단위 머지 변경 — 구독 취소 후 재구독 (사용자 확정 2026-07-23).
+
+        서버 옵션: nSigFigs 2~5 또는 None(원시), mantissa 1·2·5(nSigFigs=5일 때만).
+        저장된 구독 희망 상태도 갱신해 재연결 시 같은 단위로 다시 붙는다.
+        UI 스레드에서 호출해도 안전 — 큐에만 넣고 전송은 WS 루프가 한다.
+        """
+        coin = self._symbols[underlying]
+        target = next((s for s in self._subs
+                       if s.get("type") == "l2Book" and s.get("coin") == coin), None)
+        if target is None:
+            return  # l2Book 미구독
+        self._control.append({"method": "unsubscribe", "subscription": dict(target)})
+        target.pop("nSigFigs", None)
+        target.pop("mantissa", None)
+        extra: dict[str, int] = {}
+        if n_sig_figs is not None:
+            extra["nSigFigs"] = n_sig_figs
+            if mantissa is not None:
+                extra["mantissa"] = mantissa
+        target.update(extra)
+        self._l2_extra[coin] = extra
+        self._depth.pop(underlying, None)  # 옛 단위 사다리 폐기
+        self._control.append({"method": "subscribe", "subscription": dict(target)})
+
     # --- 실행 루프 (LSWebSocketClient와 동일 패턴) ---
 
     async def run(self) -> None:
@@ -93,11 +127,14 @@ class HLWebSocketClient:
         attempts = 0
         while True:
             ping_task: asyncio.Task[None] | None = None
+            control_task: asyncio.Task[None] | None = None
             try:
                 conn = await self._connector.connect()
+                self._control.clear()  # 재연결이면 희망 상태로 전부 재구독 — 옛 제어 폐기
                 for sub in self._subs:
                     await conn.send(json.dumps({"method": "subscribe", "subscription": sub}))
                 ping_task = asyncio.create_task(self._ping_loop(conn))
+                control_task = asyncio.create_task(self._control_loop(conn))
                 async for raw in conn:
                     attempts = 0  # 데이터 수신 = 정상 연결
                     try:
@@ -120,6 +157,8 @@ class HLWebSocketClient:
             finally:
                 if ping_task is not None:
                     ping_task.cancel()
+                if control_task is not None:
+                    control_task.cancel()
 
     @staticmethod
     async def _ping_loop(conn: WSConnection, interval_s: float = 45.0) -> None:
@@ -127,6 +166,16 @@ class HLWebSocketClient:
             while True:
                 await asyncio.sleep(interval_s)
                 await conn.send('{"method":"ping"}')
+        except Exception:  # noqa: BLE001 - 연결 종료 시 조용히 끝 (본선이 재연결)
+            return
+
+    async def _control_loop(self, conn: WSConnection, interval_s: float = 0.3) -> None:
+        """머지 변경 등 제어 메시지를 활성 연결로 전송 (UI 스레드 → 큐 → 여기)."""
+        try:
+            while True:
+                while self._control:
+                    await conn.send(json.dumps(self._control.popleft()))
+                await asyncio.sleep(interval_s)
         except Exception:  # noqa: BLE001 - 연결 종료 시 조용히 끝 (본선이 재연결)
             return
 
@@ -200,9 +249,15 @@ class HLWebSocketClient:
         top_bid = (float(bid["px"]), float(bid.get("sz", 0) or 0))
         top_ask = (float(ask["px"]), float(ask.get("sz", 0) or 0))
         # 1호가는 bbo(빠름)로 갱신하고, 2호가 아래는 최근 l2Book 것을 붙인다.
+        # 단, 머지 구독 중엔 원시 1호가를 머지 사다리에 섞지 않는다(단위가 다름).
         depth = self._depth.get(underlying)
-        bids = [top_bid] + depth[0][1:] if depth else None
-        asks = [top_ask] + depth[1][1:] if depth else None
+        if depth is None:
+            bids = asks = None
+        elif self._l2_extra.get(str(data.get("coin", ""))):
+            bids, asks = depth[0], depth[1]
+        else:
+            bids = [top_bid] + depth[0][1:]
+            asks = [top_ask] + depth[1][1:]
         return Quote(
             underlying=underlying,
             instrument=Instrument.HL_PERP,
@@ -222,11 +277,11 @@ class HLWebSocketClient:
         levels = data.get("levels")
         if underlying is None or not isinstance(levels, list) or len(levels) != 2:
             return None
-        # LS(10호가)와 맞춰 한쪽당 10단계까지만 보관.
+        # 서버 최대인 한쪽당 20단계까지 보관 (est-pr·머지 표시용).
         bids = [(float(x["px"]), float(x.get("sz", 0) or 0))
-                for x in (levels[0] or [])[:10] if isinstance(x, dict) and "px" in x]
+                for x in (levels[0] or [])[:20] if isinstance(x, dict) and "px" in x]
         asks = [(float(x["px"]), float(x.get("sz", 0) or 0))
-                for x in (levels[1] or [])[:10] if isinstance(x, dict) and "px" in x]
+                for x in (levels[1] or [])[:20] if isinstance(x, dict) and "px" in x]
         if not bids or not asks:
             return None
         self._depth[underlying] = (bids, asks)
