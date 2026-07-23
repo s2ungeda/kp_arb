@@ -6,9 +6,18 @@ from kp_arb.disparity import (
     SideDisp,
     disp,
     est_price,
+    maker_price_for_spread,
     pair_spread,
     side_disp,
 )
+
+
+def test_maker_price_for_spread() -> None:
+    # §6.2-4: P = 기준가 × (1 + HL괴리(est) − 기준값). 체결 시 스프레드 = 기준값 보장.
+    price = maker_price_for_spread(300_000.0, 0.001, 0.0006)
+    assert price == pytest.approx(300_120.0)
+    # 검산: 이 가격의 국내 disp = (P−기준가)/기준가 → HL괴리 − disp = 기준값
+    assert 0.001 - (price - 300_000.0) / 300_000.0 == pytest.approx(0.0006)
 
 
 def test_est_price_walks_depth() -> None:

@@ -31,6 +31,19 @@ def est_price(levels: Sequence[tuple[float, float]], qty: float) -> float | None
     return None
 
 
+def maker_price_for_spread(
+    base: float, hl_disp_est: float, threshold: float
+) -> float:
+    """역산 국내 maker 주문가 (DESIGN §6.2-4) — 기준값이 곧 주문가.
+
+    스프레드 = HL괴리(est) − 국내괴리 ≥ 기준값 이 체결로 보장되는 국내 주문가:
+        P = 기준가 × (1 + HL괴리(est) − 기준값)
+    진입: 기준가=SF 이론가(주식은 현재가), HL괴리=매수호가 방향 est. 청산은 매도 방향.
+    호가단위 내림/올림은 실행층(거래소 규칙 필요).
+    """
+    return base * (1.0 + hl_disp_est - threshold)
+
+
 def disp(price: float | None, base: float | None) -> float | None:
     """기준가 대비 괴리 비율. 입력이 없거나 기준가가 0 이하이면 None."""
     if price is None or base is None or base <= 0 or price <= 0:

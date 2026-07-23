@@ -25,12 +25,14 @@ from .disparity import (
     PairBoard,
     SideDisp,
     disp,
+    est_price,
+    maker_price_for_spread,
     net_entry,
     net_exit,
     pair_spread,
     side_disp,
 )
-from .domain.enums import Account, Instrument, Underlying, Venue
+from .domain.enums import Account, Instrument, Side, Underlying, Venue
 from .domain.models import OrderIntent, Position, Quote
 from .engine import ArbEngine
 from .etf_theory import EtfTheoryInputs, theory_after, theory_regular
@@ -58,6 +60,7 @@ from .theory import (
     parse_hhmm,
     select_usd_futures,
 )
+from .ticks import ceil_to_tick, floor_to_tick, maker_cap, tick_for
 
 
 def select_near_month(
@@ -442,6 +445,47 @@ class LiveSystem:
         if quote is None or fx is None:
             return side_disp(None, None, base)
         return side_disp(quote.ask * fx, quote.bid * fx, base)
+
+    def est_pair_prices(
+        self,
+        u: Underlying,
+        instrument: Instrument,
+        sets_count: int,
+        entry_threshold: float,
+        exit_threshold: float,
+    ) -> tuple[float | None, float | None, float | None, float | None]:
+        """est-pr(HL taker가)와 역산 LS maker 주문가 — 보드 표시용 (DESIGN §6.2-4).
+
+        1세트 = HL 10계약. 진입은 HL 매도라 매수호가 사다리, 청산은 매도호가.
+        반환: (HL est 진입, HL est 청산 [USD], LS 주문가 진입, LS 주문가 청산 [원]).
+        기준값은 소수(0.0006 = 0.06%). 호가단위 반올림은 실행층에서.
+        """
+        quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
+        if quote is None or sets_count <= 0:
+            return None, None, None, None
+        hl_qty = 10.0 * sets_count
+        est_bid = est_price(quote.bids or [], hl_qty)   # 진입: HL 매도 → 매수호가
+        est_ask = est_price(quote.asks or [], hl_qty)   # 청산: HL 매수 → 매도호가
+        fx, _ = self.usdkrw_effective()
+        stock = self.stock_last(u)
+        base = (self.stock_futures_theory(u)
+                if instrument is Instrument.KR_STOCK_FUTURE else stock)
+        px_entry = px_exit = None
+        if fx is not None and stock is not None and base is not None:
+            hl_bid_d = disp(est_bid * fx if est_bid is not None else None, stock)
+            hl_ask_d = disp(est_ask * fx if est_ask is not None else None, stock)
+            kr_ask, kr_bid = self._best_quote(u, instrument)  # maker 보정용 1호가
+            if hl_bid_d is not None:
+                raw = maker_price_for_spread(base, hl_bid_d, entry_threshold)
+                tick = tick_for(instrument, raw)
+                px_entry = maker_cap(Side.BUY, floor_to_tick(raw, tick),
+                                     kr_ask, kr_bid, tick)
+            if hl_ask_d is not None:
+                raw = maker_price_for_spread(base, hl_ask_d, exit_threshold)
+                tick = tick_for(instrument, raw)
+                px_exit = maker_cap(Side.SELL, ceil_to_tick(raw, tick),
+                                    kr_ask, kr_bid, tick)
+        return est_bid, est_ask, px_entry, px_exit
 
     def disparity_board(self) -> dict[tuple[Underlying, Instrument], PairBoard]:
         """HL vs 국내 상대(주식선물/ETF)별 괴리·진입/청산 스프레드 (DESIGN §6.1)."""

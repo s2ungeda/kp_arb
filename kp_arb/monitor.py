@@ -290,12 +290,34 @@ def main() -> None:
         ("현-오라클%", 9, "black"), ("마크-오라클%", 10, "black"),
         ("펀딩전", 8, "black"), ("펀딩피", 8, "black"), ("남은시간", 7, "black"),
     ])
+    # est-pr 계산 입력 — 수량(세트: 1세트=HL 10계약)·진입/청산 기준값(%) (DESIGN §6.2-4)
+    est_input = tk.Frame(root)
+    est_input.pack(fill="x", padx=4, pady=(4, 0))
+    tk.Label(est_input, text="수량(세트)", font=font).pack(side="left")
+    ent_sets = tk.Entry(est_input, width=4, justify="right", font=font)
+    ent_sets.insert(0, "1")
+    ent_sets.pack(side="left", padx=(2, 8))
+    tk.Label(est_input, text="진입기준%", font=font).pack(side="left")
+    ent_s_en = tk.Entry(est_input, width=6, justify="right", font=font)
+    ent_s_en.insert(0, "0")
+    ent_s_en.pack(side="left", padx=(2, 8))
+    tk.Label(est_input, text="청산기준%", font=font).pack(side="left")
+    ent_s_ex = tk.Entry(est_input, width=6, justify="right", font=font)
+    ent_s_ex.insert(0, "0")
+    ent_s_ex.pack(side="left", padx=(2, 8))
+    tk.Label(est_input, text="(LS주문가 = 기준값이 체결로 보장되는 maker 가격)",
+             font=font, fg="gray40").pack(side="left")
+
     # 구성요소(HL/국내 매도·매수 disp)·순진입/순청산은 화면 제외 — CSV에는 계속 기록.
     fill_board = make_grid(
         "괴리 보드 (%) — 진입=HL매수d−국내매수d(국내 maker)", [
             ("쌍", 13, "black"),
             ("진입", 8, "red"),
             ("청산", 8, "blue"),
+            ("HLest진입", 9, "red"),     # HL est-pr (USD) — 진입: 매수호가 방향
+            ("HLest청산", 9, "blue"),    # 청산: 매도호가 방향
+            ("LS주문가진입", 10, "darkred"),   # 역산 maker 주문가 (원)
+            ("LS주문가청산", 10, "darkblue"),
         ])
 
     status = tk.Label(root, text="연결 중 ...", anchor="w", font=font)
@@ -310,17 +332,35 @@ def main() -> None:
         Instrument.KR_ETF: "ETF",
     }
 
+    def _est_inputs() -> tuple[int, float, float]:
+        """est 입력칸 읽기 — 오타는 기본값(1세트, 기준 0). %→소수 환산."""
+        try:
+            sets_count = max(0, int(ent_sets.get().strip() or 0))
+        except ValueError:
+            sets_count = 1
+        def _pct(entry: tk.Entry) -> float:
+            try:
+                return float(entry.get().strip() or 0.0) / 100.0
+            except ValueError:
+                return 0.0
+        return sets_count, _pct(ent_s_en), _pct(ent_s_ex)
+
     def board_rows(system: object) -> list[tuple[str, ...]]:
         from .bootstrap import LiveSystem
 
         assert isinstance(system, LiveSystem)
+        sets_count, s_en, s_ex = _est_inputs()
         rows: list[tuple[str, ...]] = []
         for (u, inst), pair in sorted(
             system.disparity_board().items(), key=lambda kv: (kv[0][0].value, kv[0][1].value)
         ):
+            est_bid, est_ask, px_en, px_ex = system.est_pair_prices(
+                u, inst, sets_count, s_en, s_ex)
             rows.append((
                 f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
                 pct(pair.spread.entry), pct(pair.spread.exit),  # K22/K24
+                _fmt(est_bid, decimals=2), _fmt(est_ask, decimals=2),
+                _fmt(px_en, decimals=0), _fmt(px_ex, decimals=0),
             ))
         return rows
 
