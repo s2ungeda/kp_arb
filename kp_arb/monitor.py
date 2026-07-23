@@ -314,10 +314,10 @@ def main() -> None:
             ("쌍", 13, "black"),
             ("진입", 8, "red"),
             ("청산", 8, "blue"),
-            ("HLest진입", 9, "red"),     # HL est-pr (USD) — 진입: 매수호가 방향
-            ("HLest청산", 9, "blue"),    # 청산: 매도호가 방향
-            ("LS주문가진입", 10, "darkred"),   # 역산 maker 주문가 (원)
-            ("LS주문가청산", 10, "darkblue"),
+            ("진입 est", 9, "red"),     # HL est-pr (USD) — 진입: 매수호가 방향
+            ("청산 est", 9, "blue"),    # 청산: 매도호가 방향
+            ("진입 주문가", 10, "darkred"),   # 역산 LS maker 주문가 (원)
+            ("청산 주문가", 10, "darkblue"),
         ])
 
     status = tk.Label(root, text="연결 중 ...", anchor="w", font=font)
