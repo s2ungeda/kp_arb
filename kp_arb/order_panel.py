@@ -26,8 +26,8 @@ TITLES = {
     ScreenKind.AUTO_T: "자동T — HL-주식 (동시 taker)",
     ScreenKind.AUTO_M: "자동M — HL-주식선물 (LS maker→HL taker)",
 }
-BLOCK_LABELS = (("entry", "entry (국내 매수 + HL 매도)", "red"),
-                ("exit", "exit (국내 매도 + HL 매수)", "blue"))
+BLOCK_LABELS = (("entry", "entry", "red"),
+                ("exit", "exit", "blue"))
 
 
 def parse_qty(text: str) -> int:
@@ -145,6 +145,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     cb_under.pack(side="left", padx=(2, 10))
     cb_under.bind("<<ComboboxSelected>>", lambda _e: send(
         {"cmd": "select", "underlying": UNDER_MAP[cb_under.get()]}, "종목 선택"))
+    lbl_hours = tk.Label(row1, text=f"운영 {operating_text(kind)}", fg="gray25")
+    lbl_hours.pack(side="left", padx=(4, 0))
 
     def open_settings() -> None:
         win = tk.Toplevel(root)
@@ -216,10 +218,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         win.focus_set()
 
     tk.Button(row1, text="공통설정", command=open_settings).pack(side="right")
-
-    lbl_hours = tk.Label(root, text=f"운영시간: {operating_text(kind)}", anchor="w",
-                         fg="gray25")
-    lbl_hours.pack(fill="x", padx=4)
 
     # --- 실시간 표시(7-3a): 진입/청산 신호(est, %) + 현재가·환율 한 줄 ---
     live_row = tk.Frame(root)
@@ -472,7 +470,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                         text=f"현재진입수량 {info.get('position', 0)}"
                              + (f" / {max_pos}" if max_pos else ""))
                 hours = str(settings.get("operating_hours") or "").strip()
-                lbl_hours.config(text=f"운영시간: {hours or operating_text(kind)}")
+                lbl_hours.config(text=f"운영 {hours or operating_text(kind)}")
         finally:
             try:
                 root.after(1000, refresh)
