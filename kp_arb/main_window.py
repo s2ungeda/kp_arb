@@ -33,6 +33,8 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "kp-arb-core.exe"), "core"]
     if module == "kp_arb.monitor":
         return [str(exe_dir / "kp-arb.exe"), "monitor"]
+    if module == "kp_arb.fx_monitor":
+        return [str(exe_dir / "kp-arb.exe"), "fx_monitor"]
     if module == "kp_arb.order_panel":
         return [str(exe_dir / "kp-arb.exe"), *args]  # autoT | autoM
     return [str(exe_dir / "kp-arb.exe")]

@@ -21,3 +21,10 @@ def test_launch_command_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
     assert launch_command("kp_arb.monitor", ())[-1] == "monitor"
     assert launch_command("kp_arb.order_panel", ("autoM",))[-1] == "autoM"
     assert launch_command("kp_arb.main_window", ())[0].endswith("kp-arb.exe")
+
+
+def test_launch_command_fx_monitor_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", r"C:\dist\kp-arb\kp-arb.exe")
+    cmd = launch_command("kp_arb.fx_monitor", ())
+    assert cmd[0].endswith("kp-arb.exe") and cmd[-1] == "fx_monitor"

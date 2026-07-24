@@ -22,7 +22,7 @@ def main() -> None:
     import tkinter as tk
 
     root = tk.Tk()
-    root.title("kp-arb FX 노출 감시")
+    root.title("kp-arb FX 노출 감시 [v2]")  # [v2]=뒷단 스레드 수정본 (옛 창 구분용)
     root.geometry("560x460")
     root.option_add("*Font", ("Malgun Gothic", 9))
 
