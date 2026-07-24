@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .fx_reporter import Signal
@@ -25,8 +27,24 @@ PEER_TIMEOUT_S = 15.0
 HELLO = "HELLO"
 BYE = "BYE"
 TAB = "\t"
+ACCEPT_TOKEN = "Meme"  # 이 토큰만 수신 처리, 나머지는 스킵 (사용자 확정 2026-07-24)
 
 log = logging.getLogger("kp_arb.signallink")
+
+
+def parse_incoming(line: str) -> tuple[str, dict[str, object]] | None:
+    """수신 TCP 라인 "인스턴스ID\\t이름\\t<JSON>" → (보낸이 이름, JSON dict).
+
+    형식/JSON 오류는 None. token 필터는 호출측(수신 처리)에서.
+    """
+    parts = line.split(TAB, 2)
+    if len(parts) < 3:
+        return None
+    try:
+        payload = json.loads(parts[2])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return (parts[1], payload) if isinstance(payload, dict) else None
 
 
 def signal_wire_json(signal: Signal) -> str:
@@ -92,6 +110,8 @@ class SignalLinkSink:
         system_name: str = "kp-arb",
         udp_port: int = UDP_PORT,
         broadcast_ip: str = BROADCAST_IP,
+        on_message: Callable[[str, dict[str, object]], None] | None = None,
+        accept_token: str = ACCEPT_TOKEN,
     ) -> None:
         self._name = system_name
         self._udp_port = udp_port
@@ -100,11 +120,19 @@ class SignalLinkSink:
         self._peers: dict[str, _Peer] = {}
         self._seq = _SeqGen()
         self._udp: socket.socket | None = None
+        self._tcp_server: asyncio.Server | None = None
+        self._tcp_port = 0  # 실제 TCP 수신 포트 (HELLO에 알림)
+        self._on_message = on_message
+        self._accept_token = accept_token
         self._tasks: list[asyncio.Task[None]] = []
 
     async def start(self) -> None:
-        """UDP 소켓 바인딩 + 수신·하트비트 루프 시작."""
+        """UDP 발견 + TCP 수신 서버 + 하트비트 시작."""
         loop = asyncio.get_running_loop()
+        # TCP 수신 서버 — 메시지를 받아 token 필터 (포트는 OS 할당)
+        self._tcp_server = await asyncio.start_server(
+            self._handle_conn, "0.0.0.0", 0)
+        self._tcp_port = self._tcp_server.sockets[0].getsockname()[1]
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -115,15 +143,40 @@ class SignalLinkSink:
             loop.create_task(self._recv_loop()),
             loop.create_task(self._heartbeat_loop()),
         ]
-        log.info("SignalLink 시작 — UDP %d 피어 발견 (이름 %s)", self._udp_port, self._name)
+        log.info("SignalLink 시작 — UDP %d 발견 / TCP %d 수신 (이름 %s, 토큰 %s)",
+                 self._udp_port, self._tcp_port, self._name, self._accept_token)
 
     async def stop(self) -> None:
         for task in self._tasks:
             task.cancel()
+        if self._tcp_server is not None:
+            self._tcp_server.close()
+            self._tcp_server = None
         if self._udp is not None:
             self._broadcast(f"{BYE}{TAB}{self._instance_id}")
             self._udp.close()
             self._udp = None
+
+    async def _handle_conn(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """TCP 수신 — 한 줄 읽어 token=accept_token만 처리, 나머지 스킵."""
+        try:
+            raw = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            parsed = parse_incoming(line)
+            if parsed is not None:
+                name, payload = parsed
+                if payload.get("token") == self._accept_token:
+                    if self._on_message is not None:
+                        self._on_message(name, payload)
+                else:  # 다른 토큰 — 스킵
+                    log.debug("수신 스킵 (토큰 %s≠%s)",
+                              payload.get("token"), self._accept_token)
+        except (TimeoutError, OSError):
+            pass
+        finally:
+            writer.close()
 
     def _broadcast(self, packet: str) -> None:
         if self._udp is None:
@@ -135,10 +188,10 @@ class SignalLinkSink:
             pass
 
     async def _heartbeat_loop(self) -> None:
-        # TCP 서버는 안 열지만(수신 불필요), HELLO에 포트 0을 실으면 피어가 우리를 등록만
-        # 안 함 — 우리는 발신 전용이라 포트 0으로 알린다(발견은 상대 HELLO로 함).
+        # HELLO에 실제 TCP 수신 포트를 알린다 — 피어가 우리에게 메시지를 보낼 수 있게.
         while True:
-            self._broadcast(f"{HELLO}{TAB}{self._instance_id}{TAB}{self._name}{TAB}0")
+            self._broadcast(
+                f"{HELLO}{TAB}{self._instance_id}{TAB}{self._name}{TAB}{self._tcp_port}")
             self._prune_peers()
             await asyncio.sleep(HEARTBEAT_S)
 

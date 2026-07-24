@@ -74,3 +74,29 @@ def test_peer_list_includes_name() -> None:
         ip="10.0.0.5", tcp_port=5001, last_seen=1.0, name="감시창")
     peers = sink.peer_list()
     assert peers == [{"name": "감시창", "ip": "10.0.0.5", "port": 5001}]
+
+
+def test_parse_incoming_and_token_filter() -> None:
+    from kp_arb.signallink import ACCEPT_TOKEN, parse_incoming
+
+    line = ('inst1\t감시\t{"id":"s1","fx":1385.2,"total_domestic":0,'
+            '"total_coin":104,"token":"Meme","datetime":"t"}')
+    parsed = parse_incoming(line)
+    assert parsed is not None
+    name, payload = parsed
+    assert name == "감시" and payload["token"] == ACCEPT_TOKEN
+    assert payload["total_coin"] == 104
+    # 형식/JSON 오류는 None
+    assert parse_incoming("inst1\t감시") is None          # 필드 부족
+    assert parse_incoming("inst1\t감시\t{broken") is None  # JSON 오류
+
+
+def test_incoming_message_token_filter() -> None:
+    # sink가 token=Meme만 on_message 호출, 다른 토큰은 스킵 — 순수하게 필터만 검증
+    from kp_arb.signallink import parse_incoming
+
+    meme = ('i\tn\t{"token":"Meme","total_coin":1,"fx":1,"id":"a",'
+            '"total_domestic":0,"datetime":"t"}')
+    dalin = meme.replace("Meme", "Dalin")
+    assert parse_incoming(meme)[1]["token"] == "Meme"      # 처리 대상
+    assert parse_incoming(dalin)[1]["token"] == "Dalin"    # 스킵 대상(호출측이 거름)

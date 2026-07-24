@@ -29,7 +29,8 @@ class FxReportService:
         interval_s: float = 2.0, system_name: str = "kp-arb",
     ) -> None:
         self._system = system
-        self._sink = SignalLinkSink(system_name=system_name)
+        # 수신은 token="Meme"만 처리(sink가 필터) — 받은 메시지는 로그에 남긴다
+        self._sink = SignalLinkSink(system_name=system_name, on_message=self._on_message)
         self._reporter = FXExposureReporter(
             self._sink, token="Meme", notional_fn=hl_coin_notional)
         self.interval_s = interval_s
@@ -93,6 +94,11 @@ class FxReportService:
                            f"ok={self.last_sent_ok}")
         except Exception:  # noqa: BLE001 - 보고 실패가 코어를 멈추지 않게
             log.exception("FX 보고 실패 — 계속")
+
+    def _on_message(self, name: str, payload: dict[str, object]) -> None:
+        """수신 메시지(token=Meme만 도달) → 로그. total_coin·fx만 요약."""
+        self._note(f"수신 {name}: total_coin={payload.get('total_coin')} "
+                   f"fx={payload.get('fx')}")
 
     def _note(self, message: str) -> None:
         import time
