@@ -158,6 +158,9 @@ def main() -> None:
                 text=f"상태: {'일시정지' if paused else '자동 송신'} · 주기 {float(interval):g}초",
                 fg="#8b0000" if paused else "dark green")
             btn_pause.config(text="재개" if paused else "일시정지")
+            # 주기 입력칸이 비어 있으면 코어 값으로 채움 (타이밍 무관하게 확실히)
+            if interval and not ent_interval.get().strip():
+                ent_interval.insert(0, f"{float(interval):g}")
             info = fx.get("last")
             if isinstance(info, dict):
                 lbl_last.config(
@@ -192,20 +195,7 @@ def main() -> None:
             except tk.TclError:
                 pass
 
-    # 주기 입력칸 초기값
-    def fill_interval() -> None:
-        data = box["data"]
-        fx = data.get("fx") if isinstance(data, dict) else None
-        if isinstance(fx, dict) and fx.get("interval_s") is not None:
-            ent_interval.insert(0, f"{fx['interval_s']:g}")
-        else:
-            try:
-                root.after(300, fill_interval)
-            except tk.TclError:
-                pass
-
-    fill_interval()
-    refresh()
+    refresh()  # 주기 입력칸은 refresh가 비어 있을 때 코어 값으로 채운다
     drain_results()
     while True:
         try:
