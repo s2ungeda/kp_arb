@@ -58,6 +58,9 @@ class FxReportService:
         """수동 송신 요청 — 다음 틱(≤0.5초)에 값 변화 무관 강제 전송."""
         self._want_send_now = True
 
+    def clear_log(self) -> None:
+        self.log.clear()
+
     # --- 실행 루프 ---
 
     async def run(self) -> None:

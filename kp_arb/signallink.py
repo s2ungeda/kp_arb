@@ -147,13 +147,19 @@ class SignalLinkSink:
                  self._udp_port, self._tcp_port, self._name, self._accept_token)
 
     async def stop(self) -> None:
+        # BYE를 먼저 알려 피어가 우리를 정상 퇴장으로 처리하게 한 뒤 소켓을 닫는다.
+        if self._udp is not None:
+            self._broadcast(f"{BYE}{TAB}{self._instance_id}")
         for task in self._tasks:
             task.cancel()
         if self._tcp_server is not None:
             self._tcp_server.close()
+            try:  # 진행 중 수신 연결을 정상 종료할 시간
+                await asyncio.wait_for(self._tcp_server.wait_closed(), timeout=1.0)
+            except (TimeoutError, OSError):
+                pass
             self._tcp_server = None
         if self._udp is not None:
-            self._broadcast(f"{BYE}{TAB}{self._instance_id}")
             self._udp.close()
             self._udp = None
 

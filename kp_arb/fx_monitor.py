@@ -97,7 +97,12 @@ def main() -> None:
     lst_peers.pack(fill="y", expand=True)
     right = tk.Frame(mid)
     right.pack(side="left", fill="both", expand=True, padx=(6, 0))
-    tk.Label(right, text="송신 로그").pack(anchor="w")
+    log_head = tk.Frame(right)
+    log_head.pack(fill="x")
+    tk.Label(log_head, text="송신 로그").pack(side="left")
+    tk.Button(log_head, text="로그 지우기",
+              command=lambda: send({"cmd": "fx_clear_log"}, "로그 지우기")).pack(
+        side="right")
     txt_log = tk.Text(right, height=12, width=40, state="disabled")
     txt_log.pack(fill="both", expand=True)
 

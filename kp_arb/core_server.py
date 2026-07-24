@@ -212,6 +212,8 @@ def _fx_command(fx_service: FxReportService | None, body: dict[str, Any]) -> dic
         fx_service.resume()
     elif cmd == "fx_send_now":
         fx_service.request_send_now()
+    elif cmd == "fx_clear_log":
+        fx_service.clear_log()
     elif cmd == "fx_interval":
         fx_service.set_interval(float(body["seconds"]))
     else:
