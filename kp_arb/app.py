@@ -34,6 +34,9 @@ def main() -> None:
         sys.argv = [sys.argv[0], arg]  # order_panel은 argv[1]로 화면 종류를 읽는다
         from kp_arb.order_panel import main as run
         run()
+    elif arg == "fx_monitor":
+        from kp_arb.fx_monitor import main as run
+        run()
     elif arg == "keys":
         from kp_arb.key_setup import main as run
         run()

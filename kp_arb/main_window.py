@@ -126,6 +126,8 @@ def main() -> None:
                          command=lambda: open_screen("kp_arb.order_panel", "autoM"))
     m_screen.add_command(label="시세 모니터",
                          command=lambda: open_screen("kp_arb.monitor"))
+    m_screen.add_command(label="FX 노출 감시",
+                         command=lambda: open_screen("kp_arb.fx_monitor"))
     menubar.add_cascade(label="화면", menu=m_screen)
     m_core = tk.Menu(menubar, tearoff=0)
     m_core.add_command(label="코어 시작", command=start_core)

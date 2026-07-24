@@ -62,6 +62,7 @@ class _Peer:
     ip: str
     tcp_port: int
     last_seen: float
+    name: str = ""
 
 
 @dataclass
@@ -152,9 +153,9 @@ class SignalLinkSink:
             raw = data.decode("utf-8", errors="replace")
             hello = parse_hello(raw)
             if hello is not None:
-                instance_id, _name, port = hello
+                instance_id, name, port = hello
                 if instance_id != self._instance_id:
-                    self._peers[instance_id] = _Peer(addr[0], port, _now())
+                    self._peers[instance_id] = _Peer(addr[0], port, _now(), name)
                 continue
             bye = parse_bye(raw)
             if bye is not None:
@@ -195,6 +196,11 @@ class SignalLinkSink:
     def next_signal_id(self, yyyymmdd: str) -> str:
         """일별 시퀀스 id — 리포터가 id를 위임할 때 사용."""
         return self._seq.next_id(yyyymmdd)
+
+    def peer_list(self) -> list[dict[str, object]]:
+        """발견된 피어 목록 — 감시 화면 표시용 (이름·IP·포트)."""
+        return [{"name": p.name, "ip": p.ip, "port": p.tcp_port}
+                for p in self._peers.values()]
 
 
 def _now() -> float:

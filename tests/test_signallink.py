@@ -64,3 +64,13 @@ def test_seq_gen_daily_reset() -> None:
     assert gen.next_id("20260724") == "sig-20260724-001"
     assert gen.next_id("20260724") == "sig-20260724-002"
     assert gen.next_id("20260725") == "sig-20260725-001"  # 날짜 바뀌면 리셋
+
+
+def test_peer_list_includes_name() -> None:
+    from kp_arb.signallink import SignalLinkSink
+
+    sink = SignalLinkSink(system_name="kp-arb")
+    sink._peers["p1"] = __import__("kp_arb.signallink", fromlist=["_Peer"])._Peer(
+        ip="10.0.0.5", tcp_port=5001, last_seen=1.0, name="감시창")
+    peers = sink.peer_list()
+    assert peers == [{"name": "감시창", "ip": "10.0.0.5", "port": 5001}]

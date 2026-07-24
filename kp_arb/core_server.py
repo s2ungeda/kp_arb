@@ -36,6 +36,7 @@ from .strategy_core import (
 if TYPE_CHECKING:
     from .bootstrap import LiveSystem
     from .core_engine import RehearsalEngine
+    from .fx_service import FxReportService
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
@@ -200,18 +201,39 @@ def live_snapshot(
     return {"connected": True, "rehearsal": True, "screens": screens}
 
 
+def _fx_command(fx_service: FxReportService | None, body: dict[str, Any]) -> dict[str, Any]:
+    """FX 보고 감시 명령 (감시 화면 → 코어). fx_service 없으면 거부."""
+    if fx_service is None:
+        return _fail(["FX 보고 서비스 미가동 (코어 시세 미접속)"])
+    cmd = body.get("cmd")
+    if cmd == "fx_pause":
+        fx_service.pause()
+    elif cmd == "fx_resume":
+        fx_service.resume()
+    elif cmd == "fx_send_now":
+        fx_service.request_send_now()
+    elif cmd == "fx_interval":
+        fx_service.set_interval(float(body["seconds"]))
+    else:
+        return _fail([f"알 수 없는 FX 명령: {cmd!r}"])
+    return _ok()
+
+
 def make_app(
     state: CoreState,
     on_shutdown: Callable[[], None] | None = None,
     save: Callable[[], None] | None = None,
     system: LiveSystem | None = None,
     engine: RehearsalEngine | None = None,
+    fx_service: FxReportService | None = None,
 ) -> web.Application:
     """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅."""
 
     async def get_state(_request: web.Request) -> web.Response:
         payload = snapshot(state)
         payload["live"] = live_snapshot(state, system, engine)
+        payload["fx"] = (fx_service.snapshot() if fx_service is not None
+                         else {"connected": False})
         return web.json_response(payload, dumps=_dumps)
 
     async def post_command(request: web.Request) -> web.Response:
@@ -221,6 +243,10 @@ def make_app(
             return web.json_response(
                 {"ok": False, "errors": ["JSON 본문 필요"]}, status=400, dumps=_dumps)
         payload = body if isinstance(body, dict) else {}
+        cmd = payload.get("cmd")
+        if isinstance(cmd, str) and cmd.startswith("fx_"):
+            result = _fx_command(fx_service, payload)
+            return web.json_response(result, dumps=_dumps)
         result = apply_command(state, payload)
         if result.get("ok") and save:
             save()  # 입력값 저장 — 재시작 시 복원 (§6.2-0)
@@ -254,32 +280,6 @@ def _setup_logging() -> logging.Logger:
     return logging.getLogger("kp_arb.core")
 
 
-async def _fx_report_loop(system: LiveSystem, log: logging.Logger) -> None:
-    """HL 명목·환율을 외부 #2(Dalin broadcast)로 주기 전송 (7-4). 값 바뀔 때만.
-
-    total_coin = HL 보유 Σ(평균단가×수량), token="Meme". 실패해도 코어를 멈추지 않는다.
-    """
-    from .fx import hl_coin_notional
-    from .fx_reporter import FXExposureReporter
-    from .signallink import SignalLinkSink
-
-    sink = SignalLinkSink(system_name="kp-arb")
-    await sink.start()
-    reporter = FXExposureReporter(sink, token="Meme", notional_fn=hl_coin_notional)
-    try:
-        while True:
-            await asyncio.sleep(2.0)
-            positions = system.order_book.positions()
-            fx, _ = system.usdkrw_effective()
-            sent = await reporter.report_if_changed(positions, fx or 0.0)
-            if sent is not None:
-                log.info("FX 보고 → #2: total_coin=%.0f fx=%.2f ok=%s",
-                         sent.total_coin, sent.fx, reporter.last_sent_ok)
-    except asyncio.CancelledError:
-        await sink.stop()
-        raise
-
-
 async def _serve() -> None:
     import aiohttp
 
@@ -296,16 +296,19 @@ async def _serve() -> None:
         # LS/HL 접속 — 실패해도 API는 계속(화면 조작·입력 가능, 시세만 없음)
         system = None
         engine = None
+        fx_service = None
         tasks: list[asyncio.Task[None]] = []
         try:
             from .bootstrap import bootstrap_live
             from .core_engine import RehearsalEngine
+            from .fx_service import FxReportService
 
             system = await bootstrap_live(http)
             await system.start()
             engine = RehearsalEngine(state, system)
+            fx_service = FxReportService(system)
             tasks.append(asyncio.create_task(engine.run()))
-            tasks.append(asyncio.create_task(_fx_report_loop(system, log)))
+            tasks.append(asyncio.create_task(fx_service.run()))
             log.info("LiveSystem 결합 완료 — 리허설 판정 + FX 보고 시작 (발주 없음)")
         except Exception:  # noqa: BLE001 - 키 없음/네트워크 등
             log.exception("LiveSystem 시동 실패 — API만 운영 (시세 없음)")
@@ -314,7 +317,7 @@ async def _serve() -> None:
         runner = web.AppRunner(make_app(
             state, on_shutdown=stop.set,
             save=lambda: save_state(STATE_PATH, state),
-            system=system, engine=engine), access_log=None)
+            system=system, engine=engine, fx_service=fx_service), access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, HOST, DEFAULT_PORT)
         await site.start()
