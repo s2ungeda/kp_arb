@@ -456,6 +456,39 @@ class LiveSystem:
         if self._hl_ws is not None:
             self._hl_ws.set_l2_aggregation(u, n_sig_figs, mantissa)
 
+    def pair_signal(
+        self, u: Underlying, instrument: Instrument, kr_qty: int
+    ) -> tuple[float | None, float | None]:
+        """est 기반 진입/청산 스프레드(소수) — 주문 화면 표시·판정 루프 공용 (§6.2).
+
+        진입 = HL매수d(est) − 국내매수d(1호가 maker) / 청산 = HL매도d(est) − 국내매도d.
+        est는 kr_qty(국내 단위)를 HL 계약으로 환산(주식 1:1, 선물 1:10)해 산정.
+        국내 기준가: 선물 = 선물이론가, 주식 = 자기 현재가 (§6.1).
+        """
+        quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
+        if quote is None or kr_qty <= 0:
+            return None, None
+        hl_qty = float(kr_qty) * (
+            10.0 if instrument is Instrument.KR_STOCK_FUTURE else 1.0)
+        est_bid = est_price(quote.bids or [], hl_qty)
+        est_ask = est_price(quote.asks or [], hl_qty)
+        fx, _ = self.usdkrw_effective()
+        stock = self.stock_last(u)
+        base = (self.stock_futures_theory(u)
+                if instrument is Instrument.KR_STOCK_FUTURE else stock)
+        if fx is None or stock is None or base is None:
+            return None, None
+        kr_ask, kr_bid = self._best_quote(u, instrument)
+        hl_bid_d = disp(est_bid * fx if est_bid is not None else None, stock)
+        hl_ask_d = disp(est_ask * fx if est_ask is not None else None, stock)
+        kr_bid_d = disp(kr_bid, base)
+        kr_ask_d = disp(kr_ask, base)
+        entry = (hl_bid_d - kr_bid_d
+                 if hl_bid_d is not None and kr_bid_d is not None else None)
+        exit_ = (hl_ask_d - kr_ask_d
+                 if hl_ask_d is not None and kr_ask_d is not None else None)
+        return entry, exit_
+
     def est_pair_prices(
         self,
         u: Underlying,

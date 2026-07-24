@@ -211,6 +211,22 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(root, text=f"운영시간: {operating_text(kind)}", anchor="w",
              fg="gray25").pack(fill="x", padx=4)
 
+    # --- 실시간 표시(7-3a): 진입/청산 신호(est 기반, 기준값과 같은 % 단위) + 시세 ---
+    live_row = tk.Frame(root)
+    live_row.pack(fill="x", padx=4, pady=2)
+    signal_font = ("Malgun Gothic", 11, "bold")
+    lbl_sig_entry = tk.Label(live_row, text="진입  -", bg="red", fg="white",
+                             font=signal_font, width=14)
+    lbl_sig_entry.pack(side="left", ipady=2, padx=(0, 2))
+    lbl_sig_exit = tk.Label(live_row, text="청산  -", bg="blue", fg="white",
+                            font=signal_font, width=14)
+    lbl_sig_exit.pack(side="left", ipady=2)
+    lbl_position = tk.Label(live_row, text="현재진입수량 -", anchor="e")
+    lbl_position.pack(side="right")
+    lbl_prices = tk.Label(root, text="국내 -  |  HL -  |  환율 -", anchor="w",
+                          fg="gray25")
+    lbl_prices.pack(fill="x", padx=4)
+
     # --- entry/exit 블록: 세트 3줄 (LS주문 체크는 세트별) ---
     kr_tag = "S" if kind is ScreenKind.AUTO_T else "SF"
     grid = tk.Frame(root)
@@ -341,9 +357,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 w["ls_var"].set(bool(raw_set.get("ls_order", True)))
         set_status("코어 연결됨 — 마지막 입력값 복원")
 
+    def _pct_text(value: object) -> str:
+        return f"{value * 100:.4f}" if isinstance(value, int | float) else "-"
+
+    def _px_text(value: object, decimals: int = 0) -> str:
+        return f"{value:,.{decimals}f}" if isinstance(value, int | float) else "-"
+
     def refresh() -> None:
         try:  # 네트워크 없음 — 뒷단 스레드 결과만 표시
-            screen = my_screen(state_box["data"])
+            data = state_box["data"]
+            screen = my_screen(data)
             for block, sets_name in (("entry", "entry_sets"), ("exit", "exit_sets")):
                 raw_sets = screen.get(sets_name)
                 if not isinstance(raw_sets, list):
@@ -356,6 +379,23 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     done = (raw_set.get("target_qty") or 0) > 0 and (
                         raw_set.get("fired_qty", 0) >= raw_set["target_qty"])
                     w["displays"][0].config(bg="#d0f0d0" if done else "white")
+            # 실시간 수치 (코어 live 스냅샷 — 판정 루프와 같은 계산)
+            live = data.get("live") if isinstance(data, dict) else None
+            if isinstance(live, dict):
+                info_raw = (live.get("screens") or {}).get(screen_key)
+                info = info_raw if isinstance(info_raw, dict) else {}
+                lbl_sig_entry.config(text=f"진입  {_pct_text(info.get('entry'))}")
+                lbl_sig_exit.config(text=f"청산  {_pct_text(info.get('exit'))}")
+                fx_text = _px_text(info.get("fx"), 2)
+                lbl_prices.config(
+                    text=f"국내 {_px_text(info.get('kr_last'))}  |  "
+                         f"HL {_px_text(info.get('hl_last'), 4)}  |  환율 {fx_text}"
+                         + ("" if live.get("connected") else "   (시세 미접속)"))
+                max_pos = ((screen.get("settings") or {}).get("max_position")
+                           if isinstance(screen.get("settings"), dict) else None)
+                lbl_position.config(
+                    text=f"현재진입수량 {info.get('position', 0)}"
+                         + (f" / {max_pos}" if max_pos else ""))
         finally:
             try:
                 root.after(1000, refresh)

@@ -348,3 +348,34 @@ def test_disparity_board_computes_pairs() -> None:
     assert st.kr.ask is not None and abs(st.kr.ask - (500 / 300_000)) < 1e-12
     assert st.spread.entry == st.hl.bid - st.kr.bid  # 진입 공식 동일 (maker 기준)
     assert st.kr_last is not None and abs(st.kr_last) < 1e-12  # 현재가 괴리는 항상 0
+
+
+def test_pair_signal_est_based() -> None:
+    import pytest
+
+    # 7-3a: 진입 = HL매수d(est) − 국내매수d / 청산 = HL매도d(est) − 국내매도d.
+    # 주식 쌍(기준가=자기 현재가 300,000, 환율 1,500)으로 검산.
+    from kp_arb.domain.models import Quote
+
+    system, _, _ = _system([])
+    system.usdkrw_theory = 1_500.0
+    system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] = 300_000.0
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK, "krx")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
+        bid=299_500.0, ask=300_500.0, ts=0.0)
+    system.quotes[(SAMSUNG, Instrument.HL_PERP, "hl")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.HL_PERP,
+        bid=201.0, ask=202.0, ts=0.0, market="hl",
+        bids=[(201.0, 3.0), (200.0, 100.0)],
+        asks=[(202.0, 3.0), (203.0, 100.0)])
+
+    entry, exit_ = system.pair_signal(SAMSUNG, Instrument.KR_STOCK, 5)
+    # est(매수쪽, 5계약) = (201×3 + 200×2)/5 = 200.6 → 환산 300,900 → HL disp +0.003
+    # 국내 매수d = (299,500−300,000)/300,000 = −1/600 → entry = 0.003 + 1/600
+    assert entry == pytest.approx(0.003 + 1 / 600)
+    # est(매도쪽) = (202×3 + 203×2)/5 = 202.4 → 303,600 → +0.012, 국내 매도d = +1/600
+    assert exit_ == pytest.approx(0.012 - 1 / 600)
+
+    # 수량이 커지면 est가 나빠져 진입 신호는 줄어든다 (2호가까지 파고듦)
+    entry_big, _ = system.pair_signal(SAMSUNG, Instrument.KR_STOCK, 50)
+    assert entry_big is not None and entry is not None and entry_big < entry

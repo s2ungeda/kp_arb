@@ -141,3 +141,10 @@ def test_snapshot_serializable() -> None:
 
     text = json.dumps(snapshot(CoreState()), default=str, ensure_ascii=False)
     assert "autoT" in text and "autoM" in text
+
+
+def test_live_snapshot_disconnected() -> None:
+    from kp_arb.core_server import live_snapshot
+
+    live = live_snapshot(CoreState(), None, None)
+    assert live["connected"] is False and live["rehearsal"] is True

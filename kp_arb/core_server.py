@@ -1,25 +1,28 @@
-"""전략 코어 프로세스 — 로컬 명령/조회 API (DESIGN §12 "코어 하나 + 여러 화면").
+"""전략 코어 프로세스 — 접속·판정·명령의 본체 (DESIGN §12 "코어 하나 + 여러 화면").
 
     코어 시작/안전종료는 메인 화면(main.bat)에서. 단독: python -m kp_arb.core_server
 
-화면(자동T/자동M 주문·모니터·웹)은 http://127.0.0.1:8787 로 접속한다.
-- GET  /state    : CoreState 스냅샷(JSON)
-- POST /command  : {"cmd": ..., "screen": "autoT"|"autoM", ...} — apply_command 참조
+시동 시 LS/HL에 접속(LiveSystem)하고 리허설 판정 루프(7-3a — 발주 없음)를 돌린다.
+접속 실패(키 없음 등)여도 API는 계속 떠서 화면 조작·입력은 가능("시세 없음" 표시).
+로그는 콘솔 + logs/core_날짜.log 파일에 남는다.
 
-이 단계는 상태·명령까지. 실제 발주·시세(LiveSystem 결합)는 다음 단계.
+화면(자동T/자동M 주문·모니터·웹)은 http://127.0.0.1:8787 로 접속한다.
+- GET  /state    : CoreState 스냅샷 + live(신호·현재가·환율·가상포지션)
+- POST /command  : {"cmd": ..., "screen": "autoT"|"autoM", ...} — apply_command 참조
 """
 from __future__ import annotations
 
 import asyncio
 import dataclasses
 import json
+import logging
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from .domain.enums import Underlying
+from .domain.enums import Instrument, Underlying
 from .strategy_core import (
     Block,
     CoreState,
@@ -29,6 +32,10 @@ from .strategy_core import (
     threshold_check,
     validate_run,
 )
+
+if TYPE_CHECKING:
+    from .bootstrap import LiveSystem
+    from .core_engine import RehearsalEngine
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
@@ -151,15 +158,51 @@ def load_state(path: Path) -> CoreState:
     return state_from_dict(data) if isinstance(data, dict) else CoreState()
 
 
+def live_snapshot(
+    state: CoreState,
+    system: LiveSystem | None,
+    engine: RehearsalEngine | None,
+) -> dict[str, Any]:
+    """화면 표시용 실시간 수치 — 신호(est 스프레드)·현재가·환율·가상포지션 (7-3a)."""
+    if system is None:
+        return {"connected": False, "rehearsal": True, "screens": {}}
+    fx, fx_src = system.usdkrw_effective()
+    screens: dict[str, Any] = {}
+    for kind, screen in state.screens.items():
+        u = screen.underlying
+        instrument = kind.counterpart
+        entry, exit_ = system.pair_signal(u, instrument, screen.per_order_qty)
+        if instrument is Instrument.KR_STOCK:
+            kr_last = system.stock_last(u)
+        else:
+            kr_last = (system.trades.get((u, instrument, "uni"))
+                       or system.trades.get((u, instrument, "krx")))
+        runtime = engine.runtime.get(kind) if engine is not None else None
+        screens[kind.value] = {
+            "entry": entry,
+            "exit": exit_,
+            "kr_last": kr_last,
+            "hl_last": system.trades.get((u, Instrument.HL_PERP, "hl")),
+            "fx": fx,
+            "fx_src": fx_src,
+            "position": runtime.virtual_position if runtime is not None else 0,
+        }
+    return {"connected": True, "rehearsal": True, "screens": screens}
+
+
 def make_app(
     state: CoreState,
     on_shutdown: Callable[[], None] | None = None,
     save: Callable[[], None] | None = None,
+    system: LiveSystem | None = None,
+    engine: RehearsalEngine | None = None,
 ) -> web.Application:
     """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅."""
 
     async def get_state(_request: web.Request) -> web.Response:
-        return web.json_response(snapshot(state), dumps=_dumps)
+        payload = snapshot(state)
+        payload["live"] = live_snapshot(state, system, engine)
+        return web.json_response(payload, dumps=_dumps)
 
     async def post_command(request: web.Request) -> web.Response:
         try:
@@ -182,18 +225,67 @@ def make_app(
     return app
 
 
+def _setup_logging() -> logging.Logger:
+    """콘솔 + logs/core_날짜.log 파일 로그 (7-3a — 판정·발주 추적용)."""
+    import time
+
+    log_dir = Path(__file__).resolve().parent.parent / "logs"
+    try:
+        log_dir.mkdir(exist_ok=True)
+        file_handler: logging.Handler = logging.FileHandler(
+            log_dir / f"core_{time.strftime('%Y%m%d')}.log", encoding="utf-8")
+    except OSError:
+        file_handler = logging.NullHandler()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[logging.StreamHandler(), file_handler],
+    )
+    return logging.getLogger("kp_arb.core")
+
+
 async def _serve() -> None:
+    import aiohttp
+
+    log = _setup_logging()
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
     state = load_state(STATE_PATH)  # 마지막 입력값 복원 (실행 상태는 항상 꺼짐)
     stop = asyncio.Event()
-    runner = web.AppRunner(make_app(
-        state, on_shutdown=stop.set, save=lambda: save_state(STATE_PATH, state)))
-    await runner.setup()
-    site = web.TCPSite(runner, HOST, DEFAULT_PORT)
-    await site.start()
-    print(f"코어 시동: http://{HOST}:{DEFAULT_PORT} (안전종료는 메인 화면에서)")
-    await stop.wait()
-    await runner.cleanup()
-    print("코어 안전종료 완료")
+    async with aiohttp.ClientSession() as http:
+        # LS/HL 접속 — 실패해도 API는 계속(화면 조작·입력 가능, 시세만 없음)
+        system = None
+        engine = None
+        engine_task: asyncio.Task[None] | None = None
+        try:
+            from .bootstrap import bootstrap_live
+            from .core_engine import RehearsalEngine
+
+            system = await bootstrap_live(http)
+            await system.start()
+            engine = RehearsalEngine(state, system)
+            engine_task = asyncio.create_task(engine.run())
+            log.info("LiveSystem 결합 완료 — 리허설 판정 루프 시작 (발주 없음)")
+        except Exception:  # noqa: BLE001 - 키 없음/네트워크 등
+            log.exception("LiveSystem 시동 실패 — API만 운영 (시세 없음)")
+
+        runner = web.AppRunner(make_app(
+            state, on_shutdown=stop.set,
+            save=lambda: save_state(STATE_PATH, state),
+            system=system, engine=engine))
+        await runner.setup()
+        site = web.TCPSite(runner, HOST, DEFAULT_PORT)
+        await site.start()
+        log.info("코어 시동: http://%s:%s (안전종료는 메인 화면에서)", HOST, DEFAULT_PORT)
+        await stop.wait()
+        if engine_task is not None:
+            engine_task.cancel()
+        await runner.cleanup()
+        log.info("코어 안전종료 완료")  # 미체결 전량 취소는 7-3b에서 이 앞에
 
 
 def main() -> None:
