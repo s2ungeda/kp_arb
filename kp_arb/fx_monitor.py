@@ -122,9 +122,18 @@ def main() -> None:
     def refresh() -> None:
         try:
             data = box["data"]
-            fx = data.get("fx") if isinstance(data, dict) else None
-            if not isinstance(fx, dict) or fx.get("connected") is False:
-                lbl_state.config(text="상태: 코어 미접속 (시세 없음)", fg="#8b0000")
+            if not isinstance(data, dict):
+                lbl_state.config(text="상태: 코어 미접속 (메인에서 코어 시작)", fg="#8b0000")
+                root.after(1000, refresh)
+                return
+            fx = data.get("fx")
+            if not isinstance(fx, dict):
+                lbl_state.config(text="상태: 코어 구버전 — FX 미지원 (코어 재시작·재빌드)",
+                                 fg="#8b0000")
+                root.after(1000, refresh)
+                return
+            if fx.get("connected") is False:
+                lbl_state.config(text="상태: 코어 시세 미접속 (키·모드 확인)", fg="#8b0000")
                 root.after(1000, refresh)
                 return
             paused = fx.get("paused")
