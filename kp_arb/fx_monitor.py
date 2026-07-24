@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from typing import Any
@@ -25,14 +26,36 @@ def main() -> None:
     root.geometry("560x460")
     root.option_add("*Font", ("Malgun Gothic", 9))
 
+    # 명령 전송은 뒷단 스레드로 — 화면 스레드에서 네트워크 하면 창이 언다(CLAUDE.md)
+    jobs: queue.Queue[tuple[dict[str, Any], str]] = queue.Queue()
+    results: queue.Queue[tuple[str, dict[str, Any] | None]] = queue.Queue()
+
+    def sender() -> None:
+        while True:
+            payload, label = jobs.get()
+            results.put((label, core_request("/command", payload)))
+
+    threading.Thread(target=sender, daemon=True).start()
+
     def send(payload: dict[str, Any], label: str) -> None:
-        result = core_request("/command", payload)
-        if result is None:
-            set_status(f"{label} 실패 — 코어 미접속")
-        elif not result.get("ok"):
-            set_status(f"{label} 거부 — {'; '.join(result.get('errors', []))}")
-        else:
-            set_status(f"{label} 완료")
+        jobs.put((payload, label))  # 큐에만 넣고 즉시 반환
+
+    def drain_results() -> None:
+        try:
+            while True:
+                label, result = results.get_nowait()
+                if result is None:
+                    set_status(f"{label} 실패 — 코어 미접속")
+                elif not result.get("ok"):
+                    set_status(f"{label} 거부 — {'; '.join(result.get('errors', []))}")
+                else:
+                    set_status(f"{label} 완료")
+        except queue.Empty:
+            pass
+        try:
+            root.after(200, drain_results)
+        except tk.TclError:
+            pass
 
     # --- 상단: 상태 + 제어 ---
     top = tk.Frame(root)
@@ -151,6 +174,7 @@ def main() -> None:
 
     fill_interval()
     refresh()
+    drain_results()
     while True:
         try:
             root.mainloop()
