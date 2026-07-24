@@ -273,10 +273,11 @@ async def _serve() -> None:
         except Exception:  # noqa: BLE001 - 키 없음/네트워크 등
             log.exception("LiveSystem 시동 실패 — API만 운영 (시세 없음)")
 
+        # access_log=None: 화면 폴링(GET /state 1초)이 로그를 도배하지 않게
         runner = web.AppRunner(make_app(
             state, on_shutdown=stop.set,
             save=lambda: save_state(STATE_PATH, state),
-            system=system, engine=engine))
+            system=system, engine=engine), access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, HOST, DEFAULT_PORT)
         await site.start()
