@@ -56,6 +56,14 @@ def main() -> None:
     import time
     import tkinter as tk
 
+    # 마지막 상태는 **스레드 시작 전에** 읽는다 — 감시 스레드가 ui_state.json을
+    # 빈 화면 목록으로 먼저 덮어써 복원이 안 되던 문제 방지.
+    try:
+        saved_raw = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        saved_raw = {}
+    saved = saved_raw if isinstance(saved_raw, dict) else {}
+
     # 코어 생존 확인은 HTTP 왕복(최대 1초)이라 화면 스레드에서 하면 창 끌기·
     # 메뉴가 그 순간 얼어붙는다 → 뒷단 스레드가 확인하고 화면은 결과만 읽는다.
     alive_box = {"alive": False}
@@ -138,12 +146,7 @@ def main() -> None:
             except tk.TclError:
                 pass  # 창 닫힘
 
-    # --- 마지막 상태 복원: 코어가 떠 있었으면 재시동, 화면들도 다시 열기 ---
-    try:
-        saved_raw = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        saved_raw = {}
-    saved = saved_raw if isinstance(saved_raw, dict) else {}
+    # --- 마지막 상태 복원 (saved는 시동 직후 미리 읽어둠): 코어 재시동 + 화면 다시 열기 ---
     if saved.get("core") and not core_alive():
         launch_module("kp_arb.core_server", console=True)
         status.config(text="마지막 상태 복원 — 코어 시작 중 ...")
