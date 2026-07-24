@@ -293,6 +293,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             {"cmd": "set_target", "block": block, "set": index,
              "value": parse_qty(entry.get())}, "목표진입량")
 
+    def fired_reset(block: str, index: int) -> Callable[[object], None]:
+        def _reset(_event: object) -> None:
+            from tkinter import messagebox
+
+            if messagebox.askokcancel(
+                    "진입수량 초기화", f"{block} {index + 1}세트 진입수량을 0으로?"):
+                send({"cmd": "reset_fired", "block": block, "set": index},
+                     f"{block} {index + 1}세트 진입수량 초기화")
+        return _reset
+
     def ls_order_command(block: str, index: int, var: Any) -> Callable[[], None]:
         return lambda: send({"cmd": "ls_order", "block": block, "set": index,
                              "value": var.get()}, "LS주문 체크")
@@ -336,6 +346,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                                bg="white", relief="solid", bd=1)
                 lbl.grid(row=row_no, column=col, padx=1, pady=1)
                 displays.append(lbl)
+            # 진입수량 칸 더블클릭 = 초기화 (리허설 재시작용, 확인창)
+            displays[0].bind("<Double-Button-1>", fired_reset(block, i))
             set_widgets[(block, i)] = {
                 "threshold": ent_threshold, "target": ent_target,
                 "button": btn, "running": False, "ls_var": ls_var,

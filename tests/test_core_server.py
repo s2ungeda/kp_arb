@@ -164,3 +164,12 @@ def test_settings_operating_hours_validated() -> None:
                                    "operating_hours": "가나다"})
     assert not result["ok"]  # 형식 오류는 저장 거부
     assert state.screens[ScreenKind.AUTO_M].settings.operating_hours == "09:00-15:00"
+
+
+def test_reset_fired() -> None:
+    state = CoreState()
+    state.screens[ScreenKind.AUTO_M].entry_sets[0].fired_qty = 100
+    result = apply_command(state, {"cmd": "reset_fired", "screen": "autoM",
+                                   "block": "entry", "set": 0})
+    assert result["ok"]
+    assert state.screens[ScreenKind.AUTO_M].entry_sets[0].fired_qty == 0

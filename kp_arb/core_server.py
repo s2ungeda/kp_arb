@@ -97,6 +97,11 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
             block = Block(str(body["block"]))
             screen.sets_of(block)[int(body["set"])].target_qty = int(body["value"])
             return _ok()
+        if cmd == "reset_fired":  # 세트 진입수량(발주 누적) 초기화 — 리허설 재시작용
+            screen = _screen_of(state, body)
+            block = Block(str(body["block"]))
+            screen.sets_of(block)[int(body["set"])].fired_qty = 0
+            return _ok()
         if cmd == "run":  # 실행 버튼 토글 — 켤 때 검증, 끄면 정지(취소는 결합 후)
             screen = _screen_of(state, body)
             block = Block(str(body["block"]))
