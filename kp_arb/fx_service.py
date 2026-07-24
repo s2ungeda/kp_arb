@@ -79,19 +79,16 @@ class FxReportService:
             raise
 
     async def _send(self, *, force: bool) -> None:
+        # 델파이 원본과 동일 — 주기마다 무조건 전송(값 변화와 무관). force는 로그 라벨용.
         try:
             positions = self._system.order_book.positions()
             fx, _ = self._system.usdkrw_effective()
-            if force:
-                sent: Signal | None = await self._reporter.report(positions, fx or 0.0)
-            else:
-                sent = await self._reporter.report_if_changed(positions, fx or 0.0)
-            if sent is not None:
-                self.last_signal = sent
-                self.last_sent_ok = self._reporter.last_sent_ok
-                self._note(f"{'수동' if force else '자동'} 송신 "
-                           f"total_coin={sent.total_coin:.0f} fx={sent.fx:.2f} "
-                           f"ok={self.last_sent_ok}")
+            sent = await self._reporter.report(positions, fx or 0.0)
+            self.last_signal = sent
+            self.last_sent_ok = self._reporter.last_sent_ok
+            self._note(f"{'수동' if force else '자동'} 송신 "
+                       f"total_coin={sent.total_coin:.0f} fx={sent.fx:.2f} "
+                       f"ok={self.last_sent_ok}")
         except Exception:  # noqa: BLE001 - 보고 실패가 코어를 멈추지 않게
             log.exception("FX 보고 실패 — 계속")
 
