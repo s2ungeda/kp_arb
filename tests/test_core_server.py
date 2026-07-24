@@ -174,3 +174,14 @@ def test_reset_fired() -> None:
                                    "block": "entry", "set": 0})
     assert result["ok"]
     assert state.screens[ScreenKind.AUTO_M].entry_sets[0].fired_qty == 0
+
+
+def test_legacy_per_order_qty_migrates(tmp_path: Path) -> None:
+    # 옛 저장(per_order_qty 단일) → 진입/청산 양쪽으로 이어받음
+    import json as _json
+    path = tmp_path / "core_state.json"
+    path.write_text(_json.dumps({"screens": {"autoM": {"per_order_qty": 7}}}),
+                    encoding="utf-8")
+    restored = load_state(path)
+    screen = restored.screens[ScreenKind.AUTO_M]
+    assert screen.entry_per_qty == 7 and screen.exit_per_qty == 7

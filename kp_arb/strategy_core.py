@@ -295,9 +295,13 @@ def state_from_dict(data: dict[str, object]) -> CoreState:
             screen.underlying = Underlying(str(raw.get("underlying", screen.underlying)))
         except ValueError:
             pass
+        # 1회주문수량: 신규(진입/청산 별도) 우선, 없으면 옛 per_order_qty를 양쪽에 이어받음
+        legacy = raw.get("per_order_qty")
         try:
-            screen.entry_per_qty = int(raw.get("entry_per_qty", 0))
-            screen.exit_per_qty = int(raw.get("exit_per_qty", 0))
+            entry_q = raw.get("entry_per_qty")
+            exit_q = raw.get("exit_per_qty")
+            screen.entry_per_qty = int(entry_q if entry_q is not None else legacy or 0)
+            screen.exit_per_qty = int(exit_q if exit_q is not None else legacy or 0)
         except (TypeError, ValueError):
             pass
         for name, sets in (("entry_sets", screen.entry_sets),
