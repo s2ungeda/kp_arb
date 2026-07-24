@@ -123,7 +123,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     set_status(f"{label} 거부 — {'; '.join(result.get('errors', []))}")
                 else:
                     warnings = result.get("warnings") or []
-                    set_status(f"{label} 완료"
+                    set_status(f"{label} 저장됨"  # '완료'는 목표수량 달성과 헷갈려 변경
                                + (f" (경고: {'; '.join(warnings)})" if warnings else ""))
                 if callback is not None:
                     callback(result)
