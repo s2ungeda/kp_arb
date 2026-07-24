@@ -43,3 +43,15 @@ def test_pid_alive_self() -> None:
     from kp_arb.core_client import _pid_alive
     assert _pid_alive(os.getpid()) is True
     assert _pid_alive(999_999_99) is False  # 존재하지 않는 PID
+
+
+def test_auto_running_detects_running_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    import kp_arb.main_window as mw
+    state = {"screens": {"autoM": {"entry_sets": [{"running": True}],
+                                    "exit_sets": [{"running": False}]}}}
+    monkeypatch.setattr(mw, "core_request", lambda *a, **k: state)
+    assert mw._auto_running() is True
+    state["screens"]["autoM"]["entry_sets"][0]["running"] = False
+    assert mw._auto_running() is False
+    monkeypatch.setattr(mw, "core_request", lambda *a, **k: None)
+    assert mw._auto_running() is False  # 미접속이면 False

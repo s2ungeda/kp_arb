@@ -25,6 +25,21 @@ def core_alive() -> bool:
     return core_request("/state") is not None
 
 
+def _auto_running() -> bool:
+    """실행 중(running) 세트가 하나라도 있는가 — 종료 확인창 판단용."""
+    state = core_request("/state")
+    if not isinstance(state, dict):
+        return False
+    for screen in (state.get("screens") or {}).values():
+        if not isinstance(screen, dict):
+            continue
+        for block in ("entry_sets", "exit_sets"):
+            for spread_set in screen.get(block) or []:
+                if isinstance(spread_set, dict) and spread_set.get("running"):
+                    return True
+    return False
+
+
 def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
     """실행 명령 구성 — 개발(파이썬)과 배포판(exe, app.py 분기)을 모두 지원."""
     if not getattr(sys, "frozen", False):
@@ -155,10 +170,10 @@ def main() -> None:
             except tk.TclError:
                 pass  # 창 닫힘
 
-    # --- 마지막 상태 복원 (saved는 시동 직후 미리 읽어둠): 코어 재시동 + 화면 다시 열기 ---
-    if saved.get("core") and not core_alive():
+    # --- 코어는 메인과 함께 시작 (사용자 확정 2026-07-24) ---
+    if not core_alive():
         launch_module("kp_arb.core_server", console=True)
-        status.config(text="마지막 상태 복원 — 코어 시작 중 ...")
+        status.config(text="코어 시작 중 ...")
     screens = [m for m in saved.get("screens", [])
                if isinstance(m, str) and m.startswith("kp_arb.")]
     if screens:
@@ -169,9 +184,18 @@ def main() -> None:
         root.after(1500, reopen)  # 코어가 뜰 시간을 살짝 준 뒤
 
     def on_close() -> None:
-        """메인 종료 = 띄운 화면들도 함께 종료. 코어는 유지(안전종료 메뉴로만)."""
+        """메인 종료 = 화면들 + 코어까지 함께 종료 (사용자 확정 2026-07-24).
+
+        단, 자동 매매(실행 중 세트)가 있으면 확인창 — 실수로 매매를 끊지 않게.
+        """
+        from tkinter import messagebox
+
+        if _auto_running() and not messagebox.askokcancel(
+                "종료 확인", "자동 매매가 실행 중입니다.\n코어까지 종료하시겠습니까?"):
+            return
         save_ui_state()  # 닫기 직전 화면 목록 저장 — 다음 실행 때 다시 열림
         closing["flag"] = True
+        core_request("/command", {"cmd": "shutdown"})  # 코어 안전종료(정지·취소 후)
         for _, proc in launched:
             if proc.poll() is None:
                 proc.terminate()
