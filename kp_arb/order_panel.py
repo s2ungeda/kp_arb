@@ -234,16 +234,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # --- 실시간 표시(7-3a): 진입/청산 신호(est, %) + 현재가·환율 한 줄 ---
     live_row = tk.Frame(root)
     live_row.pack(fill="x", padx=4, pady=2)
-    signal_font = ("Malgun Gothic", 11, "bold")
-    lbl_sig_entry = tk.Label(live_row, text="진입  -", bg="red", fg="white",
-                             font=signal_font, width=14)
-    lbl_sig_entry.pack(side="left", ipady=2, padx=(0, 2))
-    lbl_sig_exit = tk.Label(live_row, text="청산  -", bg="blue", fg="white",
-                            font=signal_font, width=14)
-    lbl_sig_exit.pack(side="left", ipady=2)
-    lbl_prices = tk.Label(live_row, text="국내 -  |  HL -  |  환율 -", anchor="w",
-                          fg="gray25")
-    lbl_prices.pack(side="left", padx=(10, 0))
+    signal_font = ("Malgun Gothic", 10, "bold")
+    lbl_sig_entry = tk.Label(live_row, text="진입 -", bg="red", fg="white",
+                             font=signal_font, width=11)
+    lbl_sig_entry.pack(side="left", ipady=1, padx=(0, 2))
+    lbl_sig_exit = tk.Label(live_row, text="청산 -", bg="blue", fg="white",
+                            font=signal_font, width=11)
+    lbl_sig_exit.pack(side="left", ipady=1)
+    lbl_prices = tk.Label(live_row, text="- | - | -", anchor="w", fg="gray25")
+    lbl_prices.pack(side="left", padx=(8, 0))
 
     # --- entry/exit 블록: 세트 3줄 (LS주문 체크는 세트별) ---
     kr_tag = "S" if kind is ScreenKind.AUTO_T else "SF"
@@ -418,13 +417,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             if isinstance(live, dict):
                 info_raw = (live.get("screens") or {}).get(screen_key)
                 info = info_raw if isinstance(info_raw, dict) else {}
-                lbl_sig_entry.config(text=f"진입  {_pct_text(info.get('entry'))}")
-                lbl_sig_exit.config(text=f"청산  {_pct_text(info.get('exit'))}")
-                fx_text = _px_text(info.get("fx"), 2)
-                lbl_prices.config(
-                    text=f"국내 {_px_text(info.get('kr_last'))}  |  "
-                         f"HL {_px_text(info.get('hl_last'), 4)}  |  환율 {fx_text}"
-                         + ("" if live.get("connected") else "   (시세 미접속)"))
+                lbl_sig_entry.config(text=f"진입 {_pct_text(info.get('entry'))}")
+                lbl_sig_exit.config(text=f"청산 {_pct_text(info.get('exit'))}")
+                lbl_prices.config(  # 국내 | HL | 환율 (제목 없이 값만)
+                    text=f"{_px_text(info.get('kr_last'))} | "
+                         f"{_px_text(info.get('hl_last'), 4)} | "
+                         f"{_px_text(info.get('fx'), 2)}"
+                         + ("" if live.get("connected") else "  (시세 미접속)"))
                 settings_raw = screen.get("settings")
                 settings = settings_raw if isinstance(settings_raw, dict) else {}
                 if lbl_position is not None:
