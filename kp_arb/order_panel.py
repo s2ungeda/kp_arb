@@ -403,7 +403,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         set_status("코어 연결됨 — 마지막 입력값 복원")
 
     def _pct_text(value: object) -> str:
-        return f"{value * 100:.4f}" if isinstance(value, int | float) else "-"
+        return f"{value * 100:.3f}" if isinstance(value, int | float) else "-"
 
     def _px_text(value: object, decimals: int = 0) -> str:
         return f"{value:,.{decimals}f}" if isinstance(value, int | float) else "-"
