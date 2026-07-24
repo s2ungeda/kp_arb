@@ -58,8 +58,12 @@ async def test_send_records_last_and_log() -> None:
     svc._sink = _MockSink()  # type: ignore[assignment]
     svc._reporter._sink = svc._sink  # type: ignore[attr-defined]
     await svc._send(force=True)
-    assert svc.last_signal is not None and svc.last_signal.total_coin == 104.0
+    # total_coin = HL 명목(2×52=104) × 환율(1385) = 원화
+    assert svc.last_signal is not None
+    assert svc.last_signal.total_coin == 104.0 * 1385.0
     assert svc.last_signal.token == "Meme"
     snap = svc.snapshot()
-    assert snap["last"]["total_coin"] == 104.0 and snap["peers"][0]["name"] == "감시"
+    assert snap["last"]["total_coin"] == 104.0 * 1385.0
+    assert snap["peers"][0]["name"] == "감시"
+    assert snap["hl"][0]["notional"] == 104.0 * 1385.0  # 화면 구성도 원화
     assert len(snap["log"]) == 1

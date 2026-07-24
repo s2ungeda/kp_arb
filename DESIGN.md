@@ -145,11 +145,11 @@
 ### 5.7 FXExposureReporter (외부 #2 연동)
 - **책임:** 본 시스템의 **국내 다리 KRW 명목 + 환율**을 계산 → 외부 #2 환헤지 프로세스로 **노출 데이터 전송(보고)**. #2가 USD 환산·헤지 수행. 본 시스템은 USD/KRW 선물 주문·계좌를 갖지 않음.
 - **채널(확정 v0.4):** 기존 `SignalLink`(TrdBot) 재사용 — **UDP 8888 브로드캐스트**로 피어 발견/하트비트(`HELLO/BYE`, 5초), **TCP(동적 포트)**로 메시지 전송(`<ID>\t<Name>\t<Msg>\n`, UTF-8). Msg 본문 = JSON Signal.
-- **메시지 스키마(Signal):** `{id, fx, total_domestic, total_coin, token, datetime}`
-  - `total_domestic = 0` (별도 국내 버킷 미보고)
-  - `total_coin =` (주식잔고 × 평단) + (주식선물 매수계약수 × 평단 × **10 승수**) + (레버리지 ETF × 평단 × **2**) — KRW 명목
-  - `fx` = 환율, `id` = 멱등키(uuid), `token` = 공유 시크릿(env), `datetime` = 전송 시각
-  - 국내 다리는 **전략상 매수(롱) 전용** → `total_coin`은 롱 명목만 합산(국내 숏 없음). 중복은 `id` 멱등키로 #2가 필터.
+- **메시지 스키마(Signal) — 개정 2026-07-24 (원본 Dalin ChatComm.pas):** `{id, fx, total_domestic, total_coin, token, datetime}`
+  - `total_domestic = 0` (미사용)
+  - **`total_coin = Σ(HL 보유 평균단가 × 수량) × 환율`** — HL USD 명목의 **원화 환산**(#2가 원달러선물로 헤지할 KRW 금액). HL 계좌 직접 조회(수동 매매 포함), 환율 0이면 0. 정수(Cardinal)로 전송.
+  - `token = "Meme"` (수신도 이 토큰만 처리, 나머지 스킵), `fx` = 환율, `id = sig-YYYYMMDD-NNN`(일별 3자리), `datetime` = 전송 시각.
+  - 주기(기본 10초)마다 무조건 전송(델파이 DoAutoSend). 감시 화면(fx_monitor)에서 일시정지/재개·수동 송신·주기 변경·total_coin 구성 확인.
 
 ### 5.8 StateStore / Monitor
 - SQLite 영속화(재시작 복구), 로깅, 알림(임계·연결끊김·체결실패·데드존·노출보고 실패).

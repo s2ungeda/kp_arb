@@ -41,7 +41,7 @@ async def test_report_computes_total_coin() -> None:
     ]
     signal = await reporter.report(positions, fx=1_350.0, id="s1", datetime="2026-07-01")
 
-    assert signal.total_coin == 104.0
+    assert signal.total_coin == 104.0 * 1_350.0  # HL 명목 × 환율 = 원화
     assert signal.total_domestic == 0.0
     assert signal.fx == 1_350.0
     assert signal.token == "Meme"
@@ -85,7 +85,7 @@ async def test_report_if_changed_publishes_on_change() -> None:
                    underlying=SAMSUNG, side=Side.SELL, qty=5, avg_price=52.0)
     await reporter.report_if_changed([small], fx=1_350.0, id="a")
     changed = await reporter.report_if_changed([big], fx=1_350.0, id="b")
-    assert changed is not None and changed.total_coin == 260.0  # 5*52
+    assert changed is not None and changed.total_coin == 260.0 * 1_350.0  # 5*52*환율
     assert len(sink.sent) == 2
 
 
