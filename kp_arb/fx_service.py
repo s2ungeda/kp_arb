@@ -26,7 +26,7 @@ class FxReportService:
 
     def __init__(
         self, system: LiveSystem, *,
-        interval_s: float = 2.0, system_name: str = "kp-arb",
+        interval_s: float = 10.0, system_name: str = "kp-arb",
     ) -> None:
         self._system = system
         # 수신은 token="Meme"만 처리(sink가 필터) — 받은 메시지는 로그에 남긴다
@@ -124,5 +124,5 @@ class FxReportService:
             "interval_s": self.interval_s,
             "peers": self._sink.peer_list(),
             "last": last,
-            "log": list(self.log),
+            "log": list(self.log)[-60:],  # /state 크기 억제 — 최근 60줄만
         }

@@ -113,61 +113,78 @@ def main() -> None:
         status.config(text=text)
 
     # --- 코어 폴링 (뒷단 스레드) → 화면은 결과만 ---
-    box: dict[str, Any] = {"data": None}
+    box: dict[str, Any] = {"data": None, "misses": 0}
 
     def poll() -> None:
-        while True:
-            box["data"] = core_request("/state")
+        while True:  # 이 스레드는 어떤 예외로도 죽지 않는다 (죽으면 영영 미접속)
+            try:
+                result = core_request("/state", timeout=2.0)
+                if result is not None:
+                    box["data"] = result
+                    box["misses"] = 0
+                else:
+                    box["misses"] += 1
+            except Exception:  # noqa: BLE001 - 폴링 스레드 보호
+                box["misses"] += 1
             time.sleep(1.0)
 
     threading.Thread(target=poll, daemon=True).start()
 
-    shown_log_len = {"n": 0}
+    shown: dict[str, Any] = {"log": None, "peers": None}
 
     def refresh() -> None:
+        # 어떤 예외로도 갱신 루프가 끊기지 않게 전면 방어. 무거운 위젯 갱신은
+        # 실제 내용이 바뀔 때만(리스트박스·텍스트를 매초 다시 그리지 않음).
         try:
             data = box["data"]
-            if not isinstance(data, dict):
-                lbl_state.config(text="상태: 코어 미접속 (메인에서 코어 시작)", fg="#8b0000")
-                root.after(1000, refresh)
-                return
-            fx = data.get("fx")
+            fx = data.get("fx") if isinstance(data, dict) else None
             if not isinstance(fx, dict):
-                lbl_state.config(text="상태: 코어 구버전 — FX 미지원 (코어 재시작·재빌드)",
-                                 fg="#8b0000")
-                root.after(1000, refresh)
+                # 데이터 없음 — 한두 번 실패는 표시 안 하고, 여러 번 실패해야 미접속
+                if not isinstance(data, dict):
+                    if box["misses"] >= 3:
+                        lbl_state.config(text="상태: 코어 미접속 (메인에서 코어 시작)",
+                                         fg="#8b0000")
+                else:
+                    lbl_state.config(text="상태: 코어 구버전 — FX 미지원 (재시작)",
+                                     fg="#8b0000")
                 return
             if fx.get("connected") is False:
                 lbl_state.config(text="상태: 코어 시세 미접속 (키·모드 확인)", fg="#8b0000")
-                root.after(1000, refresh)
                 return
-            paused = fx.get("paused")
-            interval = fx.get("interval_s")
+            paused = bool(fx.get("paused"))
+            interval = fx.get("interval_s") or 0
             lbl_state.config(
-                text=f"상태: {'일시정지' if paused else '자동 송신'} · 주기 {interval:g}초",
+                text=f"상태: {'일시정지' if paused else '자동 송신'} · 주기 {float(interval):g}초",
                 fg="#8b0000" if paused else "dark green")
             btn_pause.config(text="재개" if paused else "일시정지")
-            peers = fx.get("peers") or []
-            lst_peers.delete(0, "end")
-            for p in peers:
-                lst_peers.insert("end", f"{p.get('name', '')} ({p.get('ip')}:{p.get('port')})")
-            if not peers:
-                lst_peers.insert("end", "(수신자 없음)")
             info = fx.get("last")
             if isinstance(info, dict):
                 lbl_last.config(
-                    text=f"마지막 송신: total_coin={info.get('total_coin', 0):,.0f} "
-                         f"fx={info.get('fx', 0):,.2f} "
+                    text=f"마지막 송신: total_coin={float(info.get('total_coin', 0)):,.0f} "
+                         f"fx={float(info.get('fx', 0)):,.2f} "
                          f"ok={info.get('ok')} @ {info.get('datetime', '')}")
+            peers = fx.get("peers") or []
+            peer_key = [(p.get("name"), p.get("ip"), p.get("port")) for p in peers]
+            if peer_key != shown["peers"]:  # 바뀔 때만 리스트박스 다시 그림
+                shown["peers"] = peer_key
+                lst_peers.delete(0, "end")
+                for p in peers:
+                    lst_peers.insert(
+                        "end", f"{p.get('name', '')} ({p.get('ip')}:{p.get('port')})")
+                if not peers:
+                    lst_peers.insert("end", "(수신자 없음)")
             entries = fx.get("log") or []
-            if len(entries) != shown_log_len["n"]:
-                shown_log_len["n"] = len(entries)
+            text = "\n".join(str(e) for e in entries)
+            if text != shown["log"]:  # 바뀔 때만 텍스트 다시 그림
+                shown["log"] = text
                 txt_log.config(state="normal")
                 txt_log.delete("1.0", "end")
-                txt_log.insert("end", "\n".join(entries[-200:]))
+                txt_log.insert("end", text)
                 txt_log.see("end")
                 txt_log.config(state="disabled")
             set_status("코어 연결됨")
+        except Exception:  # noqa: BLE001 - 갱신 1회 실패로 화면을 죽이지 않음
+            pass
         finally:
             try:
                 root.after(1000, refresh)

@@ -24,7 +24,7 @@ def core_request(path: str, payload: dict[str, Any] | None = None,
                 url, data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
             return data if isinstance(data, dict) else None
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+    except Exception:  # noqa: BLE001 - 클라이언트 헬퍼: 어떤 실패든 None(폴링 스레드 보호)
         return None
