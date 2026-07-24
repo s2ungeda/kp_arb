@@ -31,35 +31,32 @@ def hl(side: Side = Side.SELL) -> Position:
 
 
 async def test_report_computes_total_coin() -> None:
+    # total_coin = HL 보유종목 Σ(평균단가×수량) (사용자 확정 2026-07-24), token 기본 Meme
     sink = MockSink()
-    reporter = FXExposureReporter(sink, token="secret")
+    reporter = FXExposureReporter(sink)
     positions = [
-        dom(Instrument.KR_STOCK, 100, 70_000),        # 100*70000*1 = 7,000,000
-        dom(Instrument.KR_STOCK_FUTURE, 2, 71_000),   # 2*71000*10  = 1,420,000
-        dom(Instrument.KR_ETF, 10, 50_000),           # 10*50000*2  = 1,000,000
+        hl(Side.SELL),                                # 2 * 52 = 104 (HL)
+        dom(Instrument.KR_STOCK, 100, 70_000),        # 국내 — total_coin 제외
+        dom(Instrument.KR_STOCK_FUTURE, 2, 71_000),   # 국내 — 제외
     ]
     signal = await reporter.report(positions, fx=1_350.0, id="s1", datetime="2026-07-01")
 
-    assert signal.total_coin == 9_420_000.0
+    assert signal.total_coin == 104.0
     assert signal.total_domestic == 0.0
     assert signal.fx == 1_350.0
-    assert signal.token == "secret"
+    assert signal.token == "Meme"
     assert signal.id == "s1"
     assert sink.sent == [signal]
     assert reporter.last_sent_ok is True
 
 
-async def test_hl_and_short_excluded() -> None:
+async def test_only_hl_counts() -> None:
+    # HL 명목만 집계 — 국내 포지션은 롱/숏 무관하게 제외
     reporter = FXExposureReporter(MockSink())
-    positions = [hl(Side.SELL), dom(Instrument.KR_STOCK, 5, 70_000, side=Side.SELL)]
+    positions = [dom(Instrument.KR_STOCK, 5, 70_000),
+                 dom(Instrument.KR_STOCK_FUTURE, 3, 71_000, side=Side.SELL)]
     signal = await reporter.report(positions, fx=1_350.0, id="s1")
-    assert signal.total_coin == 0.0  # HL 제외 + 국내 숏 제외(롱만)
-
-
-async def test_multipliers_override() -> None:
-    reporter = FXExposureReporter(MockSink(), multipliers={Instrument.KR_ETF: 1.0})
-    signal = await reporter.report([dom(Instrument.KR_ETF, 10, 50_000)], fx=1_350.0, id="s1")
-    assert signal.total_coin == 500_000.0  # 10*50000*1 (오버라이드)
+    assert signal.total_coin == 0.0  # HL 없음
 
 
 async def test_id_generated_when_omitted() -> None:
@@ -71,7 +68,7 @@ async def test_id_generated_when_omitted() -> None:
 async def test_report_if_changed_skips_unchanged() -> None:
     sink = MockSink()
     reporter = FXExposureReporter(sink)
-    positions = [dom(Instrument.KR_STOCK, 100, 70_000)]
+    positions = [hl(Side.SELL)]
     first = await reporter.report_if_changed(positions, fx=1_350.0, id="a")
     second = await reporter.report_if_changed(positions, fx=1_350.0, id="b")
     assert first is not None
@@ -82,15 +79,17 @@ async def test_report_if_changed_skips_unchanged() -> None:
 async def test_report_if_changed_publishes_on_change() -> None:
     sink = MockSink()
     reporter = FXExposureReporter(sink)
-    await reporter.report_if_changed([dom(Instrument.KR_STOCK, 100, 70_000)], fx=1_350.0, id="a")
-    changed = await reporter.report_if_changed(
-        [dom(Instrument.KR_STOCK, 200, 70_000)], fx=1_350.0, id="b"
-    )
-    assert changed is not None and changed.total_coin == 14_000_000.0
+    small = Position(venue=Venue.HYPERLIQUID, instrument=Instrument.HL_PERP,
+                     underlying=SAMSUNG, side=Side.SELL, qty=2, avg_price=52.0)
+    big = Position(venue=Venue.HYPERLIQUID, instrument=Instrument.HL_PERP,
+                   underlying=SAMSUNG, side=Side.SELL, qty=5, avg_price=52.0)
+    await reporter.report_if_changed([small], fx=1_350.0, id="a")
+    changed = await reporter.report_if_changed([big], fx=1_350.0, id="b")
+    assert changed is not None and changed.total_coin == 260.0  # 5*52
     assert len(sink.sent) == 2
 
 
 async def test_send_failure_tracked() -> None:
     reporter = FXExposureReporter(MockSink(ok=False))
-    await reporter.report([dom(Instrument.KR_STOCK, 1, 70_000)], fx=1_350.0, id="s1")
+    await reporter.report([hl(Side.SELL)], fx=1_350.0, id="s1")
     assert reporter.last_sent_ok is False

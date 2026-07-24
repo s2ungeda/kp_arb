@@ -1,22 +1,22 @@
-"""FXExposureReporter — 국내 노출 데이터를 외부 #2로 전송(보고) (DESIGN.md §5.7, §9).
+"""FXExposureReporter — 노출 데이터를 외부 #2로 전송(보고) (DESIGN.md §5.7, §9).
 
-- 전송 값: 국내 롱 다리 KRW 명목(`total_coin`) + 환율(`fx`). USD 환산·환헤지는 #2가 수행.
+- 전송 값(사용자 확정 2026-07-24): `total_coin` = **HL 보유종목 Σ(평균단가×수량)**,
+  `total_domestic`=0, `token`="Meme", `fx`=환율. USD 환헤지는 #2가 수행.
 - 본 시스템은 USD/KRW 선물 주문·계좌를 갖지 않는다(전송만).
-- 채널: 기존 `SignalLink`(UDP 8888 발견 + TCP) 재사용 — 실제 소켓 결선은 라이브(Phase 6).
-  여기선 `ExposureSink`(Protocol) 뒤로 격리하고 테스트는 mock sink만 사용.
+- 채널: Dalin broadcast(UDP 8888 피어 발견 + TCP 전송) — `signallink.SignalLinkSink`.
+  여기선 `ExposureSink`(Protocol) 뒤로 격리하고 순수 로직은 mock sink로 테스트.
 - 메시지 = `Signal{id, fx, total_domestic=0, total_coin, token, datetime}` (기존 스키마).
 """
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable
 from typing import Protocol
 
 from pydantic import BaseModel
 
-from .domain.enums import Instrument
 from .domain.models import Position
-from .fx import domestic_krw_notional
+from .fx import hl_coin_notional
 
 
 class Signal(BaseModel):
@@ -41,13 +41,13 @@ class FXExposureReporter:
         self,
         sink: ExposureSink,
         *,
-        token: str = "",
-        multipliers: Mapping[Instrument, float] | None = None,
+        token: str = "Meme",
+        notional_fn: Callable[[Iterable[Position]], float] = hl_coin_notional,
         min_change: float = 0.0,
     ) -> None:
         self._sink = sink
         self._token = token
-        self._multipliers = multipliers
+        self._notional_fn = notional_fn  # total_coin 계산 (기본: HL 명목)
         self._min_change = min_change
         self._last_total_coin: float | None = None
         self.last_sent_ok: bool | None = None
@@ -60,8 +60,8 @@ class FXExposureReporter:
         id: str | None = None,
         datetime: str = "",
     ) -> Signal:
-        """국내 KRW 명목(total_coin) + 환율을 계산해 #2로 전송."""
-        total_coin = domestic_krw_notional(positions, self._multipliers)
+        """HL 명목(total_coin) + 환율을 계산해 #2로 전송."""
+        total_coin = self._notional_fn(list(positions))
         signal = Signal(
             id=id if id is not None else uuid.uuid4().hex,
             fx=fx,
@@ -83,8 +83,9 @@ class FXExposureReporter:
         datetime: str = "",
     ) -> Signal | None:
         """total_coin이 min_change 초과로 바뀐 경우에만 전송. 아니면 None."""
-        total_coin = domestic_krw_notional(positions, self._multipliers)
-        if self._last_total_coin is not None:
-            if abs(total_coin - self._last_total_coin) <= self._min_change:
-                return None
-        return await self.report(positions, fx, id=id, datetime=datetime)
+        pos_list = list(positions)
+        total_coin = self._notional_fn(pos_list)
+        if (self._last_total_coin is not None
+                and abs(total_coin - self._last_total_coin) <= self._min_change):
+            return None
+        return await self.report(pos_list, fx, id=id, datetime=datetime)

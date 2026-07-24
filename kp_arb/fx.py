@@ -39,6 +39,19 @@ def domestic_krw_notional(
     return total
 
 
+def hl_coin_notional(positions: Iterable[Position]) -> float:
+    """외부 #2 `total_coin`: HL 보유종목 **Σ(평균단가 × 수량)** (사용자 확정 2026-07-24).
+
+    HL perp의 USD 명목(진입 평균가 기준). 수량은 절대값(magnitude) — #2가 환헤지할
+    USD 규모. 종목(SMSN/SKHX/HYUNDAI) 전체 합. HL 외 instrument는 제외.
+    """
+    total = 0.0
+    for p in positions:
+        if p.instrument is Instrument.HL_PERP:
+            total += p.avg_price * p.qty
+    return total
+
+
 def usd_exposure(
     positions: Iterable[Position],
     hl_mark_usd: dict[Underlying, float] | None = None,

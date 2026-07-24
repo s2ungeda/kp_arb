@@ -254,6 +254,32 @@ def _setup_logging() -> logging.Logger:
     return logging.getLogger("kp_arb.core")
 
 
+async def _fx_report_loop(system: LiveSystem, log: logging.Logger) -> None:
+    """HL 명목·환율을 외부 #2(Dalin broadcast)로 주기 전송 (7-4). 값 바뀔 때만.
+
+    total_coin = HL 보유 Σ(평균단가×수량), token="Meme". 실패해도 코어를 멈추지 않는다.
+    """
+    from .fx import hl_coin_notional
+    from .fx_reporter import FXExposureReporter
+    from .signallink import SignalLinkSink
+
+    sink = SignalLinkSink(system_name="kp-arb")
+    await sink.start()
+    reporter = FXExposureReporter(sink, token="Meme", notional_fn=hl_coin_notional)
+    try:
+        while True:
+            await asyncio.sleep(2.0)
+            positions = system.order_book.positions()
+            fx, _ = system.usdkrw_effective()
+            sent = await reporter.report_if_changed(positions, fx or 0.0)
+            if sent is not None:
+                log.info("FX 보고 → #2: total_coin=%.0f fx=%.2f ok=%s",
+                         sent.total_coin, sent.fx, reporter.last_sent_ok)
+    except asyncio.CancelledError:
+        await sink.stop()
+        raise
+
+
 async def _serve() -> None:
     import aiohttp
 
@@ -270,7 +296,7 @@ async def _serve() -> None:
         # LS/HL 접속 — 실패해도 API는 계속(화면 조작·입력 가능, 시세만 없음)
         system = None
         engine = None
-        engine_task: asyncio.Task[None] | None = None
+        tasks: list[asyncio.Task[None]] = []
         try:
             from .bootstrap import bootstrap_live
             from .core_engine import RehearsalEngine
@@ -278,8 +304,9 @@ async def _serve() -> None:
             system = await bootstrap_live(http)
             await system.start()
             engine = RehearsalEngine(state, system)
-            engine_task = asyncio.create_task(engine.run())
-            log.info("LiveSystem 결합 완료 — 리허설 판정 루프 시작 (발주 없음)")
+            tasks.append(asyncio.create_task(engine.run()))
+            tasks.append(asyncio.create_task(_fx_report_loop(system, log)))
+            log.info("LiveSystem 결합 완료 — 리허설 판정 + FX 보고 시작 (발주 없음)")
         except Exception:  # noqa: BLE001 - 키 없음/네트워크 등
             log.exception("LiveSystem 시동 실패 — API만 운영 (시세 없음)")
 
@@ -293,8 +320,8 @@ async def _serve() -> None:
         await site.start()
         log.info("코어 시동: http://%s:%s (안전종료는 메인 화면에서)", HOST, DEFAULT_PORT)
         await stop.wait()
-        if engine_task is not None:
-            engine_task.cancel()
+        for task in tasks:
+            task.cancel()
         await runner.cleanup()
         log.info("코어 안전종료 완료")  # 미체결 전량 취소는 7-3b에서 이 앞에
 
