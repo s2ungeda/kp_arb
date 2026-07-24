@@ -160,41 +160,55 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         data = state_box["data"] or {}
         raw = ((data.get("screens") or {}).get(screen_key) or {}).get("settings")
         saved = raw if isinstance(raw, dict) else {}
-        fields = [  # (키, 라벨, 기본값, 정수 여부)
+        fields = [  # (키, 라벨, 기본값, 종류 int/dec/text)
             ("kr_margin_ticks", "국내 주문가 여유(틱)",
-             saved.get("kr_margin_ticks", 10), True),
+             saved.get("kr_margin_ticks", 10), "int"),
             ("hl_margin_pct", "하리 주문가 여유(예 0.01=1%)",
-             saved.get("hl_margin_pct", 0.01), False),
-            ("max_position", "종목보유최대수량", saved.get("max_position", 0), True),
+             saved.get("hl_margin_pct", 0.01), "dec"),
+            ("max_position", "종목보유최대수량", saved.get("max_position", 0), "int"),
             ("daily_limit_100m", "일거래한도(억, 0=미사용)",
-             saved.get("daily_limit_100m", 0.0), False),
+             saved.get("daily_limit_100m", 0.0), "dec"),
         ]
         if kind is ScreenKind.AUTO_M:
             fields += [
-                ("delay_ms", "딜레이(ms)", saved.get("delay_ms", 500), True),
+                ("delay_ms", "딜레이(ms)", saved.get("delay_ms", 500), "int"),
                 ("pre_order_range_ticks", "선주문진입범위(틱)",
-                 saved.get("pre_order_range_ticks", 0), True),
+                 saved.get("pre_order_range_ticks", 0), "int"),
             ]
+        fields.append(("operating_hours", "운영시간 (빈칸=기본값)",
+                       saved.get("operating_hours") or "", "text"))
         entries: dict[str, tk.Entry] = {}
-        for i, (key, label, default, integer) in enumerate(fields):
+        kinds: dict[str, str] = {}
+        for i, (key, label, default, field_kind) in enumerate(fields):
             tk.Label(win, text=label, anchor="w").grid(
                 row=i, column=0, sticky="w", padx=6, pady=3)
-            e = tk.Entry(win, width=10, justify="right", validate="key",
-                         validatecommand=vcmd_int if integer else vcmd_dec)
+            if field_kind == "text":
+                e = tk.Entry(win, width=24)
+            else:
+                e = tk.Entry(win, width=10, justify="right", validate="key",
+                             validatecommand=(vcmd_int if field_kind == "int"
+                                              else vcmd_dec))
             e.insert(0, str(default))
             e.grid(row=i, column=1, padx=6, pady=3)
             entries[key] = e
+            kinds[key] = field_kind
+        tk.Label(win, text=f"운영시간 형식: 08:00-08:50,09:00-15:30 (기본 {operating_text(kind)})",
+                 fg="gray40").grid(row=len(fields), column=0, columnspan=2,
+                                   sticky="w", padx=6)
 
         def save_settings() -> None:
             payload: dict[str, Any] = {"cmd": "settings"}
             for key, entry in entries.items():
-                value = parse_threshold(entry.get())
-                payload[key] = value if value is not None else 0
+                if kinds[key] == "text":
+                    payload[key] = entry.get().strip()
+                else:
+                    value = parse_threshold(entry.get())
+                    payload[key] = value if value is not None else 0
             send(payload, "설정 저장")
             win.destroy()
 
         buttons = tk.Frame(win)
-        buttons.grid(row=len(fields), column=0, columnspan=2, pady=(4, 6))
+        buttons.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(4, 6))
         tk.Button(buttons, text="저장", width=8, command=save_settings).pack(
             side="left", padx=4)
         tk.Button(buttons, text="취소", width=8, command=win.destroy).pack(
@@ -208,10 +222,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     tk.Button(row1, text="설정", command=open_settings).pack(side="right")
 
-    tk.Label(root, text=f"운영시간: {operating_text(kind)}", anchor="w",
-             fg="gray25").pack(fill="x", padx=4)
+    lbl_hours = tk.Label(root, text=f"운영시간: {operating_text(kind)}", anchor="w",
+                         fg="gray25")
+    lbl_hours.pack(fill="x", padx=4)
 
-    # --- 실시간 표시(7-3a): 진입/청산 신호(est 기반, 기준값과 같은 % 단위) + 시세 ---
+    # --- 실시간 표시(7-3a): 진입/청산 신호(est, %) + 현재가·환율 한 줄 ---
     live_row = tk.Frame(root)
     live_row.pack(fill="x", padx=4, pady=2)
     signal_font = ("Malgun Gothic", 11, "bold")
@@ -221,11 +236,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     lbl_sig_exit = tk.Label(live_row, text="청산  -", bg="blue", fg="white",
                             font=signal_font, width=14)
     lbl_sig_exit.pack(side="left", ipady=2)
-    lbl_position = tk.Label(live_row, text="현재진입수량 -", anchor="e")
-    lbl_position.pack(side="right")
-    lbl_prices = tk.Label(root, text="국내 -  |  HL -  |  환율 -", anchor="w",
+    lbl_prices = tk.Label(live_row, text="국내 -  |  HL -  |  환율 -", anchor="w",
                           fg="gray25")
-    lbl_prices.pack(fill="x", padx=4)
+    lbl_prices.pack(side="left", padx=(10, 0))
 
     # --- entry/exit 블록: 세트 3줄 (LS주문 체크는 세트별) ---
     kr_tag = "S" if kind is ScreenKind.AUTO_T else "SF"
@@ -268,11 +281,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         return lambda: send({"cmd": "ls_order", "block": block, "set": index,
                              "value": var.get()}, "LS주문 체크")
 
+    lbl_position: tk.Label | None = None  # entry 헤더 줄 우측에 생성
     for block, block_label, color in BLOCK_LABELS:
-        tk.Label(grid, text=block_label, fg=color,
-                 font=("Malgun Gothic", 9, "bold")).grid(
-            row=row_no, column=0, columnspan=len(headers), sticky="w",
-            pady=(6 if row_no else 0, 1))
+        head = tk.Frame(grid)
+        head.grid(row=row_no, column=0, columnspan=len(headers), sticky="we",
+                  pady=(6 if row_no else 0, 1))
+        tk.Label(head, text=block_label, fg=color,
+                 font=("Malgun Gothic", 9, "bold")).pack(side="left")
+        if block == "entry":
+            lbl_position = tk.Label(head, text="현재진입수량 -")
+            lbl_position.pack(side="right")
         row_no += 1
         for col, header in enumerate(headers):
             tk.Label(grid, text=header, fg="gray25").grid(row=row_no, column=col)
@@ -385,11 +403,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     text=f"국내 {_px_text(info.get('kr_last'))}  |  "
                          f"HL {_px_text(info.get('hl_last'), 4)}  |  환율 {fx_text}"
                          + ("" if live.get("connected") else "   (시세 미접속)"))
-                max_pos = ((screen.get("settings") or {}).get("max_position")
-                           if isinstance(screen.get("settings"), dict) else None)
-                lbl_position.config(
-                    text=f"현재진입수량 {info.get('position', 0)}"
-                         + (f" / {max_pos}" if max_pos else ""))
+                settings_raw = screen.get("settings")
+                settings = settings_raw if isinstance(settings_raw, dict) else {}
+                if lbl_position is not None:
+                    max_pos = settings.get("max_position")
+                    lbl_position.config(
+                        text=f"현재진입수량 {info.get('position', 0)}"
+                             + (f" / {max_pos}" if max_pos else ""))
+                hours = str(settings.get("operating_hours") or "").strip()
+                lbl_hours.config(text=f"운영시간: {hours or operating_text(kind)}")
         finally:
             try:
                 root.after(1000, refresh)

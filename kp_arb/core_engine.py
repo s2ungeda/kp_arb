@@ -20,7 +20,7 @@ from .strategy_core import (
     Leg,
     ScreenState,
     SpreadSet,
-    in_operating_window,
+    in_screen_operating_window,
     plan_order,
 )
 
@@ -68,7 +68,7 @@ class RehearsalEngine:
     def tick(self, now: datetime, mono: float) -> None:
         """전 화면·세트 1회 판정. now/mono 주입 — 단위 테스트 가능."""
         for kind, screen in self._state.screens.items():
-            if not in_operating_window(kind, now.time()):
+            if not in_screen_operating_window(screen, now.time()):
                 continue
             if self._session_blocked(screen):
                 continue

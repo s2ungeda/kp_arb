@@ -42,10 +42,48 @@ OPERATING_WINDOWS: dict[ScreenKind, tuple[tuple[str, str], ...]] = {
 
 
 def in_operating_window(kind: ScreenKind, now: dtime) -> bool:
-    """화면 운영시간 안인가 — 밖이면 자동 주문 발생 금지 (§6.2-1)."""
+    """화면 운영시간(기본값) 안인가 — 밖이면 자동 주문 발생 금지 (§6.2-1)."""
     return any(
         in_time_window(now, parse_hhmm(start), parse_hhmm(end))
         for start, end in OPERATING_WINDOWS[kind]
+    )
+
+
+def parse_operating_hours(text: str) -> tuple[tuple[str, str], ...]:
+    """설정창 운영시간 문자열 파싱 — "08:00-08:50,09:00-15:30" → 창 목록.
+
+    형식이 틀리면 ValueError (설정 저장 시 거부). 빈 문자열은 빈 튜플(기본값 사용).
+    """
+    windows: list[tuple[str, str]] = []
+    for part in text.split(","):
+        chunk = part.strip()
+        if not chunk:
+            continue
+        start, _, end = chunk.partition("-")
+        parse_hhmm(start.strip())  # 형식 검증 (틀리면 ValueError)
+        parse_hhmm(end.strip())
+        windows.append((start.strip(), end.strip()))
+    return tuple(windows)
+
+
+def operating_windows_for(screen: ScreenState) -> tuple[tuple[str, str], ...]:
+    """화면의 유효 운영시간 — 설정값(operating_hours) 우선, 없으면 기본값."""
+    custom = screen.settings.operating_hours.strip()
+    if custom:
+        try:
+            windows = parse_operating_hours(custom)
+        except ValueError:
+            windows = ()
+        if windows:
+            return windows
+    return OPERATING_WINDOWS[screen.kind]
+
+
+def in_screen_operating_window(screen: ScreenState, now: dtime) -> bool:
+    """화면 설정 기준 운영시간 판정 — 판정 루프·주문 계획 공용."""
+    return any(
+        in_time_window(now, parse_hhmm(start), parse_hhmm(end))
+        for start, end in operating_windows_for(screen)
     )
 
 
@@ -70,6 +108,7 @@ class ScreenSettings:
     pre_order_range_ticks: int = 0   # 자동M: 선주문진입범위(틱, 0=제한 없음)
     max_position: int = 0            # 종목보유최대수량 — 한 방향 최대(국내 단위)
     daily_limit_100m: float = 0.0    # 일거래한도(억) — 국내 매수+매도 대금. 0=미사용
+    operating_hours: str = ""        # 운영시간 덮어쓰기 "08:00-08:50,..." (빈값=기본)
 
 
 @dataclass
@@ -179,7 +218,7 @@ def plan_order(
     LS 다리는 블록의 LS주문 체크 시에만 포함(해제 = HL 주문만). HL 다리는 항상.
     """
     errors = validate_run(screen, block, index)
-    if not in_operating_window(screen.kind, now):
+    if not in_screen_operating_window(screen, now):
         errors.append("운영시간 밖")
     target = screen.sets_of(block)[index]
     remaining = max(0, target.target_qty - target.fired_qty)
@@ -272,6 +311,8 @@ def state_from_dict(data: dict[str, object]) -> CoreState:
                 s.max_position = int(raw_settings.get("max_position", s.max_position))
                 s.daily_limit_100m = float(
                     raw_settings.get("daily_limit_100m", s.daily_limit_100m))
+                s.operating_hours = str(
+                    raw_settings.get("operating_hours", s.operating_hours))
             except (TypeError, ValueError):
                 pass
     return state

@@ -130,3 +130,20 @@ def test_taker_price_margin() -> None:
     # 매수 = est-pr 위로, 매도 = 아래로 (§6.2-4). 호가단위 반올림은 실행층.
     assert taker_price(100.0, Side.BUY, 0.01) == pytest.approx(101.0)
     assert taker_price(100.0, Side.SELL, 0.01) == pytest.approx(99.0)
+
+
+def test_operating_hours_override() -> None:
+    # 설정 운영시간이 있으면 그걸로 판정, 없거나 형식 오류면 기본값 (§6.2-1)
+    from kp_arb.strategy_core import in_screen_operating_window, parse_operating_hours
+
+    assert parse_operating_hours("08:00-08:50, 10:00-11:00") == (
+        ("08:00", "08:50"), ("10:00", "11:00"))
+    assert parse_operating_hours("") == ()
+
+    screen = _screen(ScreenKind.AUTO_M)
+    assert not in_screen_operating_window(screen, time(16, 0))  # 기본 8:45~15:35 밖
+    screen.settings.operating_hours = "15:50-17:00"
+    assert in_screen_operating_window(screen, time(16, 0))      # 덮어쓰기 적용
+    assert not in_screen_operating_window(screen, time(12, 0))
+    screen.settings.operating_hours = "broken"
+    assert in_screen_operating_window(screen, time(12, 0))      # 형식 오류 → 기본값

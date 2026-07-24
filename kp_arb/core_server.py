@@ -28,6 +28,7 @@ from .strategy_core import (
     CoreState,
     ScreenKind,
     ScreenState,
+    parse_operating_hours,
     state_from_dict,
     validate_run,
 )
@@ -116,6 +117,10 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
                 body.get("pre_order_range_ticks", s.pre_order_range_ticks))
             s.max_position = int(body.get("max_position", s.max_position))
             s.daily_limit_100m = float(body.get("daily_limit_100m", s.daily_limit_100m))
+            if "operating_hours" in body:  # 운영시간 덮어쓰기 — 형식 검증 후 저장
+                hours = str(body["operating_hours"]).strip()
+                parse_operating_hours(hours)  # 틀리면 ValueError → 거부
+                s.operating_hours = hours
             return _ok()
         if cmd == "fx_month":  # 환율 표시용 원달러선물 월물 (§6.2-7)
             choice = str(body["choice"])

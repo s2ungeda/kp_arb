@@ -152,3 +152,15 @@ def test_live_snapshot_disconnected() -> None:
 
     live = live_snapshot(CoreState(), None, None)
     assert live["connected"] is False and live["rehearsal"] is True
+
+
+def test_settings_operating_hours_validated() -> None:
+    state = CoreState()
+    result = apply_command(state, {"cmd": "settings", "screen": "autoM",
+                                   "operating_hours": "09:00-15:00"})
+    assert result["ok"]
+    assert state.screens[ScreenKind.AUTO_M].settings.operating_hours == "09:00-15:00"
+    result = apply_command(state, {"cmd": "settings", "screen": "autoM",
+                                   "operating_hours": "가나다"})
+    assert not result["ok"]  # 형식 오류는 저장 거부
+    assert state.screens[ScreenKind.AUTO_M].settings.operating_hours == "09:00-15:00"
