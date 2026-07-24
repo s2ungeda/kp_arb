@@ -88,14 +88,13 @@ class FxReportService:
             from .domain.enums import Instrument
 
             positions = await self._hl_positions()  # HL 계좌 직접 조회 (수동 매매 포함)
-            fx, _ = self._system.usdkrw_effective()
-            rate = fx or 0.0
-            # total_coin 구성 — HL 종목별 (평균단가×수량×환율=원화 명목), 화면 표시용
+            # total_coin 구성 — HL 종목별 (평균단가×수량=USD 명목), 화면 표시용
             self.last_hl = [
                 {"underlying": p.underlying.value, "qty": p.qty, "avg": p.avg_price,
-                 "notional": p.avg_price * p.qty * rate}
+                 "notional": p.avg_price * p.qty}
                 for p in positions if p.instrument is Instrument.HL_PERP
             ]
+            fx = 1.0  # #2로는 환율 1 전송 (사용자 확정) — 로그·표시용
             sent = await self._reporter.report(positions, fx or 0.0)
             self.last_signal = sent
             self.last_sent_ok = self._reporter.last_sent_ok

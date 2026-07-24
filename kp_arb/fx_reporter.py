@@ -60,15 +60,15 @@ class FXExposureReporter:
         id: str | None = None,
         datetime: str = "",
     ) -> Signal:
-        """HL 명목(원화 환산 total_coin) + 환율을 계산해 #2로 전송.
+        """HL 명목(total_coin) + 환율을 #2로 전송.
 
-        total_coin = Σ(HL 평균단가 × 수량) × 환율 — #2가 원달러선물로 헤지할 KRW
-        금액(사용자 확정 2026-07-24). 환율 0(미수신)이면 total_coin도 0.
+        total_coin = Σ(HL 평균단가 × 수량) — USD 명목 그대로(환율 안 곱함,
+        사용자 확정 2026-07-24). fx는 항상 1로 전송(#2가 환산 안 함).
         """
-        total_coin = self._notional_fn(list(positions)) * fx
+        total_coin = self._notional_fn(list(positions))
         signal = Signal(
             id=id if id is not None else uuid.uuid4().hex,
-            fx=fx,
+            fx=1.0,  # 항상 1 — #2가 환산 안 함 (사용자 확정 2026-07-24)
             total_domestic=0.0,
             total_coin=total_coin,
             token=self._token,
@@ -88,7 +88,7 @@ class FXExposureReporter:
     ) -> Signal | None:
         """total_coin이 min_change 초과로 바뀐 경우에만 전송. 아니면 None."""
         pos_list = list(positions)
-        total_coin = self._notional_fn(pos_list) * fx  # 원화 환산 기준으로 변화 판단
+        total_coin = self._notional_fn(pos_list)
         if (self._last_total_coin is not None
                 and abs(total_coin - self._last_total_coin) <= self._min_change):
             return None

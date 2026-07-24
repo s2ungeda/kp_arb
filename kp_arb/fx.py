@@ -40,11 +40,10 @@ def domestic_krw_notional(
 
 
 def hl_coin_notional(positions: Iterable[Position]) -> float:
-    """HL 보유종목 **Σ(평균단가 × 수량)** — USD 명목 (사용자 확정 2026-07-24).
+    """외부 #2 `total_coin`: HL 보유종목 **Σ(평균단가 × 수량)** — USD 명목 그대로.
 
     수량은 절대값(magnitude). 종목(SMSN/SKHX/HYUNDAI) 전체 합. HL 외 제외.
-    외부 #2 `total_coin`은 이 값에 **환율을 곱한 원화 명목**(원달러선물 헤지 대상) —
-    환율 곱은 FXExposureReporter에서 적용(fx_reporter).
+    환율은 곱하지 않고 fx=1로 전송(사용자 확정 2026-07-24 — #2가 환산 안 함).
     """
     total = 0.0
     for p in positions:
