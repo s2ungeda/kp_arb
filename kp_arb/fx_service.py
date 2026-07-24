@@ -38,6 +38,7 @@ class FxReportService:
         self._want_send_now = False
         self.last_signal: Signal | None = None
         self.last_sent_ok: bool | None = None
+        self.last_hl: list[dict[str, object]] = []  # total_coin 구성(HL 종목별)
         self.log: deque[str] = deque(maxlen=200)
 
     # --- 제어 (감시 화면 명령 — 코어 이벤트 루프에서 호출, 동기 안전) ---
@@ -84,7 +85,15 @@ class FxReportService:
     async def _send(self, *, force: bool) -> None:
         # 델파이 원본과 동일 — 주기마다 무조건 전송(값 변화와 무관). force는 로그 라벨용.
         try:
-            positions = self._system.order_book.positions()
+            from .domain.enums import Instrument
+
+            positions = await self._hl_positions()  # HL 계좌 직접 조회 (수동 매매 포함)
+            # total_coin 구성 — HL 종목별 (진입평균가×수량) 내역, 화면 표시용
+            self.last_hl = [
+                {"underlying": p.underlying.value, "qty": p.qty,
+                 "avg": p.avg_price, "notional": p.avg_price * p.qty}
+                for p in positions if p.instrument is Instrument.HL_PERP
+            ]
             fx, _ = self._system.usdkrw_effective()
             sent = await self._reporter.report(positions, fx or 0.0)
             self.last_signal = sent
@@ -94,6 +103,19 @@ class FxReportService:
                        f"ok={self.last_sent_ok}")
         except Exception:  # noqa: BLE001 - 보고 실패가 코어를 멈추지 않게
             log.exception("FX 보고 실패 — 계속")
+
+    async def _hl_positions(self) -> list[Any]:
+        """HL 보유 — 계좌 직접 조회(REST) 우선, 실패 시 OrderBook.
+
+        웹사이트 등 우리 시스템 밖에서 연 포지션도 반영하려면 매번 실계좌를 읽어야 한다.
+        """
+        hl = getattr(self._system, "_hl", None)
+        if hl is not None and hasattr(hl, "get_positions"):
+            try:
+                return list(await hl.get_positions())
+            except Exception:  # noqa: BLE001 - 조회 실패 시 OrderBook으로 폴백
+                log.warning("HL 포지션 조회 실패 — OrderBook 사용", exc_info=True)
+        return self._system.order_book.positions()
 
     def _on_message(self, name: str, payload: dict[str, object]) -> None:
         """수신 메시지(token=Meme만 도달) → 로그. total_coin·fx만 요약."""
@@ -124,5 +146,6 @@ class FxReportService:
             "interval_s": self.interval_s,
             "peers": self._sink.peer_list(),
             "last": last,
+            "hl": self.last_hl,  # total_coin 구성 (HL 종목별) — 0일 때 원인 파악용
             "log": list(self.log)[-60:],  # /state 크기 억제 — 최근 60줄만
         }

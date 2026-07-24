@@ -82,11 +82,13 @@ def main() -> None:
                   {"cmd": "fx_interval", "seconds": _to_float(ent_interval.get(), 2.0)},
                   "주기 변경")).pack(side="left", padx=(2, 0))
 
-    # --- 마지막 송신값 ---
+    # --- 마지막 송신값 + total_coin 구성 ---
     last = tk.Frame(root)
     last.pack(fill="x", padx=6, pady=2)
     lbl_last = tk.Label(last, text="마지막 송신: -", anchor="w", fg="dark green")
     lbl_last.pack(side="left")
+    lbl_hl = tk.Label(root, text="HL 구성: -", anchor="w", fg="gray25")
+    lbl_hl.pack(fill="x", padx=6)
 
     # --- 피어 목록 + 로그 ---
     mid = tk.Frame(root)
@@ -167,6 +169,13 @@ def main() -> None:
                     text=f"마지막 송신: total_coin={float(info.get('total_coin', 0)):,.0f} "
                          f"fx={float(info.get('fx', 0)):,.2f} "
                          f"ok={info.get('ok')} @ {info.get('datetime', '')}")
+            hl = fx.get("hl") or []
+            if hl:
+                parts = [f"{h.get('underlying')} {h.get('qty')}×{float(h.get('avg', 0)):.2f}"
+                         f"={float(h.get('notional', 0)):,.0f}" for h in hl]
+                lbl_hl.config(text="HL 구성: " + "  ".join(parts))
+            else:
+                lbl_hl.config(text="HL 구성: (보유 없음 → total_coin=0)")
             peers = fx.get("peers") or []
             peer_key = [(p.get("name"), p.get("ip"), p.get("port")) for p in peers]
             if peer_key != shown["peers"]:  # 바뀔 때만 리스트박스 다시 그림
