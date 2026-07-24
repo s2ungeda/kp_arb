@@ -148,8 +148,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     ent_per = tk.Entry(row1, width=6, justify="right",
                        validate="key", validatecommand=vcmd_int)
     ent_per.pack(side="left", padx=(2, 10))
-    ent_per.bind("<Return>", lambda _e: send(
-        {"cmd": "per_qty", "qty": parse_qty(ent_per.get())}, "1회주문수량"))
+
+    def send_per_qty(_event: object = None) -> None:
+        send({"cmd": "per_qty", "qty": parse_qty(ent_per.get())}, "1회주문수량")
+
+    # 입력값은 칸을 벗어나는 순간 코어로 전송·저장 (실행 안 켜도 저장됨)
+    ent_per.bind("<Return>", send_per_qty)
+    ent_per.bind("<FocusOut>", send_per_qty)
 
     def open_settings() -> None:
         win = tk.Toplevel(root)
@@ -277,6 +282,18 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def run_command(block: str, index: int) -> Callable[[], None]:
         return lambda: toggle_run(block, index)
 
+    def threshold_sender(block: str, index: int,
+                         entry: Any) -> Callable[[object], None]:
+        return lambda _e: send(
+            {"cmd": "set_threshold", "block": block, "set": index,
+             "value": threshold_to_fraction(entry.get())}, "기준값")
+
+    def target_sender(block: str, index: int,
+                      entry: Any) -> Callable[[object], None]:
+        return lambda _e: send(
+            {"cmd": "set_target", "block": block, "set": index,
+             "value": parse_qty(entry.get())}, "목표진입량")
+
     def ls_order_command(block: str, index: int, var: Any) -> Callable[[], None]:
         return lambda: send({"cmd": "ls_order", "block": block, "set": index,
                              "value": var.get()}, "LS주문 체크")
@@ -303,6 +320,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             ent_target = tk.Entry(grid, width=8, justify="right",
                                   validate="key", validatecommand=vcmd_int)
             ent_target.grid(row=row_no, column=2, padx=2, pady=1)
+            # 칸을 벗어나면 즉시 코어에 저장 — 실행을 안 켜도 값이 남는다
+            ent_threshold.bind("<FocusOut>", threshold_sender(block, i, ent_threshold))
+            ent_threshold.bind("<Return>", threshold_sender(block, i, ent_threshold))
+            ent_target.bind("<FocusOut>", target_sender(block, i, ent_target))
+            ent_target.bind("<Return>", target_sender(block, i, ent_target))
             btn = tk.Button(grid, text="실행", width=6, command=run_command(block, i))
             btn.grid(row=row_no, column=3, padx=4)
             ls_var = tk.BooleanVar(value=True)
