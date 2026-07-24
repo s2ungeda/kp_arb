@@ -28,3 +28,18 @@ def test_launch_command_fx_monitor_frozen(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(sys, "executable", r"C:\dist\kp-arb\kp-arb.exe")
     cmd = launch_command("kp_arb.fx_monitor", ())
     assert cmd[0].endswith("kp-arb.exe") and cmd[-1] == "fx_monitor"
+
+
+def test_watch_parent_exit_no_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # KP_PARENT_PID 없으면 아무것도 안 함(감시 스레드 미시작)
+    from kp_arb.core_client import watch_parent_exit
+    monkeypatch.delenv("KP_PARENT_PID", raising=False)
+    watch_parent_exit()  # 예외 없이 즉시 반환
+
+
+def test_pid_alive_self() -> None:
+    import os
+
+    from kp_arb.core_client import _pid_alive
+    assert _pid_alive(os.getpid()) is True
+    assert _pid_alive(999_999_99) is False  # 존재하지 않는 PID

@@ -17,7 +17,7 @@ import sys
 from collections.abc import Callable
 from typing import Any
 
-from .core_client import core_request
+from .core_client import core_request, watch_parent_exit
 from .strategy_core import OPERATING_WINDOWS, ScreenKind
 
 UNDERLYINGS = ("하이닉스", "삼성", "현대차")
@@ -84,6 +84,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     kind = ScreenKind(sys.argv[1]) if len(sys.argv) > 1 else ScreenKind.AUTO_T
     screen_key = kind.value
 
+    watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
     root.title(f"kp-arb {TITLES[kind]}")
     root.resizable(False, False)

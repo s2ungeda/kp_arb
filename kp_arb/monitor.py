@@ -190,6 +190,9 @@ def main() -> None:
         pass
 
     from .bootstrap import LiveSystem, bootstrap_live
+    from .core_client import watch_parent_exit
+
+    watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
 
     state = MonitorState()
     system_ref: dict[str, LiveSystem] = {}

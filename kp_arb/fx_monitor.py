@@ -14,13 +14,14 @@ import threading
 import time
 from typing import Any
 
-from .core_client import core_request
+from .core_client import core_request, watch_parent_exit
 
 
 def main() -> None:
     """감시 창 실행 — 코어 클라이언트."""
     import tkinter as tk
 
+    watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
     root.title("kp-arb FX 노출 감시 [v2]")  # [v2]=뒷단 스레드 수정본 (옛 창 구분용)
     root.geometry("560x460")

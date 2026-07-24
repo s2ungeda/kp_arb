@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -44,12 +45,16 @@ def launch_module(module: str, *args: str, console: bool = False) -> subprocess.
     """모듈(또는 배포판 exe)을 별도 프로세스로 실행.
 
     화면은 콘솔 숨김(CREATE_NO_WINDOW — cmd 창 안 뜸), 코어만 새 콘솔(로그 확인용).
+    자식 화면엔 메인 PID를 넘겨(KP_PARENT_PID) 메인이 죽으면 스스로 닫히게 한다.
     """
     flags = 0
     if sys.platform == "win32":
         flags = (subprocess.CREATE_NEW_CONSOLE if console
                  else subprocess.CREATE_NO_WINDOW)
-    return subprocess.Popen(launch_command(module, args), creationflags=flags)
+    env = None
+    if not console:  # 코어는 독립 유지, 화면들만 메인 생사에 연동
+        env = {**os.environ, "KP_PARENT_PID": str(os.getpid())}
+    return subprocess.Popen(launch_command(module, args), creationflags=flags, env=env)
 
 
 def main() -> None:
