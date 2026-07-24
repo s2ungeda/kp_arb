@@ -76,8 +76,13 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
         if cmd == "select":
             _screen_of(state, body).underlying = Underlying(str(body["underlying"]))
             return _ok()
-        if cmd == "per_qty":
-            _screen_of(state, body).per_order_qty = int(body["qty"])
+        if cmd == "per_qty":  # 1회주문수량 — 진입/청산 별도 (block 지정)
+            screen = _screen_of(state, body)
+            qty = int(body["qty"])
+            if Block(str(body["block"])) is Block.ENTRY:
+                screen.entry_per_qty = qty
+            else:
+                screen.exit_per_qty = qty
             return _ok()
         if cmd == "ls_order":  # 세트별 LS주문 체크 — 해제 시 HL 주문만 (§6.2-2)
             screen = _screen_of(state, body)
@@ -175,7 +180,8 @@ def live_snapshot(
     for kind, screen in state.screens.items():
         u = screen.underlying
         instrument = kind.counterpart
-        entry, exit_ = system.pair_signal(u, instrument, screen.per_order_qty)
+        entry, exit_ = system.pair_signal(
+            u, instrument, screen.entry_per_qty, screen.exit_per_qty)
         if instrument is Instrument.KR_STOCK:
             kr_last = system.stock_last(u)
         else:

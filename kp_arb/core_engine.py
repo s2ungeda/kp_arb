@@ -73,7 +73,8 @@ class RehearsalEngine:
             if self._session_blocked(screen):
                 continue
             entry_sig, exit_sig = self._system.pair_signal(
-                screen.underlying, kind.counterpart, screen.per_order_qty)
+                screen.underlying, kind.counterpart,
+                screen.entry_per_qty, screen.exit_per_qty)
             for block, signal in ((Block.ENTRY, entry_sig), (Block.EXIT, exit_sig)):
                 if signal is None:
                     continue
@@ -113,7 +114,7 @@ class RehearsalEngine:
             return  # 목표 완료/한도 소진 등 — 로그 없이 조용히 (매 틱 반복 방지)
         kr_qty = self._kr_qty(screen, plan.legs)
         est_bid, est_ask, px_entry, px_exit = self._system.est_pair_prices(
-            screen.underlying, screen.kind.counterpart, screen.per_order_qty,
+            screen.underlying, screen.kind.counterpart, screen.per_qty(block),
             spread_set.threshold if block is Block.ENTRY else 0.0,
             spread_set.threshold if block is Block.EXIT else 0.0)
         ls_price = px_entry if block is Block.ENTRY else px_exit

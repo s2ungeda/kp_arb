@@ -14,7 +14,8 @@ class StubSystem:
     def __init__(self, entry: float | None, exit_: float | None) -> None:
         self.signals = (entry, exit_)
 
-    def pair_signal(self, u: Any, inst: Any, qty: int) -> tuple[Any, Any]:
+    def pair_signal(self, u: Any, inst: Any, entry_qty: int,
+                    exit_qty: int) -> tuple[Any, Any]:
         return self.signals
 
     def est_pair_prices(self, u: Any, inst: Any, qty: int,
@@ -25,7 +26,8 @@ class StubSystem:
 def _state(*, entry_th: float = 0.0006, delay_ms: int = 500) -> CoreState:
     state = CoreState()
     screen = state.screens[ScreenKind.AUTO_M]
-    screen.per_order_qty = 5
+    screen.entry_per_qty = 5
+    screen.exit_per_qty = 5
     screen.settings.max_position = 100
     screen.settings.delay_ms = delay_ms
     screen.entry_sets[0].threshold = entry_th

@@ -23,7 +23,7 @@ NOON = time(12, 0)
 
 def _screen(kind: ScreenKind = ScreenKind.AUTO_M, *, per: int = 5,
             max_pos: int = 100) -> ScreenState:
-    screen = ScreenState(kind=kind, per_order_qty=per)
+    screen = ScreenState(kind=kind, entry_per_qty=per, exit_per_qty=per)
     screen.settings.max_position = max_pos
     for i, value in enumerate((0.006, 0.008, 0.012)):
         screen.entry_sets[i].threshold = value
@@ -39,7 +39,7 @@ def _screen(kind: ScreenKind = ScreenKind.AUTO_M, *, per: int = 5,
 def test_validate_run() -> None:
     screen = _screen()
     assert validate_run(screen, Block.ENTRY, 0) == []
-    screen.per_order_qty = 0
+    screen.entry_per_qty = 0
     assert validate_run(screen, Block.ENTRY, 0) != []
     screen = _screen(max_pos=0)
     assert any("보유최대" in e for e in validate_run(screen, Block.ENTRY, 0))

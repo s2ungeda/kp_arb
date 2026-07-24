@@ -14,7 +14,8 @@ from kp_arb.strategy_core import CoreState, ScreenKind
 
 
 def _ready(state: CoreState, screen: str = "autoM") -> None:
-    apply_command(state, {"cmd": "per_qty", "screen": screen, "qty": 5})
+    apply_command(state, {"cmd": "per_qty", "screen": screen,
+                          "block": "entry", "qty": 5})
     apply_command(state, {"cmd": "settings", "screen": screen, "max_position": 100})
     apply_command(state, {"cmd": "set_threshold", "screen": screen,
                           "block": "entry", "set": 0, "value": 0.006})
@@ -96,7 +97,7 @@ def test_state_persistence_roundtrip(tmp_path: Path) -> None:
 
     restored = load_state(path)
     screen = restored.screens[ScreenKind.AUTO_M]
-    assert screen.per_order_qty == 5
+    assert screen.entry_per_qty == 5
     assert not screen.entry_sets[0].ls_order  # 세트별 LS주문 체크 복원
     assert screen.settings.max_position == 100
     assert screen.entry_sets[0].threshold == 0.006
@@ -126,9 +127,9 @@ async def test_http_roundtrip_and_shutdown_hook() -> None:
         assert set(data["screens"]) == {"autoT", "autoM"}
 
         resp = await client.post("/command", json={
-            "cmd": "per_qty", "screen": "autoT", "qty": 30})
+            "cmd": "per_qty", "screen": "autoT", "block": "entry", "qty": 30})
         assert resp.status == 200 and (await resp.json())["ok"]
-        assert state.screens[ScreenKind.AUTO_T].per_order_qty == 30
+        assert state.screens[ScreenKind.AUTO_T].entry_per_qty == 30
 
         resp = await client.post("/command", data=b"not json")
         assert resp.status == 400

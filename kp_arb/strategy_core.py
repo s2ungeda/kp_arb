@@ -117,7 +117,9 @@ class ScreenState:
 
     kind: ScreenKind
     underlying: Underlying = Underlying.SK_HYNIX
-    per_order_qty: int = 0           # 1회주문수량 (화면당 1개 — est-pr 공용)
+    # 1회주문수량 — 진입/청산 별도(사용자 확정 2026-07-24). 적용 버튼으로 수시 변경.
+    entry_per_qty: int = 0
+    exit_per_qty: int = 0
     entry_sets: list[SpreadSet] = field(
         default_factory=lambda: [SpreadSet() for _ in range(SET_COUNT)])
     exit_sets: list[SpreadSet] = field(
@@ -126,6 +128,10 @@ class ScreenState:
 
     def sets_of(self, block: Block) -> list[SpreadSet]:
         return self.entry_sets if block is Block.ENTRY else self.exit_sets
+
+    def per_qty(self, block: Block) -> int:
+        """블록별 1회주문수량 (est-pr·판정·주문 계획 공용)."""
+        return self.entry_per_qty if block is Block.ENTRY else self.exit_per_qty
 
 
 @dataclass
@@ -145,7 +151,7 @@ class CoreState:
 def validate_run(screen: ScreenState, block: Block, index: int) -> list[str]:
     """실행 버튼 켤 때 검증 — 위반 사유 목록(비면 통과)."""
     errors: list[str] = []
-    if screen.per_order_qty <= 0:
+    if screen.per_qty(block) <= 0:
         errors.append("1회주문수량은 1 이상이어야 함")
     if screen.settings.max_position <= 0:
         errors.append("종목보유최대수량 설정 필요")
@@ -226,7 +232,7 @@ def plan_order(
     ls_enabled = target.ls_order  # 세트별 LS주문 체크 (해제 = HL 주문만)
     qty = min(
         allowed_order_qty(block, counterpart, position_qty,
-                          screen.per_order_qty, screen.settings.max_position),
+                          screen.per_qty(block), screen.settings.max_position),
         remaining,
     )
     if remaining <= 0:
@@ -290,7 +296,8 @@ def state_from_dict(data: dict[str, object]) -> CoreState:
         except ValueError:
             pass
         try:
-            screen.per_order_qty = int(raw.get("per_order_qty", 0))
+            screen.entry_per_qty = int(raw.get("entry_per_qty", 0))
+            screen.exit_per_qty = int(raw.get("exit_per_qty", 0))
         except (TypeError, ValueError):
             pass
         for name, sets in (("entry_sets", screen.entry_sets),

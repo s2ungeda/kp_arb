@@ -457,21 +457,24 @@ class LiveSystem:
             self._hl_ws.set_l2_aggregation(u, n_sig_figs, mantissa)
 
     def pair_signal(
-        self, u: Underlying, instrument: Instrument, kr_qty: int
+        self, u: Underlying, instrument: Instrument,
+        entry_qty: int, exit_qty: int,
     ) -> tuple[float | None, float | None]:
         """est 기반 진입/청산 스프레드(소수) — 주문 화면 표시·판정 루프 공용 (§6.2).
 
         진입 = HL매수d(est) − 국내매수d(1호가 maker) / 청산 = HL매도d(est) − 국내매도d.
-        est는 kr_qty(국내 단위)를 HL 계약으로 환산(주식 1:1, 선물 1:10)해 산정.
+        est는 각 블록 수량(국내 단위)을 HL 계약으로 환산(주식 1:1, 선물 1:10)해 산정 —
+        진입은 entry_qty, 청산은 exit_qty(1회주문수량 진입/청산 분리, 사용자 확정).
         국내 기준가: 선물 = 선물이론가, 주식 = 자기 현재가 (§6.1).
         """
         quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
-        if quote is None or kr_qty <= 0:
+        if quote is None:
             return None, None
-        hl_qty = float(kr_qty) * (
-            10.0 if instrument is Instrument.KR_STOCK_FUTURE else 1.0)
-        est_bid = est_price(quote.bids or [], hl_qty)
-        est_ask = est_price(quote.asks or [], hl_qty)
+        ratio = 10.0 if instrument is Instrument.KR_STOCK_FUTURE else 1.0
+        est_bid = (est_price(quote.bids or [], entry_qty * ratio)
+                   if entry_qty > 0 else None)
+        est_ask = (est_price(quote.asks or [], exit_qty * ratio)
+                   if exit_qty > 0 else None)
         fx, _ = self.usdkrw_effective()
         stock = self.stock_last(u)
         base = (self.stock_futures_theory(u)

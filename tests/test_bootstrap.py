@@ -369,7 +369,7 @@ def test_pair_signal_est_based() -> None:
         bids=[(201.0, 3.0), (200.0, 100.0)],
         asks=[(202.0, 3.0), (203.0, 100.0)])
 
-    entry, exit_ = system.pair_signal(SAMSUNG, Instrument.KR_STOCK, 5)
+    entry, exit_ = system.pair_signal(SAMSUNG, Instrument.KR_STOCK, 5, 5)
     # est(매수쪽, 5계약) = (201×3 + 200×2)/5 = 200.6 → 환산 300,900 → HL disp +0.003
     # 국내 매수d = (299,500−300,000)/300,000 = −1/600 → entry = 0.003 + 1/600
     assert entry == pytest.approx(0.003 + 1 / 600)
@@ -377,5 +377,5 @@ def test_pair_signal_est_based() -> None:
     assert exit_ == pytest.approx(0.012 - 1 / 600)
 
     # 수량이 커지면 est가 나빠져 진입 신호는 줄어든다 (2호가까지 파고듦)
-    entry_big, _ = system.pair_signal(SAMSUNG, Instrument.KR_STOCK, 50)
+    entry_big, _ = system.pair_signal(SAMSUNG, Instrument.KR_STOCK, 50, 50)
     assert entry_big is not None and entry is not None and entry_big < entry
