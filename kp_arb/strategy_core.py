@@ -17,7 +17,6 @@ from .theory import in_time_window, parse_hhmm
 
 FUTURES_SHARES_PER_CONTRACT = 10  # 주식선물 1계약 = 10주 = HL 10계약 (§6.2-3)
 SET_COUNT = 3                     # entry/exit 각 세트 수
-THRESHOLD_LIMIT = 0.01            # 기준값 절대 한계 ±1% (§6.2-6)
 
 
 class ScreenKind(StrEnum):
@@ -101,24 +100,8 @@ class CoreState:
     fx_month: str = "near"  # 환율 표시용 원달러선물 월물 선택: near/next (§6.2-7)
 
 
-# --- 검증 (§6.2-6) ---
-
-def threshold_check(block: Block, value: float) -> tuple[list[str], list[str]]:
-    """기준값 입력 가드 → (오류, 경고). 오류는 입력 불가, 경고는 확인창."""
-    errors: list[str] = []
-    warnings: list[str] = []
-    if block is Block.ENTRY:
-        if value <= -THRESHOLD_LIMIT:
-            errors.append("entry 기준값은 -1% 이하 입력 불가")
-        elif value <= 0:
-            warnings.append("낮은수치")
-    else:
-        if value >= THRESHOLD_LIMIT:
-            errors.append("exit 기준값은 +1% 이상 입력 불가")
-        elif value >= 0:
-            warnings.append("높은수치")
-    return errors, warnings
-
+# --- 검증 ---
+# 기준값 입력 가드(0 기준 경고·±1% 한계)는 제거 — 엑셀 수치는 예시였음 (사용자 확정 2026-07-24)
 
 def validate_run(screen: ScreenState, block: Block, index: int) -> list[str]:
     """실행 버튼 켤 때 검증 — 위반 사유 목록(비면 통과)."""
@@ -132,8 +115,6 @@ def validate_run(screen: ScreenState, block: Block, index: int) -> list[str]:
         errors.append("목표진입량은 1 이상이어야 함")
     if target.threshold is None:
         errors.append("스프레드 기준값 필수")
-    else:
-        errors.extend(threshold_check(block, target.threshold)[0])
     return errors
 
 

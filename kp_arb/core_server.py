@@ -29,7 +29,6 @@ from .strategy_core import (
     ScreenKind,
     ScreenState,
     state_from_dict,
-    threshold_check,
     validate_run,
 )
 
@@ -85,18 +84,13 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
             screen.sets_of(block)[int(body["set"])].ls_order = bool(body["value"])
             return _ok()
         if cmd == "set_threshold":
+            # 기준값은 자유 입력 (0 경고·±1% 한계 제거 — 사용자 확정 2026-07-24)
             screen = _screen_of(state, body)
             block = Block(str(body["block"]))
             raw = body["value"]
-            if raw is None:
-                screen.sets_of(block)[int(body["set"])].threshold = None
-                return _ok()
-            threshold = float(raw)
-            errors, warnings = threshold_check(block, threshold)
-            if errors:
-                return _fail(errors)  # 입력 자체 거부 (±1% 한계)
-            screen.sets_of(block)[int(body["set"])].threshold = threshold
-            return {"ok": True, "errors": [], "warnings": warnings}
+            screen.sets_of(block)[int(body["set"])].threshold = (
+                None if raw is None else float(raw))
+            return _ok()
         if cmd == "set_target":
             screen = _screen_of(state, body)
             block = Block(str(body["block"]))

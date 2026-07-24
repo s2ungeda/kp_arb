@@ -39,17 +39,21 @@ def test_run_rejected_without_inputs() -> None:
     assert not state.screens[ScreenKind.AUTO_M].entry_sets[0].running
 
 
-def test_threshold_limit_and_warning() -> None:
+def test_threshold_free_input() -> None:
+    # 기준값 자유 입력 — 0 경고·±1% 한계 없음 (사용자 확정 2026-07-24)
     state = CoreState()
-    # ±1% 한계는 입력 자체 거부
     result = apply_command(state, {"cmd": "set_threshold", "screen": "autoT",
                                    "block": "entry", "set": 0, "value": -0.02})
-    assert not result["ok"]
-    assert state.screens[ScreenKind.AUTO_T].entry_sets[0].threshold is None
-    # 0 이하는 저장되지만 경고 반환 → 화면이 확인창
+    assert result["ok"] and result["warnings"] == []
+    assert state.screens[ScreenKind.AUTO_T].entry_sets[0].threshold == -0.02
     result = apply_command(state, {"cmd": "set_threshold", "screen": "autoT",
-                                   "block": "entry", "set": 0, "value": -0.001})
-    assert result["ok"] and result["warnings"] == ["낮은수치"]
+                                   "block": "exit", "set": 0, "value": 0.02})
+    assert result["ok"]
+    assert state.screens[ScreenKind.AUTO_T].exit_sets[0].threshold == 0.02
+    result = apply_command(state, {"cmd": "set_threshold", "screen": "autoT",
+                                   "block": "entry", "set": 0, "value": None})
+    assert result["ok"]
+    assert state.screens[ScreenKind.AUTO_T].entry_sets[0].threshold is None
 
 
 def test_ls_order_checkbox_per_set() -> None:

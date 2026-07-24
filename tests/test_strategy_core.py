@@ -13,7 +13,6 @@ from kp_arb.strategy_core import (
     in_operating_window,
     plan_order,
     taker_price,
-    threshold_check,
     validate_run,
 )
 
@@ -35,16 +34,7 @@ def _screen(kind: ScreenKind = ScreenKind.AUTO_M, *, per: int = 5,
     return screen
 
 
-# --- 기준값 가드 (§6.2-6) ---
-
-def test_threshold_guards() -> None:
-    assert threshold_check(Block.ENTRY, 0.006) == ([], [])
-    assert threshold_check(Block.ENTRY, 0.0)[1] == ["낮은수치"]      # 경고만
-    assert threshold_check(Block.ENTRY, -0.01)[0] != []              # -1% 이하 불가
-    assert threshold_check(Block.EXIT, -0.003) == ([], [])
-    assert threshold_check(Block.EXIT, 0.0)[1] == ["높은수치"]
-    assert threshold_check(Block.EXIT, 0.01)[0] != []                # +1% 이상 불가
-
+# --- 실행 전 검증 (기준값 가드는 제거 — 자유 입력, 사용자 확정 2026-07-24) ---
 
 def test_validate_run() -> None:
     screen = _screen()

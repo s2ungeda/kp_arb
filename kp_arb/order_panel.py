@@ -79,7 +79,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     import threading
     import time
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import ttk
 
     kind = ScreenKind(sys.argv[1]) if len(sys.argv) > 1 else ScreenKind.AUTO_T
     screen_key = kind.value
@@ -245,16 +245,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
               "value": parse_qty(w["target"].get())}, "목표진입량")
 
     def toggle_run(block: str, index: int) -> None:
+        # 기준값은 자유 입력 — 0 기준 경고창 제거 (사용자 확정 2026-07-24)
         w = set_widgets[(block, index)]
         turning_on = not w["running"]
         if turning_on:
-            value = parse_threshold(w["threshold"].get())
-            if value is not None and (
-                (block == "entry" and value <= 0) or (block == "exit" and value >= 0)
-            ) and not messagebox.askokcancel(
-                "경고", ("낮은수치" if block == "entry" else "높은수치")
-                + " — 계속하시겠습니까?"):
-                return
             send_set_inputs(block, index)
 
         def on_result(result: dict[str, Any] | None) -> None:
