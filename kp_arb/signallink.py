@@ -1,8 +1,8 @@
 """SignalLinkSink — Dalin broadcast(ChatComm.pas) 호환 노출 전송 채널.
 
 프로토콜(델파이 원본 실측):
-- **피어 발견**: UDP 8888 브로드캐스트. HELLO = "HELLO\\t인스턴스ID\\t이름\\tTCP포트",
-  BYE = "BYE\\t인스턴스ID". 15초 무응답 피어 제거. 우리도 5초마다 HELLO 브로드캐스트.
+- **피어 발견**: UDP 9999 브로드캐스트(Dalin 8888과 분리). HELLO = "HELLO\\t인스턴스ID\\t
+  이름\\tTCP포트", BYE = "BYE\\t인스턴스ID". 15초 무응답 피어 제거. 5초마다 HELLO 방송.
 - **전송**: 발견된 각 피어의 IP:TCP포트로 TCP 접속 → "인스턴스ID\\t이름\\t<JSON>\\n" 후 끊음.
 - JSON = {"id","fx","total_domestic","total_coin","token","datetime"} — total_coin/
   total_domestic은 정수(Cardinal), fx는 소수, id="sig-YYYYMMDD-NNN"(일별 3자리 시퀀스).
@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 from .fx_reporter import Signal
 
-UDP_PORT = 8888
+UDP_PORT = 9999  # 발견 포트 — Dalin(8888)과 분리해 수신측이 섞이지 않게 (사용자 확정)
 BROADCAST_IP = "255.255.255.255"
 HEARTBEAT_S = 5.0
 PEER_TIMEOUT_S = 15.0
