@@ -2,6 +2,9 @@
 rem build standalone distribution (no python needed on target PC)
 rem output: dist\kp-arb\  -> copy that folder to the target PC
 cd /d "%~dp0"
+rem stop running exes so PyInstaller can overwrite locked files in _internal
+taskkill /F /IM kp-arb-core.exe >nul 2>&1
+taskkill /F /IM kp-arb.exe >nul 2>&1
 ".venv\Scripts\python.exe" -m pip install pyinstaller
 ".venv\Scripts\python.exe" -m PyInstaller --noconfirm kp_arb.spec
 if errorlevel 1 (
