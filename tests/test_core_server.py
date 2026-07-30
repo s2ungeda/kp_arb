@@ -185,3 +185,16 @@ def test_legacy_per_order_qty_migrates(tmp_path: Path) -> None:
     restored = load_state(path)
     screen = restored.screens[ScreenKind.AUTO_M]
     assert screen.entry_per_qty == 7 and screen.exit_per_qty == 7
+
+
+def test_base_dir_dev_vs_frozen(monkeypatch) -> None:
+    import sys
+    from pathlib import Path
+
+    from kp_arb.core_server import _base_dir
+
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    assert _base_dir().name == "kp-arb" or _base_dir().is_dir()  # 개발: 프로젝트 루트
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", r"C:\dist\kp-arb\kp-arb-core.exe")
+    assert _base_dir() == Path(r"C:\dist\kp-arb")  # 배포: exe 옆

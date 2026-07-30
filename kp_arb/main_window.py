@@ -17,7 +17,10 @@ from pathlib import Path
 from .core_client import core_request
 
 # 메인 화면 마지막 상태(코어 실행 여부·띄운 화면 목록) — gitignore
-UI_STATE_PATH = Path(__file__).resolve().parent.parent / "ui_state.json"
+# 배포판(exe)은 실행파일 옆, 개발은 프로젝트 루트 (frozen에서 _internal 안 방지)
+_BASE_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+             else Path(__file__).resolve().parent.parent)
+UI_STATE_PATH = _BASE_DIR / "ui_state.json"
 
 
 def core_alive() -> bool:

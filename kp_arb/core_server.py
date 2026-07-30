@@ -40,8 +40,23 @@ if TYPE_CHECKING:
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
+
+
+def _base_dir() -> Path:
+    """상태·로그를 둘 기준 폴더. 배포판(exe)은 실행파일 옆, 개발은 프로젝트 루트.
+
+    frozen에서 __file__ 기준을 쓰면 _internal 안에 파일이 생겨 배포 폴더 복사가
+    막힌다(로그 잠김). 그래서 exe일 때는 sys.executable 옆을 쓴다.
+    """
+    import sys
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
 # 입력값 저장 파일 (§6.2-0 상태 저장) — gitignore, 명령마다 갱신
-STATE_PATH = Path(__file__).resolve().parent.parent / "core_state.json"
+STATE_PATH = _base_dir() / "core_state.json"
 
 
 def snapshot(state: CoreState) -> dict[str, Any]:
@@ -267,7 +282,7 @@ def _setup_logging() -> logging.Logger:
     """콘솔 + logs/core_날짜.log 파일 로그 (7-3a — 판정·발주 추적용)."""
     import time
 
-    log_dir = Path(__file__).resolve().parent.parent / "logs"
+    log_dir = _base_dir() / "logs"
     try:
         log_dir.mkdir(exist_ok=True)
         file_handler: logging.Handler = logging.FileHandler(
