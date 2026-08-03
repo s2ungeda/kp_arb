@@ -17,6 +17,7 @@ import sys
 from collections.abc import Callable
 from typing import Any
 
+from . import win_state
 from .core_client import core_request, watch_parent_exit
 from .strategy_core import OPERATING_WINDOWS, ScreenKind
 
@@ -88,6 +89,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     root = tk.Tk()
     root.title(f"kp-arb {TITLES[kind]}")
     root.resizable(False, False)
+    win_state.attach(root, screen_key)  # 마지막 창 위치 복원·저장
     root.option_add("*Font", ("Malgun Gothic", 9))
     # 입력 제한 — 키 입력마다 검사해 글자·특수기호를 막는다
     vcmd_int = (root.register(is_int_text), "%P")

@@ -14,6 +14,7 @@ import threading
 import time
 from typing import Any
 
+from . import win_state
 from .core_client import core_request, watch_parent_exit
 
 
@@ -25,6 +26,7 @@ def main() -> None:
     root = tk.Tk()
     root.title("kp-arb FX 노출 감시 [v2]")  # [v2]=뒷단 스레드 수정본 (옛 창 구분용)
     root.geometry("560x460")
+    win_state.attach(root, "fx_monitor")  # 마지막 창 위치 복원·저장
     root.option_add("*Font", ("Malgun Gothic", 9))
 
     # 명령 전송은 뒷단 스레드로 — 화면 스레드에서 네트워크 하면 창이 언다(CLAUDE.md)

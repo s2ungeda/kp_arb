@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+from . import win_state
 from .domain.enums import Account, Instrument, Underlying
 from .domain.models import Quote
 from .etf_theory import disparity_pct
@@ -235,6 +236,7 @@ def main() -> None:
     root = tk.Tk()
     root.title("kp-arb 시세")
     root.geometry("760x600")
+    win_state.attach(root, "monitor")  # 마지막 창 위치 복원·저장
     font = ("Malgun Gothic", 9)
 
     # 항상 위 — 창이 커져서 기본은 해제, 필요할 때 체크로 켠다.
