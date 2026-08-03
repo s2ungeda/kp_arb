@@ -13,6 +13,8 @@ if errorlevel 1 (
     exit /b 1
 )
 copy /Y config.yaml "dist\kp-arb\" >nul
+rem ship config .env template (no secrets; secrets go to keyring via keys.bat)
+copy /Y .env.example "dist\kp-arb\.env" >nul
 rem key registration shortcut for the target PC (double-click)
 (
     echo @echo off
@@ -20,5 +22,5 @@ rem key registration shortcut for the target PC (double-click)
 ) > "dist\kp-arb\keys.bat"
 echo.
 echo build complete: dist\kp-arb\
-echo copy that folder (plus your .env) to the target PC and run kp-arb.exe
+echo copy that folder to the target PC and run kp-arb.exe (edit .env if needed)
 pause
