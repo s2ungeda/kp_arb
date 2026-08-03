@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import defaultdict, deque
 from collections.abc import Callable
 from typing import Any, Protocol
@@ -21,6 +22,35 @@ from .ls_auth import TokenManager
 
 DEFAULT_DAILY_CAP = 5_000
 DEFAULT_PER_SECOND = 2  # 조회 TR 기본 초당 한도
+
+_log = logging.getLogger(__name__)
+
+# 로그에 남길 때 마스킹할 비밀 필드(요청 본문 안의 비번). 계좌번호는 마스킹 안 함(대조용).
+_SECRET_BODY_KEYS = frozenset({"Pwd", "InptPwd", "passwd"})
+
+
+def _mask_secret(value: str) -> str:
+    """비번을 로그용으로 마스킹 — 평문 금지(CLAUDE.md §5). 길이·앞뒤 1글자만 노출해
+    "1004인지 다른 값인지" 대조만 가능하게 한다. (순수 함수)"""
+    if not value:
+        return "<빈값>"
+    if len(value) <= 2:
+        return "*" * len(value) + f"(len={len(value)})"
+    return f"{value[0]}{'*' * (len(value) - 2)}{value[-1]}(len={len(value)})"
+
+
+def mask_secrets(body: Any) -> Any:
+    """요청 본문을 로그에 남기기 안전한 형태로 — 비번 필드만 마스킹하고 계좌번호 등
+    나머지는 그대로 둔다. 중첩된 ``{TR}InBlock`` 구조도 재귀 처리. (순수 함수)"""
+    if isinstance(body, dict):
+        return {
+            k: (_mask_secret(v) if k in _SECRET_BODY_KEYS and isinstance(v, str)
+                else mask_secrets(v))
+            for k, v in body.items()
+        }
+    if isinstance(body, list):
+        return [mask_secrets(x) for x in body]
+    return body
 
 
 class RateLimitError(RuntimeError):
@@ -149,6 +179,15 @@ class LSRestClient:
                 last_exc = exc
             else:
                 if resp.status_code < 500:
+                    # 거부 응답(rsp_cd가 "00"으로 시작 안 함)이면 보낸 본문을 남긴다
+                    # — 계좌번호·비번(마스킹)을 눈으로 대조하려는 목적.
+                    rsp_cd = resp.body.get("rsp_cd")
+                    if rsp_cd is not None and not str(rsp_cd).startswith("00"):
+                        _log.warning(
+                            "LS %s 거부(rsp_cd=%s): %s | 보낸본문=%s",
+                            tr_cd, rsp_cd, resp.body.get("rsp_msg"),
+                            mask_secrets(body),
+                        )
                     return resp
                 last_exc = RestError(f"server error {resp.status_code} for {tr_cd}")
 

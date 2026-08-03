@@ -11,6 +11,7 @@ from kp_arb.gateways.ls_rest import (
     RestError,
     RestResponse,
     build_headers,
+    mask_secrets,
 )
 
 BASE_URL = "https://openapi.ls-sec.co.kr:8080"
@@ -200,3 +201,51 @@ async def test_raises_after_retries_exhausted() -> None:
     with pytest.raises(RestError):
         await client.request("Q")
     assert transport.calls == 3
+
+
+# --- 로그용 비밀 마스킹 (순수 함수) ---
+
+
+def test_mask_secrets_masks_password_keeps_account() -> None:
+    body = {"CSPAQ22200InBlock1": {"AcntNo": "20142871001", "Pwd": "1004"}}
+    masked = mask_secrets(body)
+    inner = masked["CSPAQ22200InBlock1"]
+    assert inner["AcntNo"] == "20142871001"   # 계좌번호는 그대로(대조용)
+    assert inner["Pwd"] == "1**4(len=4)"      # 비번은 평문 아님
+    assert "1004" not in repr(masked)         # 평문 유출 없음
+
+
+def test_mask_secrets_flat_short_and_nonstr() -> None:
+    flat = mask_secrets({"AcntNo": "20142871001", "InptPwd": "12", "qty": 5})
+    assert flat["AcntNo"] == "20142871001"
+    assert flat["InptPwd"] == "**(len=2)"     # 2자 이하는 앞뒤 노출 안 함
+    assert flat["qty"] == 5                     # 비문자열은 그대로
+    assert mask_secrets({"passwd": ""})["passwd"] == "<빈값>"
+
+
+class RejectingTransport:
+    """거부 rsp_cd를 돌려주는 mock — 계좌비번 오류(03669) 재현."""
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any] | None,
+    ) -> RestResponse:
+        return RestResponse(
+            status_code=200,
+            body={"rsp_cd": "03669", "rsp_msg": "비밀번호 오류입니다."},
+        )
+
+
+async def test_rejection_logs_masked_body(caplog: pytest.LogCaptureFixture) -> None:
+    client = _client(RejectingTransport(), FakeClock())
+    body = {"CSPAQ22200InBlock1": {"AcntNo": "20142871001", "Pwd": "1004"}}
+    with caplog.at_level("WARNING"):
+        resp = await client.request("CSPAQ22200", body, path="/stock/accno")
+    assert resp.body["rsp_cd"] == "03669"
+    text = caplog.text
+    assert "20142871001" in text and "03669" in text  # 계좌번호·코드는 보임
+    assert "1004" not in text                          # 비번 평문은 로그에 없음
+    assert "1**4(len=4)" in text                        # 마스킹된 형태로만
