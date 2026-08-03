@@ -5,6 +5,7 @@ from kp_arb.config import (
     ChainedSecrets,
     ConfigError,
     EnvSecrets,
+    KeyringSecrets,
     LSAccount,
     LSAccounts,
     RunMode,
@@ -37,6 +38,8 @@ class MockSecrets:
 
 def test_current_mode_default_paper(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("KP_MODE", raising=False)
+    # keyring도 비워야 진짜 기본값 검증(실행 PC의 keyring에 KP_MODE가 있어도 무관하게).
+    monkeypatch.setattr(KeyringSecrets, "get", lambda self, name: None)
     assert current_mode() is RunMode.PAPER  # 안전 기본값
 
 
