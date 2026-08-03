@@ -122,7 +122,10 @@ class LSApiGateway(LSGateway):
             cred = accounts.for_account(account)
             tokens = TokenManager(cred.appkey, cred.appsecret, token_transport, now=now)
             limiter = RateLimiter(now=now)
-            rest_by_account[account] = LSRestClient(base_url, tokens, rest_transport, limiter)
+            # 재시도에 지수 백오프 — LS 서버가 가끔 뱉는 일시적 500을 텀 없는 3연속
+            # 재시도로는 못 벗어난다. 0.3s→0.6s 간격을 줘 순간 500이 지나가면 회복.
+            rest_by_account[account] = LSRestClient(
+                base_url, tokens, rest_transport, limiter, backoff_base_s=0.3)
         return cls(rest_by_account, accounts=accounts,
                    futures_symbols=futures_symbols, etf_symbols=etf_symbols)
 
