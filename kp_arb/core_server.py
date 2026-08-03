@@ -304,7 +304,9 @@ async def _serve() -> None:
     try:
         from dotenv import load_dotenv
 
-        load_dotenv()
+        # exe 옆(_base_dir)의 .env를 명시적으로 읽는다 — 배포판은 cwd가 exe 폴더가
+        # 아닐 수 있어 인자 없는 load_dotenv()로는 못 찾을 수 있다. 파일 없으면 조용히 무시.
+        load_dotenv(_base_dir() / ".env")
     except ImportError:
         pass
     state = load_state(STATE_PATH)  # 마지막 입력값 복원 (실행 상태는 항상 꺼짐)
