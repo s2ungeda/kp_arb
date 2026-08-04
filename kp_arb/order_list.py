@@ -107,8 +107,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     status.pack(fill="x", padx=6, pady=(2, 6))
 
-    # 클릭한 미체결 가격을 정정가 칸에 채워두면 정정이 편하다.
+    # 미체결 선택 시, 정정가 칸이 **비어 있을 때만** 현재가를 채운다(편의). 이미 입력한
+    # 값이 있으면 덮지 않는다 — 가격 먼저 치고 주문을 골라도 입력이 안 날아가게.
     def on_select(_e: Any) -> None:
+        if e_price.get().strip():
+            return
         sel = orders.selection()
         if not sel:
             return
