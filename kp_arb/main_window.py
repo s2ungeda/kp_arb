@@ -22,6 +22,34 @@ _BASE_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", Fal
              else Path(__file__).resolve().parent.parent)
 UI_STATE_PATH = _BASE_DIR / "ui_state.json"
 
+_MUTEX_HANDLES: list[int] = []  # 단일 인스턴스 뮤텍스 핸들 유지(프로세스 수명 동안)
+
+
+def _ensure_single_instance() -> bool:
+    """메인이 이미 떠 있으면 False(두 번째 실행 차단). Windows 네임드 뮤텍스 — 프로세스가
+    끝나면 OS가 자동 해제하므로 스테일 락 걱정이 없다. win32 외엔 항상 True(막지 않음)."""
+    if sys.platform != "win32":
+        return True
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.CreateMutexW(None, False, "kp-arb-main-window")
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        if handle:
+            kernel32.CloseHandle(handle)
+        return False
+    _MUTEX_HANDLES.append(handle)  # 닫지 않고 유지 → 종료 시 OS가 해제
+    return True
+
+
+def _warn_already_running() -> None:
+    """이미 실행 중임을 알린다(win32 메시지박스)."""
+    if sys.platform == "win32":
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(
+            0, "kp-arb 메인이 이미 실행 중입니다.", "kp-arb", 0x40)
+
 
 def core_alive() -> bool:
     """코어 생존 확인 — /state 응답 여부."""
@@ -86,6 +114,9 @@ def launch_module(module: str, *args: str, console: bool = False,
 
 def main() -> None:
     """메인 창 실행."""
+    if not _ensure_single_instance():  # 중복 실행 차단 — 이미 떠 있으면 알림 후 종료
+        _warn_already_running()
+        return
     import threading
     import time
     import tkinter as tk
