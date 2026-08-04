@@ -378,24 +378,37 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             bal_val["청산가"].config(text=_fmt_px(sym.get("liq"), dec))
             if mode_var.get() == "hoga":
                 _set_hoga_price(sym, dec)
-            _fill_hoga(sym, dec)
+            # 내 미체결이 있는 호가에 "(건수)" 표시 — 활성 종목 미체결을 가격별 집계
+            my_ords: dict[str, int] = {}
+            for o in (state_box["data"] or {}).get("open_orders") or []:
+                if (o.get("underlying") == active["underlying"]
+                        and o.get("instrument") == INSTRUMENT):
+                    ps = _fmt_px(o.get("price"), dec)
+                    my_ords[ps] = my_ords.get(ps, 0) + 1
+            _fill_hoga(sym, dec, my_ords)
         except Exception:  # noqa: BLE001 - 갱신 오류로 창이 죽지 않게 (버벅임 방지)
             pass
         _reschedule(refresh, 400)
 
-    def _fill_hoga(sym: dict[str, Any], dec: int) -> None:
+    def _fill_hoga(sym: dict[str, Any], dec: int, my_ords: dict[str, int]) -> None:
         asks = list(sym.get("asks") or [])[:8]
         bids = list(sym.get("bids") or [])[:8]
         last = sym.get("last")
         last_s = _fmt_px(last, dec) if last is not None else None
+
+        def _qcell(price_s: str, qty: Any) -> str:  # "(건수) 잔량" — 내 미체결 있으면
+            qs = _fmt_qty(qty)
+            n = my_ords.get(price_s)
+            return f"({n}) {qs}" if n else qs
+
         # 매도(파랑) 위 → 매수(빨강) 아래. 현재가와 같은 호가만 노랑 바탕(별도 현재가 행 없음).
         draw: list[tuple[str, Any, Any]] = []
         for p, q in reversed(asks):
             ps = _fmt_px(p, dec)
-            draw.append(("cur" if ps == last_s else "ask", ps, _fmt_qty(q)))
+            draw.append(("cur" if ps == last_s else "ask", ps, _qcell(ps, q)))
         for p, q in bids:
             ps = _fmt_px(p, dec)
-            draw.append(("cur" if ps == last_s else "bid", ps, _fmt_qty(q)))
+            draw.append(("cur" if ps == last_s else "bid", ps, _qcell(ps, q)))
         if _hoga_signature(draw) == state_box.get("_hsig"):
             return
         state_box["_hsig"] = _hoga_signature(draw)
