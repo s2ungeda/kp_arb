@@ -46,7 +46,11 @@ def _auto_running() -> bool:
 def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
     """실행 명령 구성 — 개발(파이썬)과 배포판(exe, app.py 분기)을 모두 지원."""
     if not getattr(sys, "frozen", False):
-        return [sys.executable, "-m", module, *args]
+        # 자식은 콘솔 있는 python.exe로 띄우고 창은 CREATE_NO_WINDOW로 숨긴다. 메인이
+        # pythonw로 뜨면 sys.executable=pythonw라 자식 stdout이 None이 되어 불안정 →
+        # python.exe로 교체(콘솔은 여전히 안 보임, stdout은 유효).
+        exe = sys.executable.replace("pythonw.exe", "python.exe")
+        return [exe, "-m", module, *args]
     exe_dir = Path(sys.executable).parent
     if module == "kp_arb.core_server":
         return [str(exe_dir / "kp-arb-core.exe"), "core"]
@@ -54,24 +58,29 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "kp-arb.exe"), "monitor"]
     if module == "kp_arb.fx_monitor":
         return [str(exe_dir / "kp-arb.exe"), "fx_monitor"]
+    if module == "kp_arb.order_hl":
+        return [str(exe_dir / "kp-arb.exe"), "order_hl"]
     if module == "kp_arb.order_panel":
         return [str(exe_dir / "kp-arb.exe"), *args]  # autoT | autoM
     return [str(exe_dir / "kp-arb.exe")]
 
 
-def launch_module(module: str, *args: str, console: bool = False) -> subprocess.Popen[bytes]:
+def launch_module(module: str, *args: str, console: bool = False,
+                  watch_parent: bool | None = None) -> subprocess.Popen[bytes]:
     """모듈(또는 배포판 exe)을 별도 프로세스로 실행.
 
-    화면은 콘솔 숨김(CREATE_NO_WINDOW — cmd 창 안 뜸), 코어만 새 콘솔(로그 확인용).
-    자식 화면엔 메인 PID를 넘겨(KP_PARENT_PID) 메인이 죽으면 스스로 닫히게 한다.
+    콘솔 숨김(CREATE_NO_WINDOW — cmd 창 안 뜸)이 기본. 코어도 콘솔 없이 띄우고 로그는
+    파일(logs/core_날짜.log)로만 남긴다. 자식 화면엔 메인 PID를 넘겨(KP_PARENT_PID)
+    메인이 죽으면 스스로 닫히게 한다 — 단 코어는 독립 유지(watch_parent=False).
     """
     flags = 0
     if sys.platform == "win32":
         flags = (subprocess.CREATE_NEW_CONSOLE if console
                  else subprocess.CREATE_NO_WINDOW)
-    env = None
-    if not console:  # 코어는 독립 유지, 화면들만 메인 생사에 연동
-        env = {**os.environ, "KP_PARENT_PID": str(os.getpid())}
+    if watch_parent is None:
+        watch_parent = not console  # 콘솔 없는 화면은 메인 생사 감시(고아 방지)
+    env = ({**os.environ, "KP_PARENT_PID": str(os.getpid())}
+           if watch_parent else None)
     return subprocess.Popen(launch_command(module, args), creationflags=flags, env=env)
 
 
@@ -131,7 +140,7 @@ def main() -> None:
         if core_alive():
             status.config(text="코어가 이미 떠 있음")
             return
-        launch_module("kp_arb.core_server", console=True)
+        launch_module("kp_arb.core_server", console=False, watch_parent=False)
         status.config(text="코어 시작 중 ...")
 
     def stop_core() -> None:
@@ -153,6 +162,8 @@ def main() -> None:
                          command=lambda: open_screen("kp_arb.monitor"))
     m_screen.add_command(label="FX 노출 감시",
                          command=lambda: open_screen("kp_arb.fx_monitor"))
+    m_screen.add_command(label="HL 일반주문 (수동)",
+                         command=lambda: open_screen("kp_arb.order_hl"))
     menubar.add_cascade(label="화면", menu=m_screen)
     m_core = tk.Menu(menubar, tearoff=0)
     m_core.add_command(label="코어 시작", command=start_core)
@@ -175,7 +186,7 @@ def main() -> None:
 
     # --- 코어는 메인과 함께 시작 (사용자 확정 2026-07-24) ---
     if not core_alive():
-        launch_module("kp_arb.core_server", console=True)
+        launch_module("kp_arb.core_server", console=False, watch_parent=False)
         status.config(text="코어 시작 중 ...")
     screens = [m for m in saved.get("screens", [])
                if isinstance(m, str) and m.startswith("kp_arb.")]

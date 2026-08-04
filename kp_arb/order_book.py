@@ -206,3 +206,9 @@ class OrderBook:
         """signed 수량(롱 +, 숏 -). 없으면 0."""
         pos = self._positions.get((underlying, instrument, account))
         return pos.qty if pos is not None else 0.0
+
+    def avg_price(self, underlying: Underlying, instrument: Instrument,
+                  account: Account | None = None) -> float:
+        """보유 평균단가. 없으면 0."""
+        pos = self._positions.get((underlying, instrument, account))
+        return pos.avg_price if pos is not None else 0.0

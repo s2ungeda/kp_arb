@@ -1,0 +1,387 @@
+"""HL 일반 주문창 (수동) — 코어 클라이언트 (DESIGN-manual-order.md §6.3).
+
+Hyperliquid perp 전용 수동 주문창(LS는 별도 화면 `order_ls`). 델파이 원본 레이아웃 —
+좌(입력+잔고) / 우(호가창) 2분할. 지정가만. 화면은 명령·표시만, 판단·주문은 코어.
+**화면 스레드 네트워크 금지** — 전송·폴링은 뒷단 스레드 + 큐, 화면은 결과만 after()로 읽는다.
+코어 명령(manual_order/amend/cancel/hl_merge/refresh)·스냅샷(/manual_state)은 LS 창과 공용.
+"""
+from __future__ import annotations
+
+import queue
+from typing import Any
+
+from . import win_state
+from .core_client import core_request, watch_parent_exit
+from .order_panel import UNDER_MAP, is_decimal_text
+
+INSTRUMENT = "hl_perp"  # 이 창은 HL perp 전용
+UNDERLYINGS = ("삼성", "하이닉스", "현대차")
+# HL 호가단위 머지 → (n_sig_figs, mantissa) — 시세 모니터와 동일 (원시=서버 기본 틱)
+HL_MERGE: dict[str, tuple[int | None, int | None]] = {
+    "원시": (None, None), "2배": (5, 2), "5배": (5, 5), "10배": (4, None), "100배": (3, None)}
+
+
+def _fmt(v: Any, digits: int = 0) -> str:
+    """수량·금액 표시 — None은 '-', 천단위 콤마."""
+    if v is None:
+        return "-"
+    try:
+        return f"{float(v):,.{digits}f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _fmt_qty(v: Any) -> str:
+    """수량 표시 — HL은 소수(0.179), 정수면 정수. 소수부 있으면 표시(끝 0 제거)."""
+    if v is None:
+        return "-"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f == int(f):
+        return f"{f:,.0f}"
+    return f"{f:,.3f}".rstrip("0").rstrip(".")
+
+
+def _fmt_px(v: Any, decimals: int | None = None) -> str:
+    """가격 표시 — decimals 주면 그 자리수로 통일(호가 정렬용), 없으면 소수부 유무로 자동."""
+    if v is None:
+        return "-"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if decimals is not None:
+        return f"{f:,.{decimals}f}"
+    if f == int(f):
+        return f"{f:,.0f}"
+    return f"{f:,.4f}".rstrip("0").rstrip(".")
+
+
+def _hl_decimals(price: Any) -> int:
+    """HL 가격 소수 자리수 — 유효숫자 5자리 규칙(정수부 자리수 기준). 종목별 사실상 고정
+    이라 호가가 바뀌어도 소수점이 흔들리지 않는다. price None/이상은 2로."""
+    try:
+        p = abs(float(price))
+    except (TypeError, ValueError):
+        return 2
+    digits = len(str(int(p))) if p >= 1 else 1
+    return max(0, 5 - digits)
+
+
+def _hoga_signature(rows: list[tuple[Any, ...]]) -> tuple[Any, ...]:
+    """호가 다시그리기 판단용 — (구분, 가격, 잔량)."""
+    return tuple((tag, price, qty) for tag, price, qty in rows)
+
+
+def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
+    """HL 일반 주문창 실행."""
+    import threading
+    import time
+    import tkinter as tk
+    from tkinter import ttk
+
+    watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
+    root = tk.Tk()
+    root.title("kp-arb HL 일반주문")
+    root.resizable(False, False)
+    win_state.attach(root, "order_hl")
+    root.option_add("*Font", ("Malgun Gothic", 9))
+    vcmd_dec = (root.register(is_decimal_text), "%P")  # HL은 수량·가격 모두 소수 허용
+
+    # --- 명령 전송: 큐 → 전송 스레드 → 결과 큐 → 화면 루프 ---
+    jobs: queue.Queue[tuple[dict[str, Any], str]] = queue.Queue()
+    results: queue.Queue[tuple[str, dict[str, Any] | None]] = queue.Queue()
+
+    def sender() -> None:
+        while True:
+            payload, label = jobs.get()
+            # 주문/정정/취소는 HL REST 왕복이라 느릴 수 있다 — 타임아웃을 넉넉히(10s).
+            # 짧으면 성공해도 '코어 미접속'으로 오인해 중복주문 위험.
+            results.put((label, core_request("/command", payload, timeout=10.0)))
+
+    threading.Thread(target=sender, daemon=True).start()
+
+    def send(payload: dict[str, Any], label: str) -> None:
+        jobs.put((payload, label))
+
+    # --- 상태 폴링: /manual_state → state_box (화면은 읽기만) ---
+    state_box: dict[str, Any] = {"data": None}
+
+    def poller() -> None:
+        while True:
+            state_box["data"] = core_request("/manual_state", timeout=2.0)
+            time.sleep(0.5)
+
+    threading.Thread(target=poller, daemon=True).start()
+
+    # ===== 좌(입력+잔고) / 우(호가창) 2분할 =====
+    top = tk.Frame(root)
+    top.pack(side="top", fill="both", padx=4, pady=4)
+    left = tk.Frame(top)
+    left.pack(side="left", anchor="n")
+    right = tk.Frame(top)
+    right.pack(side="left", anchor="n", padx=(6, 0))
+
+    def _row() -> tk.Frame:
+        f = tk.Frame(left)
+        f.pack(fill="x", pady=1)
+        return f
+
+    # 종목
+    r = _row()
+    tk.Label(r, text="HL", fg="gray25").pack(side="left")
+    cb_under = ttk.Combobox(r, values=UNDERLYINGS, width=7, state="readonly")
+    cb_under.set("삼성")
+    cb_under.pack(side="left", padx=(4, 0))
+
+    # 매수/매도 + '적'(종목 적용·조회) — 같은 줄
+    r = _row()
+    side_var = tk.StringVar(value="buy")
+    tk.Radiobutton(r, text="매수", variable=side_var, value="buy",
+                   fg="#c00000").pack(side="left")
+    tk.Radiobutton(r, text="매도", variable=side_var, value="sell",
+                   fg="#0000c0").pack(side="left", padx=(4, 0))
+    btn_apply = tk.Button(r, text="적", width=3)
+    btn_apply.pack(side="left", padx=(10, 0))
+
+    # 수량
+    r = _row()
+    tk.Label(r, text="수량", width=4, anchor="w").pack(side="left")
+    e_qty = tk.Entry(r, width=13, justify="right", validate="key",
+                     validatecommand=vcmd_dec)  # HL 수량은 소수 허용
+    e_qty.pack(side="left")
+    # 단가
+    r = _row()
+    tk.Label(r, text="단가", width=4, anchor="w").pack(side="left")
+    e_price = tk.Entry(r, width=13, justify="right", validate="key",
+                       validatecommand=vcmd_dec)
+    e_price.pack(side="left")
+
+    # 호가/가격 모드 + 틱
+    r = _row()
+    mode_var = tk.StringVar(value="price")  # "hoga" | "price"
+    tk.Radiobutton(r, text="호가", variable=mode_var, value="hoga").pack(side="left")
+    tk.Radiobutton(r, text="가격", variable=mode_var, value="price").pack(side="left")
+    tk.Label(r, text="틱").pack(side="left", padx=(6, 1))
+    tick_var = tk.IntVar(value=0)
+    tk.Spinbox(r, from_=-20, to=20, width=3, textvariable=tick_var,
+               justify="right").pack(side="left")
+
+    # Reduce / Post
+    r = _row()
+    reduce_var = tk.BooleanVar(value=False)
+    post_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(r, text="Reduce", variable=reduce_var).pack(side="left")
+    tk.Checkbutton(r, text="Post", variable=post_var).pack(side="left")
+
+    # 큰 주문 버튼
+    btn_order = tk.Button(left, text="매수 주문", height=2,
+                          fg="#c00000", font=("Malgun Gothic", 11, "bold"))
+    btn_order.pack(fill="x", pady=(3, 4))
+
+    # 잔고표 (HL — 매도가능 없음)
+    bal = tk.Frame(left, relief="groove", bd=1)
+    bal.pack(fill="x")
+    bal_rows = ("보유수량", "평가금액", "주문가능", "평가손익", "평균단가", "청산가")
+    bal_val: dict[str, tk.Label] = {}
+    for i, name in enumerate(bal_rows):
+        tk.Label(bal, text=name, width=7, anchor="w").grid(
+            row=i, column=0, sticky="w", padx=3)
+        v = tk.Label(bal, text="-", width=13, anchor="e")
+        v.grid(row=i, column=1, sticky="e", padx=3)
+        bal_val[name] = v
+
+    # 우: 호가단위 머지(오더북 위) + 호가창(헤더 없음 — 색으로 매도/매수 구분)
+    merge_row = tk.Frame(right)
+    merge_row.pack(fill="x", pady=(0, 2))
+    tk.Label(merge_row, text="호가단위").pack(side="left")
+    cb_merge = ttk.Combobox(merge_row, values=list(HL_MERGE), width=5,
+                            state="readonly")
+    cb_merge.set("원시")
+    cb_merge.pack(side="left", padx=(4, 0))
+    hoga = ttk.Treeview(right, columns=("price", "qty"), show="",
+                        height=17, selectmode="browse")
+    hoga.column("price", width=95, anchor="e")
+    hoga.column("qty", width=95, anchor="e")
+    hoga.tag_configure("ask", background="#e8eeff", foreground="#0000c0")
+    hoga.tag_configure("bid", background="#ffeef0", foreground="#c00000")
+    hoga.tag_configure("cur", background="#fff6b0")
+    hoga.pack()
+
+    # 상태바
+    status = tk.Label(root, text="-", anchor="w", relief="groove")
+    status.pack(side="top", fill="x", padx=4, pady=(0, 4))
+
+    def set_status(text: str, err: bool = False) -> None:
+        status.config(text=text, fg="#8b0000" if err else "black")
+
+    # ===== 동작 =====
+    def sym_key() -> str:
+        return f"{UNDER_MAP[cb_under.get()]}|{INSTRUMENT}"
+
+    # '적'으로 활성화한 종목만 하단 표시·주문 (콤보만 바꾼다고 안 바뀜 — 델파이 SetSymbol)
+    active: dict[str, Any] = {"key": None, "underlying": None, "name": None}
+
+    def active_symbol() -> dict[str, Any]:
+        if active["key"] is None:
+            return {}
+        data = state_box["data"] or {}
+        return ((data.get("symbols") or {}).get(active["key"])) or {}
+
+    def do_apply() -> None:
+        active.update(key=sym_key(), underlying=UNDER_MAP[cb_under.get()],
+                      name=cb_under.get())
+        send({"cmd": "manual_refresh"}, "적용·조회")  # 잔고/포지션 재조회(OrderBook 재동기)
+        refresh_side()
+        set_status(f"{cb_under.get()} 적용 — 조회 중")
+
+    def do_order() -> None:
+        if active["underlying"] is None:
+            set_status("먼저 '적'으로 종목을 적용하세요", err=True)
+            return
+        try:
+            qty = float(e_qty.get().strip())  # HL은 소수 수량 허용
+        except ValueError:
+            qty = 0.0
+        if qty <= 0:
+            set_status("수량을 입력하세요", err=True)
+            return
+        price = e_price.get().strip()
+        if not price:
+            set_status("지정가는 단가를 입력하세요", err=True)
+            return
+        send({
+            "cmd": "manual_order", "instrument": INSTRUMENT,
+            "underlying": active["underlying"], "side": side_var.get(),
+            "order_type": "limit", "qty": qty, "price": float(price),
+            "reduce_only": reduce_var.get(), "post_only": post_var.get(),
+        }, "주문")
+
+    def on_hoga_click(_e: Any) -> None:
+        # 가격모드에서만 — 클릭한 오더북 가격을 단가에 그대로(틱 없음).
+        if mode_var.get() != "price":
+            return
+        sel = hoga.selection()
+        if not sel:
+            return
+        vals = hoga.item(sel[0], "values")
+        if len(vals) < 1 or vals[0] in ("", "-"):
+            return
+        e_price.delete(0, "end")
+        e_price.insert(0, str(vals[0]).replace(",", ""))
+
+    hoga.bind("<<TreeviewSelect>>", on_hoga_click)
+
+    def _set_hoga_price(sym: dict[str, Any], dec: int) -> None:
+        # 호가모드: 매수=매수호가+틱 / 매도=매도호가+틱 (자동, 시세 따라 갱신).
+        buy = side_var.get() == "buy"
+        levels = sym.get("bids") if buy else sym.get("asks")
+        if not levels:
+            return
+        tick = 10.0 ** (-dec)  # 그 종목 소수 자리수의 최소 증분
+        price = float(levels[0][0]) + tick_var.get() * tick
+        e_price.delete(0, "end")
+        e_price.insert(0, _fmt_px(price, dec).replace(",", ""))
+
+    def on_merge(_e: Any) -> None:
+        nsf, mant = HL_MERGE[cb_merge.get()]
+        send({"cmd": "manual_hl_merge", "underlying": UNDER_MAP[cb_under.get()],
+              "n_sig_figs": nsf, "mantissa": mant}, "머지")
+
+    cb_merge.bind("<<ComboboxSelected>>", on_merge)
+    btn_order.config(command=do_order)
+    btn_apply.config(command=do_apply)
+
+    def refresh_side() -> None:
+        buy = side_var.get() == "buy"
+        name = active["name"] or cb_under.get()
+        btn_order.config(text=f"{name} {'매수' if buy else '매도'} 주문",
+                         fg="#c00000" if buy else "#0000c0")
+
+    side_var.trace_add("write", lambda *_: refresh_side())
+    refresh_side()
+
+    # ===== 화면 갱신 (네트워크 없음 — 폴링 결과만 읽어 그림) =====
+    def _reschedule(fn: Any, ms: int) -> None:
+        try:
+            root.after(ms, fn)
+        except tk.TclError:
+            pass  # 창 닫힘
+
+    def drain_results() -> None:
+        try:
+            while True:
+                label, result = results.get_nowait()
+                if result is None:
+                    set_status(f"{label} 실패 — 코어 미접속", err=True)
+                elif not result.get("ok"):
+                    set_status(f"{label} 거부 — {'; '.join(result.get('errors', []))}",
+                               err=True)
+                else:
+                    oid = result.get("order_id")
+                    set_status(f"{label} 접수됨" + (f" (#{oid})" if oid else ""))
+        except queue.Empty:
+            pass
+        _reschedule(drain_results, 200)
+
+    def _ref_price(sym: dict[str, Any]) -> Any:
+        if sym.get("last") is not None:
+            return sym.get("last")
+        asks = sym.get("asks") or []
+        bids = sym.get("bids") or []
+        return (asks[0][0] if asks else None) or (bids[0][0] if bids else None)
+
+    def refresh() -> None:
+        try:
+            sym = active_symbol()
+            dec = _hl_decimals(_ref_price(sym))
+            bal_val["보유수량"].config(text=_fmt_qty(sym.get("position")))
+            bal_val["평가금액"].config(text=_fmt(sym.get("eval")))
+            bal_val["주문가능"].config(text=_fmt(sym.get("balance")))
+            bal_val["평가손익"].config(text=_fmt(sym.get("pnl"), 2))
+            bal_val["평균단가"].config(text=_fmt_px(sym.get("avg_price"), dec))
+            bal_val["청산가"].config(text=_fmt_px(sym.get("liq"), dec))
+            if mode_var.get() == "hoga":
+                _set_hoga_price(sym, dec)
+            _fill_hoga(sym, dec)
+        except Exception:  # noqa: BLE001 - 갱신 오류로 창이 죽지 않게 (버벅임 방지)
+            pass
+        _reschedule(refresh, 400)
+
+    def _fill_hoga(sym: dict[str, Any], dec: int) -> None:
+        asks = list(sym.get("asks") or [])[:8]
+        bids = list(sym.get("bids") or [])[:8]
+        last = sym.get("last")
+        last_s = _fmt_px(last, dec) if last is not None else None
+        # 매도(파랑) 위 → 매수(빨강) 아래. 현재가와 같은 호가만 노랑 바탕(별도 현재가 행 없음).
+        draw: list[tuple[str, Any, Any]] = []
+        for p, q in reversed(asks):
+            ps = _fmt_px(p, dec)
+            draw.append(("cur" if ps == last_s else "ask", ps, _fmt_qty(q)))
+        for p, q in bids:
+            ps = _fmt_px(p, dec)
+            draw.append(("cur" if ps == last_s else "bid", ps, _fmt_qty(q)))
+        if _hoga_signature(draw) == state_box.get("_hsig"):
+            return
+        state_box["_hsig"] = _hoga_signature(draw)
+        hoga.delete(*hoga.get_children())
+        for tag, ps, qs in draw:
+            hoga.insert("", "end", values=(ps, qs), tags=(tag,))
+
+    drain_results()
+    refresh()
+    while True:
+        try:
+            root.mainloop()
+            break
+        except KeyboardInterrupt:
+            try:
+                root.winfo_exists()
+            except tk.TclError:
+                break
+
+
+if __name__ == "__main__":
+    main()

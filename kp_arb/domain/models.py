@@ -55,6 +55,8 @@ class OrderIntent(BaseModel):
     order_type: OrderType = OrderType.LIMIT
     price: float | None = None
     account: Account | None = None  # LS 전용. None이면 instrument로 자동 라우팅.
+    reduce_only: bool = False       # HL 전용 — 청산전용(포지션 증가 금지). LS는 무시.
+    post_only: bool = False         # HL 전용 — 메이커 전용(tif=Alo). LS는 무시.
 
     @field_validator("qty")
     @classmethod

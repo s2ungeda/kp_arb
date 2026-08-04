@@ -1,4 +1,4 @@
 @echo off
-rem main admin window (runs with .venv python)
+rem main admin window - no console, detached
 cd /d "%~dp0"
-".venv\Scripts\python.exe" -m kp_arb.main_window
+start "" ".venv\Scripts\pythonw.exe" -m kp_arb.main_window

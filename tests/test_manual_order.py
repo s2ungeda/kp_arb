@@ -1,0 +1,272 @@
+"""수동 주문 순수 검증 로직 + 명령 핸들러 테스트 (DESIGN-manual-order.md §6.3)."""
+import asyncio
+from typing import Any
+
+from kp_arb.core_server import _ladder, _manual_command, manual_snapshot
+from kp_arb.domain.enums import Account, Instrument, Side, Underlying, Venue
+from kp_arb.domain.models import OrderIntent, Position, Quote
+from kp_arb.manual_order import (
+    is_spot_stock,
+    sellable_qty,
+    short_sale_error,
+)
+from kp_arb.order_book import OrderBook
+
+
+def test_is_spot_stock() -> None:
+    assert is_spot_stock(Instrument.KR_STOCK)
+    assert is_spot_stock(Instrument.KR_ETF)
+    assert not is_spot_stock(Instrument.KR_STOCK_FUTURE)  # 선물은 숏 허용
+    assert not is_spot_stock(Instrument.HL_PERP)
+
+
+def test_sellable_qty() -> None:
+    assert sellable_qty(100, 30) == 70          # 보유100 − 미체결매도30
+    assert sellable_qty(50, 50) == 0
+    assert sellable_qty(10, 40) == 0            # 미체결이 보유 초과 → 0(음수 방지)
+    assert sellable_qty(0, 0) == 0
+
+
+def test_short_sale_error_spot_sell() -> None:
+    # 매도가능(70) 이내면 통과
+    assert short_sale_error(Instrument.KR_STOCK, Side.SELL, 70, 70) is None
+    assert short_sale_error(Instrument.KR_STOCK, Side.SELL, 30, 70) is None
+    # 초과면 공매도 거부
+    msg = short_sale_error(Instrument.KR_STOCK, Side.SELL, 71, 70)
+    assert msg is not None and "공매도" in msg
+    # 보유 0인데 매도 → 거부
+    assert short_sale_error(Instrument.KR_STOCK, Side.SELL, 1, 0) is not None
+
+
+def test_short_sale_error_no_constraint_cases() -> None:
+    # 매수는 언제나 통과(숏 아님)
+    assert short_sale_error(Instrument.KR_STOCK, Side.BUY, 1000, 0) is None
+    # 선물·HL 매도는 숏 허용 → 통과
+    assert short_sale_error(Instrument.KR_STOCK_FUTURE, Side.SELL, 1000, 0) is None
+    assert short_sale_error(Instrument.HL_PERP, Side.SELL, 1000, 0) is None
+
+
+# --- 명령 핸들러 (_manual_command) — 가짜 LiveSystem + 실제 OrderBook ---
+
+
+class _FakeSystem:
+    """place/cancel를 기록하는 가짜 LiveSystem(라이브 API 없음)."""
+
+    def __init__(
+        self,
+        order_book: OrderBook,
+        fail: Exception | None = None,
+        quotes: dict[Any, Quote] | None = None,
+        trades: dict[Any, float] | None = None,
+    ) -> None:
+        self.order_book = order_book
+        self._fail = fail
+        self.quotes = quotes or {}
+        self.trades = trades or {}
+        self.placed: list[OrderIntent] = []
+        self.cancelled: list[str] = []
+        self.amended: list[tuple[str, float]] = []
+        self.merges: list[tuple[Underlying, int | None, int | None]] = []
+        self.refreshed = 0
+
+    async def place(self, intent: OrderIntent) -> str:
+        if self._fail is not None:
+            raise self._fail
+        self.placed.append(intent)
+        return "OID-1"
+
+    async def cancel(self, order_id: str) -> None:
+        self.cancelled.append(order_id)
+
+    async def amend_price(self, order_id: str, price: float) -> str:
+        self.amended.append((order_id, price))
+        return "OID-2"
+
+    def set_hl_aggregation(self, u: Underlying, n_sig_figs: int | None,
+                           mantissa: int | None) -> None:
+        self.merges.append((u, n_sig_figs, mantissa))
+
+    async def refresh_snapshot(self) -> None:
+        self.refreshed += 1
+
+
+def _fake_system(
+    order_book: OrderBook,
+    fail: Exception | None = None,
+    quotes: dict[Any, Quote] | None = None,
+    trades: dict[Any, float] | None = None,
+) -> Any:
+    return _FakeSystem(order_book, fail, quotes, trades)
+
+
+def _ob_samsung(held: float = 100.0) -> OrderBook:
+    ob = OrderBook()
+    ob.load_snapshot(positions=[Position(
+        venue=Venue.LS, instrument=Instrument.KR_STOCK, underlying=Underlying.SAMSUNG,
+        side=Side.BUY, qty=held, avg_price=80000, account=Account.KR_STOCK)])
+    return ob
+
+
+async def test_manual_order_hl_buy_places() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "manual_order", "instrument": "hl_perp",
+        "underlying": "samsung", "side": "buy", "order_type": "market", "qty": 5})
+    assert r["ok"] and r["order_id"] == "OID-1"
+    assert len(sys.placed) == 1 and sys.placed[0].venue is Venue.HYPERLIQUID
+
+
+async def test_manual_order_stock_sell_within_holding() -> None:
+    sys = _fake_system(_ob_samsung(100))
+    r = await _manual_command(sys, {"cmd": "manual_order", "instrument": "kr_stock",
+        "underlying": "samsung", "side": "sell", "order_type": "limit",
+        "qty": 60, "price": 80000})
+    assert r["ok"] and len(sys.placed) == 1
+
+
+async def test_manual_order_stock_short_blocked() -> None:
+    sys = _fake_system(_ob_samsung(100))
+    r = await _manual_command(sys, {"cmd": "manual_order", "instrument": "kr_stock",
+        "underlying": "samsung", "side": "sell", "order_type": "limit",
+        "qty": 150, "price": 80000})
+    assert not r["ok"] and "공매도" in r["errors"][0]
+    assert sys.placed == []
+
+
+async def test_manual_order_sell_counts_pending() -> None:
+    ob = _ob_samsung(100)
+    ob.track("PEND", OrderIntent(venue=Venue.LS, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.KR_STOCK, side=Side.SELL, qty=40, price=80000))
+    sys = _fake_system(ob)  # 매도가능 = 100 − 40 = 60
+    r = await _manual_command(sys, {"cmd": "manual_order", "instrument": "kr_stock",
+        "underlying": "samsung", "side": "sell", "order_type": "limit",
+        "qty": 61, "price": 80000})
+    assert not r["ok"] and "공매도" in r["errors"][0]
+
+
+async def test_manual_order_future_short_allowed() -> None:
+    sys = _fake_system(OrderBook())  # 보유 0이어도 선물 숏 허용
+    r = await _manual_command(sys, {"cmd": "manual_order",
+        "instrument": "kr_stock_future", "underlying": "samsung", "side": "sell",
+        "order_type": "limit", "qty": 5, "price": 80000})
+    assert r["ok"] and len(sys.placed) == 1
+
+
+async def test_manual_order_reduce_post_flags() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "manual_order", "instrument": "hl_perp",
+        "underlying": "samsung", "side": "sell", "order_type": "limit",
+        "qty": 5, "price": 1000, "reduce_only": True, "post_only": True})
+    assert r["ok"]
+    intent = sys.placed[0]
+    assert intent.reduce_only is True and intent.post_only is True
+
+
+async def test_manual_cancel_calls_system() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "manual_cancel", "order_id": "X1"})
+    assert r["ok"] and sys.cancelled == ["X1"]
+
+
+async def test_manual_amend_calls_system() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(
+        sys, {"cmd": "manual_amend", "order_id": "X1", "price": 80500})
+    assert r["ok"] and r["order_id"] == "OID-2"
+    assert sys.amended == [("X1", 80500.0)]
+
+
+async def test_manual_amend_needs_price() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "manual_amend", "order_id": "X1"})
+    assert not r["ok"] and sys.amended == []
+
+
+async def test_manual_hl_merge_calls_system() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "manual_hl_merge",
+        "underlying": "samsung", "n_sig_figs": 5, "mantissa": 2})
+    assert r["ok"] and sys.merges == [(Underlying.SAMSUNG, 5, 2)]
+
+
+async def test_manual_hl_merge_raw_is_none() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "manual_hl_merge",
+        "underlying": "samsung", "n_sig_figs": None, "mantissa": None})
+    assert r["ok"] and sys.merges == [(Underlying.SAMSUNG, None, None)]
+
+
+async def test_manual_refresh_resyncs() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "manual_refresh"})
+    assert r["ok"]                    # 즉시 OK(응답 안 막음)
+    await asyncio.sleep(0.02)         # 백그라운드 새로고침이 돌 시간
+    assert sys.refreshed == 1
+
+
+async def test_manual_no_system_rejected() -> None:
+    assert not (await _manual_command(None, {"cmd": "manual_order"}))["ok"]
+    assert not (await _manual_command(None, {"cmd": "manual_cancel"}))["ok"]
+
+
+async def test_manual_order_bad_args_rejected() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "manual_order", "instrument": "nope",
+        "underlying": "samsung", "side": "buy", "qty": 1})
+    assert not r["ok"] and sys.placed == []
+
+
+async def test_manual_order_place_failure_reported() -> None:
+    sys = _fake_system(OrderBook(), fail=RuntimeError("거부됨"))
+    r = await _manual_command(sys, {"cmd": "manual_order", "instrument": "hl_perp",
+        "underlying": "samsung", "side": "buy", "order_type": "market", "qty": 5})
+    assert not r["ok"] and "거부됨" in r["errors"][0]
+
+
+# --- 수동창 스냅샷 (manual_snapshot) ---
+
+
+def test_ladder_sorts_and_merges() -> None:
+    q = Quote(underlying=Underlying.SK_HYNIX, instrument=Instrument.HL_PERP,
+              bid=1121.6, ask=1121.7, ts=0.0,
+              asks=[(1122.0, 0.2), (1121.7, 1.0), (1121.8, 2.0), (1122.0, 0.5)],
+              bids=[(1121.3, 1.0), (1121.6, 3.0)])
+    asks = _ladder(q, asks=True)
+    # 매도 오름차순(최우선=최저 먼저) + 같은 가격(1122.0) 잔량 병합
+    assert asks == [[1121.7, 1.0], [1121.8, 2.0], [1122.0, 0.7]]
+    bids = _ladder(q, asks=False)
+    assert bids[0][0] == 1121.6  # 매수 내림차순(최우선=최고 먼저)
+
+
+def test_manual_snapshot_no_system() -> None:
+    snap = manual_snapshot(None)
+    assert not snap["connected"] and snap["symbols"] == {} and snap["open_orders"] == []
+
+
+def test_manual_snapshot_shape() -> None:
+    ob = _ob_samsung(100)
+    ob.track("SELL1", OrderIntent(venue=Venue.LS, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.KR_STOCK, side=Side.SELL, qty=40, price=80000))
+    quote = Quote(underlying=Underlying.SAMSUNG, instrument=Instrument.KR_STOCK,
+        bid=79900, ask=80000, ts=0.0, bid_qty=10, ask_qty=20,
+        bids=[(79900, 10), (79800, 5)], asks=[(80000, 20), (80100, 8)])
+    sys = _fake_system(
+        ob,
+        quotes={(Underlying.SAMSUNG, Instrument.KR_STOCK, "krx"): quote},
+        trades={(Underlying.SAMSUNG, Instrument.KR_STOCK, "krx"): 79950.0})
+    snap = manual_snapshot(sys)
+    assert snap["connected"]
+    sam = snap["symbols"]["samsung|kr_stock"]
+    assert sam["asks"] == [[80000, 20], [80100, 8]]      # 다단계 사다리
+    assert sam["bids"][0] == [79900, 10]
+    assert sam["position"] == 100
+    assert sam["avg_price"] == 80000
+    assert sam["last"] == 79950.0
+    assert sam["pnl"] == (79950 - 80000) * 100            # 평가손익 = -5,000
+    assert sam["eval"] == 100 * 79950                     # 평가금액
+    assert sam["tick"] is not None and sam["tick"] > 0    # 호가모드용 틱
+    assert sam["sellable"] == 60                          # 보유100 − 미체결매도40
+    assert "balance" in sam                               # LS 계좌 잔고 포함
+    # HL은 매도가능(현물 전용) 없음
+    assert "sellable" not in snap["symbols"]["samsung|hl_perp"]
+    # 미체결에 SELL1 포함
+    assert any(o["order_id"] == "SELL1" for o in snap["open_orders"])

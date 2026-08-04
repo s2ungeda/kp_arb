@@ -21,8 +21,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
+from pydantic import ValidationError
 
-from .domain.enums import Instrument, Underlying
+from .domain.enums import Instrument, OrderType, Side, Underlying, Venue
+from .domain.models import OrderIntent, Quote
+from .manual_order import is_spot_stock, sellable_qty, short_sale_error
+from .routing import account_for
 from .strategy_core import (
     Block,
     CoreState,
@@ -32,6 +36,7 @@ from .strategy_core import (
     state_from_dict,
     validate_run,
 )
+from .ticks import tick_for
 
 if TYPE_CHECKING:
     from .bootstrap import LiveSystem
@@ -40,6 +45,9 @@ if TYPE_CHECKING:
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
+
+# 응답을 막지 않는 백그라운드 작업(manual_refresh 등)의 참조 보관 — 중간 GC 방지.
+_BG_TASKS: set[asyncio.Task[None]] = set()
 
 
 def _base_dir() -> Path:
@@ -216,6 +224,106 @@ def live_snapshot(
     return {"connected": True, "rehearsal": True, "screens": screens}
 
 
+# 수동 주문창이 다루는 instrument와, 호가/현재가를 고를 시장 우선순위.
+_MANUAL_INSTRUMENTS: tuple[Instrument, ...] = (
+    Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE, Instrument.HL_PERP)
+_MARKET_PREF: dict[Instrument, tuple[str, ...]] = {
+    Instrument.KR_STOCK: ("uni", "krx", "nxt"),
+    Instrument.KR_STOCK_FUTURE: ("krx", "uni", "nxt"),
+    Instrument.HL_PERP: ("hl",),
+}
+
+
+def _first(mapping: dict[Any, Any], keys: list[Any]) -> Any:
+    """keys 순서로 mapping을 훑어 처음 발견한 값(없으면 None)."""
+    for k in keys:
+        v = mapping.get(k)
+        if v is not None:
+            return v
+    return None
+
+
+def _ladder(quote: Quote | None, asks: bool) -> list[list[float]]:
+    """Quote에서 호가 사다리 [[가격, 잔량], ...] — 정렬(매도 오름/매수 내림)·중복가격 병합.
+
+    HL 원시 피드가 정렬 안 되거나 같은 가격을 중복 제시할 수 있어, 여기서 가격별로
+    잔량을 합치고 정렬한다(안 그러면 틱·현재가 강조가 틀어진다). 다단계 없으면 1호가로.
+    """
+    if quote is None:
+        return []
+    levels = quote.asks if asks else quote.bids
+    if levels:
+        merged: dict[float, float] = {}
+        for p, q in levels:
+            merged[p] = merged.get(p, 0.0) + q
+        items = sorted(merged.items(), reverse=not asks)  # 매도 오름차순 / 매수 내림차순
+        return [[p, q] for p, q in items]
+    px = quote.ask if asks else quote.bid
+    qty = (quote.ask_qty if asks else quote.bid_qty) or 0.0
+    return [[px, qty]]
+
+
+def _tick_size(
+    instrument: Instrument, price: float | None, ladder: list[list[float]]
+) -> float | None:
+    """호가모드 ±틱용 틱 크기 — KR은 규칙(ticks.tick_for), HL/시세없음은 호가 간격 추정."""
+    if instrument is not Instrument.HL_PERP and price:
+        return float(tick_for(instrument, price))
+    if len(ladder) >= 2:  # HL 등: 인접 두 호가 간격을 틱으로
+        return abs(ladder[1][0] - ladder[0][0])
+    return None
+
+
+def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
+    """수동 주문창용 스냅샷 — 취급 종목별 호가·포지션·매도가능·잔고 + 전체 미체결.
+
+    화면(일반 주문창)이 폴링해 표시만. 조회 폴링 없이 OrderBook·quotes 메모리 읽기.
+    """
+    if system is None:
+        return {"connected": False, "symbols": {}, "open_orders": []}
+    ob = system.order_book
+    pending_sell: dict[tuple[Underlying, Instrument], float] = {}
+    open_orders: list[dict[str, Any]] = []
+    for o in ob.open_orders():
+        it = o.intent
+        if it.side is Side.SELL:
+            k = (it.underlying, it.instrument)
+            pending_sell[k] = pending_sell.get(k, 0.0) + o.remaining_qty
+        open_orders.append({
+            "order_id": o.order_id, "underlying": it.underlying.value,
+            "instrument": it.instrument.value, "side": it.side.value,
+            "qty": it.qty, "remaining": o.remaining_qty,
+            "price": it.price, "status": o.status.value,
+        })
+    symbols: dict[str, Any] = {}
+    for u in Underlying:
+        for inst in _MANUAL_INSTRUMENTS:
+            mkeys = [(u, inst, m) for m in _MARKET_PREF[inst]]
+            quote = _first(system.quotes, mkeys)
+            account = account_for(inst) if inst.venue is Venue.LS else None
+            held = ob.position_qty(u, inst, account)
+            avg = ob.avg_price(u, inst, account)
+            last = _first(system.trades, mkeys)
+            bids = _ladder(quote, asks=False)
+            asks = _ladder(quote, asks=True)
+            has_pos = last is not None and held != 0
+            entry: dict[str, Any] = {
+                "bids": bids, "asks": asks,
+                "position": held, "avg_price": avg, "last": last,
+                "pnl": (last - avg) * held if has_pos else 0.0,   # 평가손익
+                "eval": abs(held) * last if has_pos else 0.0,     # 평가금액
+                "tick": _tick_size(inst, last, asks or bids),
+                "liq": None,  # HL 청산가 — 게이트웨이 확장 후 채움(v1 미제공)
+            }
+            if is_spot_stock(inst):
+                entry["sellable"] = sellable_qty(
+                    held, pending_sell.get((u, inst), 0.0))
+            if account is not None:
+                entry["balance"] = ob.balance(account)
+            symbols[f"{u.value}|{inst.value}"] = entry
+    return {"connected": True, "symbols": symbols, "open_orders": open_orders}
+
+
 def _fx_command(fx_service: FxReportService | None, body: dict[str, Any]) -> dict[str, Any]:
     """FX 보고 감시 명령 (감시 화면 → 코어). fx_service 없으면 거부."""
     if fx_service is None:
@@ -234,6 +342,101 @@ def _fx_command(fx_service: FxReportService | None, body: dict[str, Any]) -> dic
     else:
         return _fail([f"알 수 없는 FX 명령: {cmd!r}"])
     return _ok()
+
+
+async def _manual_command(
+    system: LiveSystem | None, body: dict[str, Any]
+) -> dict[str, Any]:
+    """수동 주문 명령 (일반 주문창 → 코어). DESIGN-manual-order.md §6.3.
+
+    system(라이브) 없으면 거부. 공매도(국내 현물 매도 초과)는 OrderBook 잔고로 막고,
+    나머지 검증(수량>0·가격·라우팅)은 OrderIntent가 한다. 실패 사유는 화면에 전달.
+    """
+    if system is None:
+        return _fail(["코어 시세 미접속 — 수동 주문 불가"])
+    cmd = body.get("cmd")
+    if cmd == "manual_hl_merge":  # HL 호가단위 머지(종목별) — WS 재구독
+        try:
+            underlying = Underlying(str(body["underlying"]))
+            nsf = body.get("n_sig_figs")
+            mant = body.get("mantissa")
+            n_sig_figs = int(nsf) if nsf is not None else None
+            mantissa = int(mant) if mant is not None else None
+        except (KeyError, ValueError) as exc:
+            return _fail([f"잘못된 머지 인자: {exc}"])
+        system.set_hl_aggregation(underlying, n_sig_figs, mantissa)
+        return _ok()
+    if cmd == "manual_refresh":  # 잔고/포지션 재조회 → OrderBook 재동기 ('적' 버튼)
+        # refresh_snapshot은 LS/HL REST라 느려, 응답을 막으면 화면 core_request가
+        # 타임아웃나 '코어 미접속'으로 뜬다. 백그라운드로 돌리고 즉시 OK — 결과는 폴링 반영.
+        async def _bg_refresh() -> None:
+            try:
+                await system.refresh_snapshot()
+            except Exception:  # noqa: BLE001 - 실패해도 화면은 계속(로그만)
+                logging.getLogger("kp_arb.core").warning("수동 새로고침 실패", exc_info=True)
+
+        task = asyncio.create_task(_bg_refresh())
+        _BG_TASKS.add(task)  # 참조 유지(중간 GC 방지)
+        task.add_done_callback(_BG_TASKS.discard)
+        return _ok()
+    if cmd == "manual_cancel":
+        order_id = body.get("order_id")
+        if not order_id:
+            return _fail(["order_id 필요"])
+        try:
+            await system.cancel(str(order_id))
+        except Exception as exc:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
+            return _fail([f"취소 실패: {exc}"])
+        return _ok()
+    if cmd == "manual_amend":
+        order_id = body.get("order_id")
+        raw = body.get("price")
+        if not order_id or raw is None:
+            return _fail(["order_id·price 필요"])
+        try:
+            new_id = await system.amend_price(str(order_id), float(raw))
+        except Exception as exc:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
+            return _fail([f"정정 실패: {exc}"])
+        return _ok(order_id=new_id)
+    if cmd == "manual_order":
+        try:
+            instrument = Instrument(str(body["instrument"]))
+            underlying = Underlying(str(body["underlying"]))
+            side = Side(str(body["side"]))
+            order_type = OrderType(str(body.get("order_type", "limit")))
+            qty = float(body["qty"])
+            raw_price = body.get("price")
+            price = float(raw_price) if raw_price is not None else None
+            reduce_only = bool(body.get("reduce_only", False))
+            post_only = bool(body.get("post_only", False))
+        except (KeyError, ValueError) as exc:
+            return _fail([f"잘못된 주문 인자: {exc}"])
+        # 공매도 검증 — 국내 현물 매도만(선물·HL은 양방향)
+        account = account_for(instrument) if instrument.venue is Venue.LS else None
+        if is_spot_stock(instrument) and side is Side.SELL:
+            held = system.order_book.position_qty(underlying, instrument, account)
+            pending = sum(
+                o.remaining_qty for o in system.order_book.open_orders()
+                if o.intent.underlying == underlying
+                and o.intent.instrument == instrument
+                and o.intent.side is Side.SELL
+            )
+            err = short_sale_error(instrument, side, qty, sellable_qty(held, pending))
+            if err:
+                return _fail([err])
+        try:
+            intent = OrderIntent(
+                venue=instrument.venue, underlying=underlying, instrument=instrument,
+                side=side, qty=qty, order_type=order_type, price=price,
+                reduce_only=reduce_only, post_only=post_only)
+        except ValidationError as exc:
+            return _fail([f"주문 검증 실패: {exc.errors()[0]['msg']}"])
+        try:
+            order_id = await system.place(intent)
+        except Exception as exc:  # noqa: BLE001 - 게이트웨이 거부/오류를 화면에 전달
+            return _fail([f"주문 실패: {exc}"])
+        return _ok(order_id=order_id)
+    return _fail([f"알 수 없는 수동 명령: {cmd!r}"])
 
 
 def make_app(
@@ -264,6 +467,9 @@ def make_app(
         if isinstance(cmd, str) and cmd.startswith("fx_"):
             result = _fx_command(fx_service, payload)
             return web.json_response(result, dumps=_dumps)
+        if isinstance(cmd, str) and cmd.startswith("manual_"):
+            result = await _manual_command(system, payload)
+            return web.json_response(result, dumps=_dumps)
         result = apply_command(state, payload)
         if result.get("ok") and save:
             save()  # 입력값 저장 — 재시작 시 복원 (§6.2-0)
@@ -272,14 +478,20 @@ def make_app(
             asyncio.get_running_loop().call_later(0.2, on_shutdown)
         return web.json_response(result, dumps=_dumps)
 
+    async def get_manual_state(_request: web.Request) -> web.Response:
+        # 수동 주문창 전용 폴링(호가·미체결·포지션·잔고) — /state를 무겁게 안 하려 분리.
+        return web.json_response(manual_snapshot(system), dumps=_dumps)
+
     app = web.Application()
     app.router.add_get("/state", get_state)
+    app.router.add_get("/manual_state", get_manual_state)
     app.router.add_post("/command", post_command)
     return app
 
 
 def _setup_logging() -> logging.Logger:
     """콘솔 + logs/core_날짜.log 파일 로그 (7-3a — 판정·발주 추적용)."""
+    import sys
     import time
 
     log_dir = _base_dir() / "logs"
@@ -289,10 +501,15 @@ def _setup_logging() -> logging.Logger:
             log_dir / f"core_{time.strftime('%Y%m%d')}.log", encoding="utf-8")
     except OSError:
         file_handler = logging.NullHandler()
+    handlers: list[logging.Handler] = [file_handler]
+    # 콘솔 없이(pythonw·CREATE_NO_WINDOW) 돌면 sys.stderr가 None이라 StreamHandler가
+    # 터진다 — 콘솔이 있을 때만 콘솔 출력, 없으면 파일 로그만.
+    if sys.stderr is not None:
+        handlers.insert(0, logging.StreamHandler())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        handlers=[logging.StreamHandler(), file_handler],
+        handlers=handlers,
     )
     return logging.getLogger("kp_arb.core")
 

@@ -37,6 +37,9 @@ def main() -> None:
     elif arg == "fx_monitor":
         from kp_arb.fx_monitor import main as run
         run()
+    elif arg == "order_hl":
+        from kp_arb.order_hl import main as run
+        run()
     elif arg == "keys":
         from kp_arb.key_setup import main as run
         run()

@@ -95,14 +95,17 @@ class HLSdkGateway(HLGateway):
         if intent.order_type is OrderType.LIMIT:
             if intent.price is None:
                 raise HLError("limit order requires price")
-            order_type: dict[str, Any] = {"limit": {"tif": "Gtc"}}
+            # post_only는 HL의 Alo(Add-Liquidity-Only=메이커 전용) tif.
+            tif = "Alo" if intent.post_only else "Gtc"
+            order_type: dict[str, Any] = {"limit": {"tif": tif}}
             price = float(intent.price)
         else:
             # HL은 순수 시장가가 없음 — IOC 지정가(마크 대비 슬리피지 허용)로 대응.
             price = await self._market_px(coin, is_buy)
             order_type = {"limit": {"tif": "Ioc"}}
         resp = await asyncio.to_thread(
-            self._ex.order, coin, is_buy, float(intent.qty), price, order_type
+            self._ex.order, coin, is_buy, float(intent.qty), price, order_type,
+            reduce_only=intent.reduce_only,
         )
         oid = self._parse_oid(resp)
         self._order_coin[oid] = coin

@@ -32,8 +32,9 @@ class StubExchange:
         self.cancels: list[tuple[str, int]] = []
 
     def order(self, coin: str, is_buy: bool, sz: float, px: float,
-              order_type: dict[str, Any]) -> dict[str, Any]:
+              order_type: dict[str, Any], reduce_only: bool = False) -> dict[str, Any]:
         self.orders.append((coin, is_buy, sz, px, order_type))
+        self.last_reduce_only = reduce_only
         statuses = [{"resting": {"oid": 485478010353}}]
         return {"status": "ok", "response": {"type": "order", "data": {"statuses": statuses}}}
 
