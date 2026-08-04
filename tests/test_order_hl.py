@@ -1,5 +1,12 @@
 """HL 일반주문창 순수 표시 헬퍼 테스트 (tkinter 미로드 — 함수만)."""
-from kp_arb.order_hl import _fmt, _fmt_px, _fmt_qty, _hl_decimals, _hoga_signature
+from kp_arb.order_hl import (
+    _fmt,
+    _fmt_px,
+    _fmt_qty,
+    _hl_decimals,
+    _hoga_signature,
+    _merge_ticks,
+)
 
 
 def test_fmt() -> None:
@@ -38,6 +45,18 @@ def test_hl_decimals_from_price_magnitude() -> None:
     assert _hl_decimals(1.0683) == 4      # <10 → 1자리 → 4
     assert _hl_decimals(12345) == 0       # 5자리 → 0
     assert _hl_decimals(None) == 2        # 이상값 기본 2
+
+
+def test_merge_ticks_from_price() -> None:
+    # 기준틱 = 10^(floor(log10 가격)-4), 배수 [1,2,5,10,100,1000] (유효숫자 5자리 규칙)
+    hynix = _merge_ticks(1121.6)   # 기준틱 0.1
+    assert [s for s, _, _ in hynix] == ["0.1", "0.2", "0.5", "1", "10", "100"]
+    assert hynix[0][1:] == (None, None)   # 원시
+    assert hynix[1][1:] == (5, 2)          # ×2
+    assert hynix[3][1:] == (4, None)       # ×10
+    low = _merge_ticks(600.0)      # 기준틱 0.01
+    assert [s for s, _, _ in low] == ["0.01", "0.02", "0.05", "0.1", "1", "10"]
+    assert _merge_ticks(0) == []           # 가격 0/음수는 빈 목록
 
 
 def test_hoga_signature_detects_change() -> None:

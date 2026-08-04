@@ -7,6 +7,7 @@ Hyperliquid perp 전용 수동 주문창(LS는 별도 화면 `order_ls`). 델파
 """
 from __future__ import annotations
 
+import math
 import queue
 from typing import Any
 
@@ -16,9 +17,19 @@ from .order_panel import UNDER_MAP, is_decimal_text
 
 INSTRUMENT = "hl_perp"  # 이 창은 HL perp 전용
 UNDERLYINGS = ("삼성", "하이닉스", "현대차")
-# HL 호가단위 머지 → (n_sig_figs, mantissa) — 시세 모니터와 동일 (원시=서버 기본 틱)
-HL_MERGE: dict[str, tuple[int | None, int | None]] = {
-    "원시": (None, None), "2배": (5, 2), "5배": (5, 5), "10배": (4, None), "100배": (3, None)}
+# HL 호가단위(aggregation) 단계 — (기준틱 배수, n_sig_figs, mantissa). HL은 유효숫자
+# (nSigFigs) 기준으로 뭉치므로, 종목별 실제 틱 = 기준틱×배수로 표시한다(원시/2배 라벨 대신).
+_MERGE_LEVELS: list[tuple[int, int | None, int | None]] = [
+    (1, None, None), (2, 5, 2), (5, 5, 5), (10, 4, None), (100, 3, None), (1000, 2, None)]
+
+
+def _merge_ticks(price: float) -> list[tuple[str, int | None, int | None]]:
+    """활성 종목 가격 기준 호가단위 옵션 — [(틱표시, nSigFigs, mantissa), ...].
+    기준틱 = 10^(floor(log10 가격) − 4)(유효숫자 5자리), 그 배수로 단계 구성."""
+    if price <= 0:
+        return []
+    base = 10.0 ** (math.floor(math.log10(abs(price))) - 4)
+    return [(_fmt_px(base * mult), nsf, mant) for mult, nsf, mant in _MERGE_LEVELS]
 
 
 def _fmt(v: Any, digits: int = 0) -> str:
@@ -198,10 +209,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     merge_row = tk.Frame(right)
     merge_row.pack(fill="x", pady=(0, 2))
     tk.Label(merge_row, text="호가단위").pack(side="left")
-    cb_merge = ttk.Combobox(merge_row, values=list(HL_MERGE), width=5,
-                            state="readonly")
-    cb_merge.set("원시")
+    cb_merge = ttk.Combobox(merge_row, values=[], width=7, state="readonly")
     cb_merge.pack(side="left", padx=(4, 0))
+    # 콤보 표시값(틱) → (nSigFigs, mantissa) 역매핑 — '적'에서 종목 가격으로 채운다.
+    merge_map: dict[str, tuple[int | None, int | None]] = {}
     hoga = ttk.Treeview(right, columns=("price", "qty"), show="",
                         height=17, selectmode="browse")
     hoga.column("price", width=95, anchor="e")
@@ -236,7 +247,20 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                       name=cb_under.get())
         send({"cmd": "manual_refresh"}, "적용·조회")  # 잔고/포지션 재조회(OrderBook 재동기)
         refresh_side()
+        _populate_merge()  # 종목 가격 기준 호가단위(틱) 콤보 채우기
         set_status(f"{cb_under.get()} 적용 — 조회 중")
+
+    def _populate_merge() -> None:
+        # 활성 종목 가격으로 호가단위(틱) 콤보를 채운다 — '원시/2배' 대신 실제 틱 값.
+        ref = _ref_price(active_symbol())
+        merge_map.clear()
+        vals: list[str] = []
+        for s, nsf, mant in (_merge_ticks(float(ref)) if ref else []):
+            vals.append(s)
+            merge_map[s] = (nsf, mant)
+        cb_merge["values"] = vals
+        if vals:
+            cb_merge.set(vals[0])  # 최소 틱(원시)
 
     def do_order() -> None:
         if active["underlying"] is None:
@@ -288,8 +312,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         e_price.insert(0, _fmt_px(price, dec).replace(",", ""))
 
     def on_merge(_e: Any) -> None:
-        nsf, mant = HL_MERGE[cb_merge.get()]
-        send({"cmd": "manual_hl_merge", "underlying": UNDER_MAP[cb_under.get()],
+        nsf, mant = merge_map.get(cb_merge.get(), (None, None))
+        under = active["underlying"] or UNDER_MAP[cb_under.get()]
+        send({"cmd": "manual_hl_merge", "underlying": under,
               "n_sig_figs": nsf, "mantissa": mant}, "머지")
 
     cb_merge.bind("<<ComboboxSelected>>", on_merge)
