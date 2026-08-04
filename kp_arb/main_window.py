@@ -88,6 +88,8 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "kp-arb.exe"), "fx_monitor"]
     if module == "kp_arb.order_hl":
         return [str(exe_dir / "kp-arb.exe"), "order_hl"]
+    if module == "kp_arb.order_list":
+        return [str(exe_dir / "kp-arb.exe"), "order_list"]
     if module == "kp_arb.order_panel":
         return [str(exe_dir / "kp-arb.exe"), *args]  # autoT | autoM
     return [str(exe_dir / "kp-arb.exe")]
@@ -195,6 +197,8 @@ def main() -> None:
                          command=lambda: open_screen("kp_arb.fx_monitor"))
     m_screen.add_command(label="HL 일반주문 (수동)",
                          command=lambda: open_screen("kp_arb.order_hl"))
+    m_screen.add_command(label="주문 리스트 (미체결·취소·정정)",
+                         command=lambda: open_screen("kp_arb.order_list"))
     menubar.add_cascade(label="화면", menu=m_screen)
     m_core = tk.Menu(menubar, tearoff=0)
     m_core.add_command(label="코어 시작", command=start_core)

@@ -40,6 +40,9 @@ def main() -> None:
     elif arg == "order_hl":
         from kp_arb.order_hl import main as run
         run()
+    elif arg == "order_list":
+        from kp_arb.order_list import main as run
+        run()
     elif arg == "keys":
         from kp_arb.key_setup import main as run
         run()
