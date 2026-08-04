@@ -91,20 +91,21 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     vcmd_dec = (root.register(is_decimal_text), "%P")  # HL은 수량·가격 모두 소수 허용
 
     # --- 명령 전송: 큐 → 전송 스레드 → 결과 큐 → 화면 루프 ---
-    jobs: queue.Queue[tuple[dict[str, Any], str]] = queue.Queue()
-    results: queue.Queue[tuple[str, dict[str, Any] | None]] = queue.Queue()
+    jobs: queue.Queue[tuple[dict[str, Any], str, str | None]] = queue.Queue()
+    results: queue.Queue[tuple[str, dict[str, Any] | None, str | None]] = queue.Queue()
 
     def sender() -> None:
         while True:
-            payload, label = jobs.get()
+            payload, label, detail = jobs.get()
             # 주문/정정/취소는 HL REST 왕복이라 느릴 수 있다 — 타임아웃을 넉넉히(10s).
             # 짧으면 성공해도 '코어 미접속'으로 오인해 중복주문 위험.
-            results.put((label, core_request("/command", payload, timeout=10.0)))
+            results.put((label, core_request("/command", payload, timeout=10.0), detail))
 
     threading.Thread(target=sender, daemon=True).start()
 
-    def send(payload: dict[str, Any], label: str) -> None:
-        jobs.put((payload, label))
+    def send(payload: dict[str, Any], label: str, detail: str | None = None) -> None:
+        # detail: 주문이면 "매수 167.5 10" 식 — 결과 로그에 성공/거부와 함께 표시.
+        jobs.put((payload, label, detail))
 
     # --- 상태 폴링: /manual_state → state_box (화면은 읽기만) ---
     state_box: dict[str, Any] = {"data": None}
@@ -129,22 +130,22 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         f.pack(fill="x", pady=1)
         return f
 
-    # 종목
+    # 종목 + '적'(종목 적용·조회) — 콤보 옆에 살짝 여백 두고
     r = _row()
     tk.Label(r, text="HL", fg="gray25").pack(side="left")
     cb_under = ttk.Combobox(r, values=UNDERLYINGS, width=7, state="readonly")
     cb_under.set("삼성")
     cb_under.pack(side="left", padx=(4, 0))
+    btn_apply = tk.Button(r, text="적", width=3)
+    btn_apply.pack(side="left", padx=(8, 0))
 
-    # 매수/매도 + '적'(종목 적용·조회) — 같은 줄
+    # 매수/매도
     r = _row()
     side_var = tk.StringVar(value="buy")
     tk.Radiobutton(r, text="매수", variable=side_var, value="buy",
                    fg="#c00000").pack(side="left")
     tk.Radiobutton(r, text="매도", variable=side_var, value="sell",
                    fg="#0000c0").pack(side="left", padx=(4, 0))
-    btn_apply = tk.Button(r, text="적", width=3)
-    btn_apply.pack(side="left", padx=(10, 0))
 
     # 수량
     r = _row()
@@ -210,12 +211,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     hoga.tag_configure("cur", background="#fff6b0")
     hoga.pack()
 
-    # 상태바
-    status = tk.Label(root, text="-", anchor="w", relief="groove")
+    # 상태바 — width=1(요청폭 최소) + fill=x: 긴 로그가 창 넓이를 밀지 않고 잘린다.
+    status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
     status.pack(side="top", fill="x", padx=4, pady=(0, 4))
 
     def set_status(text: str, err: bool = False) -> None:
-        status.config(text=text, fg="#8b0000" if err else "black")
+        status.config(text=text[:90], fg="#8b0000" if err else "black")  # 길면 잘라 표시
 
     # ===== 동작 =====
     def sym_key() -> str:
@@ -252,12 +253,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if not price:
             set_status("지정가는 단가를 입력하세요", err=True)
             return
+        side_kr = "매수" if side_var.get() == "buy" else "매도"
         send({
             "cmd": "manual_order", "instrument": INSTRUMENT,
             "underlying": active["underlying"], "side": side_var.get(),
             "order_type": "limit", "qty": qty, "price": float(price),
             "reduce_only": reduce_var.get(), "post_only": post_var.get(),
-        }, "주문")
+        }, "주문", f"{side_kr} {price} {qty:g}")
 
     def on_hoga_click(_e: Any) -> None:
         # 가격모드에서만 — 클릭한 오더북 가격을 단가에 그대로(틱 없음).
@@ -313,15 +315,21 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def drain_results() -> None:
         try:
             while True:
-                label, result = results.get_nowait()
+                label, result, detail = results.get_nowait()
                 if result is None:
                     set_status(f"{label} 실패 — 코어 미접속", err=True)
                 elif not result.get("ok"):
-                    set_status(f"{label} 거부 — {'; '.join(result.get('errors', []))}",
-                               err=True)
+                    reason = "; ".join(result.get("errors", []))
+                    if detail:  # 주문 거부 : 매도 167.5 10 (거부사유)
+                        set_status(f"주문 거부 : {detail} ({reason})", err=True)
+                    else:
+                        set_status(f"{label} 거부 — {reason}", err=True)
                 else:
                     oid = result.get("order_id")
-                    set_status(f"{label} 접수됨" + (f" (#{oid})" if oid else ""))
+                    if detail:  # 주문 성공 : 매수 167.5 10 (#주문번호)
+                        set_status(f"주문 성공 : {detail}" + (f" (#{oid})" if oid else ""))
+                    else:
+                        set_status(f"{label} 접수됨" + (f" (#{oid})" if oid else ""))
         except queue.Empty:
             pass
         _reschedule(drain_results, 200)
