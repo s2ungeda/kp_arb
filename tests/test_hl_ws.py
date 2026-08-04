@@ -163,8 +163,8 @@ async def test_l2book_depth_max_20() -> None:
     assert quotes[0].asks is not None and len(quotes[0].asks) == 20
 
 
-async def test_bbo_merges_recent_l2book_depth() -> None:
-    # 1호가는 bbo(빠름) 값으로, 2호가 아래는 최근 l2Book 것으로 붙는다.
+async def test_bbo_scalar_fast_ladder_from_l2book() -> None:
+    # 스칼라 bid/ask는 bbo(빠름), 사다리는 정합적 l2Book 그대로(대칭·크로스 없음).
     client = HLWebSocketClient(FakeConnector([l2book_frame(), bbo_frame()]))
     quotes = []
     client.on_quote.append(quotes.append)
@@ -172,10 +172,11 @@ async def test_bbo_merges_recent_l2book_depth() -> None:
     await client.run()
 
     q = quotes[-1]
-    assert q.bid == 183.55 and q.ask == 183.65             # bbo 최신값
-    assert q.bids is not None and q.bids[0] == (183.55, 7.0)
-    assert q.bids[1] == (183.4, 20.0)                      # l2Book 하위 단계
-    assert q.asks is not None and q.asks[1] == (183.7, 10.0)
+    assert q.bid == 183.55 and q.ask == 183.65             # bbo 최신 스칼라(빠름)
+    assert q.bids is not None and q.asks is not None
+    assert q.bids[0] == (183.5, 10.0) and len(q.bids) == 3   # l2Book 그대로(대칭)
+    assert q.asks[0] == (183.6, 5.0) and len(q.asks) == 3
+    assert max(b[0] for b in q.bids) < min(a[0] for a in q.asks)  # 크로스 없음
 
 
 async def test_bbo_without_l2book_has_no_depth() -> None:

@@ -70,9 +70,11 @@ class HLWebSocketClient:
             self._add({"type": "bbo", "coin": coin})
 
     def subscribe_l2book(self) -> None:
-        """호가창(다단계) 구독 → on_quote(Quote.bids/asks 포함). bbo보다 깊고 약간 느림."""
+        """호가창 구독 → on_quote(Quote.bids/asks). **fast=true: 5단계·빠름**(문서:
+        '5 levels if fast, 20 levels if slow'). 실측상 slow(20단계)는 ~0.4/s로 느려
+        화면이 뚝뚝 끊겨(HL 홈페이지와 비교 불가) fast로 간다 — 5단계면 표시엔 충분."""
         for coin in self._symbols.values():
-            self._add({"type": "l2Book", "coin": coin})
+            self._add({"type": "l2Book", "coin": coin, "fast": True})
 
     def subscribe_trades(self) -> None:
         """공개 체결 구독 → on_trade(현재가). 마크(1초 주기)보다 빠르다(실측 ~0.2초)."""
@@ -248,16 +250,12 @@ class HLWebSocketClient:
             return None
         top_bid = (float(bid["px"]), float(bid.get("sz", 0) or 0))
         top_ask = (float(ask["px"]), float(ask.get("sz", 0) or 0))
-        # 1호가는 bbo(빠름)로 갱신하고, 2호가 아래는 최근 l2Book 것을 붙인다.
-        # 단, 머지 구독 중엔 원시 1호가를 머지 사다리에 섞지 않는다(단위가 다름).
+        # 스칼라 bid/ask(위)는 bbo(빠름). **사다리(bids/asks)는 자체 정합적인 l2Book만**
+        # 쓴다 — 신선한 bbo 1호가를 스테일 l2에 섞으면 크로스(매도<매수)나 한쪽 단계 소실이
+        # 생긴다(실측). 사다리는 l2Book 프레임 단위로 갱신(대칭·정합, 갱신율은 l2 피드에 의존).
         depth = self._depth.get(underlying)
-        if depth is None:
-            bids = asks = None
-        elif self._l2_extra.get(str(data.get("coin", ""))):
-            bids, asks = depth[0], depth[1]
-        else:
-            bids = [top_bid] + depth[0][1:]
-            asks = [top_ask] + depth[1][1:]
+        bids = depth[0] if depth is not None else None
+        asks = depth[1] if depth is not None else None
         return Quote(
             underlying=underlying,
             instrument=Instrument.HL_PERP,
