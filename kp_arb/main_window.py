@@ -72,6 +72,37 @@ def _auto_running() -> bool:
     return False
 
 
+def _restart_step(
+    st: dict[str, Any], alive: bool, *, after: int, cooldown: int, max_restarts: int
+) -> str:
+    """코어 감시 상태를 한 스텝 갱신하고 취할 행동을 돌려준다(순수 — I/O 없음, Phase 8-5).
+
+    반환: ``"none"``(대기) · ``"restart"``(재기동) · ``"give_up"``(반복 실패로 중단).
+    st 키(제자리 갱신): intentional(안전종료 여부)·down(연속 미접속)·cooldown(부팅 유예)·
+    fails(연속 재기동 횟수)·gave_up(중단 여부). 살아있으면 카운터를 초기화한다.
+    """
+    if alive:
+        st["down"] = 0
+        st["fails"] = 0
+        st["gave_up"] = False
+        return "none"
+    if st["cooldown"] > 0:  # 시작/재기동 직후 부팅 유예 — 미접속을 세지 않음
+        st["cooldown"] -= 1
+        return "none"
+    if st["intentional"] or st["gave_up"]:  # 안전종료했거나 이미 포기 — 되살리지 않음
+        return "none"
+    st["down"] += 1
+    if st["down"] < after:
+        return "none"
+    st["down"] = 0
+    st["cooldown"] = cooldown
+    st["fails"] += 1
+    if st["fails"] > max_restarts:
+        st["gave_up"] = True
+        return "give_up"
+    return "restart"
+
+
 def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
     """실행 명령 구성 — 개발(파이썬)과 배포판(exe, app.py 분기)을 모두 지원."""
     if not getattr(sys, "frozen", False):
@@ -138,6 +169,30 @@ def main() -> None:
     closing = {"flag": False}
     launched: list[tuple[str, subprocess.Popen[bytes]]] = []
 
+    # 코어 자동 재시작(Phase 8-5) — 연속 미접속이 임계 이상이면 재기동. cooldown은 시작
+    # 직후 부팅 유예(초기값으로 시동 자체를 크래시로 오인하지 않게).
+    RESTART_AFTER = 3       # 연속 미접속 3회(~6초)면 재기동
+    RESTART_COOLDOWN = 6    # 시작/재기동 후 6회(~12초)는 부팅 유예
+    MAX_RESTARTS = 5        # 이만큼 연속 실패하면 자동 재기동 중단(수동 점검)
+    restart: dict[str, Any] = {"intentional": False, "down": 0,
+                               "cooldown": RESTART_COOLDOWN, "fails": 0, "gave_up": False}
+
+    def _alert(text: str, level: str = "warn") -> None:
+        try:
+            from . import alert
+            alert.notify(text, level)
+        except Exception:  # noqa: BLE001 - 알림 실패가 감시를 멈추지 않게
+            pass
+
+    def maybe_restart_core(alive: bool) -> None:
+        action = _restart_step(restart, alive, after=RESTART_AFTER,
+                               cooldown=RESTART_COOLDOWN, max_restarts=MAX_RESTARTS)
+        if action == "restart":
+            launch_module("kp_arb.core_server", console=False, watch_parent=False)
+            _alert("코어 미접속 감지 — 자동 재기동", "error")
+        elif action == "give_up":
+            _alert("코어 자동 재기동 반복 실패 — 중단. 수동 점검 필요", "error")
+
     def save_ui_state() -> None:
         """마지막 상태 저장 — 다음 실행 때 그대로 복원."""
         data = {"core": alive_box["alive"],
@@ -150,9 +205,11 @@ def main() -> None:
     def poll_core() -> None:
         while True:
             data = core_request("/state")  # 코어 생존 + WS 세션 현황 한 번에
-            alive_box["alive"] = data is not None
+            alive = data is not None
+            alive_box["alive"] = alive
             alive_box["ws"] = (data or {}).get("ws") or []
-            if not closing["flag"]:  # 종료 중엔 마지막 저장본을 덮지 않음
+            if not closing["flag"]:  # 종료 중엔 재기동·저장 안 함
+                maybe_restart_core(alive)
                 save_ui_state()
             time.sleep(2.0)
 
@@ -207,10 +264,14 @@ def main() -> None:
         if core_alive():
             status.config(text="코어가 이미 떠 있음")
             return
+        restart["intentional"] = False  # 사용자가 다시 켬 — 자동 재기동 재개
+        restart["gave_up"] = False
+        restart["cooldown"] = RESTART_COOLDOWN  # 부팅 유예
         launch_module("kp_arb.core_server", console=False, watch_parent=False)
         status.config(text="코어 시작 중 ...")
 
     def stop_core() -> None:
+        restart["intentional"] = True  # 안전종료 — 자동 재기동하지 않음
         result = core_request("/command", {"cmd": "shutdown"})
         if result is None:
             status.config(text="코어 미접속 — 종료할 대상 없음")
