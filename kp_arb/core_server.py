@@ -88,6 +88,24 @@ def _fail(errors: list[str]) -> dict[str, Any]:
     return {"ok": False, "errors": errors, "warnings": []}
 
 
+def _ws_order_warning(system: LiveSystem | None) -> str | None:
+    """현재 WS 건강 기준 발주 경고 사유(없으면 None). 수동은 **경고만** — 차단 안 함(§2).
+    무데이터 임계는 env ``KP_WS_MAX_IDLE_S``(기본 10초)로 조정. 자동 발주는 같은 게이트로
+    하드 차단(추후). Phase 8-6."""
+    if system is None:
+        return None
+    import os
+    import time as _time
+
+    from .ws_status import order_block_reason
+
+    try:
+        max_idle = float(os.environ.get("KP_WS_MAX_IDLE_S", "10"))
+    except ValueError:
+        max_idle = 10.0
+    return order_block_reason(system.ws_statuses(), _time.monotonic(), max_idle)
+
+
 def apply_command(  # noqa: PLR0911 - 명령 분기표
     state: CoreState, body: dict[str, Any]
 ) -> dict[str, Any]:
@@ -435,7 +453,8 @@ async def _manual_command(
             order_id = await system.place(intent)
         except Exception as exc:  # noqa: BLE001 - 게이트웨이 거부/오류를 화면에 전달
             return _fail([f"주문 실패: {exc}"])
-        return _ok(order_id=order_id)
+        warn = _ws_order_warning(system)  # 수동은 경고만(§2) — 발주는 됨
+        return _ok(order_id=order_id, warnings=[warn] if warn else [])
     return _fail([f"알 수 없는 수동 명령: {cmd!r}"])
 
 

@@ -11,6 +11,7 @@ from kp_arb.manual_order import (
     short_sale_error,
 )
 from kp_arb.order_book import OrderBook
+from kp_arb.ws_status import WsStatus
 
 
 def test_is_spot_stock() -> None:
@@ -58,11 +59,16 @@ class _FakeSystem:
         fail: Exception | None = None,
         quotes: dict[Any, Quote] | None = None,
         trades: dict[Any, float] | None = None,
+        ws: list[WsStatus] | None = None,
     ) -> None:
         self.order_book = order_book
         self._fail = fail
         self.quotes = quotes or {}
         self.trades = trades or {}
+        # 기본은 건강한 채널(연결된 주문 피드) — 무데이터 판정 없음 → 경고 없음.
+        self.ws = ws if ws is not None else [
+            WsStatus(venue="LS", name="LS", kind="주문", expects_stream=False,
+                     connected=True)]
         self.placed: list[OrderIntent] = []
         self.cancelled: list[str] = []
         self.amended: list[tuple[str, float]] = []
@@ -89,14 +95,18 @@ class _FakeSystem:
     async def refresh_snapshot(self) -> None:
         self.refreshed += 1
 
+    def ws_statuses(self) -> list[WsStatus]:
+        return self.ws
+
 
 def _fake_system(
     order_book: OrderBook,
     fail: Exception | None = None,
     quotes: dict[Any, Quote] | None = None,
     trades: dict[Any, float] | None = None,
+    ws: list[WsStatus] | None = None,
 ) -> Any:
-    return _FakeSystem(order_book, fail, quotes, trades)
+    return _FakeSystem(order_book, fail, quotes, trades, ws)
 
 
 def _ob_samsung(held: float = 100.0) -> OrderBook:
@@ -113,6 +123,23 @@ async def test_manual_order_hl_buy_places() -> None:
         "underlying": "samsung", "side": "buy", "order_type": "market", "qty": 5})
     assert r["ok"] and r["order_id"] == "OID-1"
     assert len(sys.placed) == 1 and sys.placed[0].venue is Venue.HYPERLIQUID
+
+
+async def test_manual_order_warns_when_ws_unhealthy_but_still_places() -> None:
+    # Phase 8-6 — 수동은 경고만(§2 차단 아님): WS 끊김이어도 발주는 되고 warnings에 사유.
+    down = WsStatus(venue="HL", name="HL", kind="시세/주문", expects_stream=True)  # 미연결
+    sys = _fake_system(OrderBook(), ws=[down])
+    r = await _manual_command(sys, {"cmd": "manual_order", "instrument": "hl_perp",
+        "underlying": "samsung", "side": "buy", "order_type": "market", "qty": 5})
+    assert r["ok"] and len(sys.placed) == 1        # 발주됨
+    assert r["warnings"] and "끊김" in r["warnings"][0]  # 경고 동반
+
+
+async def test_manual_order_no_warning_when_healthy() -> None:
+    sys = _fake_system(OrderBook())  # 기본 건강한 채널
+    r = await _manual_command(sys, {"cmd": "manual_order", "instrument": "hl_perp",
+        "underlying": "samsung", "side": "buy", "order_type": "market", "qty": 5})
+    assert r["ok"] and r["warnings"] == []
 
 
 async def test_manual_order_stock_sell_within_holding() -> None:

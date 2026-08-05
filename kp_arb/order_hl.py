@@ -351,10 +351,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                         set_status(f"{label} 거부 — {reason}", err=True)
                 else:
                     oid = result.get("order_id")
-                    if detail:  # 주문 성공 : 매수 167.5 10 (#주문번호)
-                        set_status(f"주문 성공 : {detail}" + (f" (#{oid})" if oid else ""))
+                    warns = "; ".join(result.get("warnings", []))
+                    tail = (f" (#{oid})" if oid else "") + (f" ⚠ {warns}" if warns else "")
+                    # 경고 있으면 빨간 글씨로 주의 환기(발주는 됨 — WS 불량 경고, §2 차단 아님)
+                    if detail:  # 주문 성공 : 매수 167.5 10 (#주문번호) ⚠ 시세 지연...
+                        set_status(f"주문 성공 : {detail}" + tail, err=bool(warns))
                     else:
-                        set_status(f"{label} 접수됨" + (f" (#{oid})" if oid else ""))
+                        set_status(f"{label} 접수됨" + tail, err=bool(warns))
         except queue.Empty:
             pass
         _reschedule(drain_results, 200)
