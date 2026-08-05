@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Protocol
 
@@ -28,6 +29,7 @@ from pydantic import BaseModel
 
 from ..domain.enums import Instrument, Underlying
 from ..domain.models import Quote
+from ..ws_status import WsStatus
 
 QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1", "UH1"})  # KRX/NXT/통합 호가
 FUTURES_QUOTE_TR = "JH0"   # 주식선물 호가 (body 필드는 H1_와 동일 가정 — 장중 실확인 예정)
@@ -161,9 +163,15 @@ class LSWebSocketClient:
         etf_symbols: dict[Underlying, str] | None = None,
         max_reconnects: int = 3,
         reconnect_backoff_s: float = 0.0,
+        status: WsStatus | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._connector = connector
         self._token = token
+        # WS 세션 현황(Phase 8-3) — 연결/끊김·수신카운트. 미주입 시 자체 생성.
+        self.status = status or WsStatus(
+            venue="LS", name="LS", kind="시세/주문", expects_stream=True)
+        self._clock = clock or time.monotonic
         # 재연결 시 새 토큰 발급용(옵션) — LS 토큰은 유효기간(약 1일)이 있어
         # 자정 이후 재접속은 옛 토큰으로 거부된다. 없으면 고정 token 재사용.
         self._token_provider = token_provider
@@ -264,9 +272,11 @@ class LSWebSocketClient:
                     self._token = await self._token_provider()  # 만료 대비 새 토큰
                 conn = await self._connector.connect()
                 self._conn = conn
+                self.status.on_connect()
                 await self._resubscribe(conn)
                 async for raw in conn:
                     attempts = 0  # 데이터 수신 = 정상 연결 — 연속 실패 카운터 초기화
+                    self.status.on_message(self._clock())
                     try:
                         self._dispatch(raw)
                     except Exception:  # noqa: BLE001 - 프레임 1건 문제로 스트림을 죽이지 않음
@@ -276,6 +286,8 @@ class LSWebSocketClient:
                             "프레임 처리 실패 — 건너뜀: %.300s", raw, exc_info=True
                         )
             except (ConnectionError, OSError):
+                if self.status.connected:
+                    self.status.on_disconnect()
                 attempts += 1
                 if attempts > self._max_reconnects:
                     raise
@@ -283,7 +295,8 @@ class LSWebSocketClient:
                     await asyncio.sleep(self._reconnect_backoff_s)
                 continue
             else:
-                return  # 스트림이 정상 종료됨
+                self.status.on_disconnect()  # 스트림 정상 종료 = 서버가 닫음 = 끊김
+                return
 
     async def _resubscribe(self, conn: WSConnection) -> None:
         for tr_cd, tr_key, tr_type in self._subs:

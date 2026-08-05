@@ -117,6 +117,19 @@ async def test_subscription_ack_ignored() -> None:
     await client.run()  # 예외 없이 통과
 
 
+async def test_ws_status_tracks_rx_and_connection() -> None:
+    # WS 세션 현황(Phase 8-3) — 연결·수신카운트·끊김 추적.
+    client = HLWebSocketClient(FakeConnector([mark_frame(), mark_frame()]),
+                               clock=lambda: 42.0)
+    assert not client.status.connected and client.status.rx_count == 0
+    await client.run()
+    assert client.status.rx_count == 2       # 2 프레임 수신
+    assert client.status.connects == 1
+    assert client.status.last_rx == 42.0
+    assert not client.status.connected       # 스트림 정상 종료 = 끊김
+    assert client.status.disconnects == 1
+
+
 def l2book_frame(coin: str = "xyz:SKHX", *, levels_per_side: int = 3) -> str:
     # l2Book 프레임: levels=[[매수단계...],[매도단계...]] — 각 {px, sz, n}.
     bids = [{"px": f"{183.5 - i * 0.1:.1f}", "sz": str((i + 1) * 10), "n": 1}

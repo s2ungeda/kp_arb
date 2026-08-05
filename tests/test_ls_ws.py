@@ -136,6 +136,22 @@ async def test_reconnect_resubscribes_and_recovers() -> None:
     assert s2.sent  # 재구독됨
 
 
+async def test_ws_status_counts_reconnect() -> None:
+    # WS 세션 현황(Phase 8-3) — 재연결 시 연결/끊김 카운트·수신카운트 추적.
+    s1 = FakeConnection([quote_frame(bid=1), quote_frame(bid=2)], fail_after=1)  # 1개 후 끊김
+    s2 = FakeConnection([quote_frame(bid=3)])                # 복구 후 정상 종료
+    client = LSWebSocketClient(FakeConnector([s1, s2]), clock=lambda: 7.0)
+    client.subscribe_quotes(Underlying.SAMSUNG)
+
+    await client.run()
+
+    assert client.status.connects == 2       # 최초 + 재연결
+    assert client.status.disconnects == 2    # 끊김 + 정상종료
+    assert client.status.rx_count == 2       # 세션별 1프레임씩
+    assert client.status.last_rx == 7.0
+    assert not client.status.connected
+
+
 async def test_reconnect_exhausted_raises() -> None:
     # 한도는 **연속** 실패에만 적용된다(데이터가 흐르면 카운터 초기화) —
     # 프레임 0개로 즉시 끊기는 세션(접속 폭풍 상황)으로 소진을 확인.

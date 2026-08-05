@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..domain.enums import Instrument, Underlying
 from ..domain.models import Quote
+from ..ws_status import WsStatus
 from .hl import Mark
 from .hl_live import HL_SYMBOLS
 from .ls_ws import Fill, TradeTick, WSConnection, WSConnector
@@ -37,12 +39,18 @@ class HLWebSocketClient:
         symbols: dict[Underlying, str] | None = None,
         max_reconnects: int = 3,
         reconnect_backoff_s: float = 0.0,
+        status: WsStatus | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._connector = connector
         self._symbols = dict(symbols or HL_SYMBOLS)
         self._by_symbol = {v: k for k, v in self._symbols.items()}
         self._max_reconnects = max_reconnects
         self._reconnect_backoff_s = reconnect_backoff_s
+        # WS 세션 현황(Phase 8-3) — 연결/끊김·수신카운트. 미주입 시 자체 생성.
+        self.status = status or WsStatus(
+            venue="HL", name="HL", kind="시세/주문", expects_stream=True)
+        self._clock = clock or time.monotonic
         self._subs: list[dict[str, Any]] = []  # subscription payload 희망 상태
         # 최근 호가창(l2Book) — bbo 프레임에 다단계를 붙일 때 사용.
         self._depth: dict[
@@ -132,6 +140,7 @@ class HLWebSocketClient:
             control_task: asyncio.Task[None] | None = None
             try:
                 conn = await self._connector.connect()
+                self.status.on_connect()
                 self._control.clear()  # 재연결이면 희망 상태로 전부 재구독 — 옛 제어 폐기
                 for sub in self._subs:
                     await conn.send(json.dumps({"method": "subscribe", "subscription": sub}))
@@ -139,6 +148,7 @@ class HLWebSocketClient:
                 control_task = asyncio.create_task(self._control_loop(conn))
                 async for raw in conn:
                     attempts = 0  # 데이터 수신 = 정상 연결
+                    self.status.on_message(self._clock())
                     try:
                         self._dispatch(raw)
                     except Exception:  # noqa: BLE001 - 프레임 1건 문제로 스트림을 죽이지 않음
@@ -148,6 +158,8 @@ class HLWebSocketClient:
                             "프레임 처리 실패 — 건너뜀: %.300s", raw, exc_info=True
                         )
             except (ConnectionError, OSError):
+                if self.status.connected:
+                    self.status.on_disconnect()
                 attempts += 1
                 if attempts > self._max_reconnects:
                     raise
@@ -155,6 +167,7 @@ class HLWebSocketClient:
                     await asyncio.sleep(self._reconnect_backoff_s)
                 continue
             else:
+                self.status.on_disconnect()  # 스트림 정상 종료 = 서버가 닫음 = 끊김
                 return
             finally:
                 if ping_task is not None:
