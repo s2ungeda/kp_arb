@@ -157,6 +157,7 @@ class LiveSystem:
         self.on_funding: list[Callable[[Underlying, float], None]] = []  # HL 예정 펀딩률
         self.on_fill: list[Callable[[Fill], None]] = []  # 체결통보 (OrderBook 반영 후 호출)
         self._tasks: list[asyncio.Task[None]] = []
+        self._bg: set[asyncio.Task[None]] = set()  # 재연결 재동기 등 백그라운드 작업(GC 방지)
 
     # --- 스냅샷 (최초 실행 + 온디맨드/UI 조회 버튼) ---
 
@@ -184,6 +185,31 @@ class LiveSystem:
         self.order_book.load_snapshot(
             positions=positions, balances=balances, open_orders=open_orders
         )
+
+    def _on_ws_reconnect(self, label: str) -> None:
+        """WS 재연결 후(동기 콜백) — 끊긴 동안 놓친 체결/외부거래를 반영하러 OrderBook을
+        거래소 실제값으로 재동기(백그라운드). 수신 루프를 막지 않게 태스크로 던진다. Phase 8-4."""
+        import logging
+
+        logging.getLogger("kp_arb.core").warning("%s WS 재연결 — 포지션/잔고 재동기", label)
+        task = asyncio.create_task(self._resync_after_reconnect(label))
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+
+    async def _resync_after_reconnect(self, label: str) -> None:
+        import asyncio as _asyncio
+        import logging
+
+        from . import alert
+
+        try:
+            await self.refresh_snapshot()
+        except Exception:  # noqa: BLE001 - 재동기 실패가 수신 루프를 죽이지 않게
+            logging.getLogger("kp_arb.core").warning(
+                "%s 재연결 재동기 실패", label, exc_info=True)
+            return
+        # 알림은 블로킹(HTTP)이라 별도 스레드로 — 미설정이면 조용히 무시.
+        await _asyncio.to_thread(alert.notify, f"{label} WS 재연결·재동기 완료", "warn")
 
     async def price_snapshots(self) -> dict[tuple[Underlying, Instrument], float]:
         """취급 전 종목 현재가 1회 조회(창 오픈 시 초기 표시용 — 마감 후엔 종가)."""
@@ -304,10 +330,12 @@ class LiveSystem:
         self._stock_ws.on_market_status.append(self.session.on_market_status)
         self._stock_ws.on_fill.append(apply_fill)
         self._stock_ws.on_order_event.append(apply_event)
+        self._stock_ws.on_reconnect.append(lambda: self._on_ws_reconnect("주식"))
         if self._deriv_ws is not None:
             self._deriv_ws.subscribe_futures_fills()
             self._deriv_ws.on_fill.append(apply_fill)
             self._deriv_ws.on_order_event.append(apply_event)
+            self._deriv_ws.on_reconnect.append(lambda: self._on_ws_reconnect("선물"))
         if self._hl_ws is not None:
             def fan_mark(mark: Mark) -> None:
                 for handler in self.on_mark:
@@ -326,6 +354,7 @@ class LiveSystem:
             self._hl_ws.on_trade.append(fan_trade)
             self._hl_ws.on_funding.append(fan_funding)
             self._hl_ws.on_fill.append(apply_fill)  # HL 체결 → OrderBook (oid로 매칭)
+            self._hl_ws.on_reconnect.append(lambda: self._on_ws_reconnect("HL"))
 
     async def start(self) -> None:
         """최초 스냅샷 → 세션 초기값(옵션) → WS 결선 → 실시간 수신 시작(재연결 포함)."""

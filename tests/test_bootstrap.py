@@ -108,6 +108,22 @@ def test_ws_statuses_collects_present_clients() -> None:
     assert [s.to_dict()["connected"] for s in statuses] == [False, False]  # 시동 전
 
 
+async def test_ws_reconnect_triggers_resync() -> None:
+    # Phase 8-4b — 재연결 훅이 OrderBook 재스냅샷(refresh_snapshot)을 백그라운드로 부른다.
+    system, _, _ = _system([], deriv_frames=[])
+    system._wire()  # on_reconnect 콜백 등록
+    calls: list[int] = []
+
+    async def spy() -> None:
+        calls.append(1)
+
+    system.refresh_snapshot = spy  # type: ignore[method-assign]
+    system._stock_ws.on_reconnect[0]()  # 재연결 발화(동기) → 백그라운드 재동기 태스크
+    for task in list(system._bg):
+        await task
+    assert calls == [1]
+
+
 async def test_start_loads_snapshot_then_streams() -> None:
     intent = OrderIntent(venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
                          side=Side.BUY, qty=10, order_type=OrderType.MARKET)
