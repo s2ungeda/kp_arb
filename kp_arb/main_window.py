@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 from .core_client import core_request
 
@@ -133,7 +134,7 @@ def main() -> None:
 
     # 코어 생존 확인은 HTTP 왕복(최대 1초)이라 화면 스레드에서 하면 창 끌기·
     # 메뉴가 그 순간 얼어붙는다 → 뒷단 스레드가 확인하고 화면은 결과만 읽는다.
-    alive_box = {"alive": False}
+    alive_box: dict[str, Any] = {"alive": False, "ws": []}
     closing = {"flag": False}
     launched: list[tuple[str, subprocess.Popen[bytes]]] = []
 
@@ -148,7 +149,9 @@ def main() -> None:
 
     def poll_core() -> None:
         while True:
-            alive_box["alive"] = core_alive()
+            data = core_request("/state")  # 코어 생존 + WS 세션 현황 한 번에
+            alive_box["alive"] = data is not None
+            alive_box["ws"] = (data or {}).get("ws") or []
             if not closing["flag"]:  # 종료 중엔 마지막 저장본을 덮지 않음
                 save_ui_state()
             time.sleep(2.0)
@@ -168,6 +171,37 @@ def main() -> None:
     lbl_core.pack(fill="x", padx=8, pady=(8, 2))
     status = tk.Label(root, text="-", anchor="w", relief="groove")
     status.pack(fill="x", padx=8, pady=(2, 8))
+
+    # WS 세션 현황(Phase 8-3) — 코어 /state의 ws를 2초마다 읽어 표시.
+    from tkinter import ttk
+
+    ws_frame = tk.LabelFrame(root, text="WS 세션")
+    ws_frame.pack(fill="x", padx=8, pady=(0, 8))
+    ws_tree = ttk.Treeview(ws_frame, columns=("no", "venue", "name", "state", "rx"),
+                           show="headings", height=3, selectmode="none")
+    for col, title, wid, anc in (("no", "No", 32, "center"), ("venue", "거래소", 48, "center"),
+                                 ("name", "이름", 96, "w"), ("state", "상태", 54, "center"),
+                                 ("rx", "수신", 84, "e")):
+        ws_tree.heading(col, text=title)
+        ws_tree.column(col, width=wid, anchor=cast(Any, anc), stretch=False)
+    ws_tree.tag_configure("up", foreground="dark green")
+    ws_tree.tag_configure("down", foreground="#8b0000")
+    ws_tree.pack(fill="x", padx=4, pady=4)
+    ws_box: dict[str, Any] = {"sig": None}
+
+    def render_ws() -> None:
+        rows = alive_box.get("ws") or []
+        sig = tuple((r.get("name"), r.get("connected"), r.get("rx_count"),
+                     r.get("disconnects")) for r in rows)
+        if sig == ws_box["sig"]:  # 변화 없으면 다시 그리지 않음(깜빡임 방지)
+            return
+        ws_box["sig"] = sig
+        ws_tree.delete(*ws_tree.get_children())
+        for i, r in enumerate(rows, 1):
+            up = bool(r.get("connected"))
+            ws_tree.insert("", "end", tags=("up" if up else "down",), values=(
+                i, r.get("venue"), r.get("name"), "연결" if up else "끊김",
+                f"{r.get('rx_count', 0):,}"))
 
     def start_core() -> None:
         if core_alive():
@@ -213,6 +247,7 @@ def main() -> None:
             else:
                 lbl_core.config(text="코어: 미접속 — 메뉴 ▸ 코어 ▸ 코어 시작",
                                 fg="#8b0000")
+            render_ws()
         finally:
             try:
                 root.after(500, refresh)
