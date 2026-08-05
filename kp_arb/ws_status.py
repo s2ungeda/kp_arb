@@ -1,0 +1,60 @@
+"""WS 세션 현황 — 연결상태·수신카운트 추적 (Phase 8-3).
+
+각 WS 게이트웨이(LS 시세·LS 주문·HL 시세·HL 주문)가 하나씩 들고, run 루프에서 연결/끊김을,
+_dispatch에서 수신을 기록한다. 순수 상태 객체(시계는 주입) — 무데이터 판정(``is_stale``)은
+주문 안전차단(Phase 8-6)이 재사용하고, 메인창이 표(no·거래소·이름·상태·수신카운트)로 표시한다.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass
+class WsStatus:
+    """WS 한 채널의 현황. 시각은 단조시계(time.monotonic)를 호출부가 주입한다."""
+
+    venue: str            # "LS" | "HL"
+    name: str             # 표시 이름 예 "LS 시세"
+    kind: str             # "시세" | "주문"
+    expects_stream: bool  # 시세=True(계속 수신) / 주문=False(체결 때만 옴)
+    connected: bool = False
+    rx_count: int = 0
+    last_rx: float | None = None   # 마지막 수신 시각(주입된 단조시계)
+    connects: int = 0              # 연결 성공 누적
+    disconnects: int = 0           # 끊김 누적
+
+    def on_connect(self) -> None:
+        self.connected = True
+        self.connects += 1
+
+    def on_disconnect(self) -> None:
+        self.connected = False
+        self.disconnects += 1
+
+    def on_message(self, now: float) -> None:
+        self.rx_count += 1
+        self.last_rx = now
+
+    def is_stale(self, now: float, max_idle_s: float) -> bool:
+        """무데이터/끊김이면 True(주문 내면 위험). 주문 피드는 무데이터가 정상이라
+        연결 여부만 본다 — 체결이 없어도 끊긴 게 아니다."""
+        if not self.connected:
+            return True
+        if not self.expects_stream:
+            return False
+        if self.last_rx is None:
+            return True  # 시세인데 아직 한 건도 못 받음
+        return (now - self.last_rx) > max_idle_s
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON 스냅샷(코어 → 메인창). 파생값(stale)은 표시부가 시각을 넣어 계산."""
+        return {
+            "venue": self.venue,
+            "name": self.name,
+            "kind": self.kind,
+            "connected": self.connected,
+            "rx_count": self.rx_count,
+            "disconnects": self.disconnects,
+            "last_rx": self.last_rx,
+        }
