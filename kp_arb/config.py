@@ -34,6 +34,8 @@ SECRET_NAMES: tuple[tuple[str, str], ...] = (
     ("LS_DERIV_ACCT_PW", "LS 선물계좌 비밀번호"),
     ("HL_AGENT_KEY", "HL 에이전트 키"),
     ("HL_ACCOUNT_ADDRESS", "HL 메인 주소"),
+    ("KP_TELEGRAM_TOKEN", "텔레그램 봇 토큰 (알림, 선택)"),
+    ("KP_TELEGRAM_CHAT_ID", "텔레그램 chat_id (알림 받을 대화, 선택)"),
 )
 
 
