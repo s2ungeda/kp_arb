@@ -117,6 +117,49 @@ async def test_subscription_ack_ignored() -> None:
     await client.run()  # 예외 없이 통과
 
 
+class _FailingConn:
+    """fail_after 프레임 후 끊기는 세션(재연결 테스트용)."""
+
+    def __init__(self, frames: list[str], *, fail_after: int | None = None) -> None:
+        self.frames = frames
+        self.fail_after = fail_after
+        self.sent: list[str] = []
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    async def _gen(self) -> AsyncIterator[str]:
+        for i, frame in enumerate(self.frames):
+            if self.fail_after is not None and i >= self.fail_after:
+                raise ConnectionError("dropped")
+            yield frame
+
+    def __aiter__(self) -> AsyncIterator[str]:
+        return self._gen()
+
+
+class _MultiConnector:
+    def __init__(self, sessions: list[_FailingConn]) -> None:
+        self.sessions = sessions
+        self.n = 0
+
+    async def connect(self) -> _FailingConn:
+        conn = self.sessions[self.n]
+        self.n += 1
+        return conn
+
+
+async def test_on_reconnect_fires_only_after_reconnect() -> None:
+    # Phase 8-4 — 최초 연결엔 안 울리고, 재연결(재구독 완료) 시 1회.
+    s1 = _FailingConn([mark_frame(), mark_frame()], fail_after=1)
+    s2 = _FailingConn([mark_frame()])
+    client = HLWebSocketClient(_MultiConnector([s1, s2]))
+    fired: list[int] = []
+    client.on_reconnect.append(lambda: fired.append(1))
+    await client.run()
+    assert fired == [1]
+
+
 async def test_ws_status_tracks_rx_and_connection() -> None:
     # WS 세션 현황(Phase 8-3) — 연결·수신카운트·끊김 추적.
     client = HLWebSocketClient(FakeConnector([mark_frame(), mark_frame()]),

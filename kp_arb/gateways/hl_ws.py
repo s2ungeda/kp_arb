@@ -65,6 +65,8 @@ class HLWebSocketClient:
         self.on_funding: list[Callable[[Underlying, float], None]] = []  # 예정 펀딩률
         self.on_fill: list[Callable[[Fill], None]] = []
         self.on_raw: list[Callable[[str], None]] = []
+        # 재연결(최초 연결 제외) 후 재구독까지 끝나면 발화 — OrderBook 재스냅샷용(Phase 8-4).
+        self.on_reconnect: list[Callable[[], None]] = []
 
     # --- 구독 등록 ---
 
@@ -144,6 +146,9 @@ class HLWebSocketClient:
                 self._control.clear()  # 재연결이면 희망 상태로 전부 재구독 — 옛 제어 폐기
                 for sub in self._subs:
                     await conn.send(json.dumps({"method": "subscribe", "subscription": sub}))
+                if self.status.connects > 1:  # 재연결(최초 아님) → 재동기 훅
+                    for on_reconnect in self.on_reconnect:
+                        on_reconnect()
                 ping_task = asyncio.create_task(self._ping_loop(conn))
                 control_task = asyncio.create_task(self._control_loop(conn))
                 async for raw in conn:

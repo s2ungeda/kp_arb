@@ -193,6 +193,8 @@ class LSWebSocketClient:
         self.on_fx_price: list[Callable[[float], None]] = []  # 통화선물 체결가 (FC0)
         self._fx_codes: set[str] = set()
         self.on_raw: list[Callable[[str], None]] = []  # 진단: 모든 원시 프레임
+        # 재연결(최초 연결 제외) 후 재구독까지 끝나면 발화 — OrderBook 재스냅샷용(Phase 8-4).
+        self.on_reconnect: list[Callable[[], None]] = []
 
     # --- 구독 등록(희망 상태). 실제 전송은 connect 시 _resubscribe ---
 
@@ -274,6 +276,9 @@ class LSWebSocketClient:
                 self._conn = conn
                 self.status.on_connect()
                 await self._resubscribe(conn)
+                if self.status.connects > 1:  # 재연결(최초 아님) → 재동기 훅
+                    for on_reconnect in self.on_reconnect:
+                        on_reconnect()
                 async for raw in conn:
                     attempts = 0  # 데이터 수신 = 정상 연결 — 연속 실패 카운터 초기화
                     self.status.on_message(self._clock())

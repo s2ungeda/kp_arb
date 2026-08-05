@@ -152,6 +152,20 @@ async def test_ws_status_counts_reconnect() -> None:
     assert not client.status.connected
 
 
+async def test_on_reconnect_fires_only_after_reconnect() -> None:
+    # Phase 8-4 — 최초 연결에는 안 울리고, 재연결(재구독 완료) 시 1회 울린다.
+    s1 = FakeConnection([quote_frame(bid=1), quote_frame(bid=2)], fail_after=1)
+    s2 = FakeConnection([quote_frame(bid=3)])
+    client = LSWebSocketClient(FakeConnector([s1, s2]))
+    client.subscribe_quotes(Underlying.SAMSUNG)
+    fired: list[int] = []
+    client.on_reconnect.append(lambda: fired.append(1))
+
+    await client.run()
+
+    assert fired == [1]  # 최초(s1) 제외, 재연결(s2)에서만
+
+
 async def test_reconnect_exhausted_raises() -> None:
     # 한도는 **연속** 실패에만 적용된다(데이터가 흐르면 카운터 초기화) —
     # 프레임 0개로 즉시 끊기는 세션(접속 폭풍 상황)으로 소진을 확인.
