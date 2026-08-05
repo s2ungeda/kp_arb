@@ -489,16 +489,48 @@ def make_app(
     return app
 
 
+class _DailyFileHandler(logging.FileHandler):
+    """자정에 파일을 바꾸는 로그 핸들러 — 항상 ``logs/core_<오늘>.log`` 에 쓴다.
+
+    표준 TimedRotatingFileHandler는 활성 파일이 날짜 없는 이름(core.log)이고 회전분에만
+    날짜가 붙어 '파일 이름=당일 날짜' 요구와 반대다. 그래서 기록할 때 날짜가 바뀌면 스스로
+    오늘 날짜 파일로 갈아탄다 — 24시간 무중단이라 시작 시각 날짜에 고정되면 안 됨(Phase 8).
+    """
+
+    def __init__(self, log_dir: Path, prefix: str = "core") -> None:
+        self._dir = log_dir
+        self._prefix = prefix
+        self._day = self._today()
+        super().__init__(self._path(self._day), encoding="utf-8")
+
+    @staticmethod
+    def _today() -> str:
+        import time
+
+        return time.strftime("%Y%m%d")
+
+    def _path(self, day: str) -> str:
+        return str((self._dir / f"{self._prefix}_{day}.log").resolve())
+
+    def emit(self, record: logging.LogRecord) -> None:
+        day = self._today()
+        if day != self._day:  # 자정 넘김 → 오늘 파일로 갈아탄다
+            self._day = day
+            self.baseFilename = self._path(day)
+            if self.stream is not None:
+                self.stream.close()
+            self.stream = self._open()
+        super().emit(record)
+
+
 def _setup_logging() -> logging.Logger:
-    """콘솔 + logs/core_날짜.log 파일 로그 (7-3a — 판정·발주 추적용)."""
+    """콘솔 + logs/core_날짜.log 파일 로그 (7-3a — 판정·발주 추적용). 자정 롤오버(Phase 8)."""
     import sys
-    import time
 
     log_dir = _base_dir() / "logs"
     try:
         log_dir.mkdir(exist_ok=True)
-        file_handler: logging.Handler = logging.FileHandler(
-            log_dir / f"core_{time.strftime('%Y%m%d')}.log", encoding="utf-8")
+        file_handler: logging.Handler = _DailyFileHandler(log_dir)
     except OSError:
         file_handler = logging.NullHandler()
     handlers: list[logging.Handler] = [file_handler]
