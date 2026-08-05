@@ -99,6 +99,15 @@ def _system(
     return system, stock_connector, deriv_connector
 
 
+def test_ws_statuses_collects_present_clients() -> None:
+    # WS 세션 현황(Phase 8-3c) — 살아있는 채널만 모으고 없는 채널(HL)은 건너뛴다.
+    system, _, _ = _system([], deriv_frames=[])
+    statuses = system.ws_statuses()
+    assert len(statuses) == 2  # LS 주식 + LS 선물 (HL 미설정 → 제외)
+    assert all(s.venue == "LS" for s in statuses)
+    assert [s.to_dict()["connected"] for s in statuses] == [False, False]  # 시동 전
+
+
 async def test_start_loads_snapshot_then_streams() -> None:
     intent = OrderIntent(venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
                          side=Side.BUY, qty=10, order_type=OrderType.MARKET)

@@ -454,6 +454,8 @@ def make_app(
         payload["live"] = live_snapshot(state, system, engine)
         payload["fx"] = (fx_service.snapshot() if fx_service is not None
                          else {"connected": False})
+        payload["ws"] = ([s.to_dict() for s in system.ws_statuses()]
+                         if system is not None else [])  # WS 세션 현황(Phase 8-3)
         return web.json_response(payload, dumps=_dumps)
 
     async def post_command(request: web.Request) -> web.Response:

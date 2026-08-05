@@ -61,6 +61,7 @@ from .theory import (
     select_usd_futures,
 )
 from .ticks import ceil_to_tick, floor_to_tick, maker_cap, tick_for
+from .ws_status import WsStatus
 
 
 def select_near_month(
@@ -456,6 +457,14 @@ class LiveSystem:
         if self._hl_ws is not None:
             self._hl_ws.set_l2_aggregation(u, n_sig_figs, mantissa)
 
+    def ws_statuses(self) -> list[WsStatus]:
+        """살아있는 WS 채널들의 현황(메인창 표·주문 안전차단 Phase 8-6용).
+
+        LS 주식·LS 선물·HL 순. 없는 채널(키 미설정 등)은 건너뛴다.
+        """
+        clients = [self._stock_ws, self._deriv_ws, self._hl_ws]
+        return [c.status for c in clients if c is not None]
+
     def pair_signal(
         self, u: Underlying, instrument: Instrument,
         entry_qty: int, exit_qty: int,
@@ -786,6 +795,7 @@ async def bootstrap_live(
 
     async def ws_for(account: Account) -> LSWebSocketClient:
         cred = accounts.for_account(account)
+        name = "LS 주식" if account == Account.KR_STOCK else "LS 선물"
 
         async def fresh_token() -> str:
             # 재연결 시마다 새 토큰 — LS 토큰 만료(약 1일) 후 재접속 거부 방지
@@ -794,6 +804,7 @@ async def bootstrap_live(
         return LSWebSocketClient(
             LSWebSocketConnector(url), token_provider=fresh_token,
             etf_symbols=etf_symbols,
+            status=WsStatus(venue="LS", name=name, kind="시세/주문", expects_stream=True),
             # 장시간 운영: 사실상 무제한 재연결 + 2초 대기 (한도는 연속 실패에만)
             max_reconnects=1_000_000, reconnect_backoff_s=2.0,
         )
