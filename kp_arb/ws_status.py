@@ -6,6 +6,7 @@ _dispatch에서 수신을 기록한다. 순수 상태 객체(시계는 주입) �
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,3 +59,24 @@ class WsStatus:
             "disconnects": self.disconnects,
             "last_rx": self.last_rx,
         }
+
+
+def order_block_reason(
+    statuses: Sequence[WsStatus], now: float, max_idle_s: float
+) -> str | None:
+    """주문을 막아야 하면 그 사유(문자열), 괜찮으면 None (Phase 8-6 주문 안전차단).
+
+    - 채널이 하나도 없으면(접속 전) 막는다.
+    - 끊긴 채널이 있으면 막는다(하나라도).
+    - 시세 채널이 무데이터(N초 초과)면 막는다 — 데이터 없이 발주는 위험.
+    끊김과 지연을 구분해 사유를 돌려준다(로그·알림·화면 표시용).
+    """
+    if not statuses:
+        return "WS 미접속"
+    down = [s.name for s in statuses if not s.connected]
+    if down:
+        return f"WS 끊김: {', '.join(down)}"
+    stale = [s.name for s in statuses if s.connected and s.is_stale(now, max_idle_s)]
+    if stale:
+        return f"시세 지연(무데이터 {max_idle_s:.0f}s+): {', '.join(stale)}"
+    return None
