@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller 스펙 — 배포판 빌드 (build_exe.bat 에서 사용).
-# 한 폴더(dist/kp-arb)에 exe 2개: kp-arb.exe(GUI, 콘솔 없음) + kp-arb-core.exe(코어, 콘솔).
+# 한 폴더(dist/meme)에 exe 2개: meme.exe(GUI, 콘솔 없음) + meme-core.exe(코어, 콘솔).
 from PyInstaller.utils.hooks import collect_submodules
 
 hidden = (
@@ -21,13 +21,13 @@ pyz = PYZ(a.pure)
 exe_gui = EXE(
     pyz, a.scripts, [],
     exclude_binaries=True,
-    name="kp-arb",
+    name="meme",
     console=False,   # 화면용 — cmd 창 없음
 )
 exe_core = EXE(
     pyz, a.scripts, [],
     exclude_binaries=True,
-    name="kp-arb-core",
+    name="meme-core",
     console=True,    # 코어 — 로그 확인용 콘솔
 )
-coll = COLLECT(exe_gui, exe_core, a.binaries, a.datas, name="kp-arb")
+coll = COLLECT(exe_gui, exe_core, a.binaries, a.datas, name="meme")

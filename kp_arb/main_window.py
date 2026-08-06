@@ -113,18 +113,18 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [exe, "-m", module, *args]
     exe_dir = Path(sys.executable).parent
     if module == "kp_arb.core_server":
-        return [str(exe_dir / "kp-arb-core.exe"), "core"]
+        return [str(exe_dir / "meme-core.exe"), "core"]
     if module == "kp_arb.monitor":
-        return [str(exe_dir / "kp-arb.exe"), "monitor"]
+        return [str(exe_dir / "meme.exe"), "monitor"]
     if module == "kp_arb.fx_monitor":
-        return [str(exe_dir / "kp-arb.exe"), "fx_monitor"]
+        return [str(exe_dir / "meme.exe"), "fx_monitor"]
     if module == "kp_arb.order_hl":
-        return [str(exe_dir / "kp-arb.exe"), "order_hl"]
+        return [str(exe_dir / "meme.exe"), "order_hl"]
     if module == "kp_arb.order_list":
-        return [str(exe_dir / "kp-arb.exe"), "order_list"]
+        return [str(exe_dir / "meme.exe"), "order_list"]
     if module == "kp_arb.order_panel":
-        return [str(exe_dir / "kp-arb.exe"), *args]  # autoT | autoM
-    return [str(exe_dir / "kp-arb.exe")]
+        return [str(exe_dir / "meme.exe"), *args]  # autoT | autoM
+    return [str(exe_dir / "meme.exe")]
 
 
 def launch_module(module: str, *args: str, console: bool = False,
