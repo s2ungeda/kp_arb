@@ -234,7 +234,7 @@ def main() -> None:
     threading.Thread(target=run_live, daemon=True).start()
 
     root = tk.Tk()
-    root.title("kp-arb 시세")
+    root.title("시세")
     root.geometry("760x600")
     win_state.attach(root, "monitor")  # 마지막 창 위치 복원·저장
     font = ("Malgun Gothic", 9)

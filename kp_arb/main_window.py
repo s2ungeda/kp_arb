@@ -49,7 +49,7 @@ def _warn_already_running() -> None:
         import ctypes
 
         ctypes.windll.user32.MessageBoxW(
-            0, "kp-arb 메인이 이미 실행 중입니다.", "kp-arb", 0x40)
+            0, "Meme 메인이 이미 실행 중입니다.", "Meme", 0x40)
 
 
 def core_alive() -> bool:
@@ -220,7 +220,7 @@ def main() -> None:
         launched.append((token, launch_module(module, *args)))
 
     root = tk.Tk()
-    root.title("kp-arb 메인")
+    root.title("Meme")
     root.resizable(False, False)
     root.option_add("*Font", ("Malgun Gothic", 9))
 

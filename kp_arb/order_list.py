@@ -23,7 +23,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
-    root.title("kp-arb 주문 리스트 (미체결·취소·정정)")
+    root.title("주문 리스트 (미체결·취소·정정)")
     root.resizable(False, False)
     win_state.attach(root, "order_list")
     root.option_add("*Font", ("Malgun Gothic", 9))

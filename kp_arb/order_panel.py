@@ -87,7 +87,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
-    root.title(f"kp-arb {TITLES[kind]}")
+    root.title(f"{TITLES[kind]}")
     root.resizable(False, False)
     win_state.attach(root, screen_key)  # 마지막 창 위치 복원·저장
     root.option_add("*Font", ("Malgun Gothic", 9))

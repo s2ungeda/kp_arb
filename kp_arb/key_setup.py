@@ -22,7 +22,7 @@ def main() -> None:
         raise SystemExit("keyring 모듈이 없어 키 등록을 할 수 없습니다") from None
 
     root = tk.Tk()
-    root.title("kp-arb 키 등록 (자격증명관리자)")
+    root.title("키 등록 (자격증명관리자)")
     root.resizable(False, False)
     root.option_add("*Font", ("Malgun Gothic", 9))
 
