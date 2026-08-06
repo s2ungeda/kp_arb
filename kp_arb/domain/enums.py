@@ -32,10 +32,11 @@ class Venue(StrEnum):
 
 
 class Account(StrEnum):
-    """LS 2계좌 (DESIGN.md §3)."""
+    """LS 계좌 (DESIGN.md §3, §9.1)."""
 
     KR_STOCK = "kr_stock"   # 주식계좌: 주식, ETF
     KR_DERIV = "kr_deriv"   # 선물옵션계좌: 주식선물, 야간선물 (주간·야간 공용)
+    KR_FX = "kr_fx"         # 원달러선물 환헤지 계좌 (별도 용도·선택, DESIGN §9.1)
 
 
 class Instrument(StrEnum):

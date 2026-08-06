@@ -111,6 +111,35 @@ def test_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert accounts.for_account(Account.KR_STOCK).appkey == "stock-ak"
 
 
+# --- 원달러선물 환헤지 계좌 (KR_FX, 선택 — DESIGN §9.1) ---
+
+
+def test_fx_account_absent_when_no_secrets() -> None:
+    accounts = LSAccounts.load(MockSecrets(_SECRETS))  # FX 자격 없음 → 비활성
+    assert accounts.has(Account.KR_FX) is False
+    with pytest.raises(ConfigError):
+        accounts.for_account(Account.KR_FX)
+
+
+def test_fx_account_loads_when_all_secrets_present() -> None:
+    secrets = {**_SECRETS,
+               "LS_FX_ACCT": "333-77", "LS_FX_ACCT_PW": "9999",
+               "LS_FX_APPKEY": "fx-ak", "LS_FX_APPSECRET": "fx-as"}
+    accounts = LSAccounts.load(MockSecrets(secrets))
+    assert accounts.has(Account.KR_FX) is True
+    fx = accounts.for_account(Account.KR_FX)
+    assert fx.number == "333-77" and fx.appkey == "fx-ak"
+    assert fx.appsecret == "fx-as" and fx.password == "9999"
+
+
+def test_fx_account_partial_secrets_ignored() -> None:
+    # 반쪽 자격(APPSECRET 누락)이면 로드하지 않는다 — 실행 중 인증 실패보다 명확히 비활성.
+    secrets = {**_SECRETS, "LS_FX_ACCT": "333-77", "LS_FX_ACCT_PW": "9999",
+               "LS_FX_APPKEY": "fx-ak"}
+    accounts = LSAccounts.load(MockSecrets(secrets))
+    assert accounts.has(Account.KR_FX) is False
+
+
 # --- 취급 종목 설정 (config.yaml) ---
 
 

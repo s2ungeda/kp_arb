@@ -32,6 +32,10 @@ SECRET_NAMES: tuple[tuple[str, str], ...] = (
     ("LS_DERIV_APPSECRET", "LS 선물계좌 AppSecret"),
     ("LS_DERIV_ACCT", "LS 선물계좌 번호"),
     ("LS_DERIV_ACCT_PW", "LS 선물계좌 비밀번호"),
+    ("LS_FX_APPKEY", "LS 원달러선물(환헤지) AppKey (선택)"),
+    ("LS_FX_APPSECRET", "LS 원달러선물(환헤지) AppSecret (선택)"),
+    ("LS_FX_ACCT", "LS 원달러선물(환헤지) 계좌번호 (선택)"),
+    ("LS_FX_ACCT_PW", "LS 원달러선물(환헤지) 비밀번호 (선택)"),
     ("HL_AGENT_KEY", "HL 에이전트 키"),
     ("HL_ACCOUNT_ADDRESS", "HL 메인 주소"),
     ("KP_TELEGRAM_TOKEN", "텔레그램 봇 토큰 (알림, 선택)"),
@@ -128,10 +132,15 @@ class LSAccount:
 
 
 class LSAccounts:
-    """LS 2계좌(주식/선물옵션)의 자격."""
+    """LS 계좌 자격 — 주식·선물옵션(필수) + 원달러선물 환헤지(KR_FX, 선택 — DESIGN §9.1)."""
 
-    def __init__(self, stock: LSAccount, deriv: LSAccount) -> None:
+    def __init__(
+        self, stock: LSAccount, deriv: LSAccount, fx: LSAccount | None = None
+    ) -> None:
         self._by_account = {Account.KR_STOCK: stock, Account.KR_DERIV: deriv}
+        # 원달러선물 헤지 계좌는 선택 — 자격이 있을 때만 등록(HL 슬롯과 동일 패턴).
+        if fx is not None:
+            self._by_account[Account.KR_FX] = fx
 
     @classmethod
     def load(cls, secrets: SecretProvider | None = None) -> LSAccounts:
@@ -143,6 +152,19 @@ class LSAccounts:
                 raise ConfigError(f"missing secret {name}")
             return value
 
+        # 환헤지 계좌: 4개 자격이 모두 있으면 로드, 하나라도 없으면 None(기능만 비활성).
+        fx_fields = {n: provider.get(n) for n in (
+            "LS_FX_ACCT", "LS_FX_ACCT_PW", "LS_FX_APPKEY", "LS_FX_APPSECRET")}
+        fx = (
+            LSAccount(
+                number=fx_fields["LS_FX_ACCT"] or "",
+                password=fx_fields["LS_FX_ACCT_PW"] or "",
+                appkey=fx_fields["LS_FX_APPKEY"] or "",
+                appsecret=fx_fields["LS_FX_APPSECRET"] or "",
+            )
+            if all(fx_fields.values())
+            else None
+        )
         return cls(
             stock=LSAccount(
                 number=req("LS_STOCK_ACCT"),
@@ -156,6 +178,7 @@ class LSAccounts:
                 appkey=req("LS_DERIV_APPKEY"),
                 appsecret=req("LS_DERIV_APPSECRET"),
             ),
+            fx=fx,
         )
 
     @classmethod
@@ -163,8 +186,15 @@ class LSAccounts:
         """환경변수만 사용(폴백/CI). = ``load(EnvSecrets())``."""
         return cls.load(EnvSecrets())
 
+    def has(self, account: Account) -> bool:
+        """그 계좌 자격이 등록돼 있는가 — KR_FX는 선택이라 없을 수 있다(§9.1)."""
+        return account in self._by_account
+
     def for_account(self, account: Account) -> LSAccount:
-        return self._by_account[account]
+        try:
+            return self._by_account[account]
+        except KeyError:
+            raise ConfigError(f"{account.value} 계좌 자격 미등록") from None
 
     def __repr__(self) -> str:
         return f"LSAccounts({list(self._by_account)})"  # 자격값 비노출
