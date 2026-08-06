@@ -34,7 +34,7 @@ def _ensure_single_instance() -> bool:
     import ctypes
 
     kernel32 = ctypes.windll.kernel32
-    handle = kernel32.CreateMutexW(None, False, "kp-arb-main-window")
+    handle = kernel32.CreateMutexW(None, False, "meme-main-window")
     if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
         if handle:
             kernel32.CloseHandle(handle)

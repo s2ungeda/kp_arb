@@ -196,5 +196,5 @@ def test_base_dir_dev_vs_frozen(monkeypatch) -> None:
     monkeypatch.setattr(sys, "frozen", False, raising=False)
     assert _base_dir().name == "kp-arb" or _base_dir().is_dir()  # 개발: 프로젝트 루트
     monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "executable", r"C:\dist\kp-arb\kp-arb-core.exe")
-    assert _base_dir() == Path(r"C:\dist\kp-arb")  # 배포: exe 옆
+    monkeypatch.setattr(sys, "executable", r"C:\dist\meme\meme-core.exe")
+    assert _base_dir() == Path(r"C:\dist\meme")  # 배포: exe 옆

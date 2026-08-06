@@ -1,7 +1,7 @@
 """키 등록 창 — Windows 자격증명관리자(keyring)에 비밀 저장. 평문 파일 불필요.
 
     keys.bat                (개발 PC)
-    kp-arb.exe keys         (배포판 — Python 없이)
+    meme.exe keys           (배포판 — Python 없이)
 
 - 빈칸으로 두면 그 키는 **변경 없음** (이미 등록된 값 유지).
 - 저장 후에도 창이 남아 등록 상태를 확인할 수 있다. 적용은 프로그램 재시작 후.

@@ -3,11 +3,11 @@
 PyInstaller로 얼리면 `python -m kp_arb.모듈` 방식을 쓸 수 없어서,
 exe 하나가 인자를 보고 분기한다 (main_window.launch_module이 인자를 맞춰 실행).
 
-    kp-arb.exe            # 메인 화면 (기본)
-    kp-arb.exe monitor    # 시세 모니터
-    kp-arb.exe autoT      # 자동T 주문 화면
-    kp-arb.exe autoM      # 자동M 주문 화면
-    kp-arb-core.exe core  # 코어 (콘솔 exe — 로그 표시)
+    meme.exe            # 메인 화면 (기본)
+    meme.exe monitor    # 시세 모니터
+    meme.exe autoT      # 자동T 주문 화면
+    meme.exe autoM      # 자동M 주문 화면
+    meme-core.exe core  # 코어 (콘솔 exe — 로그 표시)
 """
 from __future__ import annotations
 
