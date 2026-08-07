@@ -139,7 +139,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     top = tk.Frame(root)
     top.pack(side="top", fill="both", padx=4, pady=4)
     left = tk.Frame(top)
-    left.pack(side="left", anchor="n", fill="y")  # 오더북 높이만큼 늘려 하단 여백 확보(§갱신시각)
+    left.pack(side="left", anchor="n")
     right = tk.Frame(top)
     right.pack(side="left", anchor="n", padx=(6, 0))
 
@@ -253,11 +253,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         rv = tk.Label(bal, text="-", width=12, anchor="e")
         rv.grid(row=i, column=3, sticky="e", padx=(0, 4))
         bal_val[rname] = rv
-    # 잔고 마지막 재동기('적') 시각 — 좌측 입력열 하단의 남는 빈 공간(오더북이 더 길어 생김)에
-    # 텍스트만 우측 정렬로. 전체폭 한 줄 아님 (§1-5, 사용자 요청).
-    lbl_synced = tk.Label(left, text="", fg="gray40")
-    lbl_synced.pack(side="bottom", anchor="e")
-
     # 상태바 — width=1(요청폭 최소) + fill=x: 긴 로그가 창 넓이를 밀지 않고 잘린다.
     status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
     status.pack(side="top", fill="x", padx=4, pady=(0, 4))
@@ -284,7 +279,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         send({"cmd": "manual_refresh"}, "적용·조회")  # 잔고/포지션 재조회(OrderBook 재동기)
         refresh_side()
         _populate_merge()  # 종목 가격 기준 호가단위(틱) 콤보 채우기
-        lbl_synced.config(text=f"갱신 {time.strftime('%H:%M:%S')}")  # 마지막 재동기 시각(§1-5)
         set_status(f"{cb_under.get()} 적용 — 조회 중")
 
     def _populate_merge() -> None:
