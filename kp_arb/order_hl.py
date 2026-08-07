@@ -155,8 +155,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     cb_under = ttk.Combobox(head, values=UNDERLYINGS, width=7, state="readonly")
     cb_under.set("삼성")
     cb_under.grid(row=0, column=1, sticky="w", padx=(4, 0))
-    btn_apply = ttk.Button(head, text="적", width=3)  # ttk — 양옆 콤보와 높이 맞춤
-    btn_apply.grid(row=0, column=2, padx=(6, 0))
+    btn_apply = ttk.Button(head, text="적", width=3)
+    btn_apply.grid(row=0, column=2, padx=(6, 0), sticky="ns")  # 행 높이(=콤보)만큼 세로 채움
     cb_merge = ttk.Combobox(head, values=[], width=6, state="readonly")  # 호가단위(틱)
     cb_merge.grid(row=0, column=3, sticky="w", padx=(6, 0))
     # 콤보 표시값(틱) → (nSigFigs, mantissa) 역매핑 — '적'에서 종목 가격으로 채운다.
@@ -253,10 +253,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         rv = tk.Label(bal, text="-", width=12, anchor="e")
         rv.grid(row=i, column=3, sticky="e", padx=(0, 4))
         bal_val[rname] = rv
-    # 잔고를 마지막으로 재동기('적')한 시각 — 좌측 입력열 하단(오더북과 잔고표 사이 여백),
-    # 우측 정렬 (§1-5, 사용자 요청).
-    lbl_synced = tk.Label(left, text="", fg="gray40", anchor="e")
-    lbl_synced.pack(side="bottom", fill="x", pady=(4, 0))
+    # 잔고 마지막 재동기('적') 시각 — 좌측 입력열 하단의 남는 빈 공간(오더북이 더 길어 생김)에
+    # 텍스트만 우측 정렬로. 전체폭 한 줄 아님 (§1-5, 사용자 요청).
+    lbl_synced = tk.Label(left, text="", fg="gray40")
+    lbl_synced.pack(side="bottom", anchor="e")
 
     # 상태바 — width=1(요청폭 최소) + fill=x: 긴 로그가 창 넓이를 밀지 않고 잘린다.
     status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
