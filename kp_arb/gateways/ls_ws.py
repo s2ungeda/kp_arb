@@ -190,7 +190,8 @@ class LSWebSocketClient:
         self.on_fill: list[Callable[[Fill], None]] = []
         self.on_order_event: list[Callable[[OrderEvent], None]] = []
         self.on_market_status: list[Callable[[MarketStatus], None]] = []
-        self.on_fx_price: list[Callable[[float], None]] = []  # 통화선물 체결가 (FC0)
+        # 통화선물 체결가 (FC0) — (월물코드, 가격). 근/차근 구분 위해 코드 동반(§9.1).
+        self.on_fx_price: list[Callable[[str, float], None]] = []
         self._fx_codes: set[str] = set()
         self.on_raw: list[Callable[[str], None]] = []  # 진단: 모든 원시 프레임
         # 재연결(최초 연결 제외) 후 재구독까지 끝나면 발화 — OrderBook 재스냅샷용(Phase 8-4).
@@ -358,14 +359,14 @@ class LSWebSocketClient:
             for status_handler in self.on_market_status:
                 status_handler(status)
         elif tr_cd == FX_TRADE_TR:
-            fx_price = self._parse_fx(msg)
-            if fx_price is not None:
+            fx = self._parse_fx(msg)
+            if fx is not None:
                 for fx_handler in self.on_fx_price:
-                    fx_handler(fx_price)
+                    fx_handler(*fx)
         # 알 수 없는 tr_cd는 무시
 
-    def _parse_fx(self, msg: dict[str, Any]) -> float | None:
-        # FC0 체결가 필드는 'price' 가정(실측 예정 — 다르면 on_raw로 확인).
+    def _parse_fx(self, msg: dict[str, Any]) -> tuple[str, float] | None:
+        # FC0 체결가 필드는 'price' 가정(실측 예정 — 다르면 on_raw로 확인). (월물코드, 가격).
         body = msg["body"]
         code = str(body.get("focode") or body.get("shcode")
                    or msg.get("header", {}).get("tr_key", ""))
@@ -375,7 +376,7 @@ class LSWebSocketClient:
             price = float(body["price"])
         except (KeyError, TypeError, ValueError):
             return None
-        return price if price > 0 else None
+        return (code, price) if price > 0 else None
 
     def _parse_quote(self, msg: dict[str, Any]) -> Quote | None:
         body = msg["body"]

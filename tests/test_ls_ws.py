@@ -364,7 +364,7 @@ async def test_quote_carries_full_depth() -> None:
 
 
 async def test_fx_trade_updates_price() -> None:
-    # FC0(통화선물 체결, K200 계열 TR) → on_fx_price. 구독한 종목코드만.
+    # FC0(통화선물 체결) → on_fx_price(월물코드, 가격). 구독한 종목코드만.
     frame = json.dumps({"header": {"tr_cd": "FC0", "tr_key": "175W07"},
                         "body": {"focode": "175W07", "price": "1530.1"}})
     other = json.dumps({"header": {"tr_cd": "FC0", "tr_key": "175W08"},
@@ -372,13 +372,30 @@ async def test_fx_trade_updates_price() -> None:
     session = FakeConnection([other, frame])
     client = LSWebSocketClient(FakeConnector([session]))
     client.subscribe_fx("175W07")
-    prices: list[float] = []
-    client.on_fx_price.append(prices.append)
+    events: list[tuple[str, float]] = []
+    client.on_fx_price.append(lambda code, price: events.append((code, price)))
 
     await client.run()
 
-    assert prices == [1530.1]  # 다른 월물은 무시
+    assert events == [("175W07", 1530.1)]  # 미구독 월물(175W08)은 무시
     assert any('"FC0"' in msg and '"175W07"' in msg for msg in session.sent)  # 구독 전송
+
+
+async def test_fx_trade_both_months_when_subscribed() -> None:
+    # 근·차근 둘 다 구독하면 둘 다 (코드, 가격)으로 전달(§9.1 헤지 월물 선택용).
+    near = json.dumps({"header": {"tr_cd": "FC0", "tr_key": "175W07"},
+                       "body": {"focode": "175W07", "price": "1530.1"}})
+    nxt = json.dumps({"header": {"tr_cd": "FC0", "tr_key": "175W08"},
+                      "body": {"focode": "175W08", "price": "1533.4"}})
+    client = LSWebSocketClient(FakeConnector([FakeConnection([near, nxt])]))
+    client.subscribe_fx("175W07")
+    client.subscribe_fx("175W08")
+    events: list[tuple[str, float]] = []
+    client.on_fx_price.append(lambda code, price: events.append((code, price)))
+
+    await client.run()
+
+    assert events == [("175W07", 1530.1), ("175W08", 1533.4)]
 
 
 async def test_unified_quote_and_trade_parse() -> None:

@@ -58,7 +58,7 @@ from .theory import (
     days_to_expiry,
     in_time_window,
     parse_hhmm,
-    select_usd_futures,
+    select_usd_futures_months,
 )
 from .ticks import ceil_to_tick, floor_to_tick, maker_cap, tick_for
 from .ws_status import WsStatus
@@ -112,6 +112,7 @@ class LiveSystem:
         etf_symbols: dict[Underlying, str] | None = None,
         futures_expiry: dict[Underlying, int] | None = None,
         fx_futures: tuple[str, int] | None = None,
+        fx_months: list[tuple[str, int]] | None = None,
         carry_rates: CarryRates | None = None,
         fees: FeeRates | None = None,
         fx_spot_window: tuple[str, str] = ("07:50", "18:10"),
@@ -121,8 +122,14 @@ class LiveSystem:
         self.futures_symbols = dict(futures_symbols or {})
         self.etf_symbols = dict(etf_symbols or {})
         self.futures_expiry = dict(futures_expiry or {})  # 만기 YYYYMM (캐리 잔존일용)
-        # 원달러선물 (shcode, 만기YYYYMM) — t8426 최근월물 (bootstrap_live에서 조회).
+        # 원달러선물 (shcode, 만기YYYYMM) — 최근월물(환율이론가 기준, bootstrap_live 조회).
         self._fx_futures = fx_futures
+        # 구독할 원달러선물 월물 전체(근·차근, §9.1) — 없으면 최근월물 하나로 폴백.
+        self._fx_months = list(fx_months) if fx_months else (
+            [fx_futures] if fx_futures is not None else [])
+        if self._fx_futures is None and self._fx_months:
+            self._fx_futures = self._fx_months[0]
+        self.fx_futures_price: dict[str, float] = {}  # 월물코드 → 최근 현재가(근·차근)
         # 캐리 이론가 연이자율·왕복 수수료 — config.yaml 조정 대상
         self._carry = carry_rates if carry_rates is not None else CarryRates()
         self._fees = fees if fees is not None else FeeRates()
@@ -320,9 +327,11 @@ class LiveSystem:
             self._stock_ws.subscribe_futures_quotes(self.futures_symbols)
         self._stock_ws.subscribe_market_status()
         self._stock_ws.subscribe_stock_fills()
-        if self._fx_futures is not None:
-            # 원달러선물 체결(FC0) 실시간 → 환율이론가 (예비는 _fx_loop 30초 조회)
-            self._stock_ws.subscribe_fx(self._fx_futures[0])
+        if self._fx_months:
+            # 원달러선물 체결(FC0) 실시간 — 근·차근 월물 모두 구독(§9.1). 최근월물만
+            # 환율이론가로 쓰고(차근은 저장만), 예비는 _fx_loop 30초 조회.
+            for code, _ in self._fx_months:
+                self._stock_ws.subscribe_fx(code)
             self._stock_ws.on_fx_price.append(self._apply_fx_price)
         self._stock_ws.on_quote.append(fan_quote)
         self._stock_ws.on_trade.append(fan_trade)
@@ -382,12 +391,16 @@ class LiveSystem:
             return self.usdkrw_spot, "현물"
         return self.usdkrw_theory, "선물이론"
 
-    def _apply_fx_price(self, price: float) -> None:
-        """원달러선물 현재가 → 환율이론가(현물환산) 갱신. WS(FC0)·예비 조회 공용."""
+    def _apply_fx_price(self, code: str, price: float) -> None:
+        """원달러선물 현재가 수신 → 월물별 저장 + **최근월물만** 환율이론가(현물환산) 갱신.
+        차근월물은 저장만 한다(§9.1 — 헤지 월물 선택용). WS(FC0)·예비 조회 공용."""
         from datetime import date
 
-        if self._fx_futures is None or price <= 0:
+        if price <= 0:
             return
+        self.fx_futures_price[code] = price  # 근·차근 모두 최신가 보관
+        if self._fx_futures is None or code != self._fx_futures[0]:
+            return  # 차근월물 등은 환율이론가에 안 먹인다(최근월물 기준 유지)
         _, ym = self._fx_futures
         days = days_to_expiry(ym, "USD", date.today())
         self.usdkrw_futures = price
@@ -417,7 +430,7 @@ class LiveSystem:
                 if 8 <= now.hour < 16:  # 통화선물 주간장 — 이론가 예비 갱신
                     price = await self._gw.get_fx_futures_price(code)
                     if price is not None:
-                        self._apply_fx_price(price)
+                        self._apply_fx_price(code, price)  # code=최근월물
                 if in_spot:  # 외환현물 창 — HL 환산 본선 환율 (네이버 하나은행 고시)
                     from .gateways.fx_spot import fetch_usdkrw_spot
 
@@ -801,14 +814,16 @@ async def bootstrap_live(
     near_month = select_near_month(await gateway.fetch_futures_master())
     futures_symbols = {u: sh for u, (sh, _) in near_month.items()}
     futures_expiry = {u: ym for u, (_, ym) in near_month.items()}
-    # 원달러선물 최근월물 (환율이론가용, DESIGN §6.1) — 실패해도 시동 계속
+    # 원달러선물 근·차근 월물 (환율이론가=최근월물 + 헤지 월물선택용 §9.1) — 실패해도 시동 계속
     fx_futures = None
+    fx_months: list[tuple[str, int]] = []
     try:
         from datetime import datetime
 
-        fx_futures = select_usd_futures(
-            await gateway.fetch_commodity_master(), datetime.now()
+        fx_months = select_usd_futures_months(
+            await gateway.fetch_commodity_master(), datetime.now(), count=2
         )
+        fx_futures = fx_months[0] if fx_months else None
     except Exception:  # noqa: BLE001
         pass  # 환율이론가 없이 계속 (HL 괴리만 빈값)
     gateway = LSApiGateway.from_accounts(
@@ -863,6 +878,7 @@ async def bootstrap_live(
         etf_symbols=etf_symbols,
         futures_expiry=futures_expiry,
         fx_futures=fx_futures,
+        fx_months=fx_months,
         carry_rates=config.carry_rates,
         fees=config.fees,
         fx_spot_window=(config.fx_spot_window.start, config.fx_spot_window.end),

@@ -108,6 +108,23 @@ def test_ws_statuses_collects_present_clients() -> None:
     assert [s.to_dict()["connected"] for s in statuses] == [False, False]  # 시동 전
 
 
+def test_fx_price_only_near_month_feeds_theory() -> None:
+    # §9.1 — 근·차근 둘 다 저장하되, 환율이론가는 최근월물로만 갱신(차근에 섞이지 않게).
+    system, _, _ = _system([])
+    system._fx_futures = ("175W07", 202607)
+    system._fx_months = [("175W07", 202607), ("175W08", 202608)]
+
+    system._apply_fx_price("175W08", 1600.0)  # 차근월물 먼저
+    assert system.fx_futures_price["175W08"] == 1600.0
+    assert system.usdkrw_theory is None       # 차근은 이론가에 안 먹임
+    assert system.usdkrw_futures is None
+
+    system._apply_fx_price("175W07", 1530.0)  # 최근월물
+    assert system.fx_futures_price["175W07"] == 1530.0
+    assert system.usdkrw_futures == 1530.0
+    assert system.usdkrw_theory is not None    # 최근월물만 이론가 갱신
+
+
 async def test_ws_reconnect_triggers_resync() -> None:
     # Phase 8-4b — 재연결 훅이 OrderBook 재스냅샷(refresh_snapshot)을 백그라운드로 부른다.
     system, _, _ = _system([], deriv_frames=[])

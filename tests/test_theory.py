@@ -75,3 +75,23 @@ def test_select_usd_futures_near_month_skips_rolled_and_spread() -> None:
     assert select_usd_futures(rows, datetime(2026, 7, 7, 10, 0)) == ("175W07", 202607)
     # 만기일 15:45 이후 → 8월물로 롤.
     assert select_usd_futures(rows, datetime(2026, 7, 20, 16, 0)) == ("175W08", 202608)
+
+
+def test_select_usd_futures_months_near_and_next() -> None:
+    from kp_arb.theory import select_usd_futures_months
+
+    rows: list[dict[str, object]] = [
+        {"hname": "미국달러    F 202609", "shcode": "175W09"},
+        {"hname": "미국달러    F 202607", "shcode": "175W07"},  # 순서 섞여 있어도 정렬
+        {"hname": "미국달러    F 202608", "shcode": "175W08"},
+        {"hname": "미국달러 SP F 202607-202608", "shcode": "475W07"},  # 스프레드 제외
+    ]
+    # 7월물 만기 전 → [최근=7월, 차근=8월]
+    assert select_usd_futures_months(rows, datetime(2026, 7, 7, 10, 0)) == [
+        ("175W07", 202607), ("175W08", 202608)]
+    # 7월물 롤 이후 → [최근=8월, 차근=9월]
+    assert select_usd_futures_months(rows, datetime(2026, 7, 20, 16, 0)) == [
+        ("175W08", 202608), ("175W09", 202609)]
+    # count=1이면 최근월물 하나만
+    assert select_usd_futures_months(rows, datetime(2026, 7, 7, 10, 0), count=1) == [
+        ("175W07", 202607)]

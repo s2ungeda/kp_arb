@@ -71,12 +71,13 @@ def parse_ym(hname: str) -> int | None:
     return None
 
 
-def select_usd_futures(
-    rows: list[dict[str, object]], now: datetime
-) -> tuple[str, int] | None:
-    """t8426(상품선물 마스터) 행에서 미국달러선물 **최근월물** (shcode, yyyymm).
+def select_usd_futures_months(
+    rows: list[dict[str, object]], now: datetime, count: int = 2
+) -> list[tuple[str, int]]:
+    """t8426(상품선물 마스터) 행에서 미국달러선물 **가까운 월물부터 count개** [(shcode, yyyymm)].
 
-    "미국달러 ... F ..." 월물만(스프레드 SP 제외), 롤오버 지난 월물 제외.
+    "미국달러 ... F ..." 월물만(스프레드 SP 제외), 롤오버 지난 월물 제외, 만기 오름차순.
+    최근월물=[0], 차근월물=[1] (환헤지 월물 선택용 — DESIGN §9.1).
     """
     candidates: list[tuple[int, str]] = []
     for row in rows:
@@ -89,7 +90,18 @@ def select_usd_futures(
         ym = parse_ym(hname)
         if ym is not None:
             candidates.append((ym, shcode))
+    out: list[tuple[str, int]] = []
     for ym, shcode in sorted(candidates):
         if not is_rolled(ym, "USD", now):
-            return shcode, ym
-    return None
+            out.append((shcode, ym))
+            if len(out) >= count:
+                break
+    return out
+
+
+def select_usd_futures(
+    rows: list[dict[str, object]], now: datetime
+) -> tuple[str, int] | None:
+    """미국달러선물 **최근월물** (shcode, yyyymm). = ``select_usd_futures_months(..)[0]``."""
+    months = select_usd_futures_months(rows, now, count=1)
+    return months[0] if months else None
