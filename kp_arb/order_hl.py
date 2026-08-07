@@ -86,17 +86,12 @@ def _hoga_signature(rows: list[tuple[Any, ...]]) -> tuple[Any, ...]:
     return tuple((tag, price, qty) for tag, price, qty in rows)
 
 
-def _order_confirm_text(name: str, side_kr: str, qty: float, price: str) -> str:
-    """주문확인 창 문구 (§1 주문확인 체크박스) — 종목·방향·수량·단가."""
-    return f"{name} {side_kr}\n수량 {qty:g}   단가 {price}\n\n주문하시겠습니까?"
-
-
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
     """HL 일반 주문창 실행."""
     import threading
     import time
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import ttk
 
     watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
@@ -163,9 +158,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 레버리지 버튼(종목~적 아래) + Unified(호가단위 아래) — 폰트로 ~40% 축소, 표시 전용(배선 D).
     _small = ("Malgun Gothic", 7)
     btn_lev = tk.Button(head, text="Cross  5x", font=_small, padx=1, pady=0, bd=1)
-    btn_lev.grid(row=1, column=0, columnspan=2, sticky="we", pady=(1, 0))
+    btn_lev.grid(row=1, column=0, columnspan=2, sticky="we", pady=(2, 0))  # 1px 아래로
     lbl_mmode = tk.Label(head, text="Unified", fg="gray30", font=_small)
-    lbl_mmode.grid(row=1, column=2, sticky="w", padx=(3, 0))
+    lbl_mmode.grid(row=1, column=2, sticky="w", padx=(3, 0), pady=(1, 0))  # 1px 아래로
 
     # 매수/매도
     r = _row()
@@ -180,13 +175,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(r, text="수량", width=3, anchor="w").pack(side="left")
     e_qty = tk.Entry(r, width=11, justify="right", validate="key",
                      validatecommand=vcmd_dec)  # HL 수량은 소수 허용
-    e_qty.pack(side="left")
+    e_qty.pack(side="left", padx=(2, 0))  # 라벨과 2px 간격
     # 단가 + 틱
     r = _row()
     tk.Label(r, text="단가", width=3, anchor="w").pack(side="left")
     e_price = tk.Entry(r, width=11, justify="right", validate="key",
                        validatecommand=vcmd_dec)
-    e_price.pack(side="left")
+    e_price.pack(side="left", padx=(2, 0))
     tick_var = tk.IntVar(value=0)
     sp_tick = tk.Spinbox(r, from_=-20, to=20, width=3, textvariable=tick_var,
                          justify="right")  # 호가 모드에서만 보임 (_toggle_tick)
@@ -215,10 +210,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     checks.pack(side="left", anchor="n")
     reduce_var = tk.BooleanVar(value=False)
     post_var = tk.BooleanVar(value=False)
-    confirm_var = tk.BooleanVar(value=True)
+    oneclick_var = tk.BooleanVar(value=True)  # 안전 잠금 — 체크돼야만 발송(기본 체크)
     tk.Checkbutton(checks, text="Reduce", variable=reduce_var).pack(anchor="w")
     tk.Checkbutton(checks, text="Post", variable=post_var).pack(anchor="w")
-    tk.Checkbutton(checks, text="주문확인", variable=confirm_var).pack(anchor="w")
+    tk.Checkbutton(checks, text="원클릭", variable=oneclick_var).pack(anchor="w")
     btn_order = tk.Button(r, text="삼성\n매수 주문", width=8,
                           fg="white", bg="#c00000", activeforeground="white",
                           activebackground="#a00000", font=("Malgun Gothic", 13, "bold"))
@@ -294,6 +289,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             cb_merge.set(vals[0])  # 최소 틱(원시)
 
     def do_order() -> None:
+        if not oneclick_var.get():  # 안전 잠금 — 원클릭 체크돼야만 발송(사용자 확정)
+            set_status("원클릭 미체크 — 주문 안 나감", err=True)
+            return
         if active["underlying"] is None:
             set_status("먼저 '적'으로 종목을 적용하세요", err=True)
             return
@@ -309,11 +307,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             set_status("지정가는 단가를 입력하세요", err=True)
             return
         side_kr = "매수" if side_var.get() == "buy" else "매도"
-        if confirm_var.get() and not messagebox.askokcancel(  # 주문확인(§1)
-                "주문 확인",
-                _order_confirm_text(active["name"] or "", side_kr, qty, price)):
-            set_status("주문 취소됨")
-            return
         send({
             "cmd": "manual_order", "instrument": INSTRUMENT,
             "underlying": active["underlying"], "side": side_var.get(),

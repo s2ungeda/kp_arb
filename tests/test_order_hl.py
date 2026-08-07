@@ -6,17 +6,7 @@ from kp_arb.order_hl import (
     _hl_decimals,
     _hoga_signature,
     _merge_ticks,
-    _order_confirm_text,
 )
-
-
-def test_order_confirm_text() -> None:
-    txt = _order_confirm_text("하이닉스", "매수", 10.0, "1106.4")
-    assert "하이닉스 매수" in txt
-    assert "수량 10" in txt and "단가 1106.4" in txt
-    assert "주문하시겠습니까?" in txt
-    # 소수 수량은 :g로 깔끔하게 (10.0 → 10, 0.5 → 0.5)
-    assert "수량 0.5" in _order_confirm_text("삼성", "매도", 0.5, "167.5")
 
 
 def test_fmt() -> None:
