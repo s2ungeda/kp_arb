@@ -139,7 +139,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     top = tk.Frame(root)
     top.pack(side="top", fill="both", padx=4, pady=4)
     left = tk.Frame(top)
-    left.pack(side="left", anchor="n")
+    left.pack(side="left", anchor="n", fill="y")  # 오더북 높이만큼 늘려 하단 여백 확보(§갱신시각)
     right = tk.Frame(top)
     right.pack(side="left", anchor="n", padx=(6, 0))
 
@@ -148,25 +148,25 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         f.pack(fill="x", pady=1)
         return f
 
-    # 종목 + '적' + 호가단위(틱) 콤보 — 한 줄 (화면안)
-    r = _row()
-    tk.Label(r, text="HL", fg="gray25").pack(side="left")
-    cb_under = ttk.Combobox(r, values=UNDERLYINGS, width=7, state="readonly")
+    # 상단 2줄 — grid로 열 정렬(화면안): 종목/적/호가단위 // 레버리지/Unified
+    head = tk.Frame(left)
+    head.pack(fill="x", pady=1)
+    tk.Label(head, text="HL", fg="gray25").grid(row=0, column=0, sticky="w")
+    cb_under = ttk.Combobox(head, values=UNDERLYINGS, width=7, state="readonly")
     cb_under.set("삼성")
-    cb_under.pack(side="left", padx=(4, 0))
-    btn_apply = tk.Button(r, text="적", width=3)
-    btn_apply.pack(side="left", padx=(6, 0))
-    cb_merge = ttk.Combobox(r, values=[], width=6, state="readonly")  # 호가단위(틱)
-    cb_merge.pack(side="left", padx=(6, 0))
+    cb_under.grid(row=0, column=1, sticky="w", padx=(4, 0))
+    btn_apply = ttk.Button(head, text="적", width=3)  # ttk — 양옆 콤보와 높이 맞춤
+    btn_apply.grid(row=0, column=2, padx=(6, 0))
+    cb_merge = ttk.Combobox(head, values=[], width=6, state="readonly")  # 호가단위(틱)
+    cb_merge.grid(row=0, column=3, sticky="w", padx=(6, 0))
     # 콤보 표시값(틱) → (nSigFigs, mantissa) 역매핑 — '적'에서 종목 가격으로 채운다.
     merge_map: dict[str, tuple[int | None, int | None]] = {}
-
-    # [신규] 레버리지 버튼(현재값 캡션) + 마진모드 라벨(표시 전용, Unified) — 배선은 D단계
-    r = _row()
-    btn_lev = tk.Button(r, text="Cross  5x", width=12)
-    btn_lev.pack(side="left")
-    lbl_mmode = tk.Label(r, text="Unified", fg="gray30")
-    lbl_mmode.pack(side="left", padx=(8, 0))
+    # 레버리지 버튼(현재값 캡션)은 종목~적 폭(col 0-2), Unified 라벨은 호가단위 콤보(col 3) 아래로
+    # 정렬 — 표시 전용, 배선은 D단계.
+    btn_lev = tk.Button(head, text="Cross  5x")
+    btn_lev.grid(row=1, column=0, columnspan=3, sticky="we", pady=(2, 0))
+    lbl_mmode = tk.Label(head, text="Unified", fg="gray30")
+    lbl_mmode.grid(row=1, column=3, sticky="w", padx=(6, 0), pady=(2, 0))
 
     # 매수/매도
     r = _row()
@@ -189,15 +189,26 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                        validatecommand=vcmd_dec)
     e_price.pack(side="left")
     tick_var = tk.IntVar(value=0)
-    tk.Spinbox(r, from_=-20, to=20, width=3, textvariable=tick_var,
-               justify="right").pack(side="left", padx=(4, 0))
+    sp_tick = tk.Spinbox(r, from_=-20, to=20, width=3, textvariable=tick_var,
+                         justify="right")  # 호가 모드에서만 보임 (_toggle_tick)
+    sp_tick.pack(side="left", padx=(4, 0))
 
-    # 호가/가격 모드
+    # 호가/가격 모드 (default 가격)
     r = _row()
     mode_var = tk.StringVar(value="price")  # "hoga" | "price"
     tk.Radiobutton(r, text="호가", variable=mode_var, value="hoga").pack(side="left")
     tk.Radiobutton(r, text="가격", variable=mode_var, value="price").pack(
         side="left", padx=(8, 0))
+
+    def _toggle_tick(*_: Any) -> None:
+        # 가격 모드: 틱 스핀 숨김(클릭·직접입력이라 오프셋 불필요) / 호가 모드: 보임.
+        if mode_var.get() == "hoga":
+            sp_tick.pack(side="left", padx=(4, 0))
+        else:
+            sp_tick.pack_forget()
+
+    mode_var.trace_add("write", _toggle_tick)
+    _toggle_tick()  # 초기 = 가격 → 틱 숨김
 
     # 체크박스(세로) + 큰 주문 버튼(옆) — 화면안. 배경 매수 빨강·매도 파랑, 흰 굵은 글씨(§1).
     r = _row()
@@ -212,7 +223,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     btn_order = tk.Button(r, text="삼성\n매수 주문", width=11,
                           fg="white", bg="#c00000", activeforeground="white",
                           activebackground="#a00000", font=("Malgun Gothic", 13, "bold"))
-    btn_order.pack(side="left", fill="both", expand=True, padx=(8, 0))
+    # 높이 ~10% 축소 — fill=both(체크박스 3줄 높이) 대신 내부 여백만(§사용자 요청)
+    btn_order.pack(side="left", fill="x", expand=True, padx=(8, 0), ipady=7)
 
     # 우: 호가창(헤더 없음 — 색으로 매도/매수 구분). 5호가(§1-4), 좌측 입력열 높이만큼 길게.
     hoga = ttk.Treeview(right, columns=("price", "qty"), show="",
@@ -241,9 +253,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         rv = tk.Label(bal, text="-", width=12, anchor="e")
         rv.grid(row=i, column=3, sticky="e", padx=(0, 4))
         bal_val[rname] = rv
-    # 잔고를 마지막으로 재동기('적')한 시각 — 값이 언제 적 것인지 (§1-5)
-    lbl_synced = tk.Label(root, text="", fg="gray40", anchor="e")
-    lbl_synced.pack(side="top", fill="x", padx=4)
+    # 잔고를 마지막으로 재동기('적')한 시각 — 좌측 입력열 하단(오더북과 잔고표 사이 여백),
+    # 우측 정렬 (§1-5, 사용자 요청).
+    lbl_synced = tk.Label(left, text="", fg="gray40", anchor="e")
+    lbl_synced.pack(side="bottom", fill="x", pady=(4, 0))
 
     # 상태바 — width=1(요청폭 최소) + fill=x: 긴 로그가 창 넓이를 밀지 않고 잘린다.
     status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
