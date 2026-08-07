@@ -241,15 +241,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     bal_val: dict[str, tk.Label] = {}
     _BAL_LEFT = ("수량", "진입금액", "진입가", "PNL", "Liq_Prc")
     _BAL_RIGHT = ("Margin", "Funding", "Oracle", "FundRate", "CountDown")
+    # 값 칼럼 폭을 좁혀 창 너비를 줄인다(잔고표가 폼 너비를 잡고 있어서 — 사용자 요청).
     for i, (lname, rname) in enumerate(zip(_BAL_LEFT, _BAL_RIGHT, strict=True)):
-        tk.Label(bal, text=lname, width=8, anchor="w").grid(
+        tk.Label(bal, text=lname, width=7, anchor="w").grid(
             row=i, column=0, sticky="w", padx=(4, 2))
-        lv = tk.Label(bal, text="-", width=12, anchor="e")
-        lv.grid(row=i, column=1, sticky="e", padx=(0, 10))
+        lv = tk.Label(bal, text="-", width=9, anchor="e")
+        lv.grid(row=i, column=1, sticky="e", padx=(0, 6))
         bal_val[lname] = lv
         tk.Label(bal, text=rname, width=9, anchor="w").grid(
             row=i, column=2, sticky="w", padx=(4, 2))
-        rv = tk.Label(bal, text="-", width=12, anchor="e")
+        rv = tk.Label(bal, text="-", width=9, anchor="e")
         rv.grid(row=i, column=3, sticky="e", padx=(0, 4))
         bal_val[rname] = rv
     # 상태바 — width=1(요청폭 최소) + fill=x: 긴 로그가 창 넓이를 밀지 않고 잘린다.
