@@ -226,9 +226,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 높이 ~10% 축소 — fill=both(체크박스 3줄 높이) 대신 내부 여백만(§사용자 요청)
     btn_order.pack(side="left", fill="x", expand=True, padx=(8, 0), ipady=7)
 
-    # 우: 호가창(헤더 없음 — 색으로 매도/매수 구분). 5호가(§1-4), 좌측 입력열 높이만큼 길게.
+    # 우: 호가창(헤더 없음 — 색으로 매도/매수 구분). 5호가(§1-4) = 10행(매도5+매수5).
     hoga = ttk.Treeview(right, columns=("price", "qty"), show="",
-                        height=12, selectmode="browse")
+                        height=10, selectmode="browse")
     hoga.column("price", width=110, anchor="e")
     hoga.column("qty", width=110, anchor="e")
     hoga.tag_configure("ask", background="#e8eeff", foreground="#0000c0")
@@ -464,6 +464,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         hoga.delete(*hoga.get_children())
         for tag, ps, qs in draw:
             hoga.insert("", "end", values=(ps, qs), tags=(tag,))
+
+    # 오더북(10행) 바닥을 좌측 입력열 바닥(=주문버튼)과 맞춘다 — 좌측열 실제 높이를 10등분해
+    # 행높이로. 픽셀 추측 없이 정렬되고, 폰트·DPI가 달라도 따라간다. (사용자 요청)
+    root.update_idletasks()
+    _left_h = left.winfo_reqheight()
+    if _left_h > 0:
+        ttk.Style().configure("Treeview", rowheight=max(20, _left_h // 10))
 
     drain_results()
     refresh()
