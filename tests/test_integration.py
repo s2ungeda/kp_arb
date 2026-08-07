@@ -67,9 +67,9 @@ async def test_dry_run_cycle_smoke(tmp_path: Path) -> None:
     # 1) 주문 0건 (NoopStrategy)
     assert order_ids == []
     assert ls.placed == [] and hl.placed == []
-    # 2) 노출 전송 1회 이상 (total_coin = HL USD 명목 Σ평균가×수량: 2*52=104)
+    # 2) 노출 전송 1회 이상 (total_coin = HL Σ평균가×signed_qty, 숏 2*52 → -104)
     assert len(sink.sent) >= 1
-    assert sink.sent[0].total_coin == 104.0
+    assert sink.sent[0].total_coin == -104.0
     assert sink.sent[0].total_domestic == 0.0
     assert sink.sent[0].fx == 1.0  # fx는 항상 1 전송
     assert reporter.last_sent_ok is True

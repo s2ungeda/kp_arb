@@ -31,17 +31,17 @@ def hl(side: Side = Side.SELL) -> Position:
 
 
 async def test_report_computes_total_coin() -> None:
-    # total_coin = HL 보유종목 Σ(평균단가×수량) (사용자 확정 2026-07-24), token 기본 Meme
+    # total_coin = HL Σ(평균단가 × signed_qty) — 부호 있음(숏 음수, 개정 2026-08-07)
     sink = MockSink()
     reporter = FXExposureReporter(sink)
     positions = [
-        hl(Side.SELL),                                # 2 * 52 = 104 (HL)
+        hl(Side.SELL),                                # 숏 2 * 52 = -104 (HL)
         dom(Instrument.KR_STOCK, 100, 70_000),        # 국내 — total_coin 제외
         dom(Instrument.KR_STOCK_FUTURE, 2, 71_000),   # 국내 — 제외
     ]
     signal = await reporter.report(positions, fx=1_350.0, id="s1", datetime="2026-07-01")
 
-    assert signal.total_coin == 104.0    # HL USD 명목 그대로 (환율 안 곱함)
+    assert signal.total_coin == -104.0   # 숏이라 음수 (순 USD 명목, 환율 안 곱함)
     assert signal.fx == 1.0              # fx는 항상 1 전송
     assert signal.total_domestic == 0.0
     assert signal.token == "Meme"
@@ -85,8 +85,23 @@ async def test_report_if_changed_publishes_on_change() -> None:
                    underlying=SAMSUNG, side=Side.SELL, qty=5, avg_price=52.0)
     await reporter.report_if_changed([small], fx=1_350.0, id="a")
     changed = await reporter.report_if_changed([big], fx=1_350.0, id="b")
-    assert changed is not None and changed.total_coin == 260.0  # 5*52 USD 명목
+    assert changed is not None and changed.total_coin == -260.0  # 숏 5*52 → 음수
     assert len(sink.sent) == 2
+
+
+async def test_total_coin_signed_nets_long_and_short() -> None:
+    # 롱 +, 숏 −, 합이 순노출. 순 숏이면 음수(개정 2026-08-07).
+    reporter = FXExposureReporter(MockSink())
+
+    def _hl(side: Side, qty: float, avg: float) -> Position:
+        return Position(venue=Venue.HYPERLIQUID, instrument=Instrument.HL_PERP,
+                        underlying=SAMSUNG, side=side, qty=qty, avg_price=avg)
+
+    long_sig = await reporter.report([_hl(Side.BUY, 3, 100.0)], fx=1.0, id="l")
+    assert long_sig.total_coin == 300.0     # 롱 → 양수
+    net_short = await reporter.report(
+        [_hl(Side.BUY, 1, 100.0), _hl(Side.SELL, 4, 100.0)], fx=1.0, id="n")
+    assert net_short.total_coin == -300.0   # 100 − 400 = 순 숏 → 음수
 
 
 async def test_send_failure_tracked() -> None:

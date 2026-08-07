@@ -5,7 +5,8 @@
   이름\\tTCP포트", BYE = "BYE\\t인스턴스ID". 15초 무응답 피어 제거. 5초마다 HELLO 방송.
 - **전송**: 발견된 각 피어의 IP:TCP포트로 TCP 접속 → "인스턴스ID\\t이름\\t<JSON>\\n" 후 끊음.
 - JSON = {"id","fx","total_domestic","total_coin","token","datetime"} — total_coin/
-  total_domestic은 정수(Cardinal), fx는 소수, id="sig-YYYYMMDD-NNN"(일별 3자리 시퀀스).
+  total_domestic은 정수, **total_coin은 부호 있음(숏이면 음수, 개정 2026-08-07)** —
+  #2가 값을 로그만 하므로 음수 OK. fx는 소수, id="sig-YYYYMMDD-NNN"(일별 3자리 시퀀스).
 
 순수 로직(JSON 포맷·HELLO 파싱·시퀀스)은 소켓과 분리해 테스트한다.
 """

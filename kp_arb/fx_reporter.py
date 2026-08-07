@@ -1,8 +1,8 @@
 """FXExposureReporter — 노출 데이터를 외부 #2로 전송(보고) (DESIGN.md §5.7, §9).
 
-- 전송 값(사용자 확정 2026-07-24): `total_coin` = **HL 보유종목 Σ(평균단가×수량)**,
-  `total_domestic`=0, `token`="Meme", `fx`=환율. USD 환헤지는 #2가 수행.
-- 본 시스템은 USD/KRW 선물 주문·계좌를 갖지 않는다(전송만).
+- 전송 값: `total_coin` = **HL 보유종목 Σ(평균단가×signed_qty)** — 순(net) USD 명목,
+  **부호 있음**(롱 +, 숏 −, 개정 2026-08-07 — HL 양방향). `total_domestic`=0,
+  `token`="Meme", `fx`=1(전송). 주 노출 헤지는 #2가 수행. #2는 값을 로그만 함(음수 OK).
 - 채널: Dalin broadcast(UDP 9999 피어 발견 + TCP 전송) — `signallink.SignalLinkSink`.
   여기선 `ExposureSink`(Protocol) 뒤로 격리하고 순수 로직은 mock sink로 테스트.
 - 메시지 = `Signal{id, fx, total_domestic=0, total_coin, token, datetime}` (기존 스키마).

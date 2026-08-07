@@ -148,7 +148,7 @@
 - **채널(확정 v0.4):** 기존 `SignalLink`(TrdBot) 재사용 — **UDP 9999 브로드캐스트**(Dalin 8888과 분리)로 피어 발견/하트비트(`HELLO/BYE`, 5초), **TCP(동적 포트)**로 메시지 전송(`<ID>\t<Name>\t<Msg>\n`, UTF-8). Msg 본문 = JSON Signal.
 - **메시지 스키마(Signal) — 개정 2026-07-24 (원본 Dalin ChatComm.pas):** `{id, fx, total_domestic, total_coin, token, datetime}`
   - `total_domestic = 0` (미사용)
-  - **`total_coin = Σ(HL 보유 평균단가 × 수량)`** — HL **USD 명목 그대로**(환율 안 곱함, 사용자 확정 2026-07-24). HL 계좌 직접 조회(수동 매매 포함). 정수(Cardinal)로 전송.
+  - **`total_coin = Σ(HL 보유 평균단가 × signed_qty)`** — HL 순(net) USD 명목, **부호 있음**(롱 +, 숏 −, 개정 2026-08-07 — HL 양방향 매매 반영. 순 숏이면 음수). 환율 안 곱함. HL 계좌 직접 조회(수동 매매 포함). 정수로 전송 — **#2는 값을 로그만 하므로 음수 OK**.
   - `token = "Meme"` (수신도 이 토큰만 처리, 나머지 스킵), **`fx = 1`**(항상 1 — #2가 환산 안 함), `id = sig-YYYYMMDD-NNN`(일별 3자리), `datetime` = 전송 시각.
   - 주기(기본 10초)마다 무조건 전송(델파이 DoAutoSend). 감시 화면(fx_monitor)에서 일시정지/재개·수동 송신·주기 변경·total_coin 구성 확인.
 

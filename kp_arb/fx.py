@@ -40,15 +40,16 @@ def domestic_krw_notional(
 
 
 def hl_coin_notional(positions: Iterable[Position]) -> float:
-    """외부 #2 `total_coin`: HL 보유종목 **Σ(평균단가 × 수량)** — USD 명목 그대로.
+    """외부 #2 `total_coin`: HL 보유종목 **Σ(평균단가 × signed_qty)** — 순(net) USD 명목.
 
-    수량은 절대값(magnitude). 종목(SMSN/SKHX/HYUNDAI) 전체 합. HL 외 제외.
-    환율은 곱하지 않고 fx=1로 전송(사용자 확정 2026-07-24 — #2가 환산 안 함).
+    **부호 있음**(개정 2026-08-07 — HL 양방향 매매 반영): 롱 +, 숏 −. 순 포지션이
+    숏이면 음수로 나간다. #2는 값을 **로그만** 하므로(계산 안 함) 음수 전송 문제없다.
+    종목(SMSN/SKHX/HYUNDAI) 전체 합, HL 외 제외. 환율은 곱하지 않고 fx=1로 전송(#2 환산 안 함).
     """
     total = 0.0
     for p in positions:
         if p.instrument is Instrument.HL_PERP:
-            total += p.avg_price * p.qty
+            total += p.avg_price * p.signed_qty
     return total
 
 

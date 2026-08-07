@@ -20,11 +20,11 @@ def _hl(qty: float, avg: float, side: Side = Side.SELL) -> Position:
 
 
 def test_hl_coin_notional() -> None:
-    # Σ(평균단가 × 수량) — HL만, 방향 무관(절대 수량)
+    # Σ(평균단가 × signed_qty) — HL만, 부호 있음(숏 음수, 개정 2026-08-07)
     positions = [_hl(2, 52.0), _hl(3, 100.0, side=Side.SELL),
                  Position(venue=Venue.LS, instrument=Instrument.KR_STOCK,
                           underlying=SAMSUNG, side=Side.BUY, qty=100, avg_price=70_000)]
-    assert hl_coin_notional(positions) == 2 * 52.0 + 3 * 100.0  # 국내 제외
+    assert hl_coin_notional(positions) == -(2 * 52.0 + 3 * 100.0)  # 둘 다 숏 → 음수, 국내 제외
 
 
 def test_signal_wire_json_matches_delphi() -> None:
