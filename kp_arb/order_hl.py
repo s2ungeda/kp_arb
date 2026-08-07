@@ -148,14 +148,25 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         f.pack(fill="x", pady=1)
         return f
 
-    # 종목 + '적'(종목 적용·조회) — 콤보 옆에 살짝 여백 두고
+    # 종목 + '적' + 호가단위(틱) 콤보 — 한 줄 (화면안)
     r = _row()
     tk.Label(r, text="HL", fg="gray25").pack(side="left")
     cb_under = ttk.Combobox(r, values=UNDERLYINGS, width=7, state="readonly")
     cb_under.set("삼성")
     cb_under.pack(side="left", padx=(4, 0))
     btn_apply = tk.Button(r, text="적", width=3)
-    btn_apply.pack(side="left", padx=(8, 0))
+    btn_apply.pack(side="left", padx=(6, 0))
+    cb_merge = ttk.Combobox(r, values=[], width=6, state="readonly")  # 호가단위(틱)
+    cb_merge.pack(side="left", padx=(6, 0))
+    # 콤보 표시값(틱) → (nSigFigs, mantissa) 역매핑 — '적'에서 종목 가격으로 채운다.
+    merge_map: dict[str, tuple[int | None, int | None]] = {}
+
+    # [신규] 레버리지 버튼(현재값 캡션) + 마진모드 라벨(표시 전용, Unified) — 배선은 D단계
+    r = _row()
+    btn_lev = tk.Button(r, text="Cross  5x", width=12)
+    btn_lev.pack(side="left")
+    lbl_mmode = tk.Label(r, text="Unified", fg="gray30")
+    lbl_mmode.pack(side="left", padx=(8, 0))
 
     # 매수/매도
     r = _row()
@@ -171,70 +182,68 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     e_qty = tk.Entry(r, width=13, justify="right", validate="key",
                      validatecommand=vcmd_dec)  # HL 수량은 소수 허용
     e_qty.pack(side="left")
-    # 단가
+    # 단가 + 틱
     r = _row()
     tk.Label(r, text="단가", width=4, anchor="w").pack(side="left")
     e_price = tk.Entry(r, width=13, justify="right", validate="key",
                        validatecommand=vcmd_dec)
     e_price.pack(side="left")
+    tick_var = tk.IntVar(value=0)
+    tk.Spinbox(r, from_=-20, to=20, width=3, textvariable=tick_var,
+               justify="right").pack(side="left", padx=(4, 0))
 
-    # 호가/가격 모드 + 틱
+    # 호가/가격 모드
     r = _row()
     mode_var = tk.StringVar(value="price")  # "hoga" | "price"
     tk.Radiobutton(r, text="호가", variable=mode_var, value="hoga").pack(side="left")
-    tk.Radiobutton(r, text="가격", variable=mode_var, value="price").pack(side="left")
-    tk.Label(r, text="틱").pack(side="left", padx=(6, 1))
-    tick_var = tk.IntVar(value=0)
-    tk.Spinbox(r, from_=-20, to=20, width=3, textvariable=tick_var,
-               justify="right").pack(side="left")
+    tk.Radiobutton(r, text="가격", variable=mode_var, value="price").pack(
+        side="left", padx=(8, 0))
 
-    # Reduce / Post / 주문확인(기본 켜짐 — §1)
+    # 체크박스(세로) + 큰 주문 버튼(옆) — 화면안. 배경 매수 빨강·매도 파랑, 흰 굵은 글씨(§1).
     r = _row()
+    checks = tk.Frame(r)
+    checks.pack(side="left", anchor="n")
     reduce_var = tk.BooleanVar(value=False)
     post_var = tk.BooleanVar(value=False)
     confirm_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(r, text="Reduce", variable=reduce_var).pack(side="left")
-    tk.Checkbutton(r, text="Post", variable=post_var).pack(side="left")
-    tk.Checkbutton(r, text="주문확인", variable=confirm_var).pack(side="left")
-
-    # 큰 주문 버튼 — 2줄(종목명/매수·매도 주문), 배경 매수 빨강·매도 파랑, 흰 굵은 글씨(§1).
-    # 폭은 가장 긴 종목명(SK하이닉스) 기준 — 잘리면 어느 종목인지 못 읽는다.
-    btn_order = tk.Button(left, text="삼성\n매수 주문", height=2, width=11,
+    tk.Checkbutton(checks, text="Reduce", variable=reduce_var).pack(anchor="w")
+    tk.Checkbutton(checks, text="Post", variable=post_var).pack(anchor="w")
+    tk.Checkbutton(checks, text="주문확인", variable=confirm_var).pack(anchor="w")
+    btn_order = tk.Button(r, text="삼성\n매수 주문", width=11,
                           fg="white", bg="#c00000", activeforeground="white",
                           activebackground="#a00000", font=("Malgun Gothic", 13, "bold"))
-    btn_order.pack(fill="x", pady=(3, 4))
+    btn_order.pack(side="left", fill="both", expand=True, padx=(8, 0))
 
-    # 잔고표 (HL — 매도가능 없음)
-    bal = tk.Frame(left, relief="groove", bd=1)
-    bal.pack(fill="x")
-    bal_rows = ("보유수량", "평가금액", "주문가능", "평가손익", "평균단가", "청산가")
-    bal_val: dict[str, tk.Label] = {}
-    for i, name in enumerate(bal_rows):
-        tk.Label(bal, text=name, width=7, anchor="w").grid(
-            row=i, column=0, sticky="w", padx=3)
-        v = tk.Label(bal, text="-", width=13, anchor="e")
-        v.grid(row=i, column=1, sticky="e", padx=3)
-        bal_val[name] = v
-    # 잔고를 마지막으로 재동기('적')한 시각 — 값이 언제 적 것인지 (§1-5)
-    lbl_synced = tk.Label(left, text="", fg="gray40", anchor="e")
-    lbl_synced.pack(fill="x")
-
-    # 우: 호가단위 머지(오더북 위) + 호가창(헤더 없음 — 색으로 매도/매수 구분)
-    merge_row = tk.Frame(right)
-    merge_row.pack(fill="x", pady=(0, 2))
-    tk.Label(merge_row, text="호가단위").pack(side="left")
-    cb_merge = ttk.Combobox(merge_row, values=[], width=7, state="readonly")
-    cb_merge.pack(side="left", padx=(4, 0))
-    # 콤보 표시값(틱) → (nSigFigs, mantissa) 역매핑 — '적'에서 종목 가격으로 채운다.
-    merge_map: dict[str, tuple[int | None, int | None]] = {}
+    # 우: 호가창(헤더 없음 — 색으로 매도/매수 구분). 5호가(§1-4), 좌측 입력열 높이만큼 길게.
     hoga = ttk.Treeview(right, columns=("price", "qty"), show="",
-                        height=10, selectmode="browse")  # 매도 5 + 매수 5 (§1-4)
+                        height=12, selectmode="browse")
     hoga.column("price", width=110, anchor="e")
     hoga.column("qty", width=110, anchor="e")
     hoga.tag_configure("ask", background="#e8eeff", foreground="#0000c0")
     hoga.tag_configure("bid", background="#ffeef0", foreground="#c00000")
     hoga.tag_configure("cur", background="#fff6b0")
     hoga.pack()
+
+    # ===== 하단: 2열 잔고표 (§1, §1-1) — 왼쪽 포지션 / 오른쪽 마진·펀딩·오라클 =====
+    bal = tk.Frame(root, relief="groove", bd=1)
+    bal.pack(side="top", fill="x", padx=4, pady=(0, 2))
+    bal_val: dict[str, tk.Label] = {}
+    _BAL_LEFT = ("수량", "진입금액", "진입가", "PNL", "Liq_Prc")
+    _BAL_RIGHT = ("Margin", "Funding", "Oracle", "FundRate", "CountDown")
+    for i, (lname, rname) in enumerate(zip(_BAL_LEFT, _BAL_RIGHT, strict=True)):
+        tk.Label(bal, text=lname, width=8, anchor="w").grid(
+            row=i, column=0, sticky="w", padx=(4, 2))
+        lv = tk.Label(bal, text="-", width=12, anchor="e")
+        lv.grid(row=i, column=1, sticky="e", padx=(0, 10))
+        bal_val[lname] = lv
+        tk.Label(bal, text=rname, width=9, anchor="w").grid(
+            row=i, column=2, sticky="w", padx=(4, 2))
+        rv = tk.Label(bal, text="-", width=12, anchor="e")
+        rv.grid(row=i, column=3, sticky="e", padx=(0, 4))
+        bal_val[rname] = rv
+    # 잔고를 마지막으로 재동기('적')한 시각 — 값이 언제 적 것인지 (§1-5)
+    lbl_synced = tk.Label(root, text="", fg="gray40", anchor="e")
+    lbl_synced.pack(side="top", fill="x", padx=4)
 
     # 상태바 — width=1(요청폭 최소) + fill=x: 긴 로그가 창 넓이를 밀지 않고 잘린다.
     status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
@@ -340,6 +349,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     cb_merge.bind("<<ComboboxSelected>>", on_merge)
     btn_order.config(command=do_order)
     btn_apply.config(command=do_apply)
+    # 레버리지 버튼 — 설정 팝업·updateLeverage 는 D단계에서 배선(지금은 자리·표시만)
+    btn_lev.config(command=lambda: set_status("레버리지 설정은 준비 중(D단계)"))
 
     def refresh_side() -> None:
         buy = side_var.get() == "buy"
@@ -395,12 +406,18 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         try:
             sym = active_symbol()
             dec = _hl_decimals(_ref_price(sym))
-            bal_val["보유수량"].config(text=_fmt_qty(sym.get("position")))
-            bal_val["평가금액"].config(text=_fmt(sym.get("eval")))
-            bal_val["주문가능"].config(text=_fmt(sym.get("balance")))
-            bal_val["평가손익"].config(text=_fmt(sym.get("pnl"), 2))
-            bal_val["평균단가"].config(text=_fmt_px(sym.get("avg_price"), dec))
-            bal_val["청산가"].config(text=_fmt_px(sym.get("liq"), dec))
+            # 왼쪽(포지션) — 5개 다 스냅샷에 있음
+            bal_val["수량"].config(text=_fmt_qty(sym.get("position")))
+            bal_val["진입금액"].config(text=_fmt(sym.get("eval")))
+            bal_val["진입가"].config(text=_fmt_px(sym.get("avg_price"), dec))
+            bal_val["PNL"].config(text=_fmt(sym.get("pnl"), 2))
+            bal_val["Liq_Prc"].config(text=_fmt_px(sym.get("liq"), dec))
+            # 오른쪽(마진·펀딩·오라클) — 스냅샷 확장(B) 전엔 "-"
+            bal_val["Margin"].config(text=_fmt(sym.get("margin"), 2))
+            bal_val["Funding"].config(text=_fmt(sym.get("cum_funding"), 4))
+            bal_val["Oracle"].config(text=_fmt_px(sym.get("oracle"), dec))
+            bal_val["FundRate"].config(text=_fmt(sym.get("funding_rate"), 6))
+            bal_val["CountDown"].config(text=sym.get("countdown") or "-")
             if mode_var.get() == "hoga":
                 _set_hoga_price(sym, dec)
             # 내 미체결이 있는 호가에 "(건수)" 표시 — 활성 종목 미체결을 가격별 집계
