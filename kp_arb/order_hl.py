@@ -86,19 +86,26 @@ def _hoga_signature(rows: list[tuple[Any, ...]]) -> tuple[Any, ...]:
     return tuple((tag, price, qty) for tag, price, qty in rows)
 
 
+def _order_confirm_text(name: str, side_kr: str, qty: float, price: str) -> str:
+    """주문확인 창 문구 (§1 주문확인 체크박스) — 종목·방향·수량·단가."""
+    return f"{name} {side_kr}\n수량 {qty:g}   단가 {price}\n\n주문하시겠습니까?"
+
+
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
     """HL 일반 주문창 실행."""
     import threading
     import time
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import messagebox, ttk
 
     watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
     root.title("HL 일반주문")
     root.resizable(False, False)
     win_state.attach(root, "order_hl")
-    root.option_add("*Font", ("Malgun Gothic", 9))
+    # 창 크기 델파이 원본 대비 ~120% (§1) — 문자 단위 위젯이라 폰트만 키우면 비례 확대.
+    root.option_add("*Font", ("Malgun Gothic", 11))
+    ttk.Style().configure("Treeview", font=("Malgun Gothic", 11), rowheight=22)
     vcmd_dec = (root.register(is_decimal_text), "%P")  # HL은 수량·가격 모두 소수 허용
 
     # --- 명령 전송: 큐 → 전송 스레드 → 결과 큐 → 화면 루프 ---
@@ -181,16 +188,20 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Spinbox(r, from_=-20, to=20, width=3, textvariable=tick_var,
                justify="right").pack(side="left")
 
-    # Reduce / Post
+    # Reduce / Post / 주문확인(기본 켜짐 — §1)
     r = _row()
     reduce_var = tk.BooleanVar(value=False)
     post_var = tk.BooleanVar(value=False)
+    confirm_var = tk.BooleanVar(value=True)
     tk.Checkbutton(r, text="Reduce", variable=reduce_var).pack(side="left")
     tk.Checkbutton(r, text="Post", variable=post_var).pack(side="left")
+    tk.Checkbutton(r, text="주문확인", variable=confirm_var).pack(side="left")
 
-    # 큰 주문 버튼
-    btn_order = tk.Button(left, text="매수 주문", height=2,
-                          fg="#c00000", font=("Malgun Gothic", 11, "bold"))
+    # 큰 주문 버튼 — 2줄(종목명/매수·매도 주문), 배경 매수 빨강·매도 파랑, 흰 굵은 글씨(§1).
+    # 폭은 가장 긴 종목명(SK하이닉스) 기준 — 잘리면 어느 종목인지 못 읽는다.
+    btn_order = tk.Button(left, text="삼성\n매수 주문", height=2, width=11,
+                          fg="white", bg="#c00000", activeforeground="white",
+                          activebackground="#a00000", font=("Malgun Gothic", 13, "bold"))
     btn_order.pack(fill="x", pady=(3, 4))
 
     # 잔고표 (HL — 매도가능 없음)
@@ -204,6 +215,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         v = tk.Label(bal, text="-", width=13, anchor="e")
         v.grid(row=i, column=1, sticky="e", padx=3)
         bal_val[name] = v
+    # 잔고를 마지막으로 재동기('적')한 시각 — 값이 언제 적 것인지 (§1-5)
+    lbl_synced = tk.Label(left, text="", fg="gray40", anchor="e")
+    lbl_synced.pack(fill="x")
 
     # 우: 호가단위 머지(오더북 위) + 호가창(헤더 없음 — 색으로 매도/매수 구분)
     merge_row = tk.Frame(right)
@@ -214,9 +228,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 콤보 표시값(틱) → (nSigFigs, mantissa) 역매핑 — '적'에서 종목 가격으로 채운다.
     merge_map: dict[str, tuple[int | None, int | None]] = {}
     hoga = ttk.Treeview(right, columns=("price", "qty"), show="",
-                        height=17, selectmode="browse")
-    hoga.column("price", width=95, anchor="e")
-    hoga.column("qty", width=95, anchor="e")
+                        height=10, selectmode="browse")  # 매도 5 + 매수 5 (§1-4)
+    hoga.column("price", width=110, anchor="e")
+    hoga.column("qty", width=110, anchor="e")
     hoga.tag_configure("ask", background="#e8eeff", foreground="#0000c0")
     hoga.tag_configure("bid", background="#ffeef0", foreground="#c00000")
     hoga.tag_configure("cur", background="#fff6b0")
@@ -248,6 +262,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         send({"cmd": "manual_refresh"}, "적용·조회")  # 잔고/포지션 재조회(OrderBook 재동기)
         refresh_side()
         _populate_merge()  # 종목 가격 기준 호가단위(틱) 콤보 채우기
+        lbl_synced.config(text=f"갱신 {time.strftime('%H:%M:%S')}")  # 마지막 재동기 시각(§1-5)
         set_status(f"{cb_under.get()} 적용 — 조회 중")
 
     def _populate_merge() -> None:
@@ -278,6 +293,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             set_status("지정가는 단가를 입력하세요", err=True)
             return
         side_kr = "매수" if side_var.get() == "buy" else "매도"
+        if confirm_var.get() and not messagebox.askokcancel(  # 주문확인(§1)
+                "주문 확인",
+                _order_confirm_text(active["name"] or "", side_kr, qty, price)):
+            set_status("주문 취소됨")
+            return
         send({
             "cmd": "manual_order", "instrument": INSTRUMENT,
             "underlying": active["underlying"], "side": side_var.get(),
@@ -324,8 +344,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def refresh_side() -> None:
         buy = side_var.get() == "buy"
         name = active["name"] or cb_under.get()
-        btn_order.config(text=f"{name} {'매수' if buy else '매도'} 주문",
-                         fg="#c00000" if buy else "#0000c0")
+        # 2줄 캡션(종목명/방향 주문) + 배경 매수 빨강·매도 파랑, 흰 글씨(§1)
+        btn_order.config(text=f"{name}\n{'매수' if buy else '매도'} 주문",
+                         bg="#c00000" if buy else "#0000c0",
+                         activebackground="#a00000" if buy else "#000090")
 
     side_var.trace_add("write", lambda *_: refresh_side())
     refresh_side()
@@ -391,11 +413,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             _fill_hoga(sym, dec, my_ords)
         except Exception:  # noqa: BLE001 - 갱신 오류로 창이 죽지 않게 (버벅임 방지)
             pass
-        _reschedule(refresh, 400)
+        _reschedule(refresh, 500)  # 호가창 갱신 주기 500ms (§1-4)
 
     def _fill_hoga(sym: dict[str, Any], dec: int, my_ords: dict[str, int]) -> None:
-        asks = list(sym.get("asks") or [])[:8]
-        bids = list(sym.get("bids") or [])[:8]
+        asks = list(sym.get("asks") or [])[:5]  # 5호가 (§1-4)
+        bids = list(sym.get("bids") or [])[:5]
         last = sym.get("last")
         last_s = _fmt_px(last, dec) if last is not None else None
 
