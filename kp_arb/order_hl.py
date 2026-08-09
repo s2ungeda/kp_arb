@@ -412,12 +412,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             bal_val["진입가"].config(text=_fmt_px(sym.get("avg_price"), dec))
             bal_val["PNL"].config(text=_fmt(sym.get("pnl"), 2))
             bal_val["Liq_Prc"].config(text=_fmt_px(sym.get("liq"), dec))
-            # 오른쪽(마진·펀딩·오라클) — 스냅샷 확장(B) 전엔 "-"
+            # 오른쪽 — 오라클·펀딩률(WS), 마진·누적펀딩(clearinghouse, B2), 카운트다운(화면 계산)
             bal_val["Margin"].config(text=_fmt(sym.get("margin"), 2))
             bal_val["Funding"].config(text=_fmt(sym.get("cum_funding"), 4))
             bal_val["Oracle"].config(text=_fmt_px(sym.get("oracle"), dec))
-            bal_val["FundRate"].config(text=_fmt(sym.get("funding_rate"), 6))
-            bal_val["CountDown"].config(text=sym.get("countdown") or "-")
+            rate = sym.get("funding_rate")
+            bal_val["FundRate"].config(
+                text=f"{rate * 100:.4f}%" if rate is not None else "-")
+            secs = 3600 - (time.localtime().tm_min * 60 + time.localtime().tm_sec)
+            bal_val["CountDown"].config(text=f"{secs // 60:02d}:{secs % 60:02d}")
             if mode_var.get() == "hoga":
                 _set_hoga_price(sym, dec)
             # 내 미체결이 있는 호가에 "(건수)" 표시 — 활성 종목 미체결을 가격별 집계

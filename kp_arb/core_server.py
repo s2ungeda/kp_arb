@@ -331,8 +331,17 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
                 "pnl": (last - avg) * held if has_pos else 0.0,   # 평가손익
                 "eval": abs(held) * last if has_pos else 0.0,     # 평가금액
                 "tick": _tick_size(inst, last, asks or bids),
-                "liq": None,  # HL 청산가 — 게이트웨이 확장 후 채움(v1 미제공)
+                "liq": None,  # HL 청산가 — 기본 None, HL은 아래 detail에서 채움
             }
+            if inst is Instrument.HL_PERP:  # 잔고표 오른쪽(B) — 오라클·펀딩 + 상세
+                mark = system.hl_mark.get(u)
+                entry["oracle"] = mark.oracle if mark is not None else None
+                entry["funding_rate"] = system.hl_funding_rate.get(u)
+                detail = system.hl_detail.get(u) or {}
+                entry["margin"] = detail.get("margin")
+                entry["cum_funding"] = detail.get("cum_funding")
+                if detail.get("liq") is not None:
+                    entry["liq"] = detail["liq"]
             if is_spot_stock(inst):
                 entry["sellable"] = sellable_qty(
                     held, pending_sell.get((u, inst), 0.0))

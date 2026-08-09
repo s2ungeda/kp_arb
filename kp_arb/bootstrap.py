@@ -150,6 +150,11 @@ class LiveSystem:
         self.quotes: dict[tuple[Underlying, Instrument, str], Quote] = {}
         # 최신 체결가 보관소 — 시장별(krx/nxt/hl/uni). ETF 이론가의 기초가(KRX)에도 사용.
         self.trades: dict[tuple[Underlying, Instrument, str], float] = {}
+        # HL 마크(+오라클)·펀딩률 최신값 — 수동주문창 잔고표(B). WS로 실시간 갱신.
+        self.hl_mark: dict[Underlying, Mark] = {}
+        self.hl_funding_rate: dict[Underlying, float] = {}
+        # HL 포지션 상세(마진·누적펀딩·청산가) — clearinghouseState에서 refresh 때 채움(B2).
+        self.hl_detail: dict[Underlying, dict[str, float | None]] = {}
         # 기초 주식 등락률(%, drate) — ETF 이론가의 핵심 입력 (ETF 이론가.md §2).
         self.stock_change_pct: dict[tuple[Underlying, str], float] = {}
         # 예상체결가(동시호가) — (underlying, instrument)별. 기초 주식의 예상등락률 포함.
@@ -358,10 +363,18 @@ class LiveSystem:
             self._hl_ws.subscribe_bbo()     # 최우선호가+잔량 → on_quote(HL_PERP)
             self._hl_ws.subscribe_l2book()  # 호가창 다단계(2호가~) — 페깅 N호가용
             self._hl_ws.subscribe_trades()  # 공개 체결(현재가) — 마크(1초)보다 빠름
+            def store_mark(mark: Mark) -> None:  # 마크+오라클 저장(B — 잔고표)
+                self.hl_mark[mark.underlying] = mark
+
+            def store_funding(underlying: Underlying, rate: float) -> None:  # 펀딩률 저장(B)
+                self.hl_funding_rate[underlying] = rate
+
             self._hl_ws.on_mark.append(fan_mark)
+            self._hl_ws.on_mark.append(store_mark)
             self._hl_ws.on_quote.append(fan_quote)
             self._hl_ws.on_trade.append(fan_trade)
             self._hl_ws.on_funding.append(fan_funding)
+            self._hl_ws.on_funding.append(store_funding)
             self._hl_ws.on_fill.append(apply_fill)  # HL 체결 → OrderBook (oid로 매칭)
             self._hl_ws.on_reconnect.append(lambda: self._on_ws_reconnect("HL"))
 

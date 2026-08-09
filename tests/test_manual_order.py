@@ -65,6 +65,9 @@ class _FakeSystem:
         self._fail = fail
         self.quotes = quotes or {}
         self.trades = trades or {}
+        self.hl_mark: dict[Any, Any] = {}          # 잔고표(B) — 마크+오라클
+        self.hl_funding_rate: dict[Any, float] = {}
+        self.hl_detail: dict[Any, dict[str, Any]] = {}
         # 기본은 건강한 채널(연결된 주문 피드) — 무데이터 판정 없음 → 경고 없음.
         self.ws = ws if ws is not None else [
             WsStatus(venue="LS", name="LS", kind="주문", expects_stream=False,
@@ -297,3 +300,19 @@ def test_manual_snapshot_shape() -> None:
     assert "sellable" not in snap["symbols"]["samsung|hl_perp"]
     # 미체결에 SELL1 포함
     assert any(o["order_id"] == "SELL1" for o in snap["open_orders"])
+
+
+def test_manual_snapshot_hl_fields() -> None:
+    # 잔고표 오른쪽(B) — 오라클·펀딩률(WS 저장), 마진·누적펀딩·청산가(clearinghouse detail)
+    from kp_arb.gateways.hl import Mark
+
+    sys = _fake_system(OrderBook())
+    sys.hl_mark[Underlying.SAMSUNG] = Mark(
+        underlying=Underlying.SAMSUNG, price=167.5, oracle=167.4)
+    sys.hl_funding_rate[Underlying.SAMSUNG] = 0.0000125
+    sys.hl_detail[Underlying.SAMSUNG] = {"margin": 12.3, "cum_funding": -0.45, "liq": 150.0}
+    hl = manual_snapshot(sys)["symbols"]["samsung|hl_perp"]
+    assert hl["oracle"] == 167.4
+    assert hl["funding_rate"] == 0.0000125
+    assert hl["margin"] == 12.3 and hl["cum_funding"] == -0.45
+    assert hl["liq"] == 150.0  # detail이 기본 None을 덮어씀
