@@ -153,8 +153,8 @@ class LiveSystem:
         # HL 마크(+오라클)·펀딩률 최신값 — 수동주문창 잔고표(B). WS로 실시간 갱신.
         self.hl_mark: dict[Underlying, Mark] = {}
         self.hl_funding_rate: dict[Underlying, float] = {}
-        # HL 포지션 상세(마진·누적펀딩·청산가) — clearinghouseState에서 refresh 때 채움(B2).
-        self.hl_detail: dict[Underlying, dict[str, float | None]] = {}
+        # HL 포지션 상세(마진·누적펀딩·청산가·레버리지) — clearinghouseState에서 refresh 때 채움.
+        self.hl_detail: dict[Underlying, dict[str, Any]] = {}
         # 기초 주식 등락률(%, drate) — ETF 이론가의 핵심 입력 (ETF 이론가.md §2).
         self.stock_change_pct: dict[tuple[Underlying, str], float] = {}
         # 예상체결가(동시호가) — (underlying, instrument)별. 기초 주식의 예상등락률 포함.
@@ -194,6 +194,7 @@ class LiveSystem:
         if self._hl is not None:
             positions.extend(await self._hl.get_positions())
             open_orders.extend(await self._hl.get_open_orders())
+            self.hl_detail = await self._hl.get_position_details()  # 마진·청산가 등(B2, 잔고표)
         self.order_book.load_snapshot(
             positions=positions, balances=balances, open_orders=open_orders
         )

@@ -124,6 +124,25 @@ async def test_margin_and_funding_and_mark() -> None:
     assert await gw.get_mark(Underlying.HYUNDAI) == pytest.approx(312.59)
 
 
+async def test_position_details_parsed() -> None:
+    # clearinghouseState 상세(마진·누적펀딩·청산가·레버리지) — 잔고표(B2)·레버리지(D)
+    info = StubInfo(positions=[
+        {"position": {"coin": "xyz:SMSN", "szi": "-0.1", "entryPx": "184.0",
+                      "marginUsed": "12.3", "liquidationPx": "250.5",
+                      "positionValue": "18.4", "unrealizedPnl": "-0.6",
+                      "cumFunding": {"sinceOpen": "-0.05"}, "maxLeverage": "20",
+                      "leverage": {"type": "cross", "value": "5"}}},
+        {"position": {"coin": "xyz:SKHX", "szi": "0", "entryPx": "0"}},  # 미보유 → skip
+    ])
+    gw, _, _ = _gw(info)
+    details = await gw.get_position_details()
+    assert set(details) == {Underlying.SAMSUNG}
+    d = details[Underlying.SAMSUNG]
+    assert d["margin"] == 12.3 and d["liq"] == 250.5
+    assert d["cum_funding"] == -0.05 and d["max_leverage"] == 20.0
+    assert d["leverage"] == 5.0 and d["leverage_cross"] is True
+
+
 def test_default_symbols_are_measured_values() -> None:
     assert HL_SYMBOLS[Underlying.SAMSUNG] == "xyz:SMSN"
     assert HL_SYMBOLS[Underlying.SK_HYNIX] == "xyz:SKHX"

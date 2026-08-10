@@ -25,6 +25,14 @@ from .ls import OrderGoneError
 
 HL_DEX = "xyz"
 
+
+def _safe_float(v: Any) -> float | None:
+    """표시용 안전 파싱 — 없거나 숫자가 아니면 None (잔고표 상세)."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
 # 실측 확정 심볼 (perpDexs/metaAndAssetCtxs, 2026-07-02)
 HL_SYMBOLS: dict[Underlying, str] = {
     Underlying.SAMSUNG: "xyz:SMSN",
@@ -217,6 +225,33 @@ class HLSdkGateway(HLGateway):
             {"type": "clearinghouseState", "user": self._address, "dex": HL_DEX}
         )
         return float(state.get("marginSummary", {}).get("accountValue", 0.0))
+
+    async def get_position_details(self) -> dict[Underlying, dict[str, Any]]:
+        """clearinghouseState 포지션 상세(종목별) — 마진·누적펀딩·청산가·레버리지 등.
+
+        get_positions는 szi·entryPx만 쓰므로, 잔고표(B2)·레버리지(D) 표시용 나머지 필드를
+        여기서 뽑는다. leverage_cross는 D의 마진모드(교차/격리) 표시에 쓴다.
+        """
+        state = await self._post_info(
+            {"type": "clearinghouseState", "user": self._address, "dex": HL_DEX})
+        out: dict[Underlying, dict[str, Any]] = {}
+        for asset in state.get("assetPositions", []):
+            pos = asset.get("position", {})
+            underlying = self._by_symbol.get(str(pos.get("coin", "")))
+            if underlying is None or not _safe_float(pos.get("szi")):
+                continue  # 미보유(szi 0/None) 제외
+            lev = pos.get("leverage") or {}
+            out[underlying] = {
+                "margin": _safe_float(pos.get("marginUsed")),
+                "cum_funding": _safe_float((pos.get("cumFunding") or {}).get("sinceOpen")),
+                "liq": _safe_float(pos.get("liquidationPx")),
+                "position_value": _safe_float(pos.get("positionValue")),
+                "unrealized_pnl": _safe_float(pos.get("unrealizedPnl")),
+                "leverage": _safe_float(lev.get("value")),
+                "leverage_cross": lev.get("type") == "cross",  # D: 교차/격리
+                "max_leverage": _safe_float(pos.get("maxLeverage")),
+            }
+        return out
 
     async def get_funding(self, underlying: Underlying) -> float:
         coin = self._symbol(underlying)

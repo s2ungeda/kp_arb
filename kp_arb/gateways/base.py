@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..domain.enums import Account, Underlying
 from ..domain.models import OrderIntent, Position
@@ -58,6 +58,13 @@ class HLGateway(ABC):
 
     @abstractmethod
     async def get_funding(self, underlying: Underlying) -> float: ...
+
+    async def get_position_details(self) -> dict[Underlying, dict[str, Any]]:
+        """clearinghouseState 포지션 상세(마진·청산가·레버리지 등) — 표시용, 종목별.
+
+        필수 아님(기본 빈 dict). HLSdkGateway가 실제 구현(잔고표 B2·레버리지 D).
+        """
+        return {}
 
     @abstractmethod
     async def get_open_orders(self) -> Sequence[TrackedOrder]:
