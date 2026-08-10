@@ -49,14 +49,25 @@ class StubExchange:
             return {"status": "err", "response": "Invalid leverage"}
         return {"status": "ok", "response": {"type": "default"}}
 
+    def modify_order(self, oid: int, coin: str, is_buy: bool, sz: float, px: float,
+                     order_type: dict[str, Any], reduce_only: bool = False) -> dict[str, Any]:
+        self.modifies: list[tuple[Any, ...]] = getattr(self, "modifies", [])
+        self.modifies.append((oid, coin, is_buy, sz, px, reduce_only, order_type))
+        statuses = [{"resting": {"oid": oid + 1}}]
+        return {"status": "ok", "response": {"type": "order", "data": {"statuses": statuses}}}
+
 
 class StubInfo:
     """실측 shape 픽스처를 돌려주는 /info 스텁."""
 
     def __init__(self, positions: list[dict[str, Any]] | None = None,
-                 account_value: str = "19.6") -> None:
+                 account_value: str = "19.6",
+                 active_data: dict[str, Any] | None = None,
+                 open_orders: list[dict[str, Any]] | None = None) -> None:
         self._positions = positions or []
         self._account_value = account_value
+        self._active = active_data or {}  # coin -> activeAssetData 응답
+        self._open_orders = open_orders or []  # frontendOpenOrders 행
         self.posts: list[dict[str, Any]] = []
 
     def post(self, path: str, body: dict[str, Any]) -> Any:
@@ -68,6 +79,11 @@ class StubInfo:
         if body["type"] == "metaAndAssetCtxs":
             assert body["dex"] == "xyz"
             return META_CTXS
+        if body["type"] == "activeAssetData":
+            return self._active.get(body["coin"], {})  # 미설정 코인 → 빈 응답
+        if body["type"] == "frontendOpenOrders":
+            assert body["dex"] == "xyz"
+            return self._open_orders
         raise AssertionError(f"unexpected info type {body['type']}")
 
 
@@ -162,6 +178,64 @@ async def test_position_details_parsed() -> None:
     assert d["margin"] == 12.3 and d["liq"] == 250.5
     assert d["cum_funding"] == -0.05 and d["max_leverage"] == 20.0
     assert d["leverage"] == 5.0 and d["leverage_cross"] is True
+
+
+async def test_leverage_settings_from_active_asset_data() -> None:
+    # 포지션 없어도 activeAssetData로 코인별 설정 레버리지를 읽는다(§D 캡션 보정).
+    info = StubInfo(active_data={
+        "xyz:SMSN": {"leverage": {"type": "cross", "value": 10}},
+        "xyz:SKHX": {"leverage": {"type": "isolated", "value": 20, "rawUsd": "0.0"}},
+        # xyz:HYUNDAI 응답 없음(빈 dict) → 결과에서 빠짐
+    })
+    gw, _, _ = _gw(info)
+    out = await gw.get_leverage_settings()
+    assert out[Underlying.SAMSUNG] == {"leverage": 10.0, "leverage_cross": True}
+    assert out[Underlying.SK_HYNIX] == {"leverage": 20.0, "leverage_cross": False}
+    assert Underlying.HYUNDAI not in out
+
+
+def test_lev_from_active_asset_parsing() -> None:
+    from kp_arb.gateways.hl_live import _lev_from_active_asset
+    assert _lev_from_active_asset(
+        {"leverage": {"type": "cross", "value": 10}}
+    ) == {"leverage": 10.0, "leverage_cross": True}
+    assert _lev_from_active_asset(
+        {"leverage": {"type": "isolated", "value": 20, "rawUsd": "0.0"}}
+    ) == {"leverage": 20.0, "leverage_cross": False}
+    assert _lev_from_active_asset({}) is None       # 레버리지 없음
+    assert _lev_from_active_asset(None) is None      # 이상 응답
+
+
+async def test_snapshot_orders_allow_amend() -> None:
+    # get_open_orders(스냅샷)로 로드된 주문도 정정 가능해야 한다 — _order_ctx를 채워야
+    # "context required for modify" 거부가 안 난다(코어 재시작 후 정정, 특히 매도).
+    info = StubInfo(open_orders=[
+        {"coin": "xyz:SMSN", "side": "A", "origSz": "0.14", "sz": "0.14",
+         "limitPx": "185.0", "oid": 777}])
+    gw, ex, _ = _gw(info)
+    await gw.get_open_orders()  # place_order 없이 스냅샷만 로드
+    new_oid = await gw.amend_order("777", qty=0.14, price=184.0)
+    assert new_oid == "778"  # 예외 없이 정정 — 새 oid
+    assert ex.modifies[0][:3] == (777, "xyz:SMSN", False)  # 매도(is_buy=False) 보존
+
+
+async def test_amend_uses_explicit_reduce_and_post() -> None:
+    # 정정 시 reduce_only·post_only는 **명시 인자**로 전달(원주문 상속 안 함). 안 넘기면
+    # 벗겨져 소액 reduce 주문이 'Attempted to modify to invalid new order'로 거부(실측).
+    gw, ex, _ = _gw()
+    oid = await gw.place_order(_intent(Side.SELL, price=163.0))  # 원주문 옵션 무관
+    await gw.amend_order(oid, qty=0.054, price=163.1, reduce_only=True, post_only=True)
+    *_, reduce_only, order_type = ex.modifies[-1]
+    assert reduce_only is True                        # 명시 reduce 전달
+    assert order_type == {"limit": {"tif": "Alo"}}    # post_only → Alo
+
+
+async def test_amend_default_is_gtc_no_reduce() -> None:
+    gw, ex, _ = _gw()
+    oid = await gw.place_order(_intent(Side.SELL, price=163.0))
+    await gw.amend_order(oid, qty=0.054, price=163.1)  # 옵션 미지정
+    *_, reduce_only, order_type = ex.modifies[-1]
+    assert reduce_only is False and order_type == {"limit": {"tif": "Gtc"}}
 
 
 def test_default_symbols_are_measured_values() -> None:

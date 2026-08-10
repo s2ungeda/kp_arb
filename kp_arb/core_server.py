@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from .domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
+from .hl_merge import merge_tick_options
 from .manual_order import is_spot_stock, sellable_qty, short_sale_error
 from .routing import account_for
 from .strategy_core import (
@@ -343,9 +344,21 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
                 entry["cum_funding"] = detail.get("cum_funding")
                 entry["leverage"] = detail.get("leverage")            # D: 현재 배수
                 entry["leverage_cross"] = detail.get("leverage_cross")  # 교차 여부
-                entry["max_leverage"] = detail.get("max_leverage")
+                # max_leverage: 포지션 있으면 clearinghouse, 없으면 종목정보(시동 조회)
+                info = system.instruments.get((u, inst))
+                entry["max_leverage"] = (
+                    detail.get("max_leverage")
+                    if detail.get("max_leverage") is not None
+                    else (info.max_leverage if info is not None else None))
                 if detail.get("liq") is not None:
                     entry["liq"] = detail["liq"]
+                # 호가단위(틱) 옵션 — 가격 자릿수 기반(순수). '적' 전에도 화면 콤보가 채워짐.
+                _ref = last if last is not None else (
+                    (asks[0][0] if asks else None) or (bids[0][0] if bids else None))
+                entry["merge_ticks"] = [
+                    {"tick": s, "n_sig_figs": nsf, "mantissa": mant}
+                    for s, nsf, mant in merge_tick_options(float(_ref))
+                ] if _ref else []
             if is_spot_stock(inst):
                 entry["sellable"] = sellable_qty(
                     held, pending_sell.get((u, inst), 0.0))
@@ -436,8 +449,12 @@ async def _manual_command(
         raw = body.get("price")
         if not order_id or raw is None:
             return _fail(["order_id·price 필요"])
+        reduce_only = bool(body.get("reduce_only", False))  # 정정 화면 체크(HL 전용)
+        post_only = bool(body.get("post_only", False))
         try:
-            new_id = await system.amend_price(str(order_id), float(raw))
+            new_id = await system.amend_price(
+                str(order_id), float(raw),
+                reduce_only=reduce_only, post_only=post_only)
         except Exception as exc:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
             return _fail([f"정정 실패: {exc}"])
         return _ok(order_id=new_id)
@@ -599,6 +616,17 @@ def _setup_logging() -> logging.Logger:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         handlers=handlers,
     )
+    # 거래소별 주문 로그 — HL/LS 각각 별도 파일(hl_order_날짜.log / ls_order_날짜.log),
+    # 자정 롤오버. root로 전파 안 함(propagate=False) → core.log·콘솔과 분리(중복 없음).
+    for name, prefix in (("kp_arb.order.hl", "hl_order"), ("kp_arb.order.ls", "ls_order")):
+        olg = logging.getLogger(name)
+        olg.setLevel(logging.INFO)
+        olg.propagate = False
+        if not any(isinstance(h, _DailyFileHandler) for h in olg.handlers):
+            try:
+                olg.addHandler(_DailyFileHandler(log_dir, prefix=prefix))
+            except OSError:
+                pass
     return logging.getLogger("kp_arb.core")
 
 

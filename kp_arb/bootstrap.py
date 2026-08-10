@@ -20,6 +20,7 @@ from collections.abc import Callable, Coroutine
 from datetime import datetime
 from typing import Any
 
+from . import order_log
 from .config import CarryRates, FeeRates, LSAccounts
 from .disparity import (
     PairBoard,
@@ -33,12 +34,12 @@ from .disparity import (
     side_disp,
 )
 from .domain.enums import Account, Instrument, Side, Underlying, Venue
-from .domain.models import OrderIntent, Position, Quote
+from .domain.models import InstrumentInfo, OrderIntent, Position, Quote
 from .engine import ArbEngine
 from .etf_theory import EtfTheoryInputs, theory_after, theory_regular
 from .gateways.base import HLGateway
 from .gateways.hl import Mark
-from .gateways.hl_ws import HLWebSocketClient
+from .gateways.hl_ws import HLWebSocketClient, OrderUpdate
 from .gateways.ls import LSApiGateway, OrderGoneError
 from .gateways.ls_rest import RestError
 from .gateways.ls_ws import (
@@ -155,6 +156,8 @@ class LiveSystem:
         self.hl_funding_rate: dict[Underlying, float] = {}
         # HL 포지션 상세(마진·누적펀딩·청산가·레버리지) — clearinghouseState에서 refresh 때 채움.
         self.hl_detail: dict[Underlying, dict[str, Any]] = {}
+        # 종목정보(틱·승수·szDecimals·maxLeverage·만기) — 시동 시 1회 조회·보관 (§5.10).
+        self.instruments: dict[tuple[Underlying, Instrument], InstrumentInfo] = {}
         # 기초 주식 등락률(%, drate) — ETF 이론가의 핵심 입력 (ETF 이론가.md §2).
         self.stock_change_pct: dict[tuple[Underlying, str], float] = {}
         # 예상체결가(동시호가) — (underlying, instrument)별. 기초 주식의 예상등락률 포함.
@@ -195,9 +198,31 @@ class LiveSystem:
             hl_pos, self.hl_detail = await self._hl.get_positions_and_details()  # 1회 조회
             positions.extend(hl_pos)
             open_orders.extend(await self._hl.get_open_orders())
+            # 미보유 종목은 clearinghouse가 레버리지를 안 줘 캡션이 기본값(5x)에 멈춘다 —
+            # activeAssetData로 계좌 설정 레버리지를 읽어 보정(보유 종목 값은 유지). §D
+            for u, lev in (await self._hl.get_leverage_settings()).items():
+                d = self.hl_detail.setdefault(u, {})
+                d.setdefault("leverage", lev["leverage"])
+                d.setdefault("leverage_cross", lev["leverage_cross"])
         self.order_book.load_snapshot(
             positions=positions, balances=balances, open_orders=open_orders
         )
+
+    def _on_hl_order_update(self, upd: OrderUpdate) -> None:
+        """HL 주문상태 변화 → OrderBook 실시간 정합. 취소·거부 계열만 반영(체결은 userFills).
+
+        외부(홈페이지) 취소·자동취소(post-only/reduce-only/마진부족 등)도 즉시 반영돼,
+        조회(get_open_orders) 없이 호가창 유령 주문표시가 안 생긴다.
+        """
+        if not upd.is_terminal_cancel:
+            return  # open/triggered(살아있음)·filled(userFills 담당)은 여기서 처리 안 함
+        order = (self.order_book.on_reject(upd.oid) if upd.is_rejected
+                 else self.order_book.on_cancel(upd.oid))
+        log = order_log.logger_for(Venue.HYPERLIQUID)
+        if order is not None:
+            log.info("주문종료(%s) #%s — OrderBook 제거(실시간)", upd.status, upd.oid)
+        else:
+            log.info("외부 주문종료(%s) #%s (추적 안 함)", upd.status, upd.oid)
 
     def _on_ws_reconnect(self, label: str) -> None:
         """WS 재연결 후(동기 콜백) — 끊긴 동안 놓친 체결/외부거래를 반영하러 OrderBook을
@@ -241,11 +266,15 @@ class LiveSystem:
         self.order_book.track(order_id, intent)
         return order_id
 
-    async def amend_price(self, order_id: str, price: float) -> str:
+    async def amend_price(
+        self, order_id: str, price: float, *,
+        reduce_only: bool = False, post_only: bool = False,
+    ) -> str:
         """가격 정정 (venue 라우팅) — 새 주문번호를 등록하고 원주문은 취소 처리.
 
         LS는 CSPAT00701/CFOAT00200, HL은 modify 액션(취소+신규를 서버에서 한 번에).
         수량은 **잔량 기준**으로 보낸다 — 부분체결 후 원수량 정정은 거부됨(실측 01442).
+        reduce_only·post_only는 **정정 화면이 명시 전달**한다(HL 전용, 원주문 상속 안 함).
         """
         order = self.order_book.order(order_id)
         if order is None:
@@ -253,12 +282,21 @@ class LiveSystem:
         qty = order.remaining_qty
         if qty <= 0:
             raise OrderGoneError(f"order {order_id} has no remaining qty")
-        if order.intent.venue is Venue.LS:
-            new_id = await self._gw.amend_order(order_id, qty=qty, price=price)
-        else:
-            assert self._hl is not None
-            new_id = await self._hl.amend_order(order_id, qty=qty, price=price)
-        new_intent = order.intent.model_copy(update={"price": price, "qty": qty})
+        try:
+            if order.intent.venue is Venue.LS:
+                new_id = await self._gw.amend_order(order_id, qty=qty, price=price)
+            else:
+                assert self._hl is not None
+                new_id = await self._hl.amend_order(
+                    order_id, qty=qty, price=price,
+                    reduce_only=reduce_only, post_only=post_only)
+        except Exception as exc:  # 정정 거부/오류도 거래소별 파일에 남긴다
+            order_log.order_amend_rejected(
+                order.intent.venue, order_id, exc, qty=qty, price=price)
+            raise
+        new_intent = order.intent.model_copy(
+            update={"price": price, "qty": qty,
+                    "reduce_only": reduce_only, "post_only": post_only})
         self.order_book.track(new_id, new_intent)
         if new_id != order_id:
             self.order_book.on_cancel(order_id)  # 원주문은 정정으로 소멸
@@ -386,11 +424,42 @@ class LiveSystem:
             self._hl_ws.on_funding.append(fan_funding)
             self._hl_ws.on_funding.append(store_funding)
             self._hl_ws.on_fill.append(apply_fill)  # HL 체결 → OrderBook (oid로 매칭)
+            self._hl_ws.on_order_update.append(self._on_hl_order_update)  # 취소 등 실시간
             self._hl_ws.on_reconnect.append(lambda: self._on_ws_reconnect("HL"))
+
+    async def load_instruments(self) -> None:
+        """종목정보 조회·보관 — 시동 1회 (§5.10). 실패해도 시동 계속(표시·상한 보정용).
+
+        HL: metaAndAssetCtxs → szDecimals·maxLeverage·code (포지션 없어도 앎).
+        주식선물: 코드·만기(t8401 기조회) + 승수 10 / 주식: 승수 1.
+        """
+        import logging
+
+        hl_meta: dict[Underlying, dict[str, Any]] = {}
+        if self._hl is not None:
+            try:
+                hl_meta = dict(await self._hl.get_instrument_meta())
+            except Exception:  # noqa: BLE001 - 조회 실패가 시동을 막지 않게(보정용)
+                logging.getLogger("kp_arb.bootstrap").warning(
+                    "HL 종목정보 조회 실패 — 없이 계속", exc_info=True)
+        for u in Underlying:
+            m = hl_meta.get(u, {})
+            self.instruments[(u, Instrument.HL_PERP)] = InstrumentInfo(
+                underlying=u, instrument=Instrument.HL_PERP,
+                code=str(m.get("code", "")), multiplier=1.0,
+                sz_decimals=m.get("sz_decimals"), max_leverage=m.get("max_leverage"))
+            if u in self.futures_symbols:
+                self.instruments[(u, Instrument.KR_STOCK_FUTURE)] = InstrumentInfo(
+                    underlying=u, instrument=Instrument.KR_STOCK_FUTURE,
+                    code=self.futures_symbols[u], multiplier=10.0,
+                    expiry=self.futures_expiry.get(u))
+            self.instruments[(u, Instrument.KR_STOCK)] = InstrumentInfo(
+                underlying=u, instrument=Instrument.KR_STOCK, multiplier=1.0)
 
     async def start(self) -> None:
         """최초 스냅샷 → 세션 초기값(옵션) → WS 결선 → 실시간 수신 시작(재연결 포함)."""
         await self.refresh_snapshot()
+        await self.load_instruments()  # 종목정보(틱·승수·maxLeverage·만기) 보관
         self._seed_session_from_env()
         self._wire()
         # 시동 REST 조회들은 **순차 실행** — 동시에 나가면 서버 계정당 초당 한도에
@@ -885,7 +954,9 @@ async def bootstrap_live(
             HLWebSocketConnector(), symbols=config.hl_symbols(),
             max_reconnects=1_000_000, reconnect_backoff_s=2.0,
         )
-        hl_ws.subscribe_user_fills(str(default_secrets().get("HL_ACCOUNT_ADDRESS")))
+        _hl_addr = str(default_secrets().get("HL_ACCOUNT_ADDRESS"))
+        hl_ws.subscribe_user_fills(_hl_addr)
+        hl_ws.subscribe_order_updates(_hl_addr)  # 취소·자동취소 실시간 → OrderBook 정합
     except ConfigError:
         pass
 

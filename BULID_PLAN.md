@@ -293,6 +293,8 @@ mock 게이트웨이 + NoopStrategy로 시세 수신→MarketState→리스크�
 - **인증 오류**: LS 계좌비번·AppKey·HL 키 오류 시 경고.
 - **포지션/잔고 주기 재동기**: 전체환경설정(사용여부·주기 N분).
 - **로그 파일**: 당일 날짜로 롤오버(자정 넘겨 어제 파일에 쓰지 않음).
+- **거래소별 주문 로그(추가 2026-08-10)**: HL·LS **모든 주문데이터**(발주 요청+거래소 원응답, 체결통보(부분/전량·누적수량), 취소·정정, 거부)를 **거래소별 별도 파일**에 남긴다 — `logs/hl_order_날짜.log` / `logs/ls_order_날짜.log`(자정 롤오버, `core.log`와 분리·중복 없음). 로거 `kp_arb.order.hl` / `kp_arb.order.ls`(`kp_arb/order_log.py`), 발주는 게이트웨이(hl_live·ls)·체결은 OrderBook.on_fill에서 기록. 발주 응답에 filled/resting·체결수량이 남아, "주문수량≠잔고"(부분체결·상계)를 사후 재구성할 수 있다.
+- **HL 주문상태 실시간 구독(orderUpdates, 추가 2026-08-10)**: HL WS `orderUpdates`(user)를 구독해 **취소·자동취소(post-only/reduce-only/마진부족 등)·외부(홈페이지) 취소**를 실시간으로 받아 OrderBook에서 제거한다(`hl_ws.OrderUpdate` → `LiveSystem._on_hl_order_update`). 체결은 기존 `userFills`가 담당(중복 방지 — orderUpdates의 `filled`는 무시). **설계 원칙(사용자 확정)**: 실시간 푸시 우선, 조회(get_open_orders)는 최소화 — `frontendOpenOrders` 대조는 시동·재연결·`적` 때의 백업일 뿐. 종료 status 판정은 `OrderUpdate.is_terminal_cancel`(`*Canceled`·`*Rejected` 계열, filled·open·triggered 제외).
 - **코어 자동 재시작**: 메인 감시 스레드가 코어 사망 연속 N회 감지 시 재기동 + 로그·알림. 단 '안전종료'로 끈 경우 제외(의도적 종료 구분 플래그).
 - **결산·정리**: 국내장 종료 후 결산 시각(전체환경설정) → 이후 메모리 정리. 로그 파일 정리는 당분간 사용자 수동.
 - **알림 채널**: **텔레그램**(봇토큰+chat_id). 알림은 함수 하나로 추상화(채널 교체 쉽게).

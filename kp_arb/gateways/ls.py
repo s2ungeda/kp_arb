@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from .. import order_log
 from ..config import LSAccounts
 from ..domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from ..domain.models import OrderIntent, Position
@@ -162,9 +163,14 @@ class LSApiGateway(LSGateway):
             body = self._future_order_body(intent, account)
         else:
             raise NotImplementedError(f"{intent.instrument} 주문 TR 미정 [OPEN §13 #3]")
-        resp = await self._rest_for(account).request(tr_cd, body, path=path)
-        order_id = self._parse_order_id(resp, tr_cd)
+        try:
+            resp = await self._rest_for(account).request(tr_cd, body, path=path)
+            order_id = self._parse_order_id(resp, tr_cd)
+        except Exception as exc:  # 거부·오류도 거래소별 파일에 남긴다(발주거부)
+            order_log.order_rejected(intent, exc)
+            raise
         self._orders[order_id] = OrderContext(order_id, intent, account, body)
+        order_log.order_placed(intent, order_id, getattr(resp, "body", None))
         return order_id
 
     async def amend_order(
@@ -187,6 +193,7 @@ class LSApiGateway(LSGateway):
         self._orders[new_id] = OrderContext(
             new_id, ctx.intent, ctx.account, body, replaces=order_id
         )
+        order_log.order_amended(Venue.LS, order_id, new_id, qty, price)
         return new_id
 
     async def cancel_order(self, order_id: str) -> None:
@@ -199,6 +206,7 @@ class LSApiGateway(LSGateway):
             body = self._future_cancel_body(ctx)
         resp = await self._rest_for(ctx.account).request(tr_cd, body, path=path)
         self._check_ok(resp, tr_cd)
+        order_log.order_canceled(Venue.LS, order_id)
 
     async def get_positions(self, account: Account) -> Sequence[Position]:
         """계좌별 잔고(포지션) 조회. 주식 CSPAQ12300 / 선물 t0441(운영 실측)."""

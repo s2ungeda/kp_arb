@@ -68,13 +68,14 @@ class _FakeSystem:
         self.hl_mark: dict[Any, Any] = {}          # 잔고표(B) — 마크+오라클
         self.hl_funding_rate: dict[Any, float] = {}
         self.hl_detail: dict[Any, dict[str, Any]] = {}
+        self.instruments: dict[Any, Any] = {}  # 종목정보(§5.10) — 스냅샷 max_leverage 보정
         # 기본은 건강한 채널(연결된 주문 피드) — 무데이터 판정 없음 → 경고 없음.
         self.ws = ws if ws is not None else [
             WsStatus(venue="LS", name="LS", kind="주문", expects_stream=False,
                      connected=True)]
         self.placed: list[OrderIntent] = []
         self.cancelled: list[str] = []
-        self.amended: list[tuple[str, float]] = []
+        self.amended: list[tuple[str, float, bool, bool]] = []
         self.leverage_calls: list[tuple[Underlying, int, bool]] = []
         self.merges: list[tuple[Underlying, int | None, int | None]] = []
         self.refreshed = 0
@@ -88,8 +89,9 @@ class _FakeSystem:
     async def cancel(self, order_id: str) -> None:
         self.cancelled.append(order_id)
 
-    async def amend_price(self, order_id: str, price: float) -> str:
-        self.amended.append((order_id, price))
+    async def amend_price(self, order_id: str, price: float, *,
+                          reduce_only: bool = False, post_only: bool = False) -> str:
+        self.amended.append((order_id, price, reduce_only, post_only))
         return "OID-2"
 
     def set_hl_aggregation(self, u: Underlying, n_sig_figs: int | None,
@@ -207,9 +209,10 @@ async def test_manual_cancel_calls_system() -> None:
 async def test_manual_amend_calls_system() -> None:
     sys = _fake_system(OrderBook())
     r = await _manual_command(
-        sys, {"cmd": "manual_amend", "order_id": "X1", "price": 80500})
+        sys, {"cmd": "manual_amend", "order_id": "X1", "price": 80500,
+              "reduce_only": True, "post_only": True})
     assert r["ok"] and r["order_id"] == "OID-2"
-    assert sys.amended == [("X1", 80500.0)]
+    assert sys.amended == [("X1", 80500.0, True, True)]  # 정정 옵션 전달
 
 
 async def test_manual_leverage_calls_system() -> None:

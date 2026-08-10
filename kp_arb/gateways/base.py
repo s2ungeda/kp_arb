@@ -48,9 +48,11 @@ class HLGateway(ABC):
     async def cancel_order(self, order_id: str) -> None: ...
 
     async def amend_order(
-        self, order_id: str, *, qty: float | None = None, price: float | None = None
+        self, order_id: str, *, qty: float | None = None, price: float | None = None,
+        reduce_only: bool = False, post_only: bool = False,
     ) -> str:
-        """정정(modify). 기본은 미지원 — 지원 게이트웨이(HLSdkGateway)가 재정의."""
+        """정정(modify). reduce_only·post_only는 정정 화면이 명시 전달(원주문 상속 안 함).
+        기본은 미지원 — 지원 게이트웨이(HLSdkGateway)가 재정의."""
         raise NotImplementedError("이 게이트웨이는 정정을 지원하지 않는다")
 
     @abstractmethod
@@ -71,6 +73,17 @@ class HLGateway(ABC):
     ) -> tuple[Sequence[Position], dict[Underlying, dict[str, Any]]]:
         """포지션 + 상세를 함께(REST 왕복 절감). 기본은 두 메서드 조합, HLSdkGateway가 1회로."""
         return list(await self.get_positions()), await self.get_position_details()
+
+    async def get_leverage_settings(self) -> dict[Underlying, dict[str, Any]]:
+        """코인별 레버리지·마진모드(포지션 무관, activeAssetData) — 표시 캡션 보정용(§D).
+
+        필수 아님(기본 빈 dict). HLSdkGateway가 실제 구현 — 미보유 종목도 실제 배수 표시.
+        """
+        return {}
+
+    async def get_instrument_meta(self) -> dict[Underlying, dict[str, Any]]:
+        """종목 메타(code·szDecimals·maxLeverage) — 시동 종목정보(§5.10). 기본 빈 dict."""
+        return {}
 
     async def update_leverage(
         self, underlying: Underlying, leverage: int, *, is_cross: bool

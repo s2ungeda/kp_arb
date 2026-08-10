@@ -94,14 +94,20 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         except ValueError:
             set_status("정정가가 숫자가 아님", err=True)
             return
-        send({"cmd": "manual_amend", "order_id": oid, "price": new_px}, "정정")
+        # reduce/post는 정정 시 명시 전달(HL 전용, 원주문 상속 안 함 — 사용자 확정).
+        send({"cmd": "manual_amend", "order_id": oid, "price": new_px,
+              "reduce_only": reduce_var.get(), "post_only": post_var.get()}, "정정")
 
-    # 정정가 입력 + 정정/취소 버튼
+    # 정정가 입력 + 옵션(Reduce/Post, HL) + 정정/취소 버튼
     ctrl = tk.Frame(root)
     ctrl.pack(fill="x", padx=6, pady=(0, 2))
     tk.Label(ctrl, text="정정가").pack(side="left")
     e_price = tk.Entry(ctrl, width=10, justify="right")
     e_price.pack(side="left", padx=(2, 8))
+    reduce_var = tk.BooleanVar(value=False)
+    post_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(ctrl, text="Reduce", variable=reduce_var).pack(side="left")
+    tk.Checkbutton(ctrl, text="Post", variable=post_var).pack(side="left", padx=(0, 6))
     tk.Button(ctrl, text="선택 정정", command=do_amend).pack(side="left")
     tk.Button(ctrl, text="선택 취소", command=do_cancel).pack(side="left", padx=4)
 

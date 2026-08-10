@@ -16,6 +16,7 @@ import asyncio
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .. import order_log
 from ..config import ConfigError, SecretProvider, default_secrets
 from ..domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from ..domain.models import OrderIntent, Position
@@ -32,6 +33,29 @@ def _safe_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_int(v: Any) -> int | None:
+    """정수 안전 파싱 — 없거나 숫자가 아니면 None (szDecimals 등)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _lev_from_active_asset(resp: Any) -> dict[str, Any] | None:
+    """activeAssetData 응답 → {'leverage','leverage_cross'} (없으면 None).
+
+    clearinghouseState는 **보유 코인만** 레버리지를 주지만, activeAssetData는
+    포지션이 없어도 계좌의 코인별 설정 레버리지를 돌려준다(§D 캡션 보정).
+    """
+    if not isinstance(resp, dict):
+        return None
+    lev = resp.get("leverage") or {}
+    val = _safe_float(lev.get("value"))
+    if val is None:
+        return None
+    return {"leverage": val, "leverage_cross": lev.get("type") == "cross"}
 
 # 실측 확정 심볼 (perpDexs/metaAndAssetCtxs, 2026-07-02)
 HL_SYMBOLS: dict[Underlying, str] = {
@@ -58,7 +82,8 @@ class HLSdkGateway(HLGateway):
         self._symbols: dict[Underlying, str] = dict(symbols or HL_SYMBOLS)
         self._by_symbol = {v: k for k, v in self._symbols.items()}
         self._order_coin: dict[str, str] = {}  # oid -> coin (취소에 필요)
-        # oid -> (coin, is_buy, sz, px) — 정정(modify)에 원주문 정보가 필요.
+        # oid -> (coin, is_buy, sz, px) — 정정(modify)에 원주문 정보(종목·방향·수량·가격).
+        # reduce/post는 정정 시 **호출부가 명시적으로 전달**한다(원주문 상속 안 함, 사용자 확정).
         self._order_ctx: dict[str, tuple[str, bool, float, float]] = {}
         self.connected = False
 
@@ -111,13 +136,18 @@ class HLSdkGateway(HLGateway):
             # HL은 순수 시장가가 없음 — IOC 지정가(마크 대비 슬리피지 허용)로 대응.
             price = await self._market_px(coin, is_buy)
             order_type = {"limit": {"tif": "Ioc"}}
-        resp = await asyncio.to_thread(
-            self._ex.order, coin, is_buy, float(intent.qty), price, order_type,
-            reduce_only=intent.reduce_only,
-        )
-        oid = self._parse_oid(resp)
+        try:
+            resp = await asyncio.to_thread(
+                self._ex.order, coin, is_buy, float(intent.qty), price, order_type,
+                reduce_only=intent.reduce_only,
+            )
+            oid = self._parse_oid(resp)
+        except Exception as exc:  # 거부·오류도 거래소별 파일에 남긴다(발주거부)
+            order_log.order_rejected(intent, exc)
+            raise
         self._order_coin[oid] = coin
         self._order_ctx[oid] = (coin, is_buy, float(intent.qty), price)
+        order_log.order_placed(intent, oid, resp)  # 원응답(filled/resting·수량) 포함
         return oid
 
     async def amend_order(
@@ -126,17 +156,24 @@ class HLSdkGateway(HLGateway):
         *,
         qty: float | None = None,
         price: float | None = None,
+        reduce_only: bool = False,
+        post_only: bool = False,
     ) -> str:
-        """정정(modify) — 서버가 취소+신규를 액션 한 번으로 처리. 새 oid 반환."""
+        """정정(modify) — 서버가 취소+신규를 액션 한 번으로 처리. 새 oid 반환.
+
+        reduce_only·post_only는 **정정 화면이 명시적으로** 넘긴다(원주문 상속 안 함) — 안 넘겨
+        벗겨지면 소액 reduce 주문이 'Attempted to modify to invalid new order'로 거부된다(실측).
+        """
         ctx = self._order_ctx.get(order_id)
         if ctx is None:
             raise HLError(f"unknown order_id {order_id} (context required for modify)")
         coin, is_buy, sz, px = ctx
         new_sz = float(qty) if qty is not None else sz
         new_px = float(price) if price is not None else px
+        tif = "Alo" if post_only else "Gtc"  # post_only = 메이커 전용(Alo)
         resp = await asyncio.to_thread(
             self._ex.modify_order, int(order_id), coin, is_buy, new_sz, new_px,
-            {"limit": {"tif": "Gtc"}},
+            {"limit": {"tif": tif}}, reduce_only,
         )
         try:
             oid = self._parse_oid(resp)
@@ -148,6 +185,7 @@ class HLSdkGateway(HLGateway):
             raise
         self._order_coin[oid] = coin
         self._order_ctx[oid] = (coin, is_buy, new_sz, new_px)
+        order_log.order_amended(Venue.HYPERLIQUID, order_id, oid, qty, price)
         return oid
 
     async def cancel_order(self, order_id: str) -> None:
@@ -156,6 +194,7 @@ class HLSdkGateway(HLGateway):
             raise HLError(f"unknown order_id {order_id} (coin required for cancel)")
         resp = await asyncio.to_thread(self._ex.cancel, coin, int(order_id))
         self._check_ok(resp)
+        order_log.order_canceled(Venue.HYPERLIQUID, order_id)
 
     async def update_leverage(
         self, underlying: Underlying, leverage: int, *, is_cross: bool
@@ -227,18 +266,24 @@ class HLSdkGateway(HLGateway):
             underlying = self._by_symbol.get(str(row.get("coin", "")))
             if underlying is None:
                 continue
+            is_buy = str(row.get("side")) == "B"
+            coin, orig_sz, limit_px = str(row["coin"]), float(row["origSz"]), float(
+                row["limitPx"])
             intent = OrderIntent(
                 venue=Venue.HYPERLIQUID,
                 underlying=underlying,
                 instrument=Instrument.HL_PERP,
-                side=Side.BUY if str(row.get("side")) == "B" else Side.SELL,
-                qty=float(row["origSz"]),
+                side=Side.BUY if is_buy else Side.SELL,
+                qty=orig_sz,
                 order_type=OrderType.LIMIT,
-                price=float(row["limitPx"]),
+                price=limit_px,
             )
-            filled = float(row["origSz"]) - float(row["sz"])  # sz = 잔여
+            filled = orig_sz - float(row["sz"])  # sz = 잔여
             oid = str(row["oid"])
-            self._order_coin[oid] = str(row["coin"])  # 취소 가능하도록 coin 기억
+            self._order_coin[oid] = coin  # 취소 가능하도록 coin 기억
+            # 정정(modify)엔 원주문 컨텍스트가 필요 — 스냅샷 로드분도 채운다(재시작 후 정정 가능).
+            # reduce/post는 정정 시 화면이 명시 전달하므로 여기선 종목·방향·수량·가격만.
+            self._order_ctx[oid] = (coin, is_buy, orig_sz, limit_px)
             orders.append(
                 TrackedOrder(
                     order_id=oid,
@@ -259,6 +304,43 @@ class HLSdkGateway(HLGateway):
     async def get_position_details(self) -> dict[Underlying, dict[str, Any]]:
         """clearinghouseState 포지션 상세(종목별) — 마진·누적펀딩·청산가·레버리지 등(B2·D)."""
         return self._parse_positions(await self._clearinghouse())[1]
+
+    async def get_instrument_meta(self) -> dict[Underlying, dict[str, Any]]:
+        """metaAndAssetCtxs universe → 코인별 code·szDecimals·maxLeverage (시동 종목정보).
+
+        정적 메타라 시동 시 1회 조회로 충분 — 포지션 없어도 maxLeverage를 안다(§5.10).
+        """
+        meta, _ctxs = await self._post_info({"type": "metaAndAssetCtxs", "dex": HL_DEX})
+        out: dict[Underlying, dict[str, Any]] = {}
+        for asset in meta.get("universe", []):
+            name = str(asset.get("name", ""))
+            underlying = self._by_symbol.get(name)
+            if underlying is None:
+                continue
+            out[underlying] = {
+                "code": name,
+                "sz_decimals": _safe_int(asset.get("szDecimals")),
+                "max_leverage": _safe_float(asset.get("maxLeverage")),
+            }
+        return out
+
+    async def get_leverage_settings(self) -> dict[Underlying, dict[str, Any]]:
+        """모든 HL 종목의 레버리지·마진모드(activeAssetData) — **포지션 무관**, 캡션 보정용(§D).
+
+        clearinghouseState가 미보유 코인엔 레버리지를 안 줘, 주문창 캡션이 기본값(5x)에
+        멈추는 걸 막는다. 한 종목 조회 실패는 그 종목만 건너뛴다(표시용, 비핵심).
+        """
+        out: dict[Underlying, dict[str, Any]] = {}
+        for underlying, coin in self._symbols.items():
+            try:
+                resp = await self._post_info(
+                    {"type": "activeAssetData", "user": self._address, "coin": coin})
+            except Exception:  # noqa: BLE001 - 표시 보정 조회 실패가 스냅샷을 막지 않게
+                continue
+            parsed = _lev_from_active_asset(resp)
+            if parsed is not None:
+                out[underlying] = parsed
+        return out
 
     async def get_funding(self, underlying: Underlying) -> float:
         coin = self._symbol(underlying)

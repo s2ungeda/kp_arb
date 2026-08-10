@@ -17,6 +17,7 @@ import json
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from ..domain.enums import Instrument, Underlying
@@ -27,6 +28,38 @@ from .hl_live import HL_SYMBOLS
 from .ls_ws import Fill, TradeTick, WSConnection, WSConnector
 
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
+
+
+@dataclass(frozen=True)
+class OrderUpdate:
+    """HL orderUpdates 이벤트 — 주문 상태 변화(open/filled/canceled/rejected…).
+
+    체결(userFills)과 달리 **취소·거부까지** 밀어준다 — 외부(홈페이지) 취소·자동취소
+    (post-only/reduce-only/마진부족 등)를 실시간으로 알 수 있어, 조회 없이 OrderBook 정합.
+    """
+
+    oid: str
+    coin: str
+    status: str
+    side: str                 # "B"(매수)|"A"(매도)
+    sz: float                 # 남은 수량
+    orig_sz: float            # 최초 수량
+    limit_px: float | None
+
+    @property
+    def is_rejected(self) -> bool:
+        return self.status == "rejected" or self.status.endswith("Rejected")
+
+    @property
+    def is_terminal_cancel(self) -> bool:
+        """체결 제외 종료(취소·거부 계열) — 더 이상 미체결 아님 → OrderBook 제거 대상.
+
+        상태값(공식): canceled·marginCanceled·reduceOnlyCanceled·selfTradeCanceled 등
+        ``*Canceled`` 계열 + rejected·``*Rejected`` 계열. 'filled'은 userFills가 담당(제외),
+        'open'·'triggered'은 살아있음(제외).
+        """
+        s = self.status
+        return s == "canceled" or s.endswith("Canceled") or self.is_rejected
 
 
 class HLWebSocketClient:
@@ -64,6 +97,7 @@ class HLWebSocketClient:
         self.on_trade: list[Callable[[TradeTick], None]] = []      # 체결(현재가, ~0.2s)
         self.on_funding: list[Callable[[Underlying, float], None]] = []  # 예정 펀딩률
         self.on_fill: list[Callable[[Fill], None]] = []
+        self.on_order_update: list[Callable[[OrderUpdate], None]] = []  # 주문상태(취소 등)
         self.on_raw: list[Callable[[str], None]] = []
         # 재연결(최초 연결 제외) 후 재구독까지 끝나면 발화 — OrderBook 재스냅샷용(Phase 8-4).
         self.on_reconnect: list[Callable[[], None]] = []
@@ -93,6 +127,10 @@ class HLWebSocketClient:
 
     def subscribe_user_fills(self, address: str) -> None:
         self._add({"type": "userFills", "user": address})
+
+    def subscribe_order_updates(self, address: str) -> None:
+        """주문 상태 변화 구독 → on_order_update. 외부(홈페이지) 취소·자동취소도 실시간 반영."""
+        self._add({"type": "orderUpdates", "user": address})
 
     def _add(self, subscription: dict[str, Any]) -> None:
         if subscription not in self._subs:
@@ -213,6 +251,13 @@ class HLWebSocketClient:
                 for tick in self._parse_trades(data):
                     for trade_handler in self.on_trade:
                         trade_handler(tick)
+            return
+        if channel == "orderUpdates":
+            # data는 주문상태 목록(list) — 초기 스냅샷(모두 open)도 같은 형식(open은 무시됨).
+            if isinstance(data, list):
+                for upd in self._parse_order_updates(data):
+                    for upd_handler in self.on_order_update:
+                        upd_handler(upd)
             return
         if not isinstance(data, dict):
             return  # 구독 ACK("subscriptionResponse") 등
@@ -348,6 +393,26 @@ class HLWebSocketClient:
                 )
             )
         return fills
+
+    def _parse_order_updates(self, data: list[Any]) -> list[OrderUpdate]:
+        out: list[OrderUpdate] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            order = row.get("order") or {}
+            oid, status = order.get("oid"), row.get("status")
+            if oid is None or status is None:
+                continue
+            if str(order.get("coin", "")) not in self._by_symbol:
+                continue  # 대상 외 코인
+            px = order.get("limitPx")
+            out.append(OrderUpdate(
+                oid=str(oid), coin=str(order.get("coin", "")), status=str(status),
+                side=str(order.get("side", "")),
+                sz=float(order.get("sz", 0) or 0),
+                orig_sz=float(order.get("origSz", 0) or 0),
+                limit_px=float(px) if px is not None and px != "" else None))
+        return out
 
 
 class HLWebSocketConnector:

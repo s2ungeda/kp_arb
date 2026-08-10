@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 
 from kp_arb.domain.enums import Underlying
 from kp_arb.gateways.hl import Mark
-from kp_arb.gateways.hl_ws import HLWebSocketClient
+from kp_arb.gateways.hl_ws import HLWebSocketClient, OrderUpdate
 from kp_arb.gateways.ls_ws import Fill
 
 ADDR = "0x" + "a" * 40
@@ -64,6 +64,54 @@ async def test_subscribes_marks_and_fills() -> None:
     coins = {s["coin"] for s in subs if s["type"] == "activeAssetCtx"}
     assert coins == {"xyz:SMSN", "xyz:SKHX", "xyz:HYUNDAI"}
     assert {"type": "userFills", "user": ADDR} in subs
+
+
+def order_update_frame(status: str = "canceled", coin: str = "xyz:SMSN",
+                        oid: int = 485489797671) -> str:
+    return json.dumps({"channel": "orderUpdates", "data": [
+        {"order": {"coin": coin, "side": "B", "limitPx": "183.87", "sz": "0.086",
+                   "oid": oid, "timestamp": 1751400000000, "origSz": "0.14"},
+         "status": status, "statusTimestamp": 1751400000001},
+        {"order": {"coin": "xyz:NVDA", "side": "B", "limitPx": "1.0", "sz": "1",
+                   "oid": 999, "timestamp": 1751400000000, "origSz": "1"},
+         "status": "canceled", "statusTimestamp": 1751400000001},  # 대상 외 코인
+    ]})
+
+
+async def test_subscribe_order_updates_registers() -> None:
+    connector = FakeConnector([])
+    client = HLWebSocketClient(connector)
+    client.subscribe_order_updates(ADDR)
+    await client.run()
+    subs = [json.loads(m)["subscription"] for m in connector.conn.sent]
+    assert {"type": "orderUpdates", "user": ADDR} in subs
+
+
+async def test_order_update_parsed_and_filtered() -> None:
+    client = HLWebSocketClient(FakeConnector([order_update_frame("canceled")]))
+    got: list[OrderUpdate] = []
+    client.on_order_update.append(got.append)
+    await client.run()
+    assert len(got) == 1  # 대상 외(xyz:NVDA) 제외
+    u = got[0]
+    assert u.oid == "485489797671" and u.coin == "xyz:SMSN"
+    assert u.status == "canceled" and u.sz == 0.086 and u.orig_sz == 0.14
+    assert u.is_terminal_cancel is True and u.is_rejected is False
+
+
+def test_terminal_cancel_covers_status_families() -> None:
+    def upd(status: str) -> OrderUpdate:
+        return OrderUpdate(oid="1", coin="xyz:SMSN", status=status, side="B",
+                           sz=0.0, orig_sz=0.1, limit_px=None)
+    # 취소·거부 계열 = 종료(제거 대상)
+    for s in ("canceled", "marginCanceled", "reduceOnlyCanceled",
+              "selfTradeCanceled", "rejected", "tickRejected"):
+        assert upd(s).is_terminal_cancel is True, s
+    # 살아있음/체결은 제거 대상 아님(체결은 userFills가 담당)
+    for s in ("open", "triggered", "filled"):
+        assert upd(s).is_terminal_cancel is False, s
+    assert upd("tickRejected").is_rejected is True
+    assert upd("canceled").is_rejected is False
 
 
 async def test_mark_parsed() -> None:

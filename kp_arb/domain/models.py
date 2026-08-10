@@ -30,6 +30,23 @@ class InstrumentStatus(BaseModel):
     is_reference: bool = False
 
 
+class InstrumentInfo(BaseModel):
+    """종목 정보 — 시동 시 조회해 코어가 보관 (DESIGN §5.10).
+
+    틱·승수·만기 등 정적/준정적 메타. 주문 수량·가격 계산과 화면 표시(호가단위·레버리지
+    상한)의 단일 출처. 조회 출처: HL=metaAndAssetCtxs(szDecimals·maxLeverage),
+    주식선물=t8401(코드·만기)+승수 10, 주식=승수 1.
+    """
+
+    underlying: Underlying
+    instrument: Instrument
+    code: str = ""                       # 거래소 심볼(HL "xyz:SMSN" / LS shcode)
+    multiplier: float = 1.0              # 승수 — 주식 1 / 주식선물 10 / HL 1
+    sz_decimals: int | None = None       # HL 수량 소수 자리(틱 파생)
+    max_leverage: float | None = None    # HL 최대 레버리지(포지션 없어도 표시·상한)
+    expiry: int | None = None            # 주식선물 만기 YYYYMM
+
+
 class Position(BaseModel):
     venue: Venue
     instrument: Instrument

@@ -13,6 +13,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from . import order_log
 from .domain.enums import Account, Instrument, Side, Underlying
 from .domain.models import OrderIntent, Position
 from .gateways.ls_ws import Fill, OrderEvent
@@ -127,6 +128,8 @@ class OrderBook:
         )
         self._apply_fill_to_position(order.intent, fill)
         self._apply_fill_to_balance(order.intent, fill)
+        order_log.order_filled(  # 거래소별 파일에 체결통보(부분/전량·누적) 기록
+            order.intent, fill.qty, fill.price, fill.fill_id, order.filled_qty)
         return order
 
     def on_cancel(self, order_id: str) -> TrackedOrder | None:

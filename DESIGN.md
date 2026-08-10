@@ -166,6 +166,13 @@
 - **실시간 산출:** 체결 즉시 포지션(수량·평단)과 가용잔고를 로컬 증분 계산 → 리스크/전략이 실시간 값을 참조.
 - **모의 한계:** 모의 서버는 SC 통보 미수신(실측) → OrderBook은 이벤트만 소비하도록 순수하게 두고, 모의 e2e 검증 시에만 "주문 응답→합성 Fill" 어댑터 사용. 실전에서는 어댑터 없이 동일 코드.
 
+### 5.10 InstrumentInfo — 종목정보 (시동 시 조회·보관, 확정 2026-08-10)
+- **취급 종목이 적으므로**(3 underlying × 주식/주식선물/HL perp), **시동 시 종목정보를 한 번 조회해 코어가 보관**한다. 화면은 `적` 없이도 이 정보를 읽어 즉시 표시(호가단위 콤보 등). 규칙/상수/하드코딩으로 흩어져 있던 것을 한 구조로 모은다.
+- **`InstrumentInfo`**(underlying, instrument별): `code`(거래소 심볼), `multiplier`(승수 — 주식 1 / 주식선물 10 / HL 1), `sz_decimals`(HL 수량 소수·틱 파생), `max_leverage`(HL), `expiry`(주식선물 YYYYMM). 순수 도메인 모델.
+- **조회 출처(시동 1회):** HL = `metaAndAssetCtxs` universe → 코인별 `szDecimals`·`maxLeverage`(펀딩 조회와 같은 응답 재사용). 주식선물 = `t8401`(코드·만기, 이미) + 승수 10. 주식 = 승수 1·틱규칙.
+- **보관·노출:** `LiveSystem.instruments[(underlying, instrument)] = InstrumentInfo`. `manual_snapshot`에 필요한 값 노출 — 특히 **HL 호가단위(merge) 단계**는 순수 함수 `hl_merge.merge_tick_options(price)`(가격 자릿수 기반, `szDecimals`와 무관)로 스냅샷에 실어 화면 콤보가 즉시 채워지게. `max_leverage`는 포지션 없어도 레버리지 팝업 상한·표시에 사용(clearinghouse는 포지션 있을 때만 주는 한계 보완).
+- **불변식:** 틱단위·승수는 종목정보에서 읽어 **주문 수량·가격 계산의 단일 출처**로 삼는다(하드코딩 상수 산재 금지 지향). 만기 롤오버 시 재조회(기존 t8401 흐름 유지).
+
 ---
 
 ## 6. 전략 인터페이스 (전략 로직 미정)

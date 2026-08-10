@@ -7,7 +7,6 @@ Hyperliquid perp 전용 수동 주문창(LS는 별도 화면 `order_ls`). 델파
 """
 from __future__ import annotations
 
-import math
 import queue
 from typing import Any
 
@@ -17,19 +16,8 @@ from .order_panel import UNDER_MAP, is_decimal_text
 
 INSTRUMENT = "hl_perp"  # 이 창은 HL perp 전용
 UNDERLYINGS = ("삼성", "하이닉스", "현대차")
-# HL 호가단위(aggregation) 단계 — (기준틱 배수, n_sig_figs, mantissa). HL은 유효숫자
-# (nSigFigs) 기준으로 뭉치므로, 종목별 실제 틱 = 기준틱×배수로 표시한다(원시/2배 라벨 대신).
-_MERGE_LEVELS: list[tuple[int, int | None, int | None]] = [
-    (1, None, None), (2, 5, 2), (5, 5, 5), (10, 4, None), (100, 3, None), (1000, 2, None)]
-
-
-def _merge_ticks(price: float) -> list[tuple[str, int | None, int | None]]:
-    """활성 종목 가격 기준 호가단위 옵션 — [(틱표시, nSigFigs, mantissa), ...].
-    기준틱 = 10^(floor(log10 가격) − 4)(유효숫자 5자리), 그 배수로 단계 구성."""
-    if price <= 0:
-        return []
-    base = 10.0 ** (math.floor(math.log10(abs(price))) - 4)
-    return [(_fmt_px(base * mult), nsf, mant) for mult, nsf, mant in _MERGE_LEVELS]
+# 호가단위(틱) 옵션은 **코어가 계산**해 manual_snapshot의 sym["merge_ticks"]로 준다(§5.10)
+# — 화면은 '적' 전에도 그 목록으로 콤보를 채운다(라이브 가격 의존 제거).
 
 
 def _fmt(v: Any, digits: int = 0) -> str:
@@ -70,6 +58,19 @@ def _fmt_px(v: Any, decimals: int | None = None) -> str:
     return f"{f:,.4f}".rstrip("0").rstrip(".")
 
 
+def _sign_color(v: Any) -> str:
+    """부호별 글자색 — 양수(매수/이익)=빨강, 음수(매도/손실)=파랑, 0·None=검정."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "black"
+    if f > 0:
+        return "#c00000"
+    if f < 0:
+        return "#0000c0"
+    return "black"
+
+
 def _hl_decimals(price: Any) -> int:
     """HL 가격 소수 자리수 — 유효숫자 5자리 규칙(정수부 자리수 기준). 종목별 사실상 고정
     이라 호가가 바뀌어도 소수점이 흔들리지 않는다. price None/이상은 2로."""
@@ -82,8 +83,8 @@ def _hl_decimals(price: Any) -> int:
 
 
 def _hoga_signature(rows: list[tuple[Any, ...]]) -> tuple[Any, ...]:
-    """호가 다시그리기 판단용 — (구분, 가격, 잔량)."""
-    return tuple((tag, price, qty) for tag, price, qty in rows)
+    """호가 다시그리기 판단용 — (구분, 가격, 건수, 잔량)."""
+    return tuple((tag, price, cnt, qty) for tag, price, cnt, qty in rows)
 
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
@@ -146,9 +147,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         f.pack(fill="x", pady=1)
         return f
 
-    # 상단 — 종목/적/호가단위(작게) + Cross/Unified
+    # 상단 — 종목/적 + 호가단위·Unified(오른쪽 끝=주문버튼 Right) + Cross(왼쪽 아래)
     head = tk.Frame(left)
     head.pack(fill="x", pady=1)
+    head.grid_columnconfigure(2, weight=1)  # col2 확장 → 호가단위·Unified를 우측 끝으로
     cb_under = ttk.Combobox(head, values=UNDERLYINGS, width=7, state="readonly")
     cb_under.set("삼성")
     cb_under.grid(row=0, column=0, sticky="w")
@@ -156,80 +158,83 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     btn_apply.grid(row=0, column=1, padx=(2, 0), sticky="ns")
     cb_merge = ttk.Combobox(head, values=[], width=4, state="readonly",  # 호가단위(틱) 축소
                             font=("Malgun Gothic", 9))
-    cb_merge.grid(row=0, column=2, sticky="w", padx=(2, 0))
+    cb_merge.grid(row=0, column=2, sticky="e")  # 오른쪽 끝 = 주문버튼 Right
     merge_map: dict[str, tuple[int | None, int | None]] = {}
-    _small = ("Malgun Gothic", 7)
-    btn_lev = tk.Button(head, text="Cross  5x", font=_small, padx=1, pady=0, bd=1)
+    # 종목별 마지막 호가단위(틱) — 화면 저장·복원용. 콤보는 '적' 후에야 채워지므로 값을
+    # 여기 보관했다가 _populate_merge에서 그 종목 것만 되살린다(종목 바꿔도 각자 유지).
+    merge_by_sym: dict[str, str] = {}
+    _small = ("Malgun Gothic", 8)  # Cross·Unified 폰트 1 확대
+    btn_lev = tk.Button(head, text="Cross  5x", font=_small, padx=1, pady=1, bd=1)  # 높이 2↑
     btn_lev.grid(row=1, column=0, columnspan=2, sticky="we", pady=(2, 0))
     lbl_mmode = tk.Label(head, text="Unified", fg="gray30", font=_small)
-    lbl_mmode.grid(row=1, column=2, sticky="w", padx=(2, 0), pady=(1, 0))
+    lbl_mmode.grid(row=1, column=2, sticky="e", pady=(1, 0), ipady=1)  # 높이 2↑, 우측 끝
 
-    # 매수/매도(세로, 왼쪽) | 수량·단가(오른쪽으로 붙임)
-    qwrap = _row()
-    side_f = tk.Frame(qwrap)
-    side_f.pack(side="left", anchor="n")
+    # 매수/매도 — 한 줄(가로). 목업 원래 배치(잔고 칸 높이에 맞추려 각자 줄로 복원).
+    srow = _row()
     side_var = tk.StringVar(value="buy")
-    _sfont = ("Malgun Gothic", 9)
-    tk.Radiobutton(side_f, text="매수", variable=side_var, value="buy",
-                   fg="#c00000", font=_sfont).pack(anchor="w")
-    tk.Radiobutton(side_f, text="매도", variable=side_var, value="sell",
-                   fg="#0000c0", font=_sfont).pack(anchor="w")
-    qty_f = tk.Frame(qwrap)
-    qty_f.pack(side="right")   # 최대한 호가창 쪽(오른쪽)으로
-    qr1 = tk.Frame(qty_f)
-    qr1.pack(fill="x", pady=1)
-    tk.Label(qr1, text="수량", width=3, anchor="w").pack(side="left")
-    e_qty = tk.Entry(qr1, width=10, justify="right", validate="key",
+    tk.Radiobutton(srow, text="매수", variable=side_var, value="buy",
+                   fg="#c00000").pack(side="left")
+    tk.Radiobutton(srow, text="매도", variable=side_var, value="sell",
+                   fg="#0000c0").pack(side="left", padx=(16, 0))
+
+    # 수량 — 자체 줄
+    qrow = _row()
+    tk.Label(qrow, text="수량", width=3, anchor="w").pack(side="left")
+    e_qty = tk.Entry(qrow, width=10, justify="right", validate="key",
                      validatecommand=vcmd_dec, font=_BOLD)
     e_qty.pack(side="left", padx=(2, 0))
-    qr2 = tk.Frame(qty_f)
-    qr2.pack(fill="x", pady=1)
-    tk.Label(qr2, text="단가", width=3, anchor="w").pack(side="left")
-    e_price = tk.Entry(qr2, width=10, justify="right", validate="key",
-                       validatecommand=vcmd_dec, font=_BOLD)
-    e_price.pack(side="left", padx=(2, 0))
-    tick_var = tk.IntVar(value=0)
-    sp_tick = tk.Spinbox(qr2, from_=-20, to=20, width=3, textvariable=tick_var,
-                         justify="right", font=_BOLD)  # 호가 모드에서만 보임
 
-    # 호가/가격 모드 (오른쪽으로 붙임, default 가격)
+    # 단가(+틱 스핀) — 자체 줄. grid로 틱 자리를 항상 예약 → 호가 모드에서 폭 안 늘어남.
+    prow = _row()
+    tk.Label(prow, text="단가", width=3, anchor="w").grid(row=0, column=0, sticky="w")
+    e_price = tk.Entry(prow, width=10, justify="right", validate="key",
+                       validatecommand=vcmd_dec, font=_BOLD)
+    e_price.grid(row=0, column=1, sticky="w", padx=(2, 0))
+    tick_var = tk.IntVar(value=0)
+    sp_tick = tk.Spinbox(prow, from_=-20, to=20, width=3, textvariable=tick_var,
+                         justify="right", font=_BOLD)  # 호가 모드에서만 보임
+    sp_tick.grid(row=0, column=2, padx=(3, 0))
+    # 틱 자리 예약폭은 아래 update_idletasks 후 스핀 실제 폭으로 확정(숨겨도 폭 완전 고정).
+
+    # 호가/가격 모드 (default 가격) — 목업 순서(호가·가격)
     mrow = _row()
     mode_var = tk.StringVar(value="price")  # "hoga" | "price"
-    tk.Radiobutton(mrow, text="가격", variable=mode_var, value="price").pack(side="right")
-    tk.Radiobutton(mrow, text="호가", variable=mode_var, value="hoga").pack(
-        side="right", padx=(0, 6))
+    tk.Radiobutton(mrow, text="호가", variable=mode_var, value="hoga").pack(side="left")
+    tk.Radiobutton(mrow, text="가격", variable=mode_var, value="price").pack(
+        side="left", padx=(12, 0))
 
     def _toggle_tick(*_: Any) -> None:
-        # 가격 모드: 틱 스핀 숨김(클릭·직접입력) / 호가 모드: 보임.
+        # 가격 모드: 틱 스핀 숨김(자리는 grid minsize로 유지 → 폭 불변) / 호가 모드: 보임.
         if mode_var.get() == "hoga":
-            sp_tick.pack(side="left", padx=(3, 0))
+            sp_tick.grid()
         else:
-            sp_tick.pack_forget()
+            sp_tick.grid_remove()
 
     mode_var.trace_add("write", _toggle_tick)
     _toggle_tick()
 
-    # 체크박스(세로) + 매수(크게) 버튼
+    # 체크박스(세로) + 매수(크게) 버튼 — 둘 다 arow 바닥에 정렬(anchor="s")
     arow = _row()
     checks = tk.Frame(arow)
-    checks.pack(side="left", anchor="n")
+    checks.pack(side="left", anchor="s")
     reduce_var = tk.BooleanVar(value=False)
     post_var = tk.BooleanVar(value=False)
     oneclick_var = tk.BooleanVar(value=True)  # 안전 잠금 — 체크돼야만 발송(기본 체크)
-    tk.Checkbutton(checks, text="Reduce", variable=reduce_var).pack(anchor="w")
+    tk.Checkbutton(checks, text="Rdce", variable=reduce_var).pack(anchor="w")
     tk.Checkbutton(checks, text="Post", variable=post_var).pack(anchor="w")
-    tk.Checkbutton(checks, text="원클릭", variable=oneclick_var).pack(anchor="w")
-    btn_order = tk.Button(arow, text="매수", width=6,
+    tk.Checkbutton(checks, text="주문", variable=oneclick_var).pack(anchor="w")
+    btn_order = tk.Button(arow, text="매수주문", width=9,
                           fg="white", bg="#c00000", activeforeground="white",
-                          activebackground="#a00000", font=("Malgun Gothic", 16, "bold"))
-    btn_order.pack(side="left", padx=(8, 0), ipady=10)
+                          activebackground="#a00000", font=("Malgun Gothic", 14, "bold"))
+    btn_order.pack(side="left", anchor="s", padx=(8, 0), ipady=8)
 
     # 중: 오더북 — 숫자 볼드·1축소, 잔량 폭 3자리 확대. (격자선은 렌더 확인 후)
     ttk.Style().configure("Treeview", font=("Malgun Gothic", 10, "bold"), rowheight=22)
-    hoga = ttk.Treeview(mid, columns=("price", "qty"), show="",
+    hoga = ttk.Treeview(mid, columns=("price", "cnt", "qty"), show="",
                         height=10, selectmode="browse")
-    hoga.column("price", width=78, anchor="e")
-    hoga.column("qty", width=110, anchor="e")   # 잔량 폭 확대
+    hoga.column("price", width=73, anchor="center")  # 호가 가운데
+    hoga.column("cnt", width=30, anchor="w")          # 미체결 건수 "(n)" — 좌측 정렬
+    hoga.column("qty", width=85, anchor="e")          # 잔량 — 우측 정렬(그대로)
     hoga.tag_configure("ask", background="#eef2ff", foreground="#0000c0")
     hoga.tag_configure("bid", background="#fff0f2", foreground="#c00000")
     hoga.tag_configure("cur", background="#fff6b0")
@@ -261,8 +266,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                       font=_tfont, fg="gray30")
     status.pack(side="top", fill="x", padx=4, pady=(0, 4))
 
-    def set_status(text: str, err: bool = False) -> None:
-        status.config(text=text[:120], fg="#8b0000" if err else "gray30")  # 회색·거부는 빨강
+    def set_status(text: str, err: bool = False, *, ok: bool = False) -> None:
+        # 거부·실패=빨강 / 성공=검정 / 일반 안내=회색
+        if err:
+            fg = "#8b0000"
+        elif ok:
+            fg = "black"
+        else:
+            fg = "gray30"
+        status.config(text=text[:120], fg=fg)
 
     # ===== 동작 =====
     def sym_key() -> str:
@@ -285,24 +297,46 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                       name=cb_under.get())
         send({"cmd": "manual_refresh"}, "적용·조회")  # 잔고/포지션 재조회(OrderBook 재동기)
         refresh_side()
-        _populate_merge()  # 종목 가격 기준 호가단위(틱) 콤보 채우기
+        _refresh_merge_combo()          # 활성 종목 호가단위 콤보 보장(이미 채워졌으면 유지)
+        if cb_merge.get():
+            on_merge(None)              # 활성 종목 오더북을 현재(저장된) 호가단위로 집계
         set_status(f"{cb_under.get()} 적용 — 조회 중")
 
-    def _populate_merge() -> None:
-        # 활성 종목 가격으로 호가단위(틱) 콤보를 채운다 — '원시/2배' 대신 실제 틱 값.
-        ref = _ref_price(active_symbol())
+    _merge_shown: dict[str, str | None] = {"under": None}  # 콤보에 채워진 종목(재populate 판단)
+
+    def _selected_symbol() -> dict[str, Any]:
+        # 선택(콤보) 종목의 스냅샷 — '적' 전에도 읽을 수 있게 active가 아닌 cb_under 기준.
+        under = UNDER_MAP.get(cb_under.get())
+        data = state_box["data"] or {}
+        return ((data.get("symbols") or {}).get(f"{under}|{INSTRUMENT}")) or {}
+
+    def _refresh_merge_combo() -> None:
+        # 코어가 준 sym["merge_ticks"]로 콤보를 채운다('적' 전에도). 종목이 바뀌거나 처음
+        # 채울 때만 set — 사용자가 고른 값은 유지(매 틱 덮어쓰기 방지).
+        under = UNDER_MAP.get(cb_under.get())
+        if under is None:
+            return
+        if _merge_shown["under"] == under and cb_merge["values"]:
+            return  # 이미 이 종목으로 채워짐 — 유지
+        ticks = _selected_symbol().get("merge_ticks") or []
+        if not ticks:
+            return  # 아직 가격 미수신 — 다음 폴링에 재시도
         merge_map.clear()
         vals: list[str] = []
-        for s, nsf, mant in (_merge_ticks(float(ref)) if ref else []):
+        for t in ticks:
+            s = str(t.get("tick"))
             vals.append(s)
-            merge_map[s] = (nsf, mant)
+            merge_map[s] = (t.get("n_sig_figs"), t.get("mantissa"))
         cb_merge["values"] = vals
-        if vals:
-            cb_merge.set(vals[0])  # 최소 틱(원시)
+        want = merge_by_sym.get(under)  # 이 종목의 저장값 되살리기(없으면 최소 틱)
+        chosen = want if want in vals else vals[0]
+        cb_merge.set(chosen)
+        merge_by_sym[under] = chosen    # 표시값과 일치(자동저장이 이 dict을 씀)
+        _merge_shown["under"] = under
 
     def do_order() -> None:
-        if not oneclick_var.get():  # 안전 잠금 — 원클릭 체크돼야만 발송(사용자 확정)
-            set_status("원클릭 미체크 — 주문 안 나감", err=True)
+        if not oneclick_var.get():  # 안전 잠금 — '주문' 체크돼야만 발송(사용자 확정)
+            set_status("'주문' 미체크 — 안 나감", err=True)
             return
         if active["underlying"] is None:
             set_status("먼저 '적'으로 종목을 적용하세요", err=True)
@@ -366,8 +400,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     sp_tick.config(command=_on_tick_spin)
 
     def on_merge(_e: Any) -> None:
-        nsf, mant = merge_map.get(cb_merge.get(), (None, None))
         under = active["underlying"] or UNDER_MAP[cb_under.get()]
+        merge_by_sym[under] = cb_merge.get()  # 이 종목의 선택 기억(화면 저장·재적용용)
+        nsf, mant = merge_map.get(cb_merge.get(), (None, None))
         send({"cmd": "manual_hl_merge", "underlying": under,
               "n_sig_figs": nsf, "mantissa": mant}, "머지")
 
@@ -452,14 +487,33 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     btn_apply.config(command=do_apply)
     btn_lev.config(command=open_leverage_popup)
 
+    def on_bal_click(_e: Any = None) -> None:
+        # 잔고(포지션) 클릭 → 그 수량(절댓값)을 수량 에디트에 넣는다(청산 편의). 0/없으면 무시.
+        pos = active_symbol().get("position")
+        if pos is None:
+            return
+        try:
+            q = abs(float(pos))
+        except (TypeError, ValueError):
+            return
+        if q <= 0:
+            return
+        e_qty.delete(0, "end")
+        e_qty.insert(0, _fmt_qty(q).replace(",", ""))
+
+    bal_val["잔고"].config(cursor="hand2")  # 클릭 가능 표시
+    bal_val["잔고"].bind("<Button-1>", on_bal_click)
+
     def refresh_side() -> None:
         buy = side_var.get() == "buy"
-        # 크게 "매수"/"매도"만 — 배경 매수 빨강·매도 파랑, 흰 글씨
-        btn_order.config(text="매수" if buy else "매도",
+        # 2줄: 종목명 / 매수주문·매도주문. 배경 매수 빨강·매도 파랑, 흰 글씨.
+        name = active["name"] or cb_under.get()  # '적' 전이면 콤보 선택값
+        btn_order.config(text=f"{name}\n{'매수' if buy else '매도'}주문",
                          bg="#c00000" if buy else "#0000c0",
                          activebackground="#a00000" if buy else "#000090")
 
     side_var.trace_add("write", lambda *_: refresh_side())
+    cb_under.bind("<<ComboboxSelected>>", lambda *_: refresh_side())  # 버튼 종목명 즉시 갱신
     refresh_side()
 
     # ===== 화면 갱신 (네트워크 없음 — 폴링 결과만 읽어 그림) =====
@@ -483,13 +537,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                         set_status(f"{label} 거부 — {reason}", err=True)
                 else:
                     oid = result.get("order_id")
-                    warns = "; ".join(result.get("warnings", []))
-                    tail = (f" (#{oid})" if oid else "") + (f" ⚠ {warns}" if warns else "")
-                    # 경고 있으면 빨간 글씨로 주의 환기(발주는 됨 — WS 불량 경고, §2 차단 아님)
-                    if detail:  # 주문 성공 : 매수 167.5 10 (#주문번호) ⚠ 시세 지연...
-                        set_status(f"주문 성공 : {detail}" + tail, err=bool(warns))
+                    tail = f" (#{oid})" if oid else ""
+                    # 하단 로그는 주문 관련만 — WS 무데이터 경고는 여기 표시 안 함(메인창
+                    # WS표에서 확인). 발주 성공은 검정.
+                    if detail:  # 주문 성공 : 매수 163.45 0.14 (#주문번호)
+                        set_status(f"주문 성공 : {detail}" + tail, ok=True)
                     else:
-                        set_status(f"{label} 접수됨" + tail, err=bool(warns))
+                        set_status(f"{label} 접수됨" + tail, ok=True)
         except queue.Empty:
             pass
         _reschedule(drain_results, 200)
@@ -503,11 +557,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     def refresh() -> None:
         try:
+            _refresh_merge_combo()  # 호가단위 콤보 채움('적' 전에도, 선택 종목 기준)
             sym = active_symbol()
             dec = _hl_decimals(_ref_price(sym))
             # 잔고(=포지션)·PNL 우선, 나머지. 포맷: 진입가 2자리·PNL 1자리·마진/펀딩 0자리
-            bal_val["잔고"].config(text=_fmt_qty(sym.get("position")))
-            bal_val["PNL"].config(text=_fmt(sym.get("pnl"), 1))
+            pos = sym.get("position")   # 잔고(=포지션 부호): 매수 빨강 / 매도 파랑
+            bal_val["잔고"].config(text=_fmt_qty(pos), fg=_sign_color(pos))
+            pnl = sym.get("pnl")        # PNL: 이익 빨강 / 손실 파랑 / 0 검정
+            bal_val["PNL"].config(text=_fmt(pnl, 1), fg=_sign_color(pnl))
             bal_val["진입금액"].config(text=_fmt(sym.get("eval")))
             bal_val["진입가"].config(text=_fmt_px(sym.get("avg_price"), 2))
             bal_val["Liq_Prc"].config(text=_fmt_px(sym.get("liq"), dec))
@@ -546,32 +603,41 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         last = sym.get("last")
         last_s = _fmt_px(last, dec) if last is not None else None
 
-        def _qcell(price_s: str, qty: Any) -> str:  # "(건수) 잔량" — 내 미체결 있으면
-            qs = _fmt_qty(qty)
+        def _cnt(price_s: str) -> str:  # 내 미체결 건수 "(n)" — 좌측 칼럼(없으면 빈칸)
             n = my_ords.get(price_s)
-            return f"({n}) {qs}" if n else qs
+            return f"({n})" if n else ""
 
         # 매도(파랑) 위 → 매수(빨강) 아래. 현재가와 같은 호가만 노랑 바탕(별도 현재가 행 없음).
-        draw: list[tuple[str, Any, Any]] = []
+        draw: list[tuple[str, Any, str, str]] = []
         for p, q in reversed(asks):
             ps = _fmt_px(p, dec)
-            draw.append(("cur" if ps == last_s else "ask", ps, _qcell(ps, q)))
+            draw.append(("cur" if ps == last_s else "ask", ps, _cnt(ps), _fmt_qty(q)))
         for p, q in bids:
             ps = _fmt_px(p, dec)
-            draw.append(("cur" if ps == last_s else "bid", ps, _qcell(ps, q)))
+            draw.append(("cur" if ps == last_s else "bid", ps, _cnt(ps), _fmt_qty(q)))
         if _hoga_signature(draw) == state_box.get("_hsig"):
             return
         state_box["_hsig"] = _hoga_signature(draw)
         hoga.delete(*hoga.get_children())
-        for tag, ps, qs in draw:
-            hoga.insert("", "end", values=(ps, qs), tags=(tag,))
+        for tag, ps, cs, qs in draw:
+            hoga.insert("", "end", values=(ps, cs, qs), tags=(tag,))
 
-    # 오더북(10행) 바닥을 좌측 입력열 바닥(=주문버튼)과 맞춘다 — 좌측열 실제 높이를 10등분해
-    # 행높이로. 픽셀 추측 없이 정렬되고, 폰트·DPI가 달라도 따라간다. (사용자 요청)
+    # 오더북(10행) 높이를 좌측 입력열·잔고열 중 더 큰 쪽에 맞춘다 — 그 높이를 10등분해
+    # 행높이로(호가 간격↑). 픽셀 추측 없이 정렬되고, 폰트·DPI가 달라도 따라간다. (사용자 요청)
     root.update_idletasks()
-    _left_h = left.winfo_reqheight()
-    if _left_h > 0:
-        ttk.Style().configure("Treeview", rowheight=max(20, _left_h // 10))
+    _ref_h = max(left.winfo_reqheight(), rbal.winfo_reqheight())
+    if _ref_h > 0:
+        ttk.Style().configure("Treeview", rowheight=max(20, _ref_h // 10))
+    # 틱 스핀 자리를 스핀 실제 폭(+패딩 3)으로 예약 → 호가/가격 전환에도 좌측 칸 폭 불변.
+    _tick_w = sp_tick.winfo_reqwidth()
+    if _tick_w > 0:
+        prow.grid_columnconfigure(2, minsize=_tick_w + 3)
+    # 주문버튼(arow) 바닥을 오더북 바닥에 맞춘다 — 오더북이 좌측열보다 크면 그 차이만큼
+    # arow를 아래로 내린다(위 여백). 버튼·Rdce·Post·주문 Top이 함께 내려감. (사용자 요청)
+    root.update_idletasks()
+    _gap = hoga.winfo_reqheight() - left.winfo_reqheight()
+    if _gap > 0:
+        arow.pack_configure(pady=(_gap, 1))
 
     # --- 폼 필드 저장/복원 (종목·모드·체크박스 등, win_fields.json) ---
     _saved = win_state.saved_fields("order_hl")
@@ -584,6 +650,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     reduce_var.set(bool(_saved.get("reduce", False)))
     post_var.set(bool(_saved.get("post", False)))
     oneclick_var.set(bool(_saved.get("oneclick", True)))
+    _mbs = _saved.get("merge_by_sym")  # 종목별 호가단위 — '적' 후 그 종목 것만 되살림
+    if isinstance(_mbs, dict):
+        merge_by_sym.update(
+            {str(k): str(v) for k, v in _mbs.items() if isinstance(v, str) and v})
     try:
         tick_var.set(int(_saved.get("tick", 0)))
     except (ValueError, TypeError):
@@ -594,7 +664,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             win_state.save_fields("order_hl", {
                 "under": cb_under.get(), "side": side_var.get(), "mode": mode_var.get(),
                 "reduce": reduce_var.get(), "post": post_var.get(),
-                "oneclick": oneclick_var.get(), "tick": tick_var.get()})
+                "oneclick": oneclick_var.get(), "tick": tick_var.get(),
+                # 종목별 호가단위 dict 저장 — 콤보가 '적' 전 비어도 빈값 덮어쓰기 없음.
+                "merge_by_sym": dict(merge_by_sym)})  # 종목별 호가단위(틱)
             root.after(2000, _persist_fields)
         except tk.TclError:
             pass  # 창 닫힘
