@@ -42,6 +42,13 @@ class StubExchange:
         self.cancels.append((coin, oid))
         return {"status": "ok", "response": {"type": "cancel", "data": {"statuses": ["success"]}}}
 
+    def update_leverage(self, leverage: int, name: str, is_cross: bool) -> dict[str, Any]:
+        self.leverage_calls: list[tuple[int, str, bool]] = getattr(self, "leverage_calls", [])
+        self.leverage_calls.append((leverage, name, is_cross))
+        if leverage > 20:  # 상한 초과 거부 흉내
+            return {"status": "err", "response": "Invalid leverage"}
+        return {"status": "ok", "response": {"type": "default"}}
+
 
 class StubInfo:
     """실측 shape 픽스처를 돌려주는 /info 스텁."""
@@ -122,6 +129,20 @@ async def test_margin_and_funding_and_mark() -> None:
     assert await gw.get_margin() == 19.6
     assert await gw.get_funding(Underlying.SK_HYNIX) == pytest.approx(0.0004326268)
     assert await gw.get_mark(Underlying.HYUNDAI) == pytest.approx(312.59)
+
+
+async def test_update_leverage_calls_sdk() -> None:
+    gw, ex, _ = _gw()
+    await gw.update_leverage(Underlying.SAMSUNG, 10, is_cross=True)
+    assert ex.leverage_calls == [(10, "xyz:SMSN", True)]  # (배수, 심볼, 교차)
+
+
+async def test_update_leverage_raises_on_reject() -> None:
+    from kp_arb.gateways.hl import HLError
+
+    gw, _, _ = _gw()
+    with pytest.raises(HLError):
+        await gw.update_leverage(Underlying.SAMSUNG, 50, is_cross=False)  # 상한 초과
 
 
 async def test_position_details_parsed() -> None:

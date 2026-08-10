@@ -157,6 +157,19 @@ class HLSdkGateway(HLGateway):
         resp = await asyncio.to_thread(self._ex.cancel, coin, int(order_id))
         self._check_ok(resp)
 
+    async def update_leverage(
+        self, underlying: Underlying, leverage: int, *, is_cross: bool
+    ) -> None:
+        """레버리지·마진모드 변경(updateLeverage) — **주문과 별개** 액션 (§1-3).
+
+        코인별로 계정에 저장된다. 상한(maxLeverage) 초과·포지션 보유 중 증거금 부족이면 거부.
+        SDK 시그니처: update_leverage(leverage, name, is_cross).
+        """
+        coin = self._symbol(underlying)
+        resp = await asyncio.to_thread(
+            self._ex.update_leverage, int(leverage), coin, is_cross)
+        self._check_ok(resp)  # 거부 시 사유와 함께 HLError
+
     # --- 조회 ---
 
     async def get_positions(self) -> Sequence[Position]:
