@@ -330,15 +330,28 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     hoga.bind("<<TreeviewSelect>>", on_hoga_click)
 
     def _set_hoga_price(sym: dict[str, Any], dec: int) -> None:
-        # 호가모드: 매수=매수호가+틱 / 매도=매도호가+틱 (자동, 시세 따라 갱신).
+        # 호가모드: (매수=매수1호가 / 매도=매도1호가) + N × **선택한 호가단위**. 자동 갱신.
         buy = side_var.get() == "buy"
         levels = sym.get("bids") if buy else sym.get("asks")
         if not levels:
             return
-        tick = 10.0 ** (-dec)  # 그 종목 소수 자리수의 최소 증분
+        ts = cb_merge.get().replace(",", "")  # 선택 호가단위(틱) 예 "0.1". 없으면 최소틱 폴백.
+        try:
+            tick = float(ts)
+            tdec = len(ts.split(".")[1]) if "." in ts else 0  # 틱 소수 자리수
+        except (ValueError, IndexError):
+            tick, tdec = 10.0 ** (-dec), dec
         price = float(levels[0][0]) + tick_var.get() * tick
         e_price.delete(0, "end")
-        e_price.insert(0, _fmt_px(price, dec).replace(",", ""))
+        e_price.insert(0, _fmt_px(price, tdec).replace(",", ""))
+
+    def _on_tick_spin() -> None:
+        # 틱 스핀 업/다운 시 즉시 반영(refresh 500ms 안 기다리게). 호가 모드에서만.
+        if mode_var.get() == "hoga":
+            sym = active_symbol()
+            _set_hoga_price(sym, _hl_decimals(_ref_price(sym)))
+
+    sp_tick.config(command=_on_tick_spin)
 
     def on_merge(_e: Any) -> None:
         nsf, mant = merge_map.get(cb_merge.get(), (None, None))
