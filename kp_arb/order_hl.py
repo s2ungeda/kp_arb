@@ -250,9 +250,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             cell = tk.Frame(rbal)
             cbg = cell.cget("bg")
         cell.grid(row=i, column=0, sticky="we", pady=1, padx=1)
-        tk.Label(cell, text=name, width=8, anchor="w", font=_tfont, bg=cbg).pack(
-            side="left", padx=(3, 2))
-        v = tk.Label(cell, text="-", width=8, anchor="e", font=_BOLD, bg=cbg)
+        tk.Label(cell, text=name, width=9, anchor="w", font=_tfont, bg=cbg).pack(
+            side="left", padx=(3, 2))   # width 9 — CountDown 안 잘리게
+        v = tk.Label(cell, text="-", width=9, anchor="e", font=_BOLD, bg=cbg)
         v.pack(side="right", padx=(0, 3))
         bal_val[name] = v
 
