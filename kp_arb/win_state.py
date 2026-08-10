@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import tkinter as tk
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 _BASE_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
              else Path(__file__).resolve().parent.parent)
 STATE_PATH = _BASE_DIR / "win_state.json"
+FIELDS_PATH = _BASE_DIR / "win_fields.json"  # 화면별 폼 필드값(종목·체크박스 등) 저장
 
 
 def position_only(geometry: str) -> str | None:
@@ -58,6 +59,31 @@ def save(name: str, geometry: str) -> None:
     data = merge_geometry(_load(), name, geometry)
     try:
         STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def saved_fields(name: str) -> dict[str, Any]:
+    """저장된 화면 폼 필드값(dict). 없으면 빈 dict. (종목·체크박스 등)"""
+    try:
+        raw = json.loads(FIELDS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    val = raw.get(name) if isinstance(raw, dict) else None
+    return {str(k): v for k, v in val.items()} if isinstance(val, dict) else {}
+
+
+def save_fields(name: str, fields: dict[str, Any]) -> None:
+    """화면 폼 필드값 저장(다른 화면 항목은 보존). 위치(win_state.json)와 별도 파일."""
+    try:
+        raw = json.loads(FIELDS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    raw[name] = fields
+    try:
+        FIELDS_PATH.write_text(json.dumps(raw), encoding="utf-8")
     except OSError:
         pass
 

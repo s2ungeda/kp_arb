@@ -551,6 +551,34 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     if _left_h > 0:
         ttk.Style().configure("Treeview", rowheight=max(20, _left_h // 10))
 
+    # --- 폼 필드 저장/복원 (종목·모드·체크박스 등, win_fields.json) ---
+    _saved = win_state.saved_fields("order_hl")
+    if _saved.get("under") in UNDERLYINGS:
+        cb_under.set(_saved["under"])          # 종목(단, '적' 눌러야 활성 — 델파이 2단계)
+    if _saved.get("side") in ("buy", "sell"):
+        side_var.set(_saved["side"])           # trace → 버튼 색·캡션 갱신
+    if _saved.get("mode") in ("hoga", "price"):
+        mode_var.set(_saved["mode"])           # trace → 틱 스핀 표시 토글
+    reduce_var.set(bool(_saved.get("reduce", False)))
+    post_var.set(bool(_saved.get("post", False)))
+    oneclick_var.set(bool(_saved.get("oneclick", True)))
+    try:
+        tick_var.set(int(_saved.get("tick", 0)))
+    except (ValueError, TypeError):
+        pass
+
+    def _persist_fields() -> None:
+        try:
+            win_state.save_fields("order_hl", {
+                "under": cb_under.get(), "side": side_var.get(), "mode": mode_var.get(),
+                "reduce": reduce_var.get(), "post": post_var.get(),
+                "oneclick": oneclick_var.get(), "tick": tick_var.get()})
+            root.after(2000, _persist_fields)
+        except tk.TclError:
+            pass  # 창 닫힘
+
+    root.after(2000, _persist_fields)
+
     drain_results()
     refresh()
     while True:

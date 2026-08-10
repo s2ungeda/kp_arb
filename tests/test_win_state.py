@@ -32,6 +32,26 @@ def test_save_and_load_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert win_state.saved_position("none") is None
 
 
+def test_fields_save_and_load_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(win_state, "FIELDS_PATH", tmp_path / "win_fields.json")
+    win_state.save_fields("order_hl", {"under": "하이닉스", "reduce": True, "tick": 3})
+    win_state.save_fields("order_ls", {"under": "삼성"})  # 다른 화면 보존
+    assert win_state.saved_fields("order_hl") == {"under": "하이닉스", "reduce": True, "tick": 3}
+    assert win_state.saved_fields("order_ls") == {"under": "삼성"}
+    assert win_state.saved_fields("none") == {}
+
+
+def test_fields_missing_returns_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(win_state, "FIELDS_PATH", tmp_path / "none.json")
+    assert win_state.saved_fields("order_hl") == {}
+    bad = tmp_path / "bad.json"
+    bad.write_text("{broken", encoding="utf-8")
+    monkeypatch.setattr(win_state, "FIELDS_PATH", bad)
+    assert win_state.saved_fields("order_hl") == {}
+
+
 def test_load_missing_or_corrupt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(win_state, "STATE_PATH", tmp_path / "none.json")
     assert win_state.saved_position("autoT") is None
