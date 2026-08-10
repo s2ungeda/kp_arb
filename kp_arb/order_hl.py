@@ -261,6 +261,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # '적'으로 활성화한 종목만 하단 표시·주문 (콤보만 바꾼다고 안 바뀜 — 델파이 SetSymbol)
     active: dict[str, Any] = {"key": None, "underlying": None, "name": None}
+    # 종목별 마지막으로 아는 레버리지(clearinghouse 값 또는 팝업에서 적용한 값) — 포지션
+    # 없으면 조회로 못 읽어서, 팝업 재오픈 시 이 값으로 초기화(§D 낙관적).
+    lev_applied: dict[str, dict[str, Any]] = {}
 
     def active_symbol() -> dict[str, Any]:
         if active["key"] is None:
@@ -365,7 +368,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             set_status("먼저 '적'으로 종목을 적용하세요", err=True)
             return
         sym = active_symbol()
-        cur_lev, cur_cross = sym.get("leverage"), sym.get("leverage_cross")
+        # 현재값 — clearinghouse(포지션 있을 때) 우선, 없으면 마지막 적용값(lev_applied)
+        _applied = lev_applied.get(active["underlying"], {})
+        cur_lev = sym.get("leverage")
+        cur_lev = cur_lev if cur_lev is not None else _applied.get("leverage")
+        cur_cross = sym.get("leverage_cross")
+        cur_cross = cur_cross if cur_cross is not None else _applied.get("cross")
         pop = tk.Toplevel(root)
         pop.title(f"{active['name']} 레버리지")
         pop.resizable(False, False)
@@ -413,6 +421,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                         # 폴링으론 못 바뀜. 방금 적용한 값으로 바로 반영).
                         mode = "Cross" if is_cross else "Isolated"
                         btn_lev.config(text=f"{mode}  {lev}x")
+                        lev_applied[active["underlying"]] = {  # 재오픈 시 이 값으로 초기화
+                            "leverage": lev, "cross": is_cross}
                         set_status(f"레버리지 {'교차' if is_cross else '격리'} {lev}x 적용됨")
                         pop.destroy()
 
@@ -502,11 +512,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 text=f"{rate * 100:.4f}%" if rate is not None else "-")
             secs = 3600 - (time.localtime().tm_min * 60 + time.localtime().tm_sec)
             bal_val["CountDown"].config(text=f"{secs // 60:02d}:{secs % 60:02d}")
-            # 레버리지 버튼 캡션 — 현재 걸린 값(포지션 있을 때 clearinghouse에서, §1-3)
+            # 레버리지 버튼 캡션 — 포지션 있으면 clearinghouse 값이 진실(§1-3). lev_applied도 갱신.
             lev = sym.get("leverage")
             if lev is not None:
-                mode = "Cross" if sym.get("leverage_cross") else "Isolated"
-                btn_lev.config(text=f"{mode}  {int(lev)}x")
+                cross = bool(sym.get("leverage_cross"))
+                btn_lev.config(text=f"{'Cross' if cross else 'Isolated'}  {int(lev)}x")
+                if active["underlying"]:
+                    lev_applied[active["underlying"]] = {"leverage": int(lev), "cross": cross}
             if mode_var.get() == "hoga":
                 _set_hoga_price(sym, dec)
             # 내 미체결이 있는 호가에 "(건수)" 표시 — 활성 종목 미체결을 가격별 집계
