@@ -276,6 +276,15 @@ class LiveSystem:
             await self._hl.cancel_order(order_id)
             self.order_book.on_cancel(order_id)
 
+    async def update_leverage(
+        self, underlying: Underlying, leverage: int, *, is_cross: bool
+    ) -> None:
+        """HL 레버리지·마진모드 변경 — 수동주문창 §1-3. 성공 후 상세 재조회로 캡션 갱신."""
+        if self._hl is None:
+            raise RuntimeError("HL gateway not configured")
+        await self._hl.update_leverage(underlying, leverage, is_cross=is_cross)
+        self.hl_detail = await self._hl.get_position_details()  # 새 값 반영(포지션 있으면)
+
     # --- 시동 ---
 
     def _seed_session_from_env(self) -> None:

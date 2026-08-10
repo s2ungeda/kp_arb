@@ -75,6 +75,7 @@ class _FakeSystem:
         self.placed: list[OrderIntent] = []
         self.cancelled: list[str] = []
         self.amended: list[tuple[str, float]] = []
+        self.leverage_calls: list[tuple[Underlying, int, bool]] = []
         self.merges: list[tuple[Underlying, int | None, int | None]] = []
         self.refreshed = 0
 
@@ -97,6 +98,12 @@ class _FakeSystem:
 
     async def refresh_snapshot(self) -> None:
         self.refreshed += 1
+
+    async def update_leverage(self, underlying: Underlying, leverage: int,
+                              *, is_cross: bool) -> None:
+        if self._fail is not None:
+            raise self._fail
+        self.leverage_calls.append((underlying, leverage, is_cross))
 
     def ws_statuses(self) -> list[WsStatus]:
         return self.ws
@@ -203,6 +210,20 @@ async def test_manual_amend_calls_system() -> None:
         sys, {"cmd": "manual_amend", "order_id": "X1", "price": 80500})
     assert r["ok"] and r["order_id"] == "OID-2"
     assert sys.amended == [("X1", 80500.0)]
+
+
+async def test_manual_leverage_calls_system() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "manual_leverage",
+        "underlying": "samsung", "leverage": 10, "is_cross": True})
+    assert r["ok"]
+    assert sys.leverage_calls == [(Underlying.SAMSUNG, 10, True)]
+
+
+async def test_manual_leverage_bad_args() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "manual_leverage", "underlying": "samsung"})
+    assert not r["ok"] and "레버리지 인자" in r["errors"][0]
 
 
 async def test_manual_amend_needs_price() -> None:

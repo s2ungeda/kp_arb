@@ -418,6 +418,18 @@ async def _manual_command(
         except Exception as exc:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
             return _fail([f"취소 실패: {exc}"])
         return _ok()
+    if cmd == "manual_leverage":  # 레버리지·마진모드 변경(주문과 별개, §1-3)
+        try:
+            underlying = Underlying(str(body["underlying"]))
+            leverage = int(body["leverage"])
+            is_cross = bool(body["is_cross"])
+        except (KeyError, ValueError) as exc:
+            return _fail([f"잘못된 레버리지 인자: {exc}"])
+        try:
+            await system.update_leverage(underlying, leverage, is_cross=is_cross)
+        except Exception as exc:  # noqa: BLE001 - 거부 사유(상한·증거금)를 화면에 전달
+            return _fail([f"레버리지 변경 실패: {exc}"])
+        return _ok()
     if cmd == "manual_amend":
         order_id = body.get("order_id")
         raw = body.get("price")

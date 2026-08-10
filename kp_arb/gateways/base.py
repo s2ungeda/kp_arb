@@ -66,6 +66,12 @@ class HLGateway(ABC):
         """
         return {}
 
+    async def update_leverage(
+        self, underlying: Underlying, leverage: int, *, is_cross: bool
+    ) -> None:
+        """레버리지·마진모드 변경(updateLeverage) — 주문과 별개 액션(§1-3). 기본 미지원."""
+        raise NotImplementedError("이 게이트웨이는 레버리지 변경을 지원하지 않는다")
+
     @abstractmethod
     async def get_open_orders(self) -> Sequence[TrackedOrder]:
         """미체결 주문 스냅샷(최초 실행/온디맨드 조회용)."""
