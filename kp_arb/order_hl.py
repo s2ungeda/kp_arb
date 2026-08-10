@@ -359,11 +359,74 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         send({"cmd": "manual_hl_merge", "underlying": under,
               "n_sig_figs": nsf, "mantissa": mant}, "머지")
 
+    def open_leverage_popup() -> None:
+        # 레버리지·마진모드 설정 팝업(§1-3) — 주문과 별개 액션. 성공 시 닫고, 실패 시 유지+사유.
+        if active["underlying"] is None:
+            set_status("먼저 '적'으로 종목을 적용하세요", err=True)
+            return
+        sym = active_symbol()
+        cur_lev, cur_cross = sym.get("leverage"), sym.get("leverage_cross")
+        maxlev = sym.get("max_leverage")
+        pop = tk.Toplevel(root)
+        pop.title(f"{active['name']} 레버리지")
+        pop.resizable(False, False)
+        pop.transient(root)
+        mode_v = tk.StringVar(value="isolated" if cur_cross is False else "cross")
+        tk.Radiobutton(pop, text="교차(Cross)", variable=mode_v, value="cross").grid(
+            row=0, column=0, sticky="w", padx=6, pady=(6, 2))
+        tk.Radiobutton(pop, text="격리(Isolated)", variable=mode_v, value="isolated").grid(
+            row=0, column=1, sticky="w", padx=6, pady=(6, 2))
+        tk.Label(pop, text="배수").grid(row=1, column=0, sticky="e", padx=6)
+        lev_e = tk.Entry(pop, width=6, justify="right")
+        lev_e.insert(0, str(int(cur_lev)) if cur_lev else "5")
+        lev_e.grid(row=1, column=1, sticky="w", padx=6, pady=2)
+        if maxlev:
+            tk.Label(pop, text=f"상한 {int(maxlev)}x", fg="gray40").grid(row=1, column=2, padx=4)
+        msg = tk.Label(pop, text="", fg="#8b0000")
+        msg.grid(row=2, column=0, columnspan=3, padx=6, pady=(2, 0))
+
+        def apply_lev() -> None:
+            try:
+                lev = int(lev_e.get().strip())
+            except ValueError:
+                msg.config(text="배수는 정수", fg="#8b0000")
+                return
+            if lev <= 0:
+                msg.config(text="배수는 1 이상", fg="#8b0000")
+                return
+            is_cross = mode_v.get() == "cross"
+            msg.config(text="적용 중 ...", fg="gray30")
+
+            def worker() -> None:
+                result = core_request("/command", {  # 화면 스레드 아님(뒷단 스레드)
+                    "cmd": "manual_leverage", "underlying": active["underlying"],
+                    "leverage": lev, "is_cross": is_cross}, timeout=10.0)
+
+                def done() -> None:
+                    if result is None:
+                        msg.config(text="코어 미접속", fg="#8b0000")
+                    elif not result.get("ok"):
+                        msg.config(text="; ".join(result.get("errors", [])), fg="#8b0000")
+                    else:  # 성공 — 닫고 상태바 안내(캡션은 폴링이 갱신)
+                        set_status(f"레버리지 {'교차' if is_cross else '격리'} {lev}x 적용됨")
+                        pop.destroy()
+
+                try:
+                    pop.after(0, done)
+                except tk.TclError:
+                    pass  # 팝업 닫힘
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        tk.Button(pop, text="적용", command=apply_lev, width=6).grid(
+            row=3, column=0, padx=6, pady=6)
+        tk.Button(pop, text="취소", command=pop.destroy, width=6).grid(
+            row=3, column=1, padx=6, pady=6, sticky="w")
+
     cb_merge.bind("<<ComboboxSelected>>", on_merge)
     btn_order.config(command=do_order)
     btn_apply.config(command=do_apply)
-    # 레버리지 버튼 — 설정 팝업·updateLeverage 는 D단계에서 배선(지금은 자리·표시만)
-    btn_lev.config(command=lambda: set_status("레버리지 설정은 준비 중(D단계)"))
+    btn_lev.config(command=open_leverage_popup)
 
     def refresh_side() -> None:
         buy = side_var.get() == "buy"
