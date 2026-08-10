@@ -409,7 +409,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                         msg.config(text="코어 미접속", fg="#8b0000")
                     elif not result.get("ok"):
                         msg.config(text="; ".join(result.get("errors", [])), fg="#8b0000")
-                    else:  # 성공 — 닫고 상태바 안내(캡션은 폴링이 갱신)
+                    else:  # 성공 — 캡션 즉시 갱신(포지션 없으면 clearinghouse가 값을 안 줘서
+                        # 폴링으론 못 바뀜. 방금 적용한 값으로 바로 반영).
+                        mode = "Cross" if is_cross else "Isolated"
+                        btn_lev.config(text=f"{mode}  {lev}x")
                         set_status(f"레버리지 {'교차' if is_cross else '격리'} {lev}x 적용됨")
                         pop.destroy()
 

@@ -48,6 +48,7 @@ DEFAULT_PORT = 8787
 
 # 응답을 막지 않는 백그라운드 작업(manual_refresh 등)의 참조 보관 — 중간 GC 방지.
 _BG_TASKS: set[asyncio.Task[None]] = set()
+_olog = logging.getLogger("kp_arb.order")  # 수동 주문 발주·거부 기록 → logs/core_날짜.log
 
 
 def _base_dir() -> Path:
@@ -465,6 +466,8 @@ async def _manual_command(
             )
             err = short_sale_error(instrument, side, qty, sellable_qty(held, pending))
             if err:
+                _olog.warning("수동주문 거부(공매도): %s %s %s %g @ %s — %s",
+                              underlying.value, instrument.value, side.value, qty, price, err)
                 return _fail([err])
         try:
             intent = OrderIntent(
@@ -472,12 +475,20 @@ async def _manual_command(
                 side=side, qty=qty, order_type=order_type, price=price,
                 reduce_only=reduce_only, post_only=post_only)
         except ValidationError as exc:
+            _olog.warning("수동주문 거부(검증): %s %s %s %g @ %s — %s",
+                          underlying.value, instrument.value, side.value, qty, price,
+                          exc.errors()[0]["msg"])
             return _fail([f"주문 검증 실패: {exc.errors()[0]['msg']}"])
+        _desc = (f"{underlying.value} {instrument.value} {side.value} {qty:g} @ {price}"
+                 f"{' reduce' if reduce_only else ''}{' post' if post_only else ''}")
         try:
             order_id = await system.place(intent)
         except Exception as exc:  # noqa: BLE001 - 게이트웨이 거부/오류를 화면에 전달
+            _olog.warning("수동주문 거부(발주): %s — %s", _desc, exc)
             return _fail([f"주문 실패: {exc}"])
         warn = _ws_order_warning(system)  # 수동은 경고만(§2) — 발주는 됨
+        _olog.info("수동주문 접수: %s → #%s%s", _desc, order_id,
+                   f" (경고: {warn})" if warn else "")
         return _ok(order_id=order_id, warnings=[warn] if warn else [])
     return _fail([f"알 수 없는 수동 명령: {cmd!r}"])
 
