@@ -35,6 +35,27 @@ def test_snapshot_initializes_state() -> None:
     assert [o.order_id for o in ob.open_orders()] == ["100"]
 
 
+def test_snapshot_removes_stale_phantom_keeps_recent() -> None:
+    # HL은 취소·체결 통보가 없어, '적' 재조회 시 스냅샷에 사라진 미체결(phantom)을 정리한다.
+    # 단 방금 낸 주문은 아직 거래소 미체결조회에 안 뜰 수 있어 유예 내면 보존.
+    ob = OrderBook()
+    stale = ob.track("OLD", intent())
+    stale.placed_ts = 0.0  # 아주 오래됨(monotonic 기준 유예 밖) → phantom
+    ob.track("NEW", intent())  # 방금(placed_ts=now) → 유예 안
+    ob.load_snapshot(open_orders=())  # 거래소엔 아무 미체결도 없음
+    assert ob.order("OLD") is None       # 오래된 phantom 정리
+    assert ob.order("NEW") is not None    # 방금 낸 것은 보존
+
+
+def test_snapshot_keeps_exchange_orders() -> None:
+    # 스냅샷(거래소 실측)에 있으면 나이와 무관하게 유지.
+    ob = OrderBook()
+    stale = ob.track("EX", intent())
+    stale.placed_ts = 0.0
+    ob.load_snapshot(open_orders=[TrackedOrder("EX", intent(), status=OrderStatus.ACCEPTED)])
+    assert ob.order("EX") is not None
+
+
 # --- 상태 전이 (이벤트로만) ---
 
 

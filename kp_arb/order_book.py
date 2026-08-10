@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -15,6 +16,10 @@ from enum import StrEnum
 from .domain.enums import Account, Instrument, Side, Underlying
 from .domain.models import OrderIntent, Position
 from .gateways.ls_ws import Fill, OrderEvent
+
+# 스냅샷 재조정 유예(초): 방금 낸 주문은 아직 거래소 미체결조회에 안 뜰 수 있어, 이 시간
+# 안에 tracked된 주문은 스냅샷에 없어도 지우지 않는다(그보다 오래된 phantom만 정리).
+_SNAPSHOT_GRACE_S = 15.0
 
 
 class OrderStatus(StrEnum):
@@ -42,6 +47,7 @@ class TrackedOrder:
     status: OrderStatus = OrderStatus.NEW
     filled_qty: float = 0.0
     avg_fill_price: float = 0.0
+    placed_ts: float = 0.0  # 추적 시각(monotonic) — 스냅샷 재조정 유예용
 
     @property
     def is_open(self) -> bool:
@@ -82,13 +88,19 @@ class OrderBook:
             key = (p.underlying, p.instrument, p.account)
             self._positions[key] = _Pos(qty=p.signed_qty, avg_price=p.avg_price)
         self._balances = dict(balances or {})
-        for order in open_orders:
-            self._orders[order.order_id] = order
+        # 미체결 재조정: 스냅샷(거래소 실측)에 있으면 갱신, 없으면 **오래된 것만** 제거 —
+        # HL 취소/체결 통보 누락으로 남은 phantom 정리. 방금 낸 주문(유예 내)은 보존.
+        snapshot = {o.order_id: o for o in open_orders}
+        now = time.monotonic()
+        for oid in list(self._orders):
+            if oid not in snapshot and now - self._orders[oid].placed_ts >= _SNAPSHOT_GRACE_S:
+                del self._orders[oid]
+        self._orders.update(snapshot)
 
     # --- 주문 등록 (place_order 직후) ---
 
     def track(self, order_id: str, intent: OrderIntent) -> TrackedOrder:
-        order = TrackedOrder(order_id=order_id, intent=intent)
+        order = TrackedOrder(order_id=order_id, intent=intent, placed_ts=time.monotonic())
         self._orders[order_id] = order
         return order
 
