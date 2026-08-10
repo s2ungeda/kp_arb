@@ -310,9 +310,13 @@ def test_manual_snapshot_hl_fields() -> None:
     sys.hl_mark[Underlying.SAMSUNG] = Mark(
         underlying=Underlying.SAMSUNG, price=167.5, oracle=167.4)
     sys.hl_funding_rate[Underlying.SAMSUNG] = 0.0000125
-    sys.hl_detail[Underlying.SAMSUNG] = {"margin": 12.3, "cum_funding": -0.45, "liq": 150.0}
+    sys.hl_detail[Underlying.SAMSUNG] = {
+        "margin": 12.3, "cum_funding": -0.45, "liq": 150.0,
+        "leverage": 10.0, "leverage_cross": True, "max_leverage": 20.0}
     hl = manual_snapshot(sys)["symbols"]["samsung|hl_perp"]
     assert hl["oracle"] == 167.4
     assert hl["funding_rate"] == 0.0000125
     assert hl["margin"] == 12.3 and hl["cum_funding"] == -0.45
     assert hl["liq"] == 150.0  # detail이 기본 None을 덮어씀
+    assert hl["leverage"] == 10.0 and hl["leverage_cross"] is True  # D: 버튼 캡션용
+    assert hl["max_leverage"] == 20.0

@@ -434,6 +434,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 text=f"{rate * 100:.4f}%" if rate is not None else "-")
             secs = 3600 - (time.localtime().tm_min * 60 + time.localtime().tm_sec)
             bal_val["CountDown"].config(text=f"{secs // 60:02d}:{secs % 60:02d}")
+            # 레버리지 버튼 캡션 — 현재 걸린 값(포지션 있을 때 clearinghouse에서, §1-3)
+            lev = sym.get("leverage")
+            if lev is not None:
+                mode = "Cross" if sym.get("leverage_cross") else "Isolated"
+                btn_lev.config(text=f"{mode}  {int(lev)}x")
             if mode_var.get() == "hoga":
                 _set_hoga_price(sym, dec)
             # 내 미체결이 있는 호가에 "(건수)" 표시 — 활성 종목 미체결을 가격별 집계

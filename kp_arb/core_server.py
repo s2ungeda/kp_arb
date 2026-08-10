@@ -340,6 +340,9 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
                 detail = system.hl_detail.get(u) or {}
                 entry["margin"] = detail.get("margin")
                 entry["cum_funding"] = detail.get("cum_funding")
+                entry["leverage"] = detail.get("leverage")            # D: 현재 배수
+                entry["leverage_cross"] = detail.get("leverage_cross")  # 교차 여부
+                entry["max_leverage"] = detail.get("max_leverage")
                 if detail.get("liq") is not None:
                     entry["liq"] = detail["liq"]
             if is_spot_stock(inst):
