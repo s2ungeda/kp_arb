@@ -172,31 +172,48 @@ class HLSdkGateway(HLGateway):
 
     # --- 조회 ---
 
-    async def get_positions(self) -> Sequence[Position]:
-        state = await self._post_info(
-            {"type": "clearinghouseState", "user": self._address, "dex": HL_DEX}
-        )
+    async def _clearinghouse(self) -> dict[str, Any]:
+        resp: dict[str, Any] = await self._post_info(
+            {"type": "clearinghouseState", "user": self._address, "dex": HL_DEX})
+        return resp
+
+    def _parse_positions(
+        self, state: dict[str, Any]
+    ) -> tuple[list[Position], dict[Underlying, dict[str, Any]]]:
+        """clearinghouseState 한 응답 → (포지션 목록, 종목별 상세). 둘 다 여기서 뽑는다."""
         positions: list[Position] = []
+        details: dict[Underlying, dict[str, Any]] = {}
         for asset in state.get("assetPositions", []):
             pos = asset.get("position", {})
             underlying = self._by_symbol.get(str(pos.get("coin", "")))
-            if underlying is None:
+            szi = _safe_float(pos.get("szi"))
+            if underlying is None or not szi:  # 미보유(0/None) 제외
                 continue
-            szi = float(pos.get("szi", 0))
-            if szi == 0:
-                continue
-            positions.append(
-                Position(
-                    venue=Venue.HYPERLIQUID,
-                    instrument=Instrument.HL_PERP,
-                    underlying=underlying,
-                    side=Side.BUY if szi > 0 else Side.SELL,
-                    qty=abs(szi),
-                    avg_price=float(pos["entryPx"]),
-                    account=None,  # HL은 KR 계좌 없음
-                )
-            )
-        return positions
+            positions.append(Position(
+                venue=Venue.HYPERLIQUID, instrument=Instrument.HL_PERP,
+                underlying=underlying, side=Side.BUY if szi > 0 else Side.SELL,
+                qty=abs(szi), avg_price=float(pos["entryPx"]), account=None))
+            lev = pos.get("leverage") or {}
+            details[underlying] = {
+                "margin": _safe_float(pos.get("marginUsed")),
+                "cum_funding": _safe_float((pos.get("cumFunding") or {}).get("sinceOpen")),
+                "liq": _safe_float(pos.get("liquidationPx")),
+                "position_value": _safe_float(pos.get("positionValue")),
+                "unrealized_pnl": _safe_float(pos.get("unrealizedPnl")),
+                "leverage": _safe_float(lev.get("value")),
+                "leverage_cross": lev.get("type") == "cross",  # D: 교차/격리
+                "max_leverage": _safe_float(pos.get("maxLeverage")),
+            }
+        return positions, details
+
+    async def get_positions(self) -> Sequence[Position]:
+        return self._parse_positions(await self._clearinghouse())[0]
+
+    async def get_positions_and_details(
+        self,
+    ) -> tuple[Sequence[Position], dict[Underlying, dict[str, Any]]]:
+        """포지션 + 상세를 clearinghouseState **1회**로 (refresh 왕복 절감)."""
+        return self._parse_positions(await self._clearinghouse())
 
     async def get_open_orders(self) -> Sequence[Any]:
         """미체결 스냅샷(frontendOpenOrders, dex 스코프) → TrackedOrder."""
@@ -240,31 +257,8 @@ class HLSdkGateway(HLGateway):
         return float(state.get("marginSummary", {}).get("accountValue", 0.0))
 
     async def get_position_details(self) -> dict[Underlying, dict[str, Any]]:
-        """clearinghouseState 포지션 상세(종목별) — 마진·누적펀딩·청산가·레버리지 등.
-
-        get_positions는 szi·entryPx만 쓰므로, 잔고표(B2)·레버리지(D) 표시용 나머지 필드를
-        여기서 뽑는다. leverage_cross는 D의 마진모드(교차/격리) 표시에 쓴다.
-        """
-        state = await self._post_info(
-            {"type": "clearinghouseState", "user": self._address, "dex": HL_DEX})
-        out: dict[Underlying, dict[str, Any]] = {}
-        for asset in state.get("assetPositions", []):
-            pos = asset.get("position", {})
-            underlying = self._by_symbol.get(str(pos.get("coin", "")))
-            if underlying is None or not _safe_float(pos.get("szi")):
-                continue  # 미보유(szi 0/None) 제외
-            lev = pos.get("leverage") or {}
-            out[underlying] = {
-                "margin": _safe_float(pos.get("marginUsed")),
-                "cum_funding": _safe_float((pos.get("cumFunding") or {}).get("sinceOpen")),
-                "liq": _safe_float(pos.get("liquidationPx")),
-                "position_value": _safe_float(pos.get("positionValue")),
-                "unrealized_pnl": _safe_float(pos.get("unrealizedPnl")),
-                "leverage": _safe_float(lev.get("value")),
-                "leverage_cross": lev.get("type") == "cross",  # D: 교차/격리
-                "max_leverage": _safe_float(pos.get("maxLeverage")),
-            }
-        return out
+        """clearinghouseState 포지션 상세(종목별) — 마진·누적펀딩·청산가·레버리지 등(B2·D)."""
+        return self._parse_positions(await self._clearinghouse())[1]
 
     async def get_funding(self, underlying: Underlying) -> float:
         coin = self._symbol(underlying)

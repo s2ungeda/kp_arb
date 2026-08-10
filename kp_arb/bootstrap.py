@@ -192,9 +192,9 @@ class LiveSystem:
                 )
                 balances.setdefault(account, 0.0)
         if self._hl is not None:
-            positions.extend(await self._hl.get_positions())
+            hl_pos, self.hl_detail = await self._hl.get_positions_and_details()  # 1회 조회
+            positions.extend(hl_pos)
             open_orders.extend(await self._hl.get_open_orders())
-            self.hl_detail = await self._hl.get_position_details()  # 마진·청산가 등(B2, 잔고표)
         self.order_book.load_snapshot(
             positions=positions, balances=balances, open_orders=open_orders
         )

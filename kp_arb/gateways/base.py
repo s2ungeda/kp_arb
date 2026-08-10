@@ -66,6 +66,12 @@ class HLGateway(ABC):
         """
         return {}
 
+    async def get_positions_and_details(
+        self,
+    ) -> tuple[Sequence[Position], dict[Underlying, dict[str, Any]]]:
+        """포지션 + 상세를 함께(REST 왕복 절감). 기본은 두 메서드 조합, HLSdkGateway가 1회로."""
+        return list(await self.get_positions()), await self.get_position_details()
+
     async def update_leverage(
         self, underlying: Underlying, leverage: int, *, is_cross: bool
     ) -> None:
