@@ -322,11 +322,20 @@ def main() -> None:
     screens = [m for m in saved.get("screens", [])
                if isinstance(m, str) and m.startswith("kp_arb.")]
     if screens:
-        def reopen() -> None:
-            for token in screens:
-                module, *args = token.split()
-                open_screen(module, *args)
-        root.after(1500, reopen)  # 코어가 뜰 시간을 살짝 준 뒤
+        # 저장된 화면은 **코어 연결된 뒤** 연다 — 코어 미접속 상태에서 화면 조작을 막기 위함
+        # (사용자 확정). 코어가 30초 내 안 뜨면 자동 복원 포기(메뉴로 수동 오픈 유도).
+        def reopen_when_ready(waited_ms: int = 0) -> None:
+            if alive_box["alive"]:
+                for token in screens:
+                    module, *args = token.split()
+                    open_screen(module, *args)
+                return
+            if waited_ms >= 30_000:
+                status.config(text="코어 미접속 — 저장된 화면 자동 복원 안 함(메뉴에서 여세요)")
+                return
+            root.after(500, lambda: reopen_when_ready(waited_ms + 500))
+
+        root.after(500, lambda: reopen_when_ready(500))
 
     def on_close() -> None:
         """메인 종료 = 화면들 + 코어까지 함께 종료 (사용자 확정 2026-07-24).
