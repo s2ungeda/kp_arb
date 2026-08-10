@@ -366,22 +366,24 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             return
         sym = active_symbol()
         cur_lev, cur_cross = sym.get("leverage"), sym.get("leverage_cross")
-        maxlev = sym.get("max_leverage")
         pop = tk.Toplevel(root)
         pop.title(f"{active['name']} 레버리지")
         pop.resizable(False, False)
         pop.transient(root)
+        # 레버리지 버튼 바로 아래에 뜨게 — 버튼 화면 좌표 + 높이
+        pop.geometry(
+            f"+{btn_lev.winfo_rootx()}+{btn_lev.winfo_rooty() + btn_lev.winfo_height()}")
         mode_v = tk.StringVar(value="isolated" if cur_cross is False else "cross")
         tk.Radiobutton(pop, text="교차(Cross)", variable=mode_v, value="cross").grid(
             row=0, column=0, sticky="w", padx=6, pady=(6, 2))
         tk.Radiobutton(pop, text="격리(Isolated)", variable=mode_v, value="isolated").grid(
             row=0, column=1, sticky="w", padx=6, pady=(6, 2))
         tk.Label(pop, text="배수").grid(row=1, column=0, sticky="e", padx=6)
-        lev_e = tk.Entry(pop, width=6, justify="right")
-        lev_e.insert(0, str(int(cur_lev)) if cur_lev else "5")
+        lev_e = tk.Spinbox(pop, from_=1, to=10, width=5, justify="right")  # 1~10만
+        lev_e.delete(0, "end")
+        lev_e.insert(0, str(max(1, min(10, int(cur_lev) if cur_lev else 5))))
         lev_e.grid(row=1, column=1, sticky="w", padx=6, pady=2)
-        if maxlev:
-            tk.Label(pop, text=f"상한 {int(maxlev)}x", fg="gray40").grid(row=1, column=2, padx=4)
+        tk.Label(pop, text="(1~10)", fg="gray40").grid(row=1, column=2, padx=4)
         msg = tk.Label(pop, text="", fg="#8b0000")
         msg.grid(row=2, column=0, columnspan=3, padx=6, pady=(2, 0))
 
@@ -391,8 +393,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             except ValueError:
                 msg.config(text="배수는 정수", fg="#8b0000")
                 return
-            if lev <= 0:
-                msg.config(text="배수는 1 이상", fg="#8b0000")
+            if not 1 <= lev <= 10:  # 사용자 확정 — 1~10만
+                msg.config(text="배수는 1~10", fg="#8b0000")
                 return
             is_cross = mode_v.get() == "cross"
             msg.config(text="적용 중 ...", fg="gray30")
