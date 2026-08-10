@@ -127,7 +127,9 @@ class FxReportService:
 
         line = f"{time.strftime('%H:%M:%S')} {message}"
         self.log.append(line)
-        log.info("FX 보고: %s", message)
+        # 자동 송신은 2초마다라 파일 로그 도배 — 파일엔 안 남기고 감시화면(self.log)만(사용자 요청).
+        if not message.startswith("자동 송신"):
+            log.info("FX 보고: %s", message)
 
     # --- 감시 화면용 스냅샷 ---
 
