@@ -680,6 +680,8 @@ async def _serve() -> None:
         await site.start()
         log.info("코어 시동: http://%s:%s (안전종료는 메인 화면에서)", HOST, DEFAULT_PORT)
         await stop.wait()
+        if system is not None:
+            await system.stop()  # WS(_guarded_ws)·시동 태스크 명시 취소 — 종료 중 재접속 방지
         for task in tasks:
             task.cancel()
         await runner.cleanup()
