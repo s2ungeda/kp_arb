@@ -98,6 +98,20 @@ class OrderBook:
                 del self._orders[oid]
         self._orders.update(snapshot)
 
+    def replace_positions(
+        self, positions: Iterable[Position], *, instrument: Instrument
+    ) -> None:
+        """주어진 instrument의 포지션만 스냅샷 목록으로 교체 — 다른 instrument·잔고·주문 유지.
+
+        체결 이벤트 후 HL 포지션(외부 거래 포함)을 clearinghouse 실측으로 실시간 갱신할 때
+        사용(디바운스 조회). 목록에 없는 종목은 청산된 것 → 제거된다.
+        """
+        for key in [k for k in self._positions if k[1] is instrument]:
+            del self._positions[key]
+        for p in positions:
+            self._positions[(p.underlying, p.instrument, p.account)] = _Pos(
+                qty=p.signed_qty, avg_price=p.avg_price)
+
     # --- 주문 등록 (place_order 직후) ---
 
     def track(self, order_id: str, intent: OrderIntent) -> TrackedOrder:

@@ -173,6 +173,7 @@ class LiveSystem:
         self.on_fill: list[Callable[[Fill], None]] = []  # 체결통보 (OrderBook 반영 후 호출)
         self._tasks: list[asyncio.Task[None]] = []
         self._bg: set[asyncio.Task[None]] = set()  # 재연결 재동기 등 백그라운드 작업(GC 방지)
+        self._hl_refresh_pending = False  # 체결 후 HL 재조회 예약 여부(디바운스 코얼레싱)
 
     # --- 스냅샷 (최초 실행 + 온디맨드/UI 조회 버튼) ---
 
@@ -207,6 +208,37 @@ class LiveSystem:
         self.order_book.load_snapshot(
             positions=positions, balances=balances, open_orders=open_orders
         )
+
+    _HL_FILL_DEBOUNCE_S = 0.5  # 몰린 체결을 합쳐 조회 1회로 (사용자 확정)
+
+    def _schedule_hl_refresh(self) -> None:
+        """HL 체결 발생 → HL 파생값(마진·청산가·펀딩·포지션) 재조회 예약(디바운스).
+
+        이미 예약돼 있으면 무시 — 체결이 폭주해도 창(0.5s)당 조회 1회로 합친다(코얼레싱).
+        잔고·평단·PNL은 on_fill이 이미 즉시 갱신하고, 여기선 조회로만 얻는 값만 보정.
+        """
+        if self._hl is None or self._hl_refresh_pending:
+            return
+        self._hl_refresh_pending = True
+        task = asyncio.create_task(self._refresh_hl_after_fill())
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+
+    async def _refresh_hl_after_fill(self) -> None:
+        import logging
+
+        try:
+            await asyncio.sleep(self._HL_FILL_DEBOUNCE_S)
+        finally:
+            self._hl_refresh_pending = False  # 조회 전에 풀어, 조회 중 온 체결은 재예약
+        if self._hl is None:
+            return
+        try:
+            hl_pos, self.hl_detail = await self._hl.get_positions_and_details()
+            self.order_book.replace_positions(hl_pos, instrument=Instrument.HL_PERP)
+        except Exception:  # noqa: BLE001 - 조회 실패가 수신 루프를 죽이지 않게
+            logging.getLogger("kp_arb.core").warning(
+                "체결 후 HL 재조회 실패 — 다음 체결/적에 재시도", exc_info=True)
 
     def _on_hl_order_update(self, upd: OrderUpdate) -> None:
         """HL 주문상태 변화 → OrderBook 실시간 정합. 취소·거부 계열만 반영(체결은 userFills).
@@ -424,6 +456,8 @@ class LiveSystem:
             self._hl_ws.on_funding.append(fan_funding)
             self._hl_ws.on_funding.append(store_funding)
             self._hl_ws.on_fill.append(apply_fill)  # HL 체결 → OrderBook (oid로 매칭)
+            # 체결 후 마진·청산가·펀딩·(외부)포지션은 조회로만 얻음 → 디바운스 재조회(§실시간 A)
+            self._hl_ws.on_fill.append(lambda _f: self._schedule_hl_refresh())
             self._hl_ws.on_order_update.append(self._on_hl_order_update)  # 취소 등 실시간
             self._hl_ws.on_reconnect.append(lambda: self._on_ws_reconnect("HL"))
 

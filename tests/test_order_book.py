@@ -56,6 +56,24 @@ def test_snapshot_keeps_exchange_orders() -> None:
     assert ob.order("EX") is not None
 
 
+def test_replace_positions_only_touches_instrument() -> None:
+    # 체결 후 HL 포지션만 실측으로 교체 — LS·잔고·주문은 유지, 목록에 없는 HL 종목은 청산.
+    ob = OrderBook()
+    ob.load_snapshot(positions=[
+        Position(venue=Venue.LS, instrument=Instrument.KR_STOCK, underlying=SAMSUNG,
+                 side=Side.BUY, qty=100, avg_price=70_000, account=Account.KR_STOCK),
+        Position(venue=Venue.HYPERLIQUID, instrument=Instrument.HL_PERP, underlying=SAMSUNG,
+                 side=Side.BUY, qty=0.1, avg_price=163.0),
+    ])
+    ob.replace_positions([
+        Position(venue=Venue.HYPERLIQUID, instrument=Instrument.HL_PERP,
+                 underlying=Underlying.SK_HYNIX, side=Side.SELL, qty=0.05, avg_price=1400.0),
+    ], instrument=Instrument.HL_PERP)
+    assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == 0            # 청산(목록 없음)
+    assert ob.position_qty(Underlying.SK_HYNIX, Instrument.HL_PERP, None) == -0.05  # 신규
+    assert ob.position_qty(SAMSUNG, Instrument.KR_STOCK, Account.KR_STOCK) == 100   # LS 유지
+
+
 # --- 상태 전이 (이벤트로만) ---
 
 

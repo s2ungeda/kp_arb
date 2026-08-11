@@ -244,6 +244,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     bal_val: dict[str, tk.Label] = {}
     _BAL_ORDER = ("잔고", "PNL", "진입금액", "진입가", "Liq_Prc",
                   "Margin", "Funding", "Oracle", "FundRate", "CountDown")
+    # 디바운스 조회(clearinghouse) 항목 — 체결 즉시 계산이 안 돼 500ms 조회로 갱신. 라벨을
+    # 회색으로 구분(나머지는 체결 이벤트·시세로 빠르게 갱신).
+    _QUERY_FIELDS = {"Liq_Prc", "Margin", "Funding"}
     _tfont = ("Malgun Gothic", 9)
     for i, name in enumerate(_BAL_ORDER):
         important = name in ("잔고", "PNL")
@@ -255,8 +258,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             cell = tk.Frame(rbal)
             cbg = cell.cget("bg")
         cell.grid(row=i, column=0, sticky="we", pady=1, padx=1)
-        tk.Label(cell, text=name, width=9, anchor="w", font=_tfont, bg=cbg).pack(
-            side="left", padx=(3, 2))   # width 9 — CountDown 안 잘리게
+        lbl_fg = "gray45" if name in _QUERY_FIELDS else "black"  # 조회 항목 회색 구분
+        tk.Label(cell, text=name, width=9, anchor="w", font=_tfont, bg=cbg,
+                 fg=lbl_fg).pack(side="left", padx=(3, 2))   # width 9 — CountDown 안 잘리게
         v = tk.Label(cell, text="-", width=9, anchor="e", font=_BOLD, bg=cbg)
         v.pack(side="right", padx=(0, 3))
         bal_val[name] = v
@@ -360,44 +364,67 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             "reduce_only": reduce_var.get(), "post_only": post_var.get(),
         }, "주문", f"{side_kr} {price} {qty:g}")
 
-    def on_hoga_click(_e: Any) -> None:
-        # 가격모드에서만 — 클릭한 오더북 가격을 단가에 그대로(틱 없음).
-        if mode_var.get() != "price":
-            return
-        sel = hoga.selection()
-        if not sel:
-            return
-        vals = hoga.item(sel[0], "values")
-        if len(vals) < 1 or vals[0] in ("", "-"):
-            return
-        e_price.delete(0, "end")
-        e_price.insert(0, str(vals[0]).replace(",", ""))
+    # 델파이 원본(UNormalOrderEx) 기능: 호가모드는 **클릭한 호가 레벨**을 기준가로 잡고
+    # ±(틱 스핀 × 호가단위)를 더한다(매수 +, 매도 −). 최우선호가 자동추적 아님.
+    _hoga_base: dict[str, float | None] = {"price": None}  # 마지막 클릭한 호가 레벨(기준가)
 
-    hoga.bind("<<TreeviewSelect>>", on_hoga_click)
-
-    def _set_hoga_price(sym: dict[str, Any], dec: int) -> None:
-        # 호가모드: (매수=매수1호가 / 매도=매도1호가) + N × **선택한 호가단위**. 자동 갱신.
-        buy = side_var.get() == "buy"
-        levels = sym.get("bids") if buy else sym.get("asks")
-        if not levels:
-            return
-        ts = cb_merge.get().replace(",", "")  # 선택 호가단위(틱) 예 "0.1". 없으면 최소틱 폴백.
+    def _hoga_unit() -> tuple[float, int]:
+        # 오프셋 단위 = 선택 호가단위(틱). 없으면 종목 최소틱.
+        ts = cb_merge.get().replace(",", "")
         try:
-            tick = float(ts)
-            tdec = len(ts.split(".")[1]) if "." in ts else 0  # 틱 소수 자리수
+            return float(ts), (len(ts.split(".")[1]) if "." in ts else 0)
         except (ValueError, IndexError):
-            tick, tdec = 10.0 ** (-dec), dec
-        price = float(levels[0][0]) + tick_var.get() * tick
+            dec = _hl_decimals(_hoga_base["price"] or _ref_price(active_symbol()))
+            return 10.0 ** (-dec), dec
+
+    def _apply_hoga_offset() -> None:
+        base = _hoga_base["price"]
+        if base is None:
+            return
+        tick, tdec = _hoga_unit()
+        sign = 1 if side_var.get() == "buy" else -1  # 매수 +, 매도 − (델파이 SetPrice)
+        price = base + sign * tick_var.get() * tick
         e_price.delete(0, "end")
         e_price.insert(0, _fmt_px(price, tdec).replace(",", ""))
 
+    def on_hoga_click(_e: Any) -> None:
+        sel = hoga.selection()
+        if not sel:
+            return
+        vals = hoga.item(sel[0], "values")  # (가격, 건수, 잔량) — 가격은 0번
+        if len(vals) < 1 or vals[0] in ("", "-"):
+            return
+        base = float(str(vals[0]).replace(",", ""))
+        if mode_var.get() == "price":
+            e_price.delete(0, "end")           # 가격모드: 클릭가 그대로(틱 없음)
+            e_price.insert(0, str(vals[0]).replace(",", ""))
+        else:
+            _hoga_base["price"] = base          # 호가모드: 이 레벨을 기준으로 ± 틱
+            _apply_hoga_offset()
+
+    hoga.bind("<<TreeviewSelect>>", on_hoga_click)
+
     def _on_tick_spin() -> None:
-        # 틱 스핀 업/다운 시 즉시 반영(refresh 500ms 안 기다리게). 호가 모드에서만.
+        # 틱 스핀 업/다운 → 마지막 클릭 기준에 오프셋 재적용(호가 모드에서만).
         if mode_var.get() == "hoga":
-            sym = active_symbol()
-            _set_hoga_price(sym, _hl_decimals(_ref_price(sym)))
+            _apply_hoga_offset()
 
     sp_tick.config(command=_on_tick_spin)
+
+    def _on_tick_change(*_: Any) -> None:
+        # 직접 입력 포함 −20~20으로 강제 제한(화살표는 from_/to로, 타이핑은 여기서 클램프).
+        try:
+            v = tick_var.get()
+        except tk.TclError:
+            return  # 빈칸·'-' 등 입력 중 — 확정 시 다시 트리거됨
+        c = max(-20, min(20, v))
+        if c != v:
+            tick_var.set(c)               # 이 set이 다시 트리거 → 아래 오프셋 재적용
+            return
+        if mode_var.get() == "hoga":
+            _apply_hoga_offset()
+
+    tick_var.trace_add("write", _on_tick_change)
 
     def on_merge(_e: Any) -> None:
         under = active["underlying"] or UNDER_MAP[cb_under.get()]
@@ -512,7 +539,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                          bg="#c00000" if buy else "#0000c0",
                          activebackground="#a00000" if buy else "#000090")
 
-    side_var.trace_add("write", lambda *_: refresh_side())
+    def _on_side_change(*_: Any) -> None:
+        refresh_side()
+        if mode_var.get() == "hoga":
+            _apply_hoga_offset()  # 매수/매도 부호(+/−) 반영해 호가 기준가 재적용
+    side_var.trace_add("write", _on_side_change)
     cb_under.bind("<<ComboboxSelected>>", lambda *_: refresh_side())  # 버튼 종목명 즉시 갱신
     refresh_side()
 
@@ -583,8 +614,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 btn_lev.config(text=f"{'Cross' if cross else 'Isolated'}  {int(lev)}x")
                 if active["underlying"]:
                     lev_applied[active["underlying"]] = {"leverage": int(lev), "cross": cross}
-            if mode_var.get() == "hoga":
-                _set_hoga_price(sym, dec)
+            # 호가모드 가격은 클릭·틱 스핀 때만 산출(자동추적 안 함 — 델파이 원본 기능)
             # 내 미체결이 있는 호가에 "(건수)" 표시 — 활성 종목 미체결을 가격별 집계
             my_ords: dict[str, int] = {}
             for o in (state_box["data"] or {}).get("open_orders") or []:
