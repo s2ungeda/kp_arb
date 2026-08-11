@@ -173,6 +173,7 @@ class LiveSystem:
         self.on_funding: list[Callable[[Underlying, float], None]] = []  # HL 예정 펀딩률
         self.on_fill: list[Callable[[Fill], None]] = []  # 체결통보 (OrderBook 반영 후 호출)
         self.fills: deque[dict[str, Any]] = deque(maxlen=200)  # 체결내역(최신 우선, 주문리스트)
+        self.cancels: deque[dict[str, Any]] = deque(maxlen=200)  # 취소내역(최신 우선)
         self.on_fill.append(self._record_fill)  # 체결내역 보관 — 항상 기록
         self._tasks: list[asyncio.Task[None]] = []
         self._bg: set[asyncio.Task[None]] = set()  # 재연결 재동기 등 백그라운드 작업(GC 방지)
@@ -230,6 +231,17 @@ class LiveSystem:
             "side": it.side.value, "qty": fill.qty, "price": fill.price,
         })
 
+    def _record_cancel(self, order: TrackedOrder) -> None:
+        """취소내역 보관(주문 리스트 '취소' 행) — 취소 시각과 함께. 취소된(잔여) 수량 기준."""
+        import time as _t
+
+        it = order.intent
+        self.cancels.appendleft({
+            "time": _t.strftime("%H:%M:%S"),
+            "underlying": it.underlying.value, "instrument": it.instrument.value,
+            "side": it.side.value, "qty": order.remaining_qty, "price": it.price,
+        })
+
     _HL_FILL_DEBOUNCE_S = 0.5  # 몰린 체결을 합쳐 조회 1회로 (사용자 확정)
 
     def _schedule_hl_refresh(self) -> None:
@@ -274,6 +286,7 @@ class LiveSystem:
         log = order_log.logger_for(Venue.HYPERLIQUID)
         if order is not None:
             log.info("주문종료(%s) #%s — OrderBook 제거(실시간)", upd.status, upd.oid)
+            self._record_cancel(order)  # 취소내역(주문 리스트 '취소' 행)
         else:
             log.info("외부 주문종료(%s) #%s (추적 안 함)", upd.status, upd.oid)
 
@@ -343,9 +356,10 @@ class LiveSystem:
                 new_id = await self._hl.amend_order(
                     order_id, qty=qty, price=price,
                     reduce_only=reduce_only, post_only=post_only)
-        except Exception as exc:  # 정정 거부/오류도 거래소별 파일에 남긴다
+        except Exception as exc:  # 정정 거부/오류도 거래소별 파일에 남긴다(실린 옵션 포함)
             order_log.order_amend_rejected(
-                order.intent.venue, order_id, exc, qty=qty, price=price)
+                order.intent.venue, order_id, exc, qty=qty, price=price,
+                reduce_only=reduce_only, post_only=post_only)
             raise
         new_intent = order.intent.model_copy(
             update={"price": price, "qty": qty,

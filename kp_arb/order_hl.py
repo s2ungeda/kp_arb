@@ -591,13 +591,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             _refresh_merge_combo()  # 호가단위 콤보 채움('적' 전에도, 선택 종목 기준)
             sym = active_symbol()
             dec = _hl_decimals(_ref_price(sym))
-            # 잔고(=포지션)·PNL 우선, 나머지. 포맷: 진입가 2자리·PNL 1자리·마진/펀딩 0자리
+            # 잔고(=포지션)·PNL 우선, 나머지. 포맷: 진입가 3자리·PNL 1자리·마진/펀딩 0자리
             pos = sym.get("position")   # 잔고(=포지션 부호): 매수 빨강 / 매도 파랑
             bal_val["잔고"].config(text=_fmt_qty(pos), fg=_sign_color(pos))
             pnl = sym.get("pnl")        # PNL: 이익 빨강 / 손실 파랑 / 0 검정
             bal_val["PNL"].config(text=_fmt(pnl, 1), fg=_sign_color(pnl))
             bal_val["진입금액"].config(text=_fmt(sym.get("eval")))
-            bal_val["진입가"].config(text=_fmt_px(sym.get("avg_price"), 2))
+            bal_val["진입가"].config(text=_fmt_px(sym.get("avg_price"), 3))
             bal_val["Liq_Prc"].config(text=_fmt_px(sym.get("liq"), dec))
             bal_val["Margin"].config(text=_fmt(sym.get("margin"), 0))
             bal_val["Funding"].config(text=_fmt(sym.get("cum_funding"), 0))

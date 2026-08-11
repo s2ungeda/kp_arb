@@ -300,7 +300,8 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
     화면(일반 주문창)이 폴링해 표시만. 조회 폴링 없이 OrderBook·quotes 메모리 읽기.
     """
     if system is None:
-        return {"connected": False, "symbols": {}, "open_orders": [], "fills": []}
+        return {"connected": False, "symbols": {}, "open_orders": [],
+                "fills": [], "cancels": []}
     ob = system.order_book
     pending_sell: dict[tuple[Underlying, Instrument], float] = {}
     open_orders: list[dict[str, Any]] = []
@@ -314,6 +315,7 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
             "instrument": it.instrument.value, "side": it.side.value,
             "qty": it.qty, "remaining": o.remaining_qty,
             "price": it.price, "status": o.status.value,
+            "time": o.placed_at,  # 접수 시각(HH:MM:SS) — 주문 리스트 '시각' 칸
         })
     symbols: dict[str, Any] = {}
     for u in Underlying:
@@ -366,8 +368,9 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
                 entry["balance"] = ob.balance(account)
             symbols[f"{u.value}|{inst.value}"] = entry
     fills = list(getattr(system, "fills", []))[:50]  # 최신 우선(코어 보관), 최근 50건
-    return {"connected": True, "symbols": symbols,
-            "open_orders": open_orders, "fills": fills}
+    cancels = list(getattr(system, "cancels", []))[:50]
+    return {"connected": True, "symbols": symbols, "open_orders": open_orders,
+            "fills": fills, "cancels": cancels}
 
 
 def _fx_command(fx_service: FxReportService | None, body: dict[str, Any]) -> dict[str, Any]:

@@ -53,6 +53,9 @@ class StubExchange:
                      order_type: dict[str, Any], reduce_only: bool = False) -> dict[str, Any]:
         self.modifies: list[tuple[Any, ...]] = getattr(self, "modifies", [])
         self.modifies.append((oid, coin, is_buy, sz, px, reduce_only, order_type))
+        if getattr(self, "cross_reject", False):  # HL always_place=false 크로싱 거부 흉내
+            return {"status": "ok", "response": {"type": "order", "data": {"statuses": [
+                {"error": "Post only order would have immediately matched"}]}}}
         statuses = [{"resting": {"oid": oid + 1}}]
         return {"status": "ok", "response": {"type": "order", "data": {"statuses": statuses}}}
 
@@ -228,6 +231,17 @@ async def test_amend_uses_explicit_reduce_and_post() -> None:
     *_, reduce_only, order_type = ex.modifies[-1]
     assert reduce_only is True                        # 명시 reduce 전달
     assert order_type == {"limit": {"tif": "Alo"}}    # post_only → Alo
+
+
+async def test_crossing_amend_rejected_clearly() -> None:
+    # HL modify가 크로싱 Gtc를 ALO로 강제해 거부하면(always_place=false), 명확히 안내하고
+    # 거부한다(폴백 없음 — 사용자 확정 "정정 안 되면 빼도 됨"). 신규 주문은 안 낸다.
+    gw, ex, _ = _gw()
+    ex.cross_reject = True  # modify가 'immediately matched'로 거부
+    oid = await gw.place_order(_intent(Side.BUY, price=166.0))
+    with pytest.raises(HLError, match="취소 후 신규"):
+        await gw.amend_order(oid, qty=0.1, price=171.0)
+    assert len(ex.orders) == 1 and not ex.cancels  # 폴백 없음(신규·취소 안 함)
 
 
 async def test_amend_default_is_gtc_no_reduce() -> None:

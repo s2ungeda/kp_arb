@@ -171,6 +171,10 @@ class HLSdkGateway(HLGateway):
         new_sz = float(qty) if qty is not None else sz
         new_px = float(price) if price is not None else px
         tif = "Alo" if post_only else "Gtc"  # post_only = 메이커 전용(Alo)
+        # 실제로 거래소에 보내는 tif·인자를 남긴다 — 'post 안 했는데 post로 나감' 진단용.
+        order_log.logger_for(Venue.HYPERLIQUID).info(
+            "정정요청 #%s coin=%s buy=%s sz=%s px=%s tif=%s reduce=%s",
+            order_id, coin, is_buy, new_sz, new_px, tif, reduce_only)
         resp = await asyncio.to_thread(
             self._ex.modify_order, int(order_id), coin, is_buy, new_sz, new_px,
             {"limit": {"tif": tif}}, reduce_only,
@@ -178,14 +182,20 @@ class HLSdkGateway(HLGateway):
         try:
             oid = self._parse_oid(resp)
         except HLError as exc:
-            # 실측: 이미 체결/취소된 주문 정정 → "Cannot modify canceled or filled
-            # order" — LS 01433과 같은 체결 경합. 정상 흐름의 거부로 구분한다.
-            if "cannot modify canceled or filled" in str(exc).lower():
+            low = str(exc).lower()
+            # 실측: 이미 체결/취소된 주문 정정 → 체결 경합. 정상 흐름의 거부로 구분.
+            if "cannot modify canceled or filled" in low:
                 raise OrderGoneError(str(exc)) from exc
+            # HL modify(always_place=false)는 **크로싱(즉시 체결) Gtc를 post-only(ALO)로 강제**
+            # → 거부(문서 확인). taker 정정은 modify로 불가 — 명확히 안내(취소 후 신규).
+            if "immediately matched" in low:
+                raise HLError(
+                    "즉시체결 가격으로는 정정 불가(HL 사양) — 취소 후 신규 주문하세요") from exc
             raise
         self._order_coin[oid] = coin
         self._order_ctx[oid] = (coin, is_buy, new_sz, new_px)
-        order_log.order_amended(Venue.HYPERLIQUID, order_id, oid, qty, price)
+        order_log.order_amended(Venue.HYPERLIQUID, order_id, oid, qty, price,
+                                reduce_only=reduce_only, post_only=post_only)
         return oid
 
     async def cancel_order(self, order_id: str) -> None:

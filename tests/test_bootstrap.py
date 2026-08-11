@@ -50,6 +50,23 @@ def test_record_fill_tracks_known_skips_external() -> None:
     assert len(sys.fills) == 1  # 외부(미추적) 체결은 종목·방향 몰라 스킵
 
 
+def test_record_cancel_captures_time_and_intent() -> None:
+    # 취소내역 보관 — 취소된(잔여) 수량·종목·방향·시각을 담는다(주문 리스트 '취소' 행).
+    from collections import deque
+    from types import SimpleNamespace
+
+    ob = OrderBook()
+    order = ob.track("O9", OrderIntent(
+        venue=Venue.HYPERLIQUID, underlying=Underlying.SK_HYNIX,
+        instrument=Instrument.HL_PERP, side=Side.BUY, qty=0.05,
+        order_type=OrderType.LIMIT, price=1400.0))
+    sys = SimpleNamespace(cancels=deque(maxlen=200))
+    LiveSystem._record_cancel(sys, order)
+    assert len(sys.cancels) == 1
+    c = sys.cancels[0]
+    assert c["side"] == "buy" and c["qty"] == 0.05 and c["time"]  # 시각 채워짐
+
+
 def test_select_near_month_futures() -> None:
     symbols = select_near_month_futures(MASTER_ROWS)
     assert symbols == {

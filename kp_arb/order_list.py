@@ -24,6 +24,11 @@ def _sym(underlying: object, instrument: str) -> str:
     return f"{underlying} 선물" if instrument == "kr_stock_future" else f"{underlying}"
 
 
+# 주문상태 한글 표시 — '구분'의 '주문'과 헷갈리지 않게 상태는 한글로(accepted=접수 등).
+_ST_KR = {"new": "신규", "accepted": "접수", "partial": "부분", "filled": "체결",
+          "cancelled": "취소", "rejected": "거부"}
+
+
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
     """주문 리스트 창 실행."""
     import threading
@@ -66,24 +71,29 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     filt = tk.Frame(root)
     filt.pack(fill="x", padx=6, pady=(6, 0))
     tk.Label(filt, text="표시").pack(side="left")
-    show_orders = tk.BooleanVar(value=True)   # 접수(미체결)
+    show_orders = tk.BooleanVar(value=True)   # 미체결 주문
     show_fills = tk.BooleanVar(value=True)     # 체결
-    tk.Checkbutton(filt, text="접수", variable=show_orders,
+    show_cancels = tk.BooleanVar(value=True)   # 취소
+    tk.Checkbutton(filt, text="주문", variable=show_orders,
                    command=lambda: _rerender()).pack(side="left")
     tk.Checkbutton(filt, text="체결", variable=show_fills,
                    command=lambda: _rerender()).pack(side="left")
+    tk.Checkbutton(filt, text="취소", variable=show_cancels,
+                   command=lambda: _rerender()).pack(side="left")
 
+    # 구분='주문'(미체결)/'체결' — 상태(accepted 등)와 헷갈리지 않게 '주문'으로. 상태는 한글.
     tree = ttk.Treeview(
-        root, columns=("kind", "ex", "sym", "side", "qty", "price", "info"),
+        root, columns=("kind", "ex", "sym", "side", "qty", "rem", "price", "st", "time"),
         show="headings", height=16, selectmode="browse")
     for c, t, w in (("kind", "구분", 44), ("ex", "거래소", 42), ("sym", "종목", 92),
-                    ("side", "매매", 44), ("qty", "수량", 60), ("price", "가격", 84),
-                    ("info", "상태/시각", 96)):
+                    ("side", "매매", 44), ("qty", "수량", 58), ("rem", "잔량", 58),
+                    ("price", "가격", 84), ("st", "상태", 52), ("time", "시각", 72)):
         tree.heading(c, text=t)
         tree.column(c, width=w, anchor="e")
     tree.column("kind", anchor="center")
     tree.column("ex", anchor="center")
     tree.column("side", anchor="center")
+    tree.column("time", anchor="center")
     # 전부 검은색(사용자 확정) — 매수/매도는 '매매' 칸 텍스트로만 구분(색 없음).
     tree.pack(fill="x", padx=6, pady=(2, 2))
 
@@ -97,7 +107,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if not sel:
             return None
         iid = sel[0]
-        return None if iid.startswith("__fill") else iid  # 체결행은 취소/정정 대상 아님
+        return None if iid.startswith("__") else iid  # 체결·취소 행은 취소/정정 대상 아님
 
     def do_cancel() -> None:
         oid = _selected_oid()
@@ -145,12 +155,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if e_price.get().strip():
             return
         sel = tree.selection()
-        if not sel or sel[0].startswith("__fill"):
+        if not sel or sel[0].startswith("__"):
             return
-        vals = tree.item(sel[0], "values")  # (구분, 종목, 매매, 수량, 가격, 상태/시각)
-        if len(vals) >= 5 and vals[4] not in ("", "-"):
+        vals = tree.item(sel[0], "values")  # (구분,거래소,종목,매매,수량,잔량,가격,상태,시각)
+        if len(vals) >= 7 and vals[6] not in ("", "-"):
             e_price.delete(0, "end")
-            e_price.insert(0, str(vals[4]).replace(",", ""))
+            e_price.insert(0, str(vals[6]).replace(",", ""))
 
     tree.bind("<<TreeviewSelect>>", on_select)
 
@@ -185,18 +195,20 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         _reschedule(refresh, 400)
 
     def _rows() -> list[tuple[str, str, tuple[Any, ...]]]:
-        # (iid, tag, 값) — 필터(접수/체결)로 골라 한 표에 합침. 접수 먼저, 그다음 체결.
+        # (iid, tag, 값) — 필터(주문/체결)로 골라 한 표에. 주문(미체결) 먼저, 그다음 체결.
+        # 상태·시각은 별 칸. 주문=상태+잔량(시각 없음) / 체결=시각(상태 없음).
         data = state_box["data"] or {}
         out: list[tuple[str, str, tuple[Any, ...]]] = []
         if show_orders.get():
             for o in data.get("open_orders") or []:
                 buy = o.get("side") == "buy"
                 inst = str(o.get("instrument"))
-                info = f"{o.get('status')} 잔{_fmt_qty(o.get('remaining'))}"
+                stk = _ST_KR.get(str(o.get("status")), o.get("status"))  # 상태만(잔량 별 칸)
                 out.append((str(o.get("order_id")), "buy" if buy else "sell",
-                            ("접수", _venue(inst), _sym(o.get("underlying"), inst),
+                            ("주문", _venue(inst), _sym(o.get("underlying"), inst),
                              "매수" if buy else "매도",
-                             _fmt_qty(o.get("qty")), _fmt_px(o.get("price")), info)))
+                             _fmt_qty(o.get("qty")), _fmt_qty(o.get("remaining")),
+                             _fmt_px(o.get("price")), stk, o.get("time", ""))))  # 접수시각
         if show_fills.get():
             for i, f in enumerate(data.get("fills") or []):
                 buy = f.get("side") == "buy"
@@ -204,7 +216,17 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 out.append((f"__fill{i}", "buy" if buy else "sell",
                             ("체결", _venue(inst), _sym(f.get("underlying"), inst),
                              "매수" if buy else "매도",
-                             _fmt_qty(f.get("qty")), _fmt_px(f.get("price")), f.get("time"))))
+                             _fmt_qty(f.get("qty")), "",  # 체결량=수량, 잔량 없음
+                             _fmt_px(f.get("price")), "", f.get("time"))))  # 체결시각
+        if show_cancels.get():
+            for i, c in enumerate(data.get("cancels") or []):
+                buy = c.get("side") == "buy"
+                inst = str(c.get("instrument"))
+                out.append((f"__cancel{i}", "buy" if buy else "sell",
+                            ("취소", _venue(inst), _sym(c.get("underlying"), inst),
+                             "매수" if buy else "매도",
+                             _fmt_qty(c.get("qty")), "",
+                             _fmt_px(c.get("price")), "취소", c.get("time"))))  # 취소시각
         return out
 
     def _render() -> None:

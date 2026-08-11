@@ -51,16 +51,21 @@ def order_canceled(venue: Venue, order_id: str) -> None:
 
 
 def order_amended(venue: Venue, order_id: str, new_id: str,
-                  qty: float | None, price: float | None) -> None:
-    """정정(원주문 → 새 주문)."""
-    logger_for(venue).info("정정 #%s → #%s qty=%s price=%s", order_id, new_id, qty, price)
+                  qty: float | None, price: float | None,
+                  *, reduce_only: bool = False, post_only: bool = False) -> None:
+    """정정(원주문 → 새 주문). 실제로 실어보낸 옵션(reduce/post)도 남긴다."""
+    logger_for(venue).info(
+        "정정 #%s → #%s qty=%s price=%s reduce=%s post=%s",
+        order_id, new_id, qty, price, reduce_only, post_only)
 
 
 def order_amend_rejected(venue: Venue, order_id: str, error: object,
-                         *, qty: float | None = None, price: float | None = None) -> None:
-    """정정 거부/오류 — 게이트웨이 예외(사유 포함). 원주문·요청값 함께 남긴다."""
+                         *, qty: float | None = None, price: float | None = None,
+                         reduce_only: bool = False, post_only: bool = False) -> None:
+    """정정 거부/오류 — 게이트웨이 예외(사유 포함). 요청값·옵션(reduce/post) 함께 남긴다."""
     logger_for(venue).warning(
-        "정정거부 #%s (요청 qty=%s price=%s) — %s", order_id, qty, price, error)
+        "정정거부 #%s (요청 qty=%s price=%s reduce=%s post=%s) — %s",
+        order_id, qty, price, reduce_only, post_only, error)
 
 
 def order_filled(intent: OrderIntent, fill_qty: float, fill_price: float,
