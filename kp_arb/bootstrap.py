@@ -16,6 +16,7 @@ HL 게이트웨이는 슬롯만 예비(라이브 결선 시 추가).
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Callable, Coroutine
 from datetime import datetime
 from typing import Any
@@ -171,6 +172,8 @@ class LiveSystem:
         self.on_expected: list[Callable[[ExpectedPrice], None]] = []  # 예상체결가
         self.on_funding: list[Callable[[Underlying, float], None]] = []  # HL 예정 펀딩률
         self.on_fill: list[Callable[[Fill], None]] = []  # 체결통보 (OrderBook 반영 후 호출)
+        self.fills: deque[dict[str, Any]] = deque(maxlen=200)  # 체결내역(최신 우선, 주문리스트)
+        self.on_fill.append(self._record_fill)  # 체결내역 보관 — 항상 기록
         self._tasks: list[asyncio.Task[None]] = []
         self._bg: set[asyncio.Task[None]] = set()  # 재연결 재동기 등 백그라운드 작업(GC 방지)
         self._hl_refresh_pending = False  # 체결 후 HL 재조회 예약 여부(디바운스 코얼레싱)
@@ -208,6 +211,24 @@ class LiveSystem:
         self.order_book.load_snapshot(
             positions=positions, balances=balances, open_orders=open_orders
         )
+
+    def _record_fill(self, fill: Fill) -> None:
+        """체결내역 보관(주문 리스트 표시용) — 추적 주문이면 종목·방향을 안다.
+
+        OrderBook.on_fill 뒤에 불려 주문을 조회한다. 외부(미추적) 체결은 종목·방향을
+        몰라 스킵(추후 userFills raw로 확장 가능).
+        """
+        import time as _t
+
+        order = self.order_book.order(fill.order_id)
+        if order is None:
+            return
+        it = order.intent
+        self.fills.appendleft({
+            "time": _t.strftime("%H:%M:%S"),
+            "underlying": it.underlying.value, "instrument": it.instrument.value,
+            "side": it.side.value, "qty": fill.qty, "price": fill.price,
+        })
 
     _HL_FILL_DEBOUNCE_S = 0.5  # 몰린 체결을 합쳐 조회 1회로 (사용자 확정)
 

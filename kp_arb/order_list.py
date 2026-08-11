@@ -52,17 +52,31 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     threading.Thread(target=poller, daemon=True).start()
 
-    # ===== UI =====
+    # ===== UI (위=체결내역 / 아래=미체결) =====
+    tk.Label(root, text="체결내역", anchor="w").pack(fill="x", padx=6, pady=(6, 0))
+    execs = ttk.Treeview(
+        root, columns=("time", "sym", "side", "qty", "price"),
+        show="headings", height=6, selectmode="none")
+    for c, t, w in (("time", "시각", 70), ("sym", "종목", 140), ("side", "구분", 44),
+                    ("qty", "수량", 60), ("price", "가격", 84)):
+        execs.heading(c, text=t)
+        execs.column(c, width=w, anchor="e")
+    execs.column("side", anchor="center")
+    execs.tag_configure("buy", foreground="#c00000")   # 매수 빨강
+    execs.tag_configure("sell", foreground="#0000c0")  # 매도 파랑
+    execs.pack(fill="x", padx=6, pady=(0, 4))
+
+    tk.Label(root, text="미체결", anchor="w").pack(fill="x", padx=6, pady=(0, 0))
     orders = ttk.Treeview(
         root, columns=("oid", "sym", "side", "qty", "rem", "price", "st"),
-        show="headings", height=12, selectmode="browse")
+        show="headings", height=10, selectmode="browse")
     for c, t, w in (("oid", "주문번호", 100), ("sym", "종목", 140), ("side", "구분", 44),
                     ("qty", "수량", 60), ("rem", "잔량", 60), ("price", "가격", 84),
                     ("st", "상태", 60)):
         orders.heading(c, text=t)
         orders.column(c, width=w, anchor="e")
     orders.column("side", anchor="center")
-    orders.pack(fill="x", padx=6, pady=(6, 2))
+    orders.pack(fill="x", padx=6, pady=(0, 2))
 
     status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
 
@@ -108,7 +122,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     post_var = tk.BooleanVar(value=False)
     tk.Checkbutton(ctrl, text="Reduce", variable=reduce_var).pack(side="left")
     tk.Checkbutton(ctrl, text="Post", variable=post_var).pack(side="left", padx=(0, 6))
-    tk.Button(ctrl, text="선택 정정", command=do_amend).pack(side="left")
+    tk.Button(ctrl, text="선택 취소&신규", command=do_amend).pack(side="left")
     tk.Button(ctrl, text="선택 취소", command=do_cancel).pack(side="left", padx=4)
 
     status.pack(fill="x", padx=6, pady=(2, 6))
@@ -155,9 +169,24 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         try:
             data = state_box["data"] or {}
             _fill(data.get("open_orders") or [])
+            _fill_execs(data.get("fills") or [])
         except Exception:  # noqa: BLE001 - 갱신 오류로 창이 죽지 않게
             pass
         _reschedule(refresh, 400)
+
+    def _fill_execs(fills: list[dict[str, Any]]) -> None:
+        # 체결내역(코어 보관, 최신 우선). 변화 없으면 다시 안 그림.
+        sig = tuple((f.get("time"), f.get("qty"), f.get("price")) for f in fills)
+        if sig == state_box.get("_fsig"):
+            return
+        state_box["_fsig"] = sig
+        execs.delete(*execs.get_children())
+        for f in fills:
+            buy = f.get("side") == "buy"
+            sym = f"{f.get('underlying')} {f.get('instrument')}"
+            execs.insert("", "end", tags=("buy" if buy else "sell",),
+                         values=(f.get("time"), sym, "매수" if buy else "매도",
+                                 _fmt_qty(f.get("qty")), _fmt_px(f.get("price"))))
 
     def _fill(open_orders: list[dict[str, Any]]) -> None:
         sig = tuple((o.get("order_id"), o.get("remaining"), o.get("status"))

@@ -300,7 +300,7 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
     화면(일반 주문창)이 폴링해 표시만. 조회 폴링 없이 OrderBook·quotes 메모리 읽기.
     """
     if system is None:
-        return {"connected": False, "symbols": {}, "open_orders": []}
+        return {"connected": False, "symbols": {}, "open_orders": [], "fills": []}
     ob = system.order_book
     pending_sell: dict[tuple[Underlying, Instrument], float] = {}
     open_orders: list[dict[str, Any]] = []
@@ -365,7 +365,9 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
             if account is not None:
                 entry["balance"] = ob.balance(account)
             symbols[f"{u.value}|{inst.value}"] = entry
-    return {"connected": True, "symbols": symbols, "open_orders": open_orders}
+    fills = list(getattr(system, "fills", []))[:50]  # 최신 우선(코어 보관), 최근 50건
+    return {"connected": True, "symbols": symbols,
+            "open_orders": open_orders, "fills": fills}
 
 
 def _fx_command(fx_service: FxReportService | None, body: dict[str, Any]) -> dict[str, Any]:

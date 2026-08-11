@@ -28,6 +28,28 @@ MASTER_ROWS = [
 ]
 
 
+def test_record_fill_tracks_known_skips_external() -> None:
+    # 체결내역 보관 — 추적 주문은 종목·방향과 함께 기록, 외부(미추적)는 스킵.
+    from collections import deque
+    from types import SimpleNamespace
+
+    from kp_arb.gateways.ls_ws import Fill
+
+    ob = OrderBook()
+    ob.track("O1", OrderIntent(
+        venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.HL_PERP, side=Side.SELL, qty=0.1,
+        order_type=OrderType.LIMIT, price=163.0))
+    sys = SimpleNamespace(order_book=ob, fills=deque(maxlen=200))
+    LiveSystem._record_fill(sys, Fill(  # type: ignore[arg-type]
+        fill_id="F1", order_id="O1", qty=0.1, price=163.0, fee=0.0, ts=1.0))
+    assert len(sys.fills) == 1
+    assert sys.fills[0]["side"] == "sell" and sys.fills[0]["qty"] == 0.1
+    LiveSystem._record_fill(sys, Fill(  # type: ignore[arg-type]
+        fill_id="F2", order_id="EXT", qty=1.0, price=1.0, fee=0.0, ts=1.0))
+    assert len(sys.fills) == 1  # 외부(미추적) 체결은 종목·방향 몰라 스킵
+
+
 def test_select_near_month_futures() -> None:
     symbols = select_near_month_futures(MASTER_ROWS)
     assert symbols == {
