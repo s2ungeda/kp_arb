@@ -14,6 +14,16 @@ from .core_client import core_request, watch_parent_exit
 from .order_hl import _fmt_px, _fmt_qty
 
 
+def _venue(instrument: str) -> str:
+    """거래소 구분 — HL perp만 HL, 나머지(국내 주식/선물)는 LS."""
+    return "HL" if instrument == "hl_perp" else "LS"
+
+
+def _sym(underlying: object, instrument: str) -> str:
+    """종목 표시 — 거래소는 별도 컬럼이라 여기선 종목명(+선물 태그)만."""
+    return f"{underlying} 선물" if instrument == "kr_stock_future" else f"{underlying}"
+
+
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
     """주문 리스트 창 실행."""
     import threading
@@ -52,31 +62,30 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     threading.Thread(target=poller, daemon=True).start()
 
-    # ===== UI (위=체결내역 / 아래=미체결) =====
-    tk.Label(root, text="체결내역", anchor="w").pack(fill="x", padx=6, pady=(6, 0))
-    execs = ttk.Treeview(
-        root, columns=("time", "sym", "side", "qty", "price"),
-        show="headings", height=6, selectmode="none")
-    for c, t, w in (("time", "시각", 70), ("sym", "종목", 140), ("side", "구분", 44),
-                    ("qty", "수량", 60), ("price", "가격", 84)):
-        execs.heading(c, text=t)
-        execs.column(c, width=w, anchor="e")
-    execs.column("side", anchor="center")
-    execs.tag_configure("buy", foreground="#c00000")   # 매수 빨강
-    execs.tag_configure("sell", foreground="#0000c0")  # 매도 파랑
-    execs.pack(fill="x", padx=6, pady=(0, 4))
+    # ===== UI (접수·체결 한 표 + 유형 필터) =====
+    filt = tk.Frame(root)
+    filt.pack(fill="x", padx=6, pady=(6, 0))
+    tk.Label(filt, text="표시").pack(side="left")
+    show_orders = tk.BooleanVar(value=True)   # 접수(미체결)
+    show_fills = tk.BooleanVar(value=True)     # 체결
+    tk.Checkbutton(filt, text="접수", variable=show_orders,
+                   command=lambda: _rerender()).pack(side="left")
+    tk.Checkbutton(filt, text="체결", variable=show_fills,
+                   command=lambda: _rerender()).pack(side="left")
 
-    tk.Label(root, text="미체결", anchor="w").pack(fill="x", padx=6, pady=(0, 0))
-    orders = ttk.Treeview(
-        root, columns=("oid", "sym", "side", "qty", "rem", "price", "st"),
-        show="headings", height=10, selectmode="browse")
-    for c, t, w in (("oid", "주문번호", 100), ("sym", "종목", 140), ("side", "구분", 44),
-                    ("qty", "수량", 60), ("rem", "잔량", 60), ("price", "가격", 84),
-                    ("st", "상태", 60)):
-        orders.heading(c, text=t)
-        orders.column(c, width=w, anchor="e")
-    orders.column("side", anchor="center")
-    orders.pack(fill="x", padx=6, pady=(0, 2))
+    tree = ttk.Treeview(
+        root, columns=("kind", "ex", "sym", "side", "qty", "price", "info"),
+        show="headings", height=16, selectmode="browse")
+    for c, t, w in (("kind", "구분", 44), ("ex", "거래소", 42), ("sym", "종목", 92),
+                    ("side", "매매", 44), ("qty", "수량", 60), ("price", "가격", 84),
+                    ("info", "상태/시각", 96)):
+        tree.heading(c, text=t)
+        tree.column(c, width=w, anchor="e")
+    tree.column("kind", anchor="center")
+    tree.column("ex", anchor="center")
+    tree.column("side", anchor="center")
+    # 전부 검은색(사용자 확정) — 매수/매도는 '매매' 칸 텍스트로만 구분(색 없음).
+    tree.pack(fill="x", padx=6, pady=(2, 2))
 
     status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
 
@@ -84,8 +93,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         status.config(text=text[:90], fg="#8b0000" if err else "black")
 
     def _selected_oid() -> str | None:
-        sel = orders.selection()
-        return str(orders.item(sel[0], "values")[0]) if sel else None
+        sel = tree.selection()
+        if not sel:
+            return None
+        iid = sel[0]
+        return None if iid.startswith("__fill") else iid  # 체결행은 취소/정정 대상 아님
 
     def do_cancel() -> None:
         oid = _selected_oid()
@@ -132,15 +144,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def on_select(_e: Any) -> None:
         if e_price.get().strip():
             return
-        sel = orders.selection()
-        if not sel:
+        sel = tree.selection()
+        if not sel or sel[0].startswith("__fill"):
             return
-        vals = orders.item(sel[0], "values")
-        if len(vals) >= 6 and vals[5] not in ("", "-"):
+        vals = tree.item(sel[0], "values")  # (구분, 종목, 매매, 수량, 가격, 상태/시각)
+        if len(vals) >= 5 and vals[4] not in ("", "-"):
             e_price.delete(0, "end")
-            e_price.insert(0, str(vals[5]).replace(",", ""))
+            e_price.insert(0, str(vals[4]).replace(",", ""))
 
-    orders.bind("<<TreeviewSelect>>", on_select)
+    tree.bind("<<TreeviewSelect>>", on_select)
 
     # ===== 화면 갱신 (네트워크 없음 — 폴링 결과만 읽어 그림) =====
     def _reschedule(fn: Any, ms: int) -> None:
@@ -167,45 +179,51 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     def refresh() -> None:
         try:
-            data = state_box["data"] or {}
-            _fill(data.get("open_orders") or [])
-            _fill_execs(data.get("fills") or [])
+            _render()
         except Exception:  # noqa: BLE001 - 갱신 오류로 창이 죽지 않게
             pass
         _reschedule(refresh, 400)
 
-    def _fill_execs(fills: list[dict[str, Any]]) -> None:
-        # 체결내역(코어 보관, 최신 우선). 변화 없으면 다시 안 그림.
-        sig = tuple((f.get("time"), f.get("qty"), f.get("price")) for f in fills)
-        if sig == state_box.get("_fsig"):
-            return
-        state_box["_fsig"] = sig
-        execs.delete(*execs.get_children())
-        for f in fills:
-            buy = f.get("side") == "buy"
-            sym = f"{f.get('underlying')} {f.get('instrument')}"
-            execs.insert("", "end", tags=("buy" if buy else "sell",),
-                         values=(f.get("time"), sym, "매수" if buy else "매도",
-                                 _fmt_qty(f.get("qty")), _fmt_px(f.get("price"))))
+    def _rows() -> list[tuple[str, str, tuple[Any, ...]]]:
+        # (iid, tag, 값) — 필터(접수/체결)로 골라 한 표에 합침. 접수 먼저, 그다음 체결.
+        data = state_box["data"] or {}
+        out: list[tuple[str, str, tuple[Any, ...]]] = []
+        if show_orders.get():
+            for o in data.get("open_orders") or []:
+                buy = o.get("side") == "buy"
+                inst = str(o.get("instrument"))
+                info = f"{o.get('status')} 잔{_fmt_qty(o.get('remaining'))}"
+                out.append((str(o.get("order_id")), "buy" if buy else "sell",
+                            ("접수", _venue(inst), _sym(o.get("underlying"), inst),
+                             "매수" if buy else "매도",
+                             _fmt_qty(o.get("qty")), _fmt_px(o.get("price")), info)))
+        if show_fills.get():
+            for i, f in enumerate(data.get("fills") or []):
+                buy = f.get("side") == "buy"
+                inst = str(f.get("instrument"))
+                out.append((f"__fill{i}", "buy" if buy else "sell",
+                            ("체결", _venue(inst), _sym(f.get("underlying"), inst),
+                             "매수" if buy else "매도",
+                             _fmt_qty(f.get("qty")), _fmt_px(f.get("price")), f.get("time"))))
+        return out
 
-    def _fill(open_orders: list[dict[str, Any]]) -> None:
-        sig = tuple((o.get("order_id"), o.get("remaining"), o.get("status"))
-                    for o in open_orders)
+    def _render() -> None:
+        rows = _rows()
+        sig = tuple((iid, *vals) for iid, _, vals in rows)
         if sig == state_box.get("_sig"):
-            return
+            return  # 변화 없으면 다시 안 그림(선택 유지)
         state_box["_sig"] = sig
-        keep = orders.selection()
-        orders.delete(*orders.get_children())
-        for o in open_orders:
-            sym = f"{o.get('underlying')} {o.get('instrument')}"
-            side = "매수" if o.get("side") == "buy" else "매도"
-            orders.insert("", "end", iid=str(o.get("order_id")),
-                          values=(o.get("order_id"), sym, side,
-                                  _fmt_qty(o.get("qty")), _fmt_qty(o.get("remaining")),
-                                  _fmt_px(o.get("price")), o.get("status")))
+        keep = tree.selection()
+        tree.delete(*tree.get_children())
+        for iid, tag, vals in rows:
+            tree.insert("", "end", iid=iid, values=vals, tags=(tag,))
         for iid in keep:
-            if orders.exists(iid):
-                orders.selection_set(iid)
+            if tree.exists(iid):
+                tree.selection_set(iid)
+
+    def _rerender() -> None:
+        state_box["_sig"] = None  # 필터 바뀜 → 강제 재그림
+        _render()
 
     drain_results()
     refresh()
