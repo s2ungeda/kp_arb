@@ -1,13 +1,14 @@
 """부트스트랩 계약 테스트 — 시동(스냅샷→실시간 결선)과 선물 월물 선택. 라이브 없음."""
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 
 from kp_arb.bootstrap import LiveSystem, select_near_month_futures
 from kp_arb.domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent, Position
-from kp_arb.gateways.ls_ws import LSWebSocketClient
+from kp_arb.gateways.ls_ws import LSWebSocketClient, WSClosed
 from kp_arb.gateways.mock_ls import MockLSGateway
 from kp_arb.order_book import OrderBook, OrderStatus
 from kp_arb.session_service import SessionService
@@ -67,6 +68,34 @@ def test_record_cancel_captures_time_and_intent() -> None:
     assert c["side"] == "buy" and c["qty"] == 0.05 and c["time"]  # 시각 채워짐
 
 
+async def test_guarded_ws_restarts_then_stops(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # graceful close(run 정상 반환) → 재시작(재연결) / WSClosed → 종료 / 예외 → 포기.
+    orig_sleep = asyncio.sleep
+    monkeypatch.setattr("kp_arb.bootstrap.asyncio.sleep", lambda *_: orig_sleep(0))
+    calls = {"n": 0}
+
+    async def make_run() -> None:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return          # graceful close → 재시작
+        raise WSClosed      # 커넥터 종료 → 재시작 안 함
+
+    await LiveSystem._guarded_ws("HL", make_run)
+    assert calls["n"] == 3  # 정상반환 2회 재시작 후 WSClosed로 종료(무한 아님)
+
+
+async def test_guarded_ws_gives_up_on_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # 예외(설정·인증 등)면 재시작 안 하고 그 채널만 포기(무한 재시도 방지).
+    calls = {"n": 0}
+
+    async def make_run() -> None:
+        calls["n"] += 1
+        raise RuntimeError("auth 실패")
+
+    await LiveSystem._guarded_ws("선물", make_run)  # 예외 삼키고 반환
+    assert calls["n"] == 1  # 1회만 — 재시작 안 함
+
+
 def test_select_near_month_futures() -> None:
     symbols = select_near_month_futures(MASTER_ROWS)
     assert symbols == {
@@ -98,6 +127,7 @@ class FakeConnection:
     async def _gen(self) -> AsyncIterator[str]:
         for frame in self.frames:
             yield frame
+        raise WSClosed  # 프레임 소진 = 세션 종료(테스트) — _guarded_ws 재시작 루프를 끊는다
 
     def __aiter__(self) -> AsyncIterator[str]:
         return self._gen()

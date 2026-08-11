@@ -534,13 +534,14 @@ class LiveSystem:
         # 시동 REST 조회들은 **순차 실행** — 동시에 나가면 서버 계정당 초당 한도에
         # 걸려 일부(t1901 등)가 실패한다(운영 실측). 환율 폴링은 그 뒤에 시작.
         self._tasks = [asyncio.create_task(self._startup_queries())]
-        self._tasks.append(asyncio.create_task(self._guarded_ws("주식", self._stock_ws.run())))
+        # run 자체가 아니라 **팩토리(.run)**를 넘긴다 — 재시작 때 새 코루틴을 만들어야 하므로.
+        self._tasks.append(asyncio.create_task(self._guarded_ws("주식", self._stock_ws.run)))
         if self._deriv_ws is not None:
             self._tasks.append(
-                asyncio.create_task(self._guarded_ws("선물", self._deriv_ws.run()))
+                asyncio.create_task(self._guarded_ws("선물", self._deriv_ws.run))
             )
         if self._hl_ws is not None:
-            self._tasks.append(asyncio.create_task(self._guarded_ws("HL", self._hl_ws.run())))
+            self._tasks.append(asyncio.create_task(self._guarded_ws("HL", self._hl_ws.run)))
 
     def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]:
         """HL 환산에 실제 쓰는 환율과 출처: 주간 창(fx_spot_window) 안이고 외환현물이
@@ -880,17 +881,34 @@ class LiveSystem:
             await asyncio.gather(self._fx_loop(), self._etf_refs_retry_loop())
 
     @staticmethod
-    async def _guarded_ws(name: str, run: Coroutine[Any, Any, None]) -> None:
-        """WS 하나가 죽어도 전체를 멈추지 않는다 — 예: KP_MODE=live인데 선물 키가
-        모의뿐이면 선물 WS만 실패(토큰 불일치). 경고만 남기고 그 채널 없이 계속."""
+    async def _guarded_ws(
+        name: str, make_run: Callable[[], Coroutine[Any, Any, None]]
+    ) -> None:
+        """WS 하나가 죽어도 전체를 멈추지 않고, **run()이 정상 반환하면 재시작(재연결)**한다.
+
+        run() 내부는 예외 끊김만 재연결하고, **서버 graceful close(async for 정상 종료)는
+        반환**한다 — HL은 배포·유휴로 graceful close가 흔해 그대로 두면 영구 끊김. 그 경우를
+        여기서 재시작으로 이어붙인다(백오프 2초). **예외로 죽으면**(설정·인증 등) 원래대로 그
+        채널만 포기한다(재시작 안 함 — 무한 재시도·폭주 방지). shutdown(취소)도 재시작 안 함.
+        """
         import logging
 
-        try:
-            await run
-        except Exception:  # noqa: BLE001 - 채널 단위 격리
-            logging.getLogger("kp_arb.bootstrap").exception(
-                "%s WS 중단 — 해당 채널 없이 계속", name
-            )
+        from .gateways.ls_ws import WSClosed
+
+        log = logging.getLogger("kp_arb.bootstrap")
+        while True:
+            try:
+                await make_run()
+            except asyncio.CancelledError:
+                raise  # 종료(shutdown) — 재시작 안 함
+            except WSClosed:
+                return  # 커넥터 명시 종료(테스트/셧다운) — 재시작 안 함
+            except Exception:  # noqa: BLE001 - 채널 단위 격리(설정·인증 오류 등)
+                log.exception("%s WS 중단 — 해당 채널 없이 계속", name)
+                return
+            # run() 정상 반환 = 서버 graceful close(끊김) → 재연결 위해 재시작
+            log.warning("%s WS 끊김(정상종료) — 재연결", name)
+            await asyncio.sleep(2.0)
 
     # --- 엔진 연결 (실시간 시세·포지션·잔고 → 전략 판단) ---
 

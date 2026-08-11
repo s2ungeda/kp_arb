@@ -138,6 +138,15 @@ class ExpectedPrice(BaseModel):
     change_pct: float | None = None  # 예상등락률(%, jnilydrate — 부호 보정됨, 문서 §2)
 
 
+class WSClosed(Exception):
+    """커넥터가 세션을 명시적으로 종료(더 이상 재연결 안 함) — 테스트/셧다운용.
+
+    운영 커넥터(라이브)는 절대 던지지 않는다: 서버 graceful close는 run()이 반환하고
+    `_guarded_ws`가 재연결로 이어붙인다. 테스트 가짜 커넥터가 프레임 소진을 알려 무한
+    재시작을 끊는 용도(이게 없으면 재시작 루프가 테스트에서 폭주한다).
+    """
+
+
 class WSConnection(Protocol):
     """단일 WS 세션. 구독 메시지 전송 + 프레임 비동기 수신."""
 
