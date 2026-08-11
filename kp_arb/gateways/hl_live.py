@@ -85,6 +85,9 @@ class HLSdkGateway(HLGateway):
         # oid -> (coin, is_buy, sz, px) — 정정(modify)에 원주문 정보(종목·방향·수량·가격).
         # reduce/post는 정정 시 **호출부가 명시적으로 전달**한다(원주문 상속 안 함, 사용자 확정).
         self._order_ctx: dict[str, tuple[str, bool, float, float]] = {}
+        # 발주 응답이 즉시체결(filled)이면 (체결수량, 평균가) — place() 직후 꺼내 OrderBook에
+        # 반영한다(userFills 놓쳐도 미체결로 안 남게). pop_place_fill로 1회 소비.
+        self._last_place_fill: tuple[float, float] | None = None
         self.connected = False
 
     @classmethod
@@ -147,8 +150,28 @@ class HLSdkGateway(HLGateway):
             raise
         self._order_coin[oid] = coin
         self._order_ctx[oid] = (coin, is_buy, float(intent.qty), price)
+        self._last_place_fill = self._parse_place_fill(resp)  # 즉시체결이면 (수량, 평균가)
         order_log.order_placed(intent, oid, resp)  # 원응답(filled/resting·수량) 포함
         return oid
+
+    @staticmethod
+    def _parse_place_fill(resp: dict[str, Any]) -> tuple[float, float] | None:
+        """발주 응답의 즉시체결(filled) → (체결수량, 평균가). resting(미체결)이면 None."""
+        try:
+            status = resp["response"]["data"]["statuses"][0]
+        except (KeyError, IndexError, TypeError):
+            return None
+        f = status.get("filled") if isinstance(status, dict) else None
+        if not f:
+            return None
+        sz, px = _safe_float(f.get("totalSz")), _safe_float(f.get("avgPx"))
+        return (sz, px) if sz and px is not None else None
+
+    def pop_place_fill(self) -> tuple[float, float] | None:
+        """직전 발주의 즉시체결값(있으면) — 1회 소비. place()가 OrderBook 반영에 쓴다."""
+        f = self._last_place_fill
+        self._last_place_fill = None
+        return f
 
     async def amend_order(
         self,

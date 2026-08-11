@@ -74,6 +74,19 @@ def test_replace_positions_only_touches_instrument() -> None:
     assert ob.position_qty(SAMSUNG, Instrument.KR_STOCK, Account.KR_STOCK) == 100   # LS 유지
 
 
+def test_on_fill_ignores_duplicate_after_full_fill() -> None:
+    # 발주 즉시체결을 반영해 전량 체결된 뒤, userFills 중복 통보가 와도 초과체결 안 된다.
+    ob = OrderBook()
+    ob.track("O1", OrderIntent(
+        venue=Venue.HYPERLIQUID, underlying=SAMSUNG, instrument=Instrument.HL_PERP,
+        side=Side.SELL, qty=0.1, order_type=OrderType.LIMIT, price=165.0))
+    ob.on_fill(fill("O1", 0.1, 168.0))  # 전량 체결
+    assert ob.order("O1").status is OrderStatus.FILLED
+    assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == -0.1
+    ob.on_fill(fill("O1", 0.1, 168.0, fill_id="F2"))  # 중복(같은 체결 재통보) → 무시
+    assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == -0.1  # 초과 안 됨
+
+
 # --- 상태 전이 (이벤트로만) ---
 
 

@@ -85,6 +85,10 @@ class HLGateway(ABC):
         """종목 메타(code·szDecimals·maxLeverage) — 시동 종목정보(§5.10). 기본 빈 dict."""
         return {}
 
+    def pop_place_fill(self) -> tuple[float, float] | None:
+        """직전 발주의 즉시체결(수량, 평균가) — 없으면 None. HLSdkGateway가 구현(§즉시체결)."""
+        return None
+
     async def update_leverage(
         self, underlying: Underlying, leverage: int, *, is_cross: bool
     ) -> None:

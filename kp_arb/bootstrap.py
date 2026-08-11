@@ -322,14 +322,29 @@ class LiveSystem:
     # --- 주문 (등록까지 한 번에 — 이후 상태는 이벤트로만) ---
 
     async def place(self, intent: OrderIntent) -> str:
-        """venue 라우팅 주문 + OrderBook 등록. 이후 상태는 이벤트로만."""
+        """venue 라우팅 주문 + OrderBook 등록. 이후 상태는 이벤트로만.
+
+        HL은 발주 즉시체결(크로싱)이면 응답에 이미 체결이 실려온다 — userFills를 놓쳐도
+        미체결로 남지 않게 그 체결을 바로 반영한다(중복은 OrderBook 초과체결 가드가 무시).
+        """
         if intent.venue is Venue.LS:
             order_id = await self._gw.place_order(intent)
-        elif self._hl is not None:
-            order_id = await self._hl.place_order(intent)
-        else:
+            self.order_book.track(order_id, intent)
+            return order_id
+        if self._hl is None:
             raise RuntimeError("HL gateway not configured")
+        order_id = await self._hl.place_order(intent)
         self.order_book.track(order_id, intent)
+        place_fill = self._hl.pop_place_fill()  # 발주 즉시체결 (수량, 평균가) | None
+        if place_fill is not None:
+            sz, px = place_fill
+            fill = Fill(fill_id=f"place-{order_id}", order_id=order_id,
+                        qty=sz, price=px, ts=0.0)
+            # 주문 체결처리 + 포지션만 반영(미체결 잔류 방지). **체결내역 기록·엔진 통지는
+            # userFills가 전담** — 여기서 on_fill 핸들러를 부르면 이중 기록된다(place-체결 +
+            # userFills). clearinghouse 재조회는 안전(중복 아님)이라 트리거해 포지션 정합.
+            self.order_book.on_fill(fill)
+            self._schedule_hl_refresh()
         return order_id
 
     async def amend_price(

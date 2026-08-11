@@ -35,7 +35,11 @@ class StubExchange:
               order_type: dict[str, Any], reduce_only: bool = False) -> dict[str, Any]:
         self.orders.append((coin, is_buy, sz, px, order_type))
         self.last_reduce_only = reduce_only
-        statuses = [{"resting": {"oid": 485478010353}}]
+        if getattr(self, "fill_on_place", False):  # 발주 즉시체결(크로싱) 흉내
+            statuses: list[dict[str, Any]] = [
+                {"filled": {"totalSz": str(sz), "avgPx": "168.23", "oid": 485478010353}}]
+        else:
+            statuses = [{"resting": {"oid": 485478010353}}]
         return {"status": "ok", "response": {"type": "order", "data": {"statuses": statuses}}}
 
     def cancel(self, coin: str, oid: int) -> dict[str, Any]:
@@ -110,6 +114,22 @@ async def test_limit_order_uses_dex_symbol_and_parses_oid() -> None:
     assert coin == "xyz:SMSN"  # 실측 심볼(SAMSUNG 아님)
     assert is_buy is False and sz == 0.1 and px == 180.0
     assert otype == {"limit": {"tif": "Gtc"}}
+
+
+async def test_place_immediate_fill_exposed_via_pop() -> None:
+    # 발주 즉시체결(응답 filled)이면 (체결수량, 평균가)를 pop_place_fill로 1회 노출한다
+    # — place()가 이걸 OrderBook에 반영해 미체결로 안 남게 한다.
+    gw, ex, _ = _gw()
+    ex.fill_on_place = True
+    await gw.place_order(_intent(Side.SELL, price=165.0))  # qty 0.1
+    assert gw.pop_place_fill() == (0.1, 168.23)  # (수량, 평균가)
+    assert gw.pop_place_fill() is None            # 1회 소비
+
+
+async def test_place_resting_has_no_place_fill() -> None:
+    gw, _, _ = _gw()
+    await gw.place_order(_intent(Side.SELL, price=180.0))  # resting(미체결)
+    assert gw.pop_place_fill() is None
 
 
 async def test_market_order_becomes_ioc_with_slippage() -> None:

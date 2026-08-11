@@ -134,6 +134,8 @@ class OrderBook:
         order = self._orders.get(fill.order_id)
         if order is None:
             return None
+        if order.remaining_qty <= 0:  # 이미 전량 체결(발주응답 즉시체결 반영 등) — 중복 통보 무시
+            return order
         total = order.filled_qty + fill.qty
         order.avg_fill_price = (
             (order.avg_fill_price * order.filled_qty + fill.price * fill.qty) / total
