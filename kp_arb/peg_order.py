@@ -2,8 +2,9 @@
 
     python -m kp_arb.peg_order
 
-선택한 호가 단계(N호가)에 지정가를 걸고, 호가가 움직이면 **정정**으로 따라
-옮긴다 (LS는 정정 TR, HL[실계정 주의!]은 modify 액션 — 둘 다 요청 1회).
+선택한 호가 단계(N호가)에 지정가를 걸고, 호가가 움직이면 따라 옮긴다.
+LS는 **정정 TR**(요청 1회), **HL은 정정 금지 — 취소 후 신규**로 옮긴다
+(원자적 modify가 크로싱 시 원주문을 잃어서다. 실계정 주의!).
 체결되면 그 수량만큼 **반대 방향으로 전환**해 계속 추적한다
 (매수→매도→매수→… 무한 반복). Run을 끄면 미체결을 취소하고 멈춘다.
 """
@@ -102,7 +103,16 @@ class PegController:
         try:
             if decision.action is PegAction.PLACE:
                 self.order_id = await system.place(self._intent(decision.price))
-            else:  # AMEND (LS·HL 공통 — HL은 modify 액션)
+            elif self.venue is Venue.HYPERLIQUID:
+                # HL은 어떤 경우에도 정정 금지(원자적 modify가 크로싱 시 원주문 소실) —
+                # 취소 후 신규로 대체. 취소가 성공한 경우에만 신규를 낸다. 취소 중 잔량
+                # 없으면(체결/취소됨) OrderGoneError → 아래 except가 체결 확인으로 이어감.
+                assert self.order_id is not None
+                await system.cancel(self.order_id)
+                self.order_id = None
+                self.order_price = None
+                self.order_id = await system.place(self._intent(decision.price))
+            else:  # LS 정정(정정 TR — 요청 1회)
                 assert self.order_id is not None
                 self.order_id = await system.amend_price(self.order_id, decision.price)
         except RateLimitError:
@@ -118,14 +128,17 @@ class PegController:
             return "거부 — 재시도"
         self.order_price = decision.price
         elapsed_ms = (time.perf_counter() - t0) * 1000
+        # HL의 AMEND는 실제로 취소후신규로 실행되므로 라벨을 구분해 표시한다.
+        label = ("취소후신규" if decision.action is PegAction.AMEND
+                 and self.venue is Venue.HYPERLIQUID else decision.action.value)
         _log.info(
             "%s %s %s %s %d호가: %s @ %s → #%s @ %s (%.0fms)",
-            decision.action.value, self.venue.value, self.underlying.value,
+            label, self.venue.value, self.underlying.value,
             self.side.value, self.level,
             old_id or "-", old_price if old_price is not None else "-",
             self.order_id, decision.price, elapsed_ms,
         )
-        return f"{note}{decision.action.value} @ {decision.price:,.2f} (#{self.order_id})"
+        return f"{note}{label} @ {decision.price:,.2f} (#{self.order_id})"
 
     async def stop(self) -> str:
         """Run 해제: 미체결이면 취소."""

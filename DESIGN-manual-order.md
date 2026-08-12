@@ -251,7 +251,11 @@ HL 웹이나 다른 데서 거래하면 이 화면에 안 잡힌다.
 - **세션 데드존**: 수동 주문은 사람이 판단하므로 데드존/세션 가드로 **막지 않는다**(닫혀 있으면 LS/HL가 거부). 자동 판정 루프(§6.2)와 무관.
 - **WS 건강 경고(Phase 8-6, 확정 2026-08-05 / 표시 위치 개정 2026-08-10)**: WS 끊김/시세 무데이터(N초, env `KP_WS_MAX_IDLE_S` 기본 10초)여도 **수동 주문은 막지 않고 발주하되, 응답 `warnings`에 사유를 싣는다**(사용자 확정: "차단 없이 경고만"). 판정은 순수 함수 `ws_status.order_block_reason`. **표시 위치(개정)**: 이 경고는 **주문창 하단 로그에는 표시하지 않는다** — 그 로그는 **주문 관련(성공/거부/접수)만** 보여준다(주문 성공=검정, 거부·실패=빨강). WS 건강 상태는 **메인창 WS 세션 표**에서 본다(사용자 확정 2026-08-10: HL 주문에 무관한 LS 무데이터 경고가 붙어 거부처럼 보이는 혼동 제거). 코어는 `warnings`를 계속 실어 보내므로 다른 소비자·자동 발주 게이트는 영향 없음. **자동 발주(§6.2, 추후)는 같은 게이트로 하드 차단**(신규 진입 금지 = 데드존 불변식).
 
-- **정정은 LS만(개정 2026-08-11)**: **수동 정정(order_list)은 LS 주문만** 허용한다. HL은 화면에서 차단(선택 시 "정정 불가 — 취소 후 신규"). 이유: HL modify(batchModify)는 **크로싱 정정 시 원주문 취소+새주문 거부로 주문 소실**(always_place=false → 크로싱 Gtc를 ALO 강제, 실측 로그 확인). 사전 크로싱 판정은 시세 지연·레이스로 신뢰 불가라 안 한다. Reduce/Post 옵션 UI 제거. **주의**: peg_order의 HL 자동 페깅은 별개(대기 가격이라 크로싱 드묾, 추후 재검토). 백엔드 `amend_price`/`HLSdkGateway.amend_order`(modify)는 유지(peg 사용).
+- **HL은 어떤 경우에도 정정 금지 — 취소 후 신규(확정 2026-08-12)**: HL modify(batchModify)는 **크로싱 정정 시 원주문 취소+새주문 거부로 주문 소실**(always_place=false → 크로싱 Gtc를 ALO 강제, 실측 로그 확인). 사전 크로싱 판정은 시세 지연·레이스로 신뢰 불가. 그래서 **HL 주문은 수동·peg·전략 어디서도 정정하지 않고 취소 후 신규로 대체**한다. 강제 지점:
+  - **`LiveSystem.amend_price`(유일 정정 라우팅)가 HL을 `HLAmendForbidden`으로 하드 거부** — 어느 경로로 와도 HL modify가 안 나간다(단일 차단점).
+  - **수동(order_list)**: LS만 정정, HL은 화면·코어(manual_amend) 양쪽 차단("정정 불가 — 취소 후 신규"). Reduce/Post 옵션 UI 제거.
+  - **peg_order**: 호가 이동 시 HL은 정정 대신 **취소 후 신규**로 옮긴다(LS는 정정 TR 유지).
+  - 게이트웨이 `HLSdkGateway.amend_order`(modify)는 코드로는 남아 있으나 **시스템에서 도달 불가**(정책상 호출 안 함).
 
 ### 3) 수량 단위
 
@@ -261,7 +265,7 @@ HL 웹이나 다른 데서 거래하면 이 화면에 안 잡힌다.
 
 - `manual_order` {instrument, underlying, side, order_type(=limit), qty, price, reduce_only?, post_only?} → 공매도·라우팅 검증 후 `place`, `order_id`. reduce_only/post_only는 **HL 전용**(LS는 무시).
   **[신규]** 레버리지·마진모드는 **여기서 받지 않는다** — 주문과 별개 액션이라 아래 `manual_leverage` 로 뺀다.
-- `manual_amend` {order_id, price} → `amend_price`(잔량 기준 정정 = 취소+신규).
+- `manual_amend` {order_id, price} → `amend_price`(LS 전용, 잔량 기준 정정). **HL이면 거부**("HL은 정정 미지원 — 취소 후 신규", 코어에서 차단).
 - `manual_cancel` {order_id} → `cancel`.
 - `manual_hl_merge` {underlying, n_sig_figs, mantissa} → `set_hl_aggregation`(HL 호가단위 머지, WS 재구독).
 - `manual_refresh` {} → `refresh_snapshot`(잔고/포지션 재조회 → OrderBook 재동기, '적' 버튼·HTS 외부거래 반영).

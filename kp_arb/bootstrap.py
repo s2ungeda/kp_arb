@@ -97,6 +97,15 @@ def select_near_month_futures(rows: list[dict[str, object]]) -> dict[Underlying,
     return {u: shcode for u, (shcode, _) in select_near_month(rows).items()}
 
 
+class HLAmendForbidden(RuntimeError):
+    """HL 정정 금지 — 취소 후 신규로 대체한다.
+
+    HL의 원자적 modify는 크로싱 시 원주문을 잃을 수 있어(취소는 되고 신규는 거부),
+    어떤 경우에도 HL 주문은 정정하지 않는다(수동·peg·전략 전부). amend_price가 유일한
+    정정 라우팅 지점이라 여기서 HL을 하드 거부하면 어느 경로로 와도 막힌다.
+    """
+
+
 class LiveSystem:
     """조립된 부품(게이트웨이·WS·OrderBook·세션)의 시동/결선/온디맨드 조회."""
 
@@ -356,26 +365,24 @@ class LiveSystem:
         self, order_id: str, price: float, *,
         reduce_only: bool = False, post_only: bool = False,
     ) -> str:
-        """가격 정정 (venue 라우팅) — 새 주문번호를 등록하고 원주문은 취소 처리.
+        """가격 정정 (LS 전용) — 새 주문번호를 등록하고 원주문은 취소 처리.
 
-        LS는 CSPAT00701/CFOAT00200, HL은 modify 액션(취소+신규를 서버에서 한 번에).
-        수량은 **잔량 기준**으로 보낸다 — 부분체결 후 원수량 정정은 거부됨(실측 01442).
-        reduce_only·post_only는 **정정 화면이 명시 전달**한다(HL 전용, 원주문 상속 안 함).
+        **HL은 어떤 경우에도 정정 금지**(원자적 modify가 크로싱 시 원주문 소실) —
+        HL 주문이 오면 HLAmendForbidden으로 거부한다. HL은 취소 후 신규로 대체한다
+        (peg는 그렇게 동작, 수동은 화면·코어에서도 차단). 이 메서드가 유일한 정정 라우팅
+        지점이라 여기서 막으면 어느 경로로 와도 HL modify가 나가지 않는다.
+        LS는 CSPAT00701/CFOAT00200. 수량은 **잔량 기준** — 부분체결 후 원수량 정정 거부(01442).
         """
         order = self.order_book.order(order_id)
         if order is None:
             raise ValueError(f"unknown order {order_id}")
+        if order.intent.venue is not Venue.LS:  # HL 등 — 정정 금지, 취소 후 신규로
+            raise HLAmendForbidden(f"HL 정정 금지 — 취소 후 신규 (order {order_id})")
         qty = order.remaining_qty
         if qty <= 0:
             raise OrderGoneError(f"order {order_id} has no remaining qty")
         try:
-            if order.intent.venue is Venue.LS:
-                new_id = await self._gw.amend_order(order_id, qty=qty, price=price)
-            else:
-                assert self._hl is not None
-                new_id = await self._hl.amend_order(
-                    order_id, qty=qty, price=price,
-                    reduce_only=reduce_only, post_only=post_only)
+            new_id = await self._gw.amend_order(order_id, qty=qty, price=price)
         except Exception as exc:  # 정정 거부/오류도 거래소별 파일에 남긴다(실린 옵션 포함)
             order_log.order_amend_rejected(
                 order.intent.venue, order_id, exc, qty=qty, price=price,

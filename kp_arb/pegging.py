@@ -1,10 +1,10 @@
 """호가 추적(페깅) 주문 판단 — 순수 로직 (주문 테스트 도구용).
 
 선택한 호가 단계(예: 매수 2호가)에 지정가를 걸어 두고, 호가가 움직이면
-**정정**으로 따라 옮긴다. LS는 정정 TR(CSPAT00701 등), HL도 modify 액션이
-있어 두 거래소 모두 요청 한 번으로 처리된다.
-
-이 모듈은 "지금 무엇을 해야 하는가"만 판단한다(주문 실행은 창/시스템 몫).
+따라 옮긴다. 이 모듈은 "지금 무엇을 해야 하는가"만 판단한다(주문 실행은
+창/시스템 몫). AMEND는 '주문을 목표가로 옮겨라'는 추상 판단이고, **실행 방식은
+거래소별로 다르다** — LS는 정정 TR(CSPAT00701 등) 1회, HL은 정정 금지라
+취소 후 신규로 옮긴다(peg_order.step).
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .domain.models import Quote
 class PegAction(StrEnum):
     NONE = "none"    # 그대로 둠 (목표가와 일치)
     PLACE = "place"  # 신규 주문
-    AMEND = "amend"  # 정정 (LS·HL 공통)
+    AMEND = "amend"  # 주문을 목표가로 옮김 — LS는 정정 TR, HL은 취소 후 신규(실행부에서 분기)
     WAIT = "wait"    # 목표가를 알 수 없음 (호가 미수신 등)
 
 

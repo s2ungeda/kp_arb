@@ -5,7 +5,9 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 
-from kp_arb.bootstrap import LiveSystem, select_near_month_futures
+import pytest
+
+from kp_arb.bootstrap import HLAmendForbidden, LiveSystem, select_near_month_futures
 from kp_arb.domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent, Position
 from kp_arb.gateways.ls_ws import LSWebSocketClient, WSClosed
@@ -323,6 +325,29 @@ async def test_place_routes_hl_to_hl_gateway() -> None:
                                          instrument=Instrument.HL_PERP, side=Side.SELL,
                                          qty=0.1, order_type=OrderType.MARKET))
     assert oid.startswith("HL-") and len(hl_gw.placed) == 1
+    await system.wait()
+
+
+async def test_amend_price_forbids_hl() -> None:
+    # HL은 어떤 경우에도 정정 금지 — amend_price(유일 정정 라우팅)가 하드 거부한다.
+    from kp_arb.gateways.hl_ws import HLWebSocketClient
+    from kp_arb.gateways.mock_hl import MockHLGateway
+
+    hl_gw = MockHLGateway()
+    system = LiveSystem(
+        gateway=MockLSGateway(),  # type: ignore[arg-type]
+        order_book=OrderBook(),
+        session=SessionService(),
+        stock_ws=LSWebSocketClient(FakeConnector([])),
+        hl_gateway=hl_gw,
+        hl_ws=HLWebSocketClient(FakeConnector([])),
+    )
+    await system.start()
+    oid = await system.place(OrderIntent(venue=Venue.HYPERLIQUID, underlying=SAMSUNG,
+        instrument=Instrument.HL_PERP, side=Side.SELL, qty=0.1,
+        order_type=OrderType.LIMIT, price=100.0))
+    with pytest.raises(HLAmendForbidden):
+        await system.amend_price(oid, 101.0)
     await system.wait()
 
 
