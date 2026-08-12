@@ -454,6 +454,11 @@ async def _manual_command(
         raw = body.get("price")
         if not order_id or raw is None:
             return _fail(["order_id·price 필요"])
+        # HL 정정 금지(DESIGN-manual-order 2026-08-11 — 크로싱 정정 시 주문 소실). 화면
+        # 차단(order_list)에 더해 코어에서도 방어 — 다른 경로로 들어와도 modify가 안 나간다.
+        target = system.order_book.order(str(order_id))
+        if target is not None and target.intent.venue is Venue.HYPERLIQUID:
+            return _fail(["HL은 정정 미지원 — 취소 후 신규 주문하세요"])
         reduce_only = bool(body.get("reduce_only", False))  # 정정 화면 체크(HL 전용)
         post_only = bool(body.get("post_only", False))
         try:

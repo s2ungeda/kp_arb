@@ -235,6 +235,29 @@ async def test_manual_amend_needs_price() -> None:
     assert not r["ok"] and sys.amended == []
 
 
+async def test_manual_amend_hl_blocked_at_core() -> None:
+    # HL 정정 금지가 화면뿐 아니라 코어에서도 막힌다 — 대상 주문이 HL이면 거부, modify 미발생.
+    ob = OrderBook()
+    ob.track("H1", OrderIntent(venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.HL_PERP, side=Side.SELL, qty=1, price=1000.0))
+    sys = _fake_system(ob)
+    r = await _manual_command(
+        sys, {"cmd": "manual_amend", "order_id": "H1", "price": 1010})
+    assert not r["ok"] and "HL" in r["errors"][0]
+    assert sys.amended == []       # 코어에서 차단 — amend_price 안 불림
+
+
+async def test_manual_amend_ls_still_allowed() -> None:
+    # LS 주문은 정정 허용 — 코어 방어가 HL만 막는다.
+    ob = OrderBook()
+    ob.track("L1", OrderIntent(venue=Venue.LS, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.KR_STOCK, side=Side.SELL, qty=10, price=80000.0))
+    sys = _fake_system(ob)
+    r = await _manual_command(
+        sys, {"cmd": "manual_amend", "order_id": "L1", "price": 80500})
+    assert r["ok"] and sys.amended == [("L1", 80500.0, False, False)]
+
+
 async def test_manual_hl_merge_calls_system() -> None:
     sys = _fake_system(OrderBook())
     r = await _manual_command(sys, {"cmd": "manual_hl_merge",

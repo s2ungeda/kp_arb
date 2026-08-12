@@ -56,6 +56,19 @@ def test_snapshot_keeps_exchange_orders() -> None:
     assert ob.order("EX") is not None
 
 
+def test_snapshot_preserves_orders_of_unreconciled_account() -> None:
+    # 한 계좌 조회 실패(reconcile 목록에서 빠짐) → 그 계좌의 살아있는 미체결은 보존.
+    ob = OrderBook()
+    s = ob.track("S1", intent(instrument=Instrument.KR_STOCK))
+    s.placed_ts = 0.0  # 오래됨(유예 밖)
+    d = ob.track("D1", intent(instrument=Instrument.KR_STOCK_FUTURE))
+    d.placed_ts = 0.0
+    # KR_STOCK만 조회 성공(빈 미체결) — KR_DERIV는 실패라 정리 대상 아님.
+    ob.load_snapshot(open_orders=(), reconcile_accounts={Account.KR_STOCK})
+    assert ob.order("S1") is None      # 조회 성공 계좌 → phantom 정리
+    assert ob.order("D1") is not None   # 조회 실패 계좌 → 보존
+
+
 def test_replace_positions_only_touches_instrument() -> None:
     # 체결 후 HL 포지션만 실측으로 교체 — LS·잔고·주문은 유지, 목록에 없는 HL 종목은 청산.
     ob = OrderBook()
@@ -85,6 +98,53 @@ def test_on_fill_ignores_duplicate_after_full_fill() -> None:
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == -0.1
     ob.on_fill(fill("O1", 0.1, 168.0, fill_id="F2"))  # 중복(같은 체결 재통보) → 무시
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == -0.1  # 초과 안 됨
+
+
+def _hl_intent(side: Side, qty: float) -> OrderIntent:
+    return OrderIntent(venue=Venue.HYPERLIQUID, underlying=SAMSUNG,
+                       instrument=Instrument.HL_PERP, side=side, qty=qty,
+                       order_type=OrderType.LIMIT, price=100.0)
+
+
+def test_place_fill_absorbs_duplicate_userfill_partial() -> None:
+    # 부분 즉시체결: 발주응답 3/5 선반영 → 같은 3을 userFills가 재통보해도 이중 반영 안 됨.
+    ob = OrderBook()
+    ob.track("O1", _hl_intent(Side.BUY, 5))
+    ob.apply_place_fill(fill("O1", 3, 100.0, fill_id="place-O1"))  # 발주응답 선반영
+    assert ob.order("O1").filled_qty == 3
+    assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == 3
+    assert ob.order("O1").status is OrderStatus.PARTIAL
+
+    ob.on_fill(fill("O1", 3, 100.0, fill_id="hl1"))  # 같은 체결 userFills 재통보 → 흡수
+    assert ob.order("O1").filled_qty == 3                            # 6 아님
+    assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == 3   # 이중 반영 안 됨
+    assert ob.order("O1").status is OrderStatus.PARTIAL
+
+    ob.on_fill(fill("O1", 2, 101.0, fill_id="hl2"))  # 잔여 2 진짜 체결
+    assert ob.order("O1").filled_qty == 5
+    assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == 5
+    assert ob.order("O1").status is OrderStatus.FILLED
+
+
+def test_place_fill_absorb_across_split_userfills() -> None:
+    # 선반영 3을 userFills가 2+1로 쪼개 재통보 → 각각 흡수(총 3), 이중 반영 없음.
+    ob = OrderBook()
+    ob.track("O1", _hl_intent(Side.BUY, 5))
+    ob.apply_place_fill(fill("O1", 3, 100.0, fill_id="place-O1"))
+    ob.on_fill(fill("O1", 2, 100.0, fill_id="hl1"))  # 2 흡수(잔여 선반영 1)
+    ob.on_fill(fill("O1", 1, 100.0, fill_id="hl2"))  # 1 흡수(선반영 0)
+    assert ob.order("O1").filled_qty == 3
+    assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == 3
+
+
+def test_place_fill_absorb_partial_when_userfill_batches_more() -> None:
+    # userFills 한 건이 즉시체결분(선반영 3)+잔여 1 = 4를 묶어 오면: 3 흡수, 1만 신규 반영.
+    ob = OrderBook()
+    ob.track("O1", _hl_intent(Side.BUY, 5))
+    ob.apply_place_fill(fill("O1", 3, 100.0, fill_id="place-O1"))
+    ob.on_fill(fill("O1", 4, 100.0, fill_id="hl1"))
+    assert ob.order("O1").filled_qty == 4
+    assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == 4
 
 
 # --- 상태 전이 (이벤트로만) ---

@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -50,6 +50,7 @@ class TrackedOrder:
     avg_fill_price: float = 0.0
     placed_ts: float = 0.0  # 추적 시각(monotonic) — 스냅샷 재조정 유예용
     placed_at: str = ""     # 접수 시각(HH:MM:SS, 표시용) — 주문 리스트 '시각' 칸
+    provisional_filled: float = 0.0  # 발주 응답 선반영 수량 — userFills 재통보 흡수용(HL 즉시체결)
 
     @property
     def is_open(self) -> bool:
@@ -83,8 +84,14 @@ class OrderBook:
         positions: Iterable[Position] = (),
         balances: dict[Account, float] | None = None,
         open_orders: Iterable[TrackedOrder] = (),
+        reconcile_accounts: Collection[Account | None] | None = None,
     ) -> None:
-        """REST 스냅샷으로 상태 초기화. 이후 갱신은 이벤트로만."""
+        """REST 스냅샷으로 상태 초기화. 이후 갱신은 이벤트로만.
+
+        reconcile_accounts: phantom 정리를 적용할 계좌 목록(조회에 성공한 계좌만).
+        None이면 전 계좌 정리(기존 동작). 지정하면 **그 계좌의 주문만** 정리 대상 —
+        조회 실패한 계좌의 살아있는 미체결이 빈 스냅샷 때문에 지워지는 것을 막는다.
+        """
         self._positions.clear()
         for p in positions:
             key = (p.underlying, p.instrument, p.account)
@@ -95,7 +102,12 @@ class OrderBook:
         snapshot = {o.order_id: o for o in open_orders}
         now = time.monotonic()
         for oid in list(self._orders):
-            if oid not in snapshot and now - self._orders[oid].placed_ts >= _SNAPSHOT_GRACE_S:
+            if oid in snapshot:
+                continue
+            order = self._orders[oid]
+            if reconcile_accounts is not None and order.intent.account not in reconcile_accounts:
+                continue  # 조회 실패(또는 미조회) 계좌 — 살아있는 주문 보존
+            if now - order.placed_ts >= _SNAPSHOT_GRACE_S:
                 del self._orders[oid]
         self._orders.update(snapshot)
 
@@ -130,25 +142,58 @@ class OrderBook:
         return order
 
     def on_fill(self, fill: Fill) -> TrackedOrder | None:
-        """체결 이벤트 → 주문 누적·상태 전이 + 포지션·잔고 증분. 미지 주문은 무시(None)."""
+        """체결 이벤트 → 주문 누적·상태 전이 + 포지션·잔고 증분. 미지 주문은 무시(None).
+
+        발주 응답으로 선반영(apply_place_fill)한 즉시체결이 있으면, userFills가 같은
+        체결을 재통보하는 만큼(provisional_filled)을 흡수해 이중 반영을 막는다 —
+        부분 즉시체결(잔량이 남는 경우)도 안전.
+        """
         order = self._orders.get(fill.order_id)
         if order is None:
             return None
-        if order.remaining_qty <= 0:  # 이미 전량 체결(발주응답 즉시체결 반영 등) — 중복 통보 무시
+        qty = fill.qty
+        if order.provisional_filled > 0:  # 발주응답 선반영분 — userFills 재통보 흡수
+            absorbed = min(qty, order.provisional_filled)
+            order.provisional_filled -= absorbed
+            qty -= absorbed
+        if qty <= 0:  # 전량 흡수(선반영과 중복) — 무시
             return order
-        total = order.filled_qty + fill.qty
+        if order.remaining_qty <= 0:  # 이미 전량 체결 뒤 중복 통보 — 무시
+            return order
+        self._apply_fill_core(order, qty, fill.price, fill.fee, fill.fill_id)
+        return order
+
+    def apply_place_fill(self, fill: Fill) -> TrackedOrder | None:
+        """발주 응답의 즉시체결을 선반영(HL). 이후 userFills 재통보는 그 수량만큼 흡수돼
+        이중 반영되지 않는다 — userFills를 놓쳐도 주문·포지션이 정합(미체결 잔류 방지).
+
+        체결내역(deque) 기록·엔진 통지는 userFills가 전담하므로 여기선 호출하지 않는다.
+        """
+        order = self._orders.get(fill.order_id)
+        if order is None:
+            return None
+        applied = min(fill.qty, order.remaining_qty)  # 주문수량 초과분은 무시
+        if applied <= 0:
+            return order
+        self._apply_fill_core(order, applied, fill.price, fill.fee, fill.fill_id)
+        order.provisional_filled += applied
+        return order
+
+    def _apply_fill_core(self, order: TrackedOrder, qty: float, price: float,
+                         fee: float, fill_id: str) -> None:
+        """누적·상태 전이 + 포지션·잔고 반영(수량 명시). on_fill/apply_place_fill 공용."""
+        total = order.filled_qty + qty
         order.avg_fill_price = (
-            (order.avg_fill_price * order.filled_qty + fill.price * fill.qty) / total
+            (order.avg_fill_price * order.filled_qty + price * qty) / total
         )
         order.filled_qty = total
         order.status = (
             OrderStatus.FILLED if total >= order.intent.qty else OrderStatus.PARTIAL
         )
-        self._apply_fill_to_position(order.intent, fill)
-        self._apply_fill_to_balance(order.intent, fill)
+        self._apply_fill_to_position(order.intent, qty, price)
+        self._apply_fill_to_balance(order.intent, qty, price, fee)
         order_log.order_filled(  # 거래소별 파일에 체결통보(부분/전량·누적) 기록
-            order.intent, fill.qty, fill.price, fill.fill_id, order.filled_qty)
-        return order
+            order.intent, qty, price, fill_id, order.filled_qty)
 
     def on_cancel(self, order_id: str) -> TrackedOrder | None:
         order = self._orders.get(order_id)
@@ -176,32 +221,36 @@ class OrderBook:
 
     # --- 증분 계산 (순수) ---
 
-    def _apply_fill_to_position(self, intent: OrderIntent, fill: Fill) -> None:
+    def _apply_fill_to_position(
+        self, intent: OrderIntent, qty: float, price: float
+    ) -> None:
         key = (intent.underlying, intent.instrument, intent.account)
         pos = self._positions.setdefault(key, _Pos())
-        signed = fill.qty if intent.side is Side.BUY else -fill.qty
+        signed = qty if intent.side is Side.BUY else -qty
         new_qty = pos.qty + signed
         if pos.qty == 0 or (pos.qty > 0) == (signed > 0):
             # 신규 또는 같은 방향 증가 → 평단 가중평균.
             pos.avg_price = (
-                (abs(pos.qty) * pos.avg_price + fill.qty * fill.price) / abs(new_qty)
+                (abs(pos.qty) * pos.avg_price + qty * price) / abs(new_qty)
             )
         elif (new_qty > 0) != (pos.qty > 0) and new_qty != 0:
-            pos.avg_price = fill.price  # 방향 반전 → 남은 수량의 평단 = 체결가
+            pos.avg_price = price  # 방향 반전 → 남은 수량의 평단 = 체결가
         elif new_qty == 0:
             pos.avg_price = 0.0  # 청산
         # 상계(방향 유지·감소)는 평단 유지.
         pos.qty = new_qty
 
-    def _apply_fill_to_balance(self, intent: OrderIntent, fill: Fill) -> None:
+    def _apply_fill_to_balance(
+        self, intent: OrderIntent, qty: float, price: float, fee: float
+    ) -> None:
         # KR 계좌 현금 증분(매수 -금액 / 매도 +금액, 수수료 차감).
         # HL(계좌 없음)은 마진 모델이라 제외.
         if intent.account is None:
             return
-        amount = fill.qty * fill.price
+        amount = qty * price
         delta = -amount if intent.side is Side.BUY else amount
         self._balances[intent.account] = (
-            self._balances.get(intent.account, 0.0) + delta - fill.fee
+            self._balances.get(intent.account, 0.0) + delta - fee
         )
 
     # --- 실시간 조회 ---

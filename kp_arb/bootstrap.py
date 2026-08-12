@@ -187,6 +187,7 @@ class LiveSystem:
         positions: list[Position] = []
         balances: dict[Account, float] = {}
         open_orders: list[TrackedOrder] = []
+        reconciled: set[Account | None] = set()  # 조회 성공한 계좌만 phantom 정리 대상
         for account in (Account.KR_STOCK, Account.KR_DERIV):
             # 실계좌 환경 편차(선물 계좌 없음, 형식 거부 등)로 한 계좌 조회가
             # 실패해도 시동을 멈추지 않는다 — 해당 계좌만 빼고 계속.
@@ -194,6 +195,7 @@ class LiveSystem:
                 balances[account] = await self._gw.get_balance(account)
                 positions.extend(await self._gw.get_positions(account))
                 open_orders.extend(await self._gw.get_open_orders(account))
+                reconciled.add(account)
             except RestError:
                 logging.getLogger("kp_arb.bootstrap").warning(
                     "%s 계좌 스냅샷 실패 — 이 계좌 없이 계속", account.value, exc_info=True
@@ -203,14 +205,17 @@ class LiveSystem:
             hl_pos, self.hl_detail = await self._hl.get_positions_and_details()  # 1회 조회
             positions.extend(hl_pos)
             open_orders.extend(await self._hl.get_open_orders())
+            reconciled.add(None)  # HL 주문(계좌 없음) 조회 성공
             # 미보유 종목은 clearinghouse가 레버리지를 안 줘 캡션이 기본값(5x)에 멈춘다 —
             # activeAssetData로 계좌 설정 레버리지를 읽어 보정(보유 종목 값은 유지). §D
             for u, lev in (await self._hl.get_leverage_settings()).items():
                 d = self.hl_detail.setdefault(u, {})
                 d.setdefault("leverage", lev["leverage"])
                 d.setdefault("leverage_cross", lev["leverage_cross"])
+        # 조회 실패 계좌의 살아있는 미체결이 빈 스냅샷 탓에 지워지지 않도록 성공 계좌만 정리.
         self.order_book.load_snapshot(
-            positions=positions, balances=balances, open_orders=open_orders
+            positions=positions, balances=balances, open_orders=open_orders,
+            reconcile_accounts=reconciled,
         )
 
     def _record_fill(self, fill: Fill) -> None:
@@ -340,10 +345,10 @@ class LiveSystem:
             sz, px = place_fill
             fill = Fill(fill_id=f"place-{order_id}", order_id=order_id,
                         qty=sz, price=px, ts=0.0)
-            # 주문 체결처리 + 포지션만 반영(미체결 잔류 방지). **체결내역 기록·엔진 통지는
-            # userFills가 전담** — 여기서 on_fill 핸들러를 부르면 이중 기록된다(place-체결 +
-            # userFills). clearinghouse 재조회는 안전(중복 아님)이라 트리거해 포지션 정합.
-            self.order_book.on_fill(fill)
+            # 주문 체결처리 + 포지션만 반영(미체결 잔류 방지). apply_place_fill은 선반영
+            # 수량을 기록해 뒤이어 오는 userFills 재통보를 그 수량만큼 흡수한다(부분 즉시
+            # 체결도 이중 반영 안 됨). 체결내역 기록·엔진 통지는 userFills가 전담.
+            self.order_book.apply_place_fill(fill)
             self._schedule_hl_refresh()
         return order_id
 
