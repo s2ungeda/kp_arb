@@ -242,18 +242,19 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # 우: 잔고 10줄 — 잔고·PNL은 흰 박스(중요), 나머지는 그냥. 라벨 2축소, 값 볼드.
     bal_val: dict[str, tk.Label] = {}
-    _BAL_ORDER = ("잔고", "PNL", "진입금액", "진입가", "Liq_Prc",
+    _BAL_ORDER = ("잔고", "PNL", "진입가", "평가액($)", "Liq_Prc",
                   "Margin", "Funding", "Oracle", "FundRate", "CountDown")
     # 디바운스 조회(clearinghouse) 항목 — 체결 즉시 계산이 안 돼 500ms 조회로 갱신. 라벨을
     # 회색으로 구분(나머지는 체결 이벤트·시세로 빠르게 갱신).
     _QUERY_FIELDS = {"Liq_Prc", "Margin", "Funding"}
     _tfont = ("Malgun Gothic", 9)
+    _BAL_HL_BG = "#ffe680"  # 잔고·PNL 강조 바탕(노란색) — 색글자(빨강/파랑/검정)와 대비
     for i, name in enumerate(_BAL_ORDER):
         important = name in ("잔고", "PNL")
         if important:
-            cell = tk.Frame(rbal, bg="white", highlightbackground="gray50",
+            cell = tk.Frame(rbal, bg=_BAL_HL_BG, highlightbackground="gray50",
                             highlightthickness=1)
-            cbg = "white"
+            cbg = _BAL_HL_BG
         else:
             cell = tk.Frame(rbal)
             cbg = cell.cget("bg")
@@ -364,9 +365,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             "reduce_only": reduce_var.get(), "post_only": post_var.get(),
         }, "주문", f"{side_kr} {price} {qty:g}")
 
-    # 델파이 원본(UNormalOrderEx) 기능: 호가모드는 **클릭한 호가 레벨**을 기준가로 잡고
-    # ±(틱 스핀 × 호가단위)를 더한다(매수 +, 매도 −). 최우선호가 자동추적 아님.
-    _hoga_base: dict[str, float | None] = {"price": None}  # 마지막 클릭한 호가 레벨(기준가)
+    # 델파이 원본(UNormalOrderEx.SetPrice) 기능: 호가모드는 **클릭한 호가 레벨(측+번호)**을
+    # 기억하고, 그 레벨의 **현재가** + ±(틱 스핀 × 호가단위)를 단가에 넣는다(매수 +, 매도 −).
+    # 시세가 갱신되면 그 레벨의 현재가가 바뀌므로 단가도 매 갱신 재계산된다(레벨 추적).
+    _hoga_lvl: dict[str, Any] = {"side": None, "idx": None}  # 추적 레벨(없으면 side=None)
 
     def _hoga_unit() -> tuple[float, int]:
         # 오프셋 단위 = 선택 호가단위(틱). 없으면 종목 최소틱.
@@ -374,13 +376,20 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         try:
             return float(ts), (len(ts.split(".")[1]) if "." in ts else 0)
         except (ValueError, IndexError):
-            dec = _hl_decimals(_hoga_base["price"] or _ref_price(active_symbol()))
+            dec = _hl_decimals(_ref_price(active_symbol()))
             return 10.0 ** (-dec), dec
 
     def _apply_hoga_offset() -> None:
-        base = _hoga_base["price"]
-        if base is None:
+        # 추적 중인 레벨의 **현재가**를 기준으로 ±(틱 스핀 × 호가단위) 적용. 레벨이 없거나
+        # 사라졌으면 그대로 둔다. 매 시세 갱신(refresh)에서도 불려 단가가 레벨을 따라간다.
+        side = _hoga_lvl["side"]
+        idx = _hoga_lvl["idx"]
+        if side is None or idx is None:
             return
+        levels = list((active_symbol().get("asks" if side == "ask" else "bids")) or [])
+        if idx >= len(levels):
+            return
+        base = float(levels[idx][0])
         tick, tdec = _hoga_unit()
         sign = 1 if side_var.get() == "buy" else -1  # 매수 +, 매도 − (델파이 SetPrice)
         price = base + sign * tick_var.get() * tick
@@ -394,13 +403,24 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         vals = hoga.item(sel[0], "values")  # (가격, 건수, 잔량) — 가격은 0번
         if len(vals) < 1 or vals[0] in ("", "-"):
             return
-        base = float(str(vals[0]).replace(",", ""))
         if mode_var.get() == "price":
-            e_price.delete(0, "end")           # 가격모드: 클릭가 그대로(틱 없음)
+            _hoga_lvl["side"] = None            # 가격모드: 추적 안 함 — 클릭가 그대로
+            e_price.delete(0, "end")
             e_price.insert(0, str(vals[0]).replace(",", ""))
+            return
+        # 호가모드: 클릭 행이 매도(ask)/매수(bid) 몇 번째 레벨인지 기억(가격값 아님).
+        # 표시는 위=역순 asks, 아래=bids 순 → 행번호로 측·index 환산.
+        children = hoga.get_children()
+        try:
+            row = children.index(sel[0])
+        except ValueError:
+            return
+        n_ask = int(state_box.get("_n_ask") or 0)
+        if row < n_ask:
+            _hoga_lvl.update(side="ask", idx=n_ask - 1 - row)  # 위쪽은 asks 역순
         else:
-            _hoga_base["price"] = base          # 호가모드: 이 레벨을 기준으로 ± 틱
-            _apply_hoga_offset()
+            _hoga_lvl.update(side="bid", idx=row - n_ask)
+        _apply_hoga_offset()
 
     hoga.bind("<<TreeviewSelect>>", on_hoga_click)
 
@@ -596,11 +616,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             bal_val["잔고"].config(text=_fmt_qty(pos), fg=_sign_color(pos))
             pnl = sym.get("pnl")        # PNL: 이익 빨강 / 손실 파랑 / 0 검정
             bal_val["PNL"].config(text=_fmt(pnl, 1), fg=_sign_color(pnl))
-            bal_val["진입금액"].config(text=_fmt(sym.get("eval")))
+            bal_val["평가액($)"].config(text=_fmt(sym.get("eval")))
             bal_val["진입가"].config(text=_fmt_px(sym.get("avg_price"), 3))
             bal_val["Liq_Prc"].config(text=_fmt_px(sym.get("liq"), dec))
             bal_val["Margin"].config(text=_fmt(sym.get("margin"), 0))
-            bal_val["Funding"].config(text=_fmt(sym.get("cum_funding"), 0))
+            # Funding: HL cumFunding.sinceOpen은 '지불한 펀딩'(+ = 지불/비용)이라 사이트
+            # "Funding"(손익 관점, 지불 = −)과 부호가 반대 → 뒤집어 맞춘다(= −cumFunding).
+            # 실측·문서로 확인(clearinghouseState 소스는 맞음, 규약만 반대). 사이트처럼 2자리.
+            cf = sym.get("cum_funding")
+            bal_val["Funding"].config(text=_fmt(-cf if cf is not None else None, 2))
             bal_val["Oracle"].config(text=_fmt_px(sym.get("oracle"), dec))
             rate = sym.get("funding_rate")
             bal_val["FundRate"].config(
@@ -614,7 +638,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 btn_lev.config(text=f"{'Cross' if cross else 'Isolated'}  {int(lev)}x")
                 if active["underlying"]:
                     lev_applied[active["underlying"]] = {"leverage": int(lev), "cross": cross}
-            # 호가모드 가격은 클릭·틱 스핀 때만 산출(자동추적 안 함 — 델파이 원본 기능)
+            # 호가모드 단가는 추적 레벨의 현재가로 매 갱신 재계산(_fill_hoga 뒤 _apply_hoga_offset)
             # 내 미체결이 있는 호가에 "(건수)" 표시 — 활성 종목 미체결을 가격별 집계
             my_ords: dict[str, int] = {}
             for o in (state_box["data"] or {}).get("open_orders") or []:
@@ -623,6 +647,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     ps = _fmt_px(o.get("price"), dec)
                     my_ords[ps] = my_ords.get(ps, 0) + 1
             _fill_hoga(sym, dec, my_ords)
+            if mode_var.get() == "hoga":
+                _apply_hoga_offset()  # 추적 중인 호가 레벨의 현재가로 단가 재계산(따라감)
         except Exception:  # noqa: BLE001 - 갱신 오류로 창이 죽지 않게 (버벅임 방지)
             pass
         _reschedule(refresh, 500)  # 호가창 갱신 주기 500ms (§1-4)
@@ -630,6 +656,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def _fill_hoga(sym: dict[str, Any], dec: int, my_ords: dict[str, int]) -> None:
         asks = list(sym.get("asks") or [])[:5]  # 5호가 (§1-4)
         bids = list(sym.get("bids") or [])[:5]
+        state_box["_n_ask"] = len(asks)  # 위쪽 ask 행 수 — 호가클릭 행→레벨 환산 기준
         last = sym.get("last")
         last_s = _fmt_px(last, dec) if last is not None else None
 
