@@ -39,7 +39,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
     root.title("주문 리스트 (미체결·취소·정정)")
-    root.resizable(False, False)
+    root.resizable(True, True)  # 창 크기 조절 허용 — 목록이 세로로 늘어남(win_state가 크기 저장)
     win_state.attach(root, "order_list")
     root.option_add("*Font", ("Malgun Gothic", 9))
 
@@ -71,15 +71,25 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     filt = tk.Frame(root)
     filt.pack(fill="x", padx=6, pady=(6, 0))
     tk.Label(filt, text="표시").pack(side="left")
-    show_orders = tk.BooleanVar(value=True)   # 미체결 주문
-    show_fills = tk.BooleanVar(value=True)     # 체결
-    show_cancels = tk.BooleanVar(value=True)   # 취소
+    # 표시 필터 — 마지막 값 복원, 토글 때마다 저장(win_fields.json). 없으면 전부 켬.
+    _saved = win_state.saved_fields("order_list")
+    show_orders = tk.BooleanVar(value=bool(_saved.get("show_orders", True)))   # 미체결 주문
+    show_fills = tk.BooleanVar(value=bool(_saved.get("show_fills", True)))      # 체결
+    show_cancels = tk.BooleanVar(value=bool(_saved.get("show_cancels", True)))  # 취소
+
+    def _on_filter() -> None:
+        win_state.save_fields("order_list", {
+            "show_orders": show_orders.get(),
+            "show_fills": show_fills.get(),
+            "show_cancels": show_cancels.get()})
+        _rerender()
+
     tk.Checkbutton(filt, text="주문", variable=show_orders,
-                   command=lambda: _rerender()).pack(side="left")
+                   command=_on_filter).pack(side="left")
     tk.Checkbutton(filt, text="체결", variable=show_fills,
-                   command=lambda: _rerender()).pack(side="left")
+                   command=_on_filter).pack(side="left")
     tk.Checkbutton(filt, text="취소", variable=show_cancels,
-                   command=lambda: _rerender()).pack(side="left")
+                   command=_on_filter).pack(side="left")
 
     # 구분='주문'(미체결)/'체결' — 상태(accepted 등)와 헷갈리지 않게 '주문'으로. 상태는 한글.
     tree = ttk.Treeview(
@@ -95,7 +105,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tree.column("side", anchor="center")
     tree.column("time", anchor="center")
     # 전부 검은색(사용자 확정) — 매수/매도는 '매매' 칸 텍스트로만 구분(색 없음).
-    tree.pack(fill="x", padx=6, pady=(2, 2))
+    tree.pack(fill="both", expand=True, padx=6, pady=(2, 2))  # 창 크기 따라 세로로 확장
 
     status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
 
@@ -246,6 +256,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def _rerender() -> None:
         state_box["_sig"] = None  # 필터 바뀜 → 강제 재그림
         _render()
+
+    # 최소 크기 — 가로는 컬럼 전체 폭, 세로는 하단(버튼·상태바) 안 잘릴 만큼.
+    root.update_idletasks()
+    root.minsize(root.winfo_reqwidth(), 220)
 
     drain_results()
     refresh()
