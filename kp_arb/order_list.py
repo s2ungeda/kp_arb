@@ -3,12 +3,17 @@
 전체 미체결 주문(HL·LS 공통)을 표로 보고 **취소·정정**한다. 코어 명령
 manual_cancel/manual_amend 사용(주문창과 별도 화면). 화면 스레드는 네트워크 금지 —
 전송·폴링은 뒷단 스레드 + 큐, 화면은 저장된 결과만 after()로 읽는다.
+
+표는 ttk.Treeview가 아니라 **Label 그리드**(스크롤 캔버스) — 셀 단위 색을 주려고. 지금은
+'매매' 칸만 매수=빨강/매도=파랑, 나머지는 검정. 스타일은 ui_theme 토큰(DESIGN-ui.md).
 """
 from __future__ import annotations
 
 import queue
-from typing import Any
+from collections.abc import Callable
+from typing import Any, cast
 
+from . import ui_theme as T
 from . import win_state
 from .core_client import core_request, watch_parent_exit
 from .order_hl import _fmt_px, _fmt_qty
@@ -28,6 +33,17 @@ def _sym(underlying: object, instrument: str) -> str:
 _ST_KR = {"new": "신규", "accepted": "접수", "partial": "부분", "filled": "체결",
           "cancelled": "취소", "rejected": "거부"}
 
+# 표 컬럼: (제목, 최소폭px, 정렬). '매매'(index 3)만 색을 준다.
+_COLS: tuple[tuple[str, int, str], ...] = (
+    ("구분", 44, "center"), ("거래소", 42, "center"), ("종목", 92, "w"),
+    ("매매", 44, "center"), ("수량", 58, "e"), ("잔량", 58, "e"),
+    ("가격", 84, "e"), ("상태", 52, "e"), ("시각", 72, "center"))
+_SIDE_COL = 3  # 색을 주는 유일한 칸
+_NORM_BG = "white"
+_SEL_BG = "#cce5ff"   # 선택 행 바탕
+_HDR_BG = "#f0f0f0"   # 헤더 바탕(연회색)
+_GRID_LINE = "#c8c8c8"  # 셀 사이 1px 구분선 — 프레임 bg가 틈으로 비침(시세 모니터와 동일)
+
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
     """주문 리스트 창 실행."""
@@ -39,9 +55,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
     root.title("주문 리스트 (미체결·취소·정정)")
-    root.resizable(True, True)  # 창 크기 조절 허용 — 목록이 세로로 늘어남(win_state가 크기 저장)
+    root.resizable(True, True)  # 크기 조절 — 표 행만 확장(root.rowconfigure weight)
     win_state.attach(root, "order_list")
-    root.option_add("*Font", ("Malgun Gothic", 9))
+    T.apply_base(root)
 
     # --- 명령 전송: 큐 → 전송 스레드 → 결과 큐 → 화면 루프 ---
     jobs: queue.Queue[tuple[dict[str, Any], str]] = queue.Queue()
@@ -67,15 +83,18 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     threading.Thread(target=poller, daemon=True).start()
 
-    # ===== UI (접수·체결 한 표 + 유형 필터) =====
+    # ===== 레이아웃 (grid: 표 행[1]만 세로 확장, 나머지 고정) =====
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(1, weight=1)
+
+    # --- 유형 필터 (row 0) ---
     filt = tk.Frame(root)
-    filt.pack(fill="x", padx=6, pady=(6, 0))
+    filt.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
     tk.Label(filt, text="표시").pack(side="left")
-    # 표시 필터 — 마지막 값 복원, 토글 때마다 저장(win_fields.json). 없으면 전부 켬.
-    _saved = win_state.saved_fields("order_list")
-    show_orders = tk.BooleanVar(value=bool(_saved.get("show_orders", True)))   # 미체결 주문
-    show_fills = tk.BooleanVar(value=bool(_saved.get("show_fills", True)))      # 체결
-    show_cancels = tk.BooleanVar(value=bool(_saved.get("show_cancels", True)))  # 취소
+    _saved = win_state.saved_fields("order_list")  # 마지막 값 복원(없으면 전부 켬)
+    show_orders = tk.BooleanVar(value=bool(_saved.get("show_orders", True)))
+    show_fills = tk.BooleanVar(value=bool(_saved.get("show_fills", True)))
+    show_cancels = tk.BooleanVar(value=bool(_saved.get("show_cancels", True)))
 
     def _on_filter() -> None:
         win_state.save_fields("order_list", {
@@ -91,33 +110,79 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Checkbutton(filt, text="취소", variable=show_cancels,
                    command=_on_filter).pack(side="left")
 
-    # 구분='주문'(미체결)/'체결' — 상태(accepted 등)와 헷갈리지 않게 '주문'으로. 상태는 한글.
-    tree = ttk.Treeview(
-        root, columns=("kind", "ex", "sym", "side", "qty", "rem", "price", "st", "time"),
-        show="headings", height=16, selectmode="browse")
-    for c, t, w in (("kind", "구분", 44), ("ex", "거래소", 42), ("sym", "종목", 92),
-                    ("side", "매매", 44), ("qty", "수량", 58), ("rem", "잔량", 58),
-                    ("price", "가격", 84), ("st", "상태", 52), ("time", "시각", 72)):
-        tree.heading(c, text=t)
-        tree.column(c, width=w, anchor="e")
-    tree.column("kind", anchor="center")
-    tree.column("ex", anchor="center")
-    tree.column("side", anchor="center")
-    tree.column("time", anchor="center")
-    # 전부 검은색(사용자 확정) — 매수/매도는 '매매' 칸 텍스트로만 구분(색 없음).
-    tree.pack(fill="both", expand=True, padx=6, pady=(2, 2))  # 창 크기 따라 세로로 확장
+    # --- 표: Label 그리드 + 스크롤 캔버스 (row 1, 확장) ---
+    table = tk.Frame(root)
+    table.grid(row=1, column=0, sticky="nsew", padx=6, pady=(2, 2))
+    canvas = tk.Canvas(table, highlightthickness=0, bg=_NORM_BG)
+    vsb = ttk.Scrollbar(table, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=vsb.set)
+    vsb.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    grid = tk.Frame(canvas, bg=_GRID_LINE)  # 이 회색이 셀 틈(1px)으로 비쳐 구분선이 됨
+    _gwin = canvas.create_window((0, 0), window=grid, anchor="nw")
+    grid.bind("<Configure>",
+              lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>",
+                lambda e: canvas.itemconfigure(_gwin, width=e.width))  # 폭 채움
+    canvas.bind_all("<MouseWheel>",
+                    lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+    for c, (title, w, _a) in enumerate(_COLS):
+        # weight → 창을 넓히면 컬럼(셀)도 폭에 비례해 늘어남. minsize는 최소폭.
+        grid.columnconfigure(c, minsize=w, weight=w)
+        tk.Label(grid, text=title, font=T.FONT_LABEL, bg=_HDR_BG).grid(
+            row=0, column=c, sticky="nsew", padx=(0, 1), pady=(0, 1))  # 1px 틈=구분선
 
-    status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
+    cells: list[list[tk.Label]] = []          # 재사용 행 풀 — cells[r] = 9개 Label
+    row_iid: list[str] = []                    # 각 행의 현재 iid(주문번호/__체결·__취소)
+    row_vals: dict[str, tuple[Any, ...]] = {}  # iid → 값 튜플(정정/선택 편의용)
+    sel: dict[str, str | None] = {"iid": None}
+
+    def _highlight() -> None:
+        nvis = int(state_box.get("_nvis") or 0)
+        for r in range(nvis):
+            bg = _SEL_BG if sel["iid"] and row_iid[r] == sel["iid"] else _NORM_BG
+            for lbl in cells[r]:
+                lbl.configure(bg=bg)
+
+    def _fill_price_on_select() -> None:
+        # 미체결 선택 시 정정가 칸이 **비어 있을 때만** 그 가격을 채운다(입력 보존).
+        iid = sel["iid"]
+        if not iid or iid.startswith("__") or e_price.get().strip():
+            return
+        vals = row_vals.get(iid)
+        if vals and len(vals) >= 7 and vals[6] not in ("", "-"):
+            e_price.delete(0, "end")
+            e_price.insert(0, str(vals[6]).replace(",", ""))
+
+    def _select_row(r: int) -> None:
+        if r < len(row_iid) and row_iid[r]:
+            sel["iid"] = row_iid[r]
+            _highlight()
+            _fill_price_on_select()
+
+    def _clicker(i: int) -> Callable[[Any], None]:
+        return lambda _e: _select_row(i)  # 행 index 고정 — 재사용 행이라 클릭 시 현재 iid
+
+    def _ensure_rows(n: int) -> None:
+        while len(cells) < n:
+            rr = len(cells)
+            labels: list[tk.Label] = []
+            for c, (_t, _w, a) in enumerate(_COLS):
+                lbl = tk.Label(grid, font=T.FONT_LABEL, bg=_NORM_BG,
+                               anchor=cast(Any, a), padx=3)
+                lbl.grid(row=rr + 1, column=c, sticky="nsew",  # +1: 0행은 헤더
+                         padx=(0, 1), pady=(0, 1))  # 1px 회색 구분선(프레임 bg 비침)
+                lbl.bind("<Button-1>", _clicker(rr))
+                labels.append(lbl)
+            cells.append(labels)
+            row_iid.append("")
 
     def set_status(text: str, err: bool = False) -> None:
-        status.config(text=text[:90], fg="#8b0000" if err else "black")
+        status.config(text=text[:90], fg=T.C_ERR if err else T.C_ZERO)
 
     def _selected_oid() -> str | None:
-        sel = tree.selection()
-        if not sel:
-            return None
-        iid = sel[0]
-        return None if iid.startswith("__") else iid  # 체결·취소 행은 취소/정정 대상 아님
+        iid = sel["iid"]
+        return None if not iid or iid.startswith("__") else iid  # 체결·취소행 제외
 
     def do_cancel() -> None:
         oid = _selected_oid()
@@ -127,13 +192,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         send({"cmd": "manual_cancel", "order_id": oid}, "취소")
 
     def do_amend() -> None:
-        sel = tree.selection()
         oid = _selected_oid()
         if oid is None:
             set_status("정정할 미체결 주문을 선택하세요", err=True)
             return
-        # HL은 정정 미지원(크로싱 시 원주문 소실 위험) — LS만 정정. 거래소 열로 판별.
-        if str(tree.item(sel[0], "values")[1]) == "HL":
+        # HL은 정정 미지원(크로싱 시 원주문 소실 위험) — LS만 정정. 거래소 칸으로 판별.
+        vals = row_vals.get(oid)
+        if vals and str(vals[1]) == "HL":
             set_status("정정 불가 — HL은 정정 미지원(취소 후 신규 주문)", err=True)
             return
         price = e_price.get().strip()
@@ -147,32 +212,19 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             return
         send({"cmd": "manual_amend", "order_id": oid, "price": new_px}, "정정")
 
-    # 정정가 입력 + 정정/취소 버튼 (LS만 정정 — HL은 미지원)
+    # --- 정정가 입력 + 버튼 (row 2) ---
     ctrl = tk.Frame(root)
-    ctrl.pack(fill="x", padx=6, pady=(0, 2))
+    ctrl.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 2))
     tk.Label(ctrl, text="정정가").pack(side="left")
-    e_price = tk.Entry(ctrl, width=10, justify="right")
+    e_price = tk.Entry(ctrl, width=10, justify="right", font=T.FONT_NUM)
     e_price.pack(side="left", padx=(2, 8))
     tk.Button(ctrl, text="선택 정정", command=do_amend).pack(side="left")
     tk.Button(ctrl, text="선택 취소", command=do_cancel).pack(side="left", padx=4)
-    tk.Label(ctrl, text="(LS 만 정정 가능)", fg="gray40").pack(side="left", padx=(6, 0))
+    tk.Label(ctrl, text="(LS 만 정정 가능)", fg=T.C_MUTED).pack(side="left", padx=(6, 0))
 
-    status.pack(fill="x", padx=6, pady=(2, 6))
-
-    # 미체결 선택 시, 정정가 칸이 **비어 있을 때만** 현재가를 채운다(편의). 이미 입력한
-    # 값이 있으면 덮지 않는다 — 가격 먼저 치고 주문을 골라도 입력이 안 날아가게.
-    def on_select(_e: Any) -> None:
-        if e_price.get().strip():
-            return
-        sel = tree.selection()
-        if not sel or sel[0].startswith("__"):
-            return
-        vals = tree.item(sel[0], "values")  # (구분,거래소,종목,매매,수량,잔량,가격,상태,시각)
-        if len(vals) >= 7 and vals[6] not in ("", "-"):
-            e_price.delete(0, "end")
-            e_price.insert(0, str(vals[6]).replace(",", ""))
-
-    tree.bind("<<TreeviewSelect>>", on_select)
+    # --- 상태바 (row 3, 맨 아래) ---
+    status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
+    status.grid(row=3, column=0, sticky="ew", padx=6, pady=(2, 6))
 
     # ===== 화면 갱신 (네트워크 없음 — 폴링 결과만 읽어 그림) =====
     def _reschedule(fn: Any, ms: int) -> None:
@@ -205,20 +257,20 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         _reschedule(refresh, 400)
 
     def _rows() -> list[tuple[str, str, tuple[Any, ...]]]:
-        # (iid, tag, 값) — 필터(주문/체결)로 골라 한 표에. 주문(미체결) 먼저, 그다음 체결.
-        # 상태·시각은 별 칸. 주문=상태+잔량(시각 없음) / 체결=시각(상태 없음).
+        # (iid, side, 값9) — 필터로 골라 한 표에. 주문(미체결)→체결→취소 순.
+        # 상태·시각은 별 칸. 주문=상태+잔량(시각 없음) / 체결·취소=시각.
         data = state_box["data"] or {}
         out: list[tuple[str, str, tuple[Any, ...]]] = []
         if show_orders.get():
             for o in data.get("open_orders") or []:
                 buy = o.get("side") == "buy"
                 inst = str(o.get("instrument"))
-                stk = _ST_KR.get(str(o.get("status")), o.get("status"))  # 상태만(잔량 별 칸)
+                stk = _ST_KR.get(str(o.get("status")), o.get("status"))
                 out.append((str(o.get("order_id")), "buy" if buy else "sell",
                             ("주문", _venue(inst), _sym(o.get("underlying"), inst),
                              "매수" if buy else "매도",
                              _fmt_qty(o.get("qty")), _fmt_qty(o.get("remaining")),
-                             _fmt_px(o.get("price")), stk, o.get("time", ""))))  # 접수시각
+                             _fmt_px(o.get("price")), stk, o.get("time", ""))))
         if show_fills.get():
             for i, f in enumerate(data.get("fills") or []):
                 buy = f.get("side") == "buy"
@@ -226,8 +278,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 out.append((f"__fill{i}", "buy" if buy else "sell",
                             ("체결", _venue(inst), _sym(f.get("underlying"), inst),
                              "매수" if buy else "매도",
-                             _fmt_qty(f.get("qty")), "",  # 체결량=수량, 잔량 없음
-                             _fmt_px(f.get("price")), "", f.get("time"))))  # 체결시각
+                             _fmt_qty(f.get("qty")), "",
+                             _fmt_px(f.get("price")), "", f.get("time"))))
         if show_cancels.get():
             for i, c in enumerate(data.get("cancels") or []):
                 buy = c.get("side") == "buy"
@@ -236,30 +288,41 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                             ("취소", _venue(inst), _sym(c.get("underlying"), inst),
                              "매수" if buy else "매도",
                              _fmt_qty(c.get("qty")), "",
-                             _fmt_px(c.get("price")), "취소", c.get("time"))))  # 취소시각
+                             _fmt_px(c.get("price")), "취소", c.get("time"))))
         return out
 
     def _render() -> None:
         rows = _rows()
         sig = tuple((iid, *vals) for iid, _, vals in rows)
         if sig == state_box.get("_sig"):
-            return  # 변화 없으면 다시 안 그림(선택 유지)
+            return  # 변화 없으면 다시 안 그림(선택·스크롤 유지)
         state_box["_sig"] = sig
-        keep = tree.selection()
-        tree.delete(*tree.get_children())
-        for iid, tag, vals in rows:
-            tree.insert("", "end", iid=iid, values=vals, tags=(tag,))
-        for iid in keep:
-            if tree.exists(iid):
-                tree.selection_set(iid)
+        _ensure_rows(len(rows))
+        row_vals.clear()
+        for r, (iid, side, vals) in enumerate(rows):
+            row_iid[r] = iid
+            row_vals[iid] = vals
+            for c, text in enumerate(vals):
+                fg = (T.C_BUY if side == "buy" else T.C_SELL) if c == _SIDE_COL \
+                    else T.C_ZERO  # 매매 칸만 색, 나머지 검정
+                cells[r][c].configure(text=text, fg=fg)
+                cells[r][c].grid()  # 숨겼던 행 되살림
+        for r in range(len(rows), len(cells)):  # 남는 행 숨김
+            row_iid[r] = ""
+            for lbl in cells[r]:
+                lbl.grid_remove()
+        state_box["_nvis"] = len(rows)
+        if sel["iid"] not in row_vals:  # 선택 행이 사라졌으면 해제
+            sel["iid"] = None
+        _highlight()
 
     def _rerender() -> None:
         state_box["_sig"] = None  # 필터 바뀜 → 강제 재그림
         _render()
 
-    # 최소 크기 — 가로는 컬럼 전체 폭, 세로는 하단(버튼·상태바) 안 잘릴 만큼.
-    root.update_idletasks()
-    root.minsize(root.winfo_reqwidth(), 220)
+    # 최소 크기 — 가로는 컬럼 전체 폭(+스크롤바), 세로는 하단 안 잘릴 만큼.
+    _tot_w = sum(w for _t, w, _a in _COLS) + 30
+    root.minsize(_tot_w, 220)
 
     drain_results()
     refresh()
