@@ -33,12 +33,14 @@ def _sym(underlying: object, instrument: str) -> str:
 _ST_KR = {"new": "신규", "accepted": "접수", "partial": "부분", "filled": "체결",
           "cancelled": "취소", "rejected": "거부"}
 
-# 표 컬럼: (제목, 최소폭px, 정렬). '매매'(index 3)만 색을 준다.
+# 표 컬럼: (제목, 최소폭px, 정렬). '매매'(index 2)만 색을 준다.
+# 행 유형별 채움: 주문=주문가·수량·접수 / 체결=원주문+체결 전부 / 취소=주문가·수량·접수.
 _COLS: tuple[tuple[str, int, str], ...] = (
-    ("구분", 44, "center"), ("거래소", 42, "center"), ("종목", 92, "w"),
-    ("매매", 44, "center"), ("수량", 58, "e"), ("잔량", 58, "e"),
-    ("가격", 84, "e"), ("상태", 52, "e"), ("시각", 72, "center"))
-_SIDE_COL = 3  # 색을 주는 유일한 칸
+    ("거래소", 42, "center"), ("종목", 88, "w"), ("매매", 40, "center"),
+    ("주문가", 70, "e"), ("수량", 52, "e"), ("체결가", 70, "e"),
+    ("체결량", 52, "e"), ("상태", 44, "center"), ("접수시각", 66, "center"),
+    ("체결시각", 66, "center"), ("주문번호", 104, "e"))
+_SIDE_COL = 2  # 색을 주는 유일한 칸(매매)
 _NORM_BG = "white"
 _SEL_BG = "#cce5ff"   # 선택 행 바탕
 _HDR_BG = "#f0f0f0"   # 헤더 바탕(연회색)
@@ -115,15 +117,18 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     table.grid(row=1, column=0, sticky="nsew", padx=6, pady=(2, 2))
     canvas = tk.Canvas(table, highlightthickness=0, bg=_NORM_BG)
     vsb = ttk.Scrollbar(table, orient="vertical", command=canvas.yview)
-    canvas.configure(yscrollcommand=vsb.set)
+    hsb = ttk.Scrollbar(table, orient="horizontal", command=canvas.xview)
+    canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
     vsb.pack(side="right", fill="y")
+    hsb.pack(side="bottom", fill="x")
     canvas.pack(side="left", fill="both", expand=True)
     grid = tk.Frame(canvas, bg=_GRID_LINE)  # 이 회색이 셀 틈(1px)으로 비쳐 구분선이 됨
     _gwin = canvas.create_window((0, 0), window=grid, anchor="nw")
     grid.bind("<Configure>",
               lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-    canvas.bind("<Configure>",
-                lambda e: canvas.itemconfigure(_gwin, width=e.width))  # 폭 채움
+    # 넓으면 캔버스 폭까지 채워 셀이 늘어나고(weight), 좁으면 자연폭 유지 → 가로 스크롤.
+    canvas.bind("<Configure>", lambda e: canvas.itemconfigure(
+        _gwin, width=max(e.width, grid.winfo_reqwidth())))
     canvas.bind_all("<MouseWheel>",
                     lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
     for c, (title, w, _a) in enumerate(_COLS):
@@ -150,9 +155,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if not iid or iid.startswith("__") or e_price.get().strip():
             return
         vals = row_vals.get(iid)
-        if vals and len(vals) >= 7 and vals[6] not in ("", "-"):
+        if vals and len(vals) >= 4 and vals[3] not in ("", "-"):  # 주문가(index 3)
             e_price.delete(0, "end")
-            e_price.insert(0, str(vals[6]).replace(",", ""))
+            e_price.insert(0, str(vals[3]).replace(",", ""))
 
     def _select_row(r: int) -> None:
         if r < len(row_iid) and row_iid[r]:
@@ -196,9 +201,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if oid is None:
             set_status("정정할 미체결 주문을 선택하세요", err=True)
             return
-        # HL은 정정 미지원(크로싱 시 원주문 소실 위험) — LS만 정정. 거래소 칸으로 판별.
+        # HL은 정정 미지원(크로싱 시 원주문 소실 위험) — LS만 정정. 거래소 칸(index 0)으로 판별.
         vals = row_vals.get(oid)
-        if vals and str(vals[1]) == "HL":
+        if vals and str(vals[0]) == "HL":
             set_status("정정 불가 — HL은 정정 미지원(취소 후 신규 주문)", err=True)
             return
         price = e_price.get().strip()
@@ -212,9 +217,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             return
         send({"cmd": "manual_amend", "order_id": oid, "price": new_px}, "정정")
 
-    # --- 정정가 입력 + 버튼 (row 2) ---
-    ctrl = tk.Frame(root)
-    ctrl.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 2))
+    # --- 정정가 입력 + 버튼 — 표시 체크박스와 같은 줄(filt) 오른쪽에 배치 ---
+    ctrl = tk.Frame(filt)
+    ctrl.pack(side="right")
     tk.Label(ctrl, text="정정가").pack(side="left")
     e_price = tk.Entry(ctrl, width=10, justify="right", font=T.FONT_NUM)
     e_price.pack(side="left", padx=(2, 8))
@@ -222,9 +227,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Button(ctrl, text="선택 취소", command=do_cancel).pack(side="left", padx=4)
     tk.Label(ctrl, text="(LS 만 정정 가능)", fg=T.C_MUTED).pack(side="left", padx=(6, 0))
 
-    # --- 상태바 (row 3, 맨 아래) ---
+    # --- 상태바 (row 2, 맨 아래) ---
     status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
-    status.grid(row=3, column=0, sticky="ew", padx=6, pady=(2, 6))
+    status.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 6))
 
     # ===== 화면 갱신 (네트워크 없음 — 폴링 결과만 읽어 그림) =====
     def _reschedule(fn: Any, ms: int) -> None:
@@ -257,8 +262,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         _reschedule(refresh, 400)
 
     def _rows() -> list[tuple[str, str, tuple[Any, ...]]]:
-        # (iid, side, 값9) — 필터로 골라 한 표에. 주문(미체결)→체결→취소 순.
-        # 상태·시각은 별 칸. 주문=상태+잔량(시각 없음) / 체결·취소=시각.
+        # (iid, side, 값11) — 필터로 골라 한 표에. 주문(미체결)→체결→취소 순.
+        # 열: 거래소·종목·매매·주문가·수량·체결가·체결량·상태·접수시각·체결시각·주문번호.
         data = state_box["data"] or {}
         out: list[tuple[str, str, tuple[Any, ...]]] = []
         if show_orders.get():
@@ -267,28 +272,35 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 inst = str(o.get("instrument"))
                 stk = _ST_KR.get(str(o.get("status")), o.get("status"))
                 out.append((str(o.get("order_id")), "buy" if buy else "sell",
-                            ("주문", _venue(inst), _sym(o.get("underlying"), inst),
+                            (_venue(inst), _sym(o.get("underlying"), inst),
                              "매수" if buy else "매도",
-                             _fmt_qty(o.get("qty")), _fmt_qty(o.get("remaining")),
-                             _fmt_px(o.get("price")), stk, o.get("time", ""))))
+                             _fmt_px(o.get("price")), _fmt_qty(o.get("qty")),
+                             "", "",  # 체결가·체결량 공백(미체결)
+                             stk, o.get("time", ""), "",  # 접수시각·체결시각(공백)
+                             str(o.get("order_id")))))
         if show_fills.get():
             for i, f in enumerate(data.get("fills") or []):
                 buy = f.get("side") == "buy"
                 inst = str(f.get("instrument"))
                 out.append((f"__fill{i}", "buy" if buy else "sell",
-                            ("체결", _venue(inst), _sym(f.get("underlying"), inst),
+                            (_venue(inst), _sym(f.get("underlying"), inst),
                              "매수" if buy else "매도",
-                             _fmt_qty(f.get("qty")), "",
-                             _fmt_px(f.get("price")), "", f.get("time"))))
+                             _fmt_px(f.get("order_price")),  # 원주문 주문가
+                             _fmt_qty(f.get("order_qty")),   # 원주문 수량
+                             _fmt_px(f.get("price")), _fmt_qty(f.get("qty")),
+                             "체결", f.get("accept_time", ""), f.get("time", ""),
+                             str(f.get("order_id", "")))))
         if show_cancels.get():
             for i, c in enumerate(data.get("cancels") or []):
                 buy = c.get("side") == "buy"
                 inst = str(c.get("instrument"))
                 out.append((f"__cancel{i}", "buy" if buy else "sell",
-                            ("취소", _venue(inst), _sym(c.get("underlying"), inst),
+                            (_venue(inst), _sym(c.get("underlying"), inst),
                              "매수" if buy else "매도",
-                             _fmt_qty(c.get("qty")), "",
-                             _fmt_px(c.get("price")), "취소", c.get("time"))))
+                             _fmt_px(c.get("price")), _fmt_qty(c.get("qty")),
+                             "", "",  # 체결가·체결량 공백(취소행)
+                             "취소", c.get("accept_time", ""), "",  # 접수시각·체결시각(공백)
+                             str(c.get("order_id", "")))))
         return out
 
     def _render() -> None:
@@ -320,9 +332,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         state_box["_sig"] = None  # 필터 바뀜 → 강제 재그림
         _render()
 
-    # 최소 크기 — 가로는 컬럼 전체 폭(+스크롤바), 세로는 하단 안 잘릴 만큼.
-    _tot_w = sum(w for _t, w, _a in _COLS) + 30
-    root.minsize(_tot_w, 220)
+    # 최소 크기 — 가로는 **상단 컨트롤이 들어갈 폭**까지만(표는 좁아지면 가로 스크롤).
+    root.update_idletasks()
+    root.minsize(filt.winfo_reqwidth() + 24, 200)
 
     drain_results()
     refresh()

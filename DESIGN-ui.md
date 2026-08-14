@@ -1,6 +1,6 @@
 # DESIGN-ui.md — 화면 공통 스타일 계약 (tkinter 클라이언트)
 
-이 문서는 모든 창(order_hl, order_list, monitor, fx_monitor, main_window …)이 따르는 **UI 일관성 규칙**이다. 기준은 **개발 완료된 일반주문창(order_hl)** 이며, 그 값을 `kp_arb/ui_theme.py`에 토큰으로 굳혔다.
+이 문서는 모든 창(order_hl, order_list, monitor, fx_monitor, main_window …)이 따르는 **UI 일관성 규칙**이다. **색·역할**은 개발 완료된 일반주문창(order_hl) 기준이고, **기본 폰트는 일반 창(base 9)** 기준이다(대부분 창이 9, order_hl처럼 정보밀도 높은 큰 화면만 예외로 11). 값은 `kp_arb/ui_theme.py`에 토큰으로 굳혔다.
 
 ## 0. 원칙
 - 화면은 **raw 폰트 튜플·색 문자열을 직접 쓰지 않는다.** `ui_theme`의 **역할 토큰만** 참조한다.
@@ -11,12 +11,14 @@
 
 | 토큰 | 값 | 용도 |
 |---|---|---|
-| `FONT_BASE` | 11 | 창 기본(라벨·일반 텍스트) — `apply_base`가 `*Font`로 지정 |
-| `FONT_NUM` | 11 **bold** | **숫자·입력값**(수량·단가·잔고·가격) — *숫자는 볼드* 규칙 |
-| `FONT_GRID` | 10 **bold** | 표(Treeview: 호가창·주문목록), 행높이 `ROWHEIGHT=22` |
+| `FONT_BASE` | 9 | 창 기본(라벨·버튼·체크박스) — `apply_base`가 `*Font`로 지정 |
+| `FONT_NUM` | 9 **bold** | **숫자·입력값** — *숫자는 볼드* 규칙 |
 | `FONT_LABEL` | 9 | 표 제목·상태바·콤보 |
 | `FONT_SMALL` | 8 | 보조 캡션(Cross·Unified 등) |
+| `FONT_GRID` | 10 **bold** | 표(Treeview: 호가창 등), 행높이 `ROWHEIGHT=22` |
 | `FONT_STRONG` | 14 **bold** | 강조 버튼(주문 버튼) |
+| `FONT_BASE_LG` | 11 | **큰 화면 기본** — 정보밀도 높은 일반주문창(order_hl) 등 예외 |
+| `FONT_NUM_LG` | 11 **bold** | 큰 화면 숫자·입력값 |
 
 ## 2. 색 (의미별)
 

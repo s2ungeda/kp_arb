@@ -240,20 +240,27 @@ class LiveSystem:
             return
         it = order.intent
         self.fills.appendleft({
-            "time": _t.strftime("%H:%M:%S"),
+            "time": _t.strftime("%H:%M:%S"),        # 체결시각
+            "order_id": order.order_id,             # 주문번호(주문리스트 표시)
+            "accept_time": order.placed_at,         # 접수시각(원주문)
             "underlying": it.underlying.value, "instrument": it.instrument.value,
-            "side": it.side.value, "qty": fill.qty, "price": fill.price,
+            "side": it.side.value,
+            "qty": fill.qty, "price": fill.price,           # 체결량·체결가
+            "order_qty": it.qty, "order_price": it.price,   # 원주문 수량·주문가
         })
 
     def _record_cancel(self, order: TrackedOrder) -> None:
-        """취소내역 보관(주문 리스트 '취소' 행) — 취소 시각과 함께. 취소된(잔여) 수량 기준."""
+        """취소내역 보관(주문 리스트 '취소' 행) — 원주문 정보 기준(주문번호·주문가·주문수량·
+        접수시각). 취소시각(time)은 보관하되 현재 열엔 미표시."""
         import time as _t
 
         it = order.intent
         self.cancels.appendleft({
-            "time": _t.strftime("%H:%M:%S"),
+            "time": _t.strftime("%H:%M:%S"),        # 취소시각(현재 열엔 미표시)
+            "order_id": order.order_id,             # 주문번호
+            "accept_time": order.placed_at,         # 접수시각
             "underlying": it.underlying.value, "instrument": it.instrument.value,
-            "side": it.side.value, "qty": order.remaining_qty, "price": it.price,
+            "side": it.side.value, "qty": it.qty, "price": it.price,  # 주문수량·주문가
         })
 
     _HL_FILL_DEBOUNCE_S = 0.5  # 몰린 체결을 합쳐 조회 1회로 (사용자 확정)
