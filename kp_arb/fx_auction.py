@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Any
 
 from .domain.enums import Side
 
@@ -89,3 +91,34 @@ def compute_hedge(stock_side: Side, contracts: int, stock_price: float,
     px = hedge_price(fx_price, tick_count, fx_side)
     qty = hedge_qty(contracts, stock_price, fx_price, hedge_ratio)
     return fx_side, px, qty
+
+
+@dataclass(frozen=True)
+class FuturesAck:
+    """LS 선물 접수(O01)에서 뽑은 대응주문 계산용 값."""
+
+    order_id: str
+    code: str      # 선물 종목코드 (fnoIsuno, 예 'A1169000'=삼성 / 'A5069000'=하이닉스)
+    side: Side
+    qty: int       # 계약수 (ordqty)
+    price: float   # 주문가 (ordprc)
+
+
+def parse_futures_ack(body: dict[str, Any]) -> FuturesAck | None:
+    """LS 선물 접수(O01) body → FuturesAck. 필드 없거나 이상하면 None.
+
+    실측 키(2026-08-18): fnoIsuno(종목코드)·bnstp(2매수/1매도)·ordqty·ordprc·ordno.
+    신규/정정 구분은 호출측이 OrderEvent.org_order_id(=orgordno, 신규면 None)로 판정한다.
+    """
+    try:
+        code = str(body["fnoIsuno"]).strip()
+        bnstp = str(body["bnstp"]).strip()
+        qty = int(str(body["ordqty"]).strip())
+        price = float(str(body["ordprc"]).strip())
+        order_id = str(body["ordno"]).strip()
+    except (KeyError, ValueError, TypeError):
+        return None
+    if not code or bnstp not in ("1", "2") or qty <= 0:
+        return None
+    side = Side.BUY if bnstp == "2" else Side.SELL
+    return FuturesAck(order_id=order_id, code=code, side=side, qty=qty, price=price)

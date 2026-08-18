@@ -1,11 +1,13 @@
 """원달러선물 동시호가 대응주문 순수 로직 테스트 (DESIGN-fx-auction.md §4)."""
 from kp_arb.domain.enums import Side
 from kp_arb.fx_auction import (
+    FuturesAck,
     compute_hedge,
     hedge_price,
     hedge_qty,
     hedge_side,
     in_auction_window,
+    parse_futures_ack,
 )
 
 WINDOWS = [("08:30", "08:46"), ("15:35", "15:46")]
@@ -84,3 +86,29 @@ def test_compute_hedge_buy_and_sell() -> None:
     assert compute_hedge(Side.BUY, 20, 142150, 1421.5, 10, 0.5) == (Side.SELL, 1420.5, 1)
     # 주식선물 매도 → 원달러선물 매수, 현재가 + 틱
     assert compute_hedge(Side.SELL, 20, 142150, 1421.5, 10, 0.5) == (Side.BUY, 1422.5, 1)
+
+
+# --- 선물 접수(O01) 파싱 (실측 body 키, 2026-08-18) ---
+
+
+def _o01(fnoisuno: str, bnstp: str, ordqty: str, ordprc: str, ordno: str) -> dict:
+    # 실측 O01은 필드가 100+개 — 파서가 쓰는 키만 담아도 동일하게 동작.
+    return {"fnoIsuno": fnoisuno, "bnstp": bnstp, "ordqty": ordqty,
+            "ordprc": ordprc, "ordno": ordno, "orgordno": "0", "trcode1": "FO01"}
+
+
+def test_parse_o01_hynix_buy() -> None:  # 실측 order 2222
+    ack = parse_futures_ack(_o01("A5069000", "2", "1", "1753000.00", "2222"))
+    assert ack == FuturesAck("2222", "A5069000", Side.BUY, 1, 1753000.0)
+
+
+def test_parse_o01_samsung_sell() -> None:  # 실측 order 2225
+    ack = parse_futures_ack(_o01("A1169000", "1", "1", "293000.00", "2225"))
+    assert ack == FuturesAck("2225", "A1169000", Side.SELL, 1, 293000.0)
+
+
+def test_parse_o01_bad_or_missing_returns_none() -> None:
+    assert parse_futures_ack({"bnstp": "2", "ordqty": "1"}) is None       # 종목 없음
+    assert parse_futures_ack(_o01("A1169000", "9", "1", "1.0", "1")) is None   # 매매구분 이상
+    assert parse_futures_ack(_o01("A1169000", "2", "0", "1.0", "1")) is None   # 수량 0
+    assert parse_futures_ack(_o01("A1169000", "2", "x", "1.0", "1")) is None   # 수량 비숫자
