@@ -43,6 +43,9 @@ def main() -> None:
     elif arg == "order_list":
         from kp_arb.order_list import main as run
         run()
+    elif arg == "fx_auction_order":
+        from kp_arb.fx_auction_order import main as run
+        run()
     elif arg == "keys":
         from kp_arb.key_setup import main as run
         run()

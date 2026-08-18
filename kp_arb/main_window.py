@@ -122,6 +122,8 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "meme.exe"), "order_hl"]
     if module == "kp_arb.order_list":
         return [str(exe_dir / "meme.exe"), "order_list"]
+    if module == "kp_arb.fx_auction_order":
+        return [str(exe_dir / "meme.exe"), "fx_auction_order"]
     if module == "kp_arb.order_panel":
         return [str(exe_dir / "meme.exe"), *args]  # autoT | autoM
     return [str(exe_dir / "meme.exe")]
@@ -294,6 +296,8 @@ def main() -> None:
                          command=lambda: open_screen("kp_arb.order_hl"))
     m_screen.add_command(label="주문 리스트 (미체결·취소·정정)",
                          command=lambda: open_screen("kp_arb.order_list"))
+    m_screen.add_command(label="원달러선물 동시호가 주문",
+                         command=lambda: open_screen("kp_arb.fx_auction_order"))
     menubar.add_cascade(label="화면", menu=m_screen)
     m_core = tk.Menu(menubar, tearoff=0)
     m_core.add_command(label="코어 시작", command=start_core)
