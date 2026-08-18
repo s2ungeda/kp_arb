@@ -570,11 +570,13 @@ def make_app(
                 {"ok": False, "errors": ["JSON 본문 필요"]}, status=400, dumps=_dumps)
         payload = body if isinstance(body, dict) else {}
         cmd = payload.get("cmd")
+        # fx_auction_* 는 fx_* 보다 **먼저** 검사(둘 다 "fx_"로 시작 — 순서 중요).
+        if isinstance(cmd, str) and (cmd.startswith("manual_")
+                                     or cmd.startswith("fx_auction_")):
+            result = await _manual_command(system, payload)
+            return web.json_response(result, dumps=_dumps)
         if isinstance(cmd, str) and cmd.startswith("fx_"):
             result = _fx_command(fx_service, payload)
-            return web.json_response(result, dumps=_dumps)
-        if isinstance(cmd, str) and cmd.startswith("manual_"):
-            result = await _manual_command(system, payload)
             return web.json_response(result, dumps=_dumps)
         result = apply_command(state, payload)
         if result.get("ok") and save:
