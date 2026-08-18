@@ -9,13 +9,11 @@
 from __future__ import annotations
 
 import queue
-from typing import Any
+from typing import Any, cast
 
 from . import ui_theme as T
 from . import win_state
 from .core_client import core_request, watch_parent_exit
-
-_MONTH_LABELS = ("최근월물", "차근월물")  # 콤보 표시 — 코어 fx_auction.codes[0/1]에 매핑
 
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
@@ -28,7 +26,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
     root.title("원달러선물 동시호가 주문")
-    root.resizable(False, False)
+    root.resizable(True, True)  # 크기 조절 — 발주내역 리스트만 확장(폼·상태바 고정)
     win_state.attach(root, "fx_auction_order")
     T.apply_base(root)
 
@@ -53,24 +51,25 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def send(payload: dict[str, Any], label: str) -> None:
         jobs.put((payload, label))
 
-    # ===== 입력 폼 =====
+    # ===== 상단 grid: col0 라벨 / col1 입력(좁게) / col2 [개시 체크 위 + 실행 버튼] =====
     form = tk.Frame(root)
     form.pack(fill="x", padx=8, pady=(8, 2))
 
-    # 주문시간: 장전 시작~종료 / 마감 시작~종료 (4칸)
-    tk.Label(form, text="주문시간").grid(row=0, column=0, sticky="w", pady=2)
-    trow = tk.Frame(form)
-    trow.grid(row=0, column=1, columnspan=3, sticky="w")
+    def _lab(text: str, r: int) -> None:
+        tk.Label(form, text=text).grid(row=r, column=0, sticky="w", padx=(0, 6), pady=1)
 
-    def _time_entry(parent: tk.Frame, default: str) -> tk.Entry:
-        e = tk.Entry(parent, width=6, justify="center", font=T.FONT_NUM)
+    # 주문시간: 장전 시작~종료 / 마감 시작~종료 (4칸) — col1~2 걸침
+    _lab("주문시간", 0)
+    trow = tk.Frame(form)
+    trow.grid(row=0, column=1, columnspan=2, sticky="w", pady=1)
+
+    def _time_entry(default: str) -> tk.Entry:
+        e = tk.Entry(trow, width=6, justify="center", font=T.FONT_NUM)
         e.insert(0, default)
         return e
 
-    e_pre_s = _time_entry(trow, "08:30")
-    e_pre_e = _time_entry(trow, "08:46")
-    e_cls_s = _time_entry(trow, "15:35")
-    e_cls_e = _time_entry(trow, "15:46")
+    e_pre_s, e_pre_e = _time_entry("08:30"), _time_entry("08:46")
+    e_cls_s, e_cls_e = _time_entry("15:35"), _time_entry("15:46")
     e_pre_s.pack(side="left")
     tk.Label(trow, text="~").pack(side="left", padx=2)
     e_pre_e.pack(side="left")
@@ -79,54 +78,77 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(trow, text="~").pack(side="left", padx=2)
     e_cls_e.pack(side="left")
 
-    # 종목 콤보 + 대응주문 개시 체크
-    tk.Label(form, text="종목").grid(row=1, column=0, sticky="w", pady=2)
-    cb_month = ttk.Combobox(form, values=list(_MONTH_LABELS), width=8, state="readonly")
-    cb_month.current(0)
-    cb_month.grid(row=1, column=1, sticky="w")
-    arm_var = tk.BooleanVar(value=False)  # 대응주문 개시 — 실행 게이트
+    # 종목: 원달러선물 종목코드(근·차근) 콤보 (col1) — 오른쪽 끝이 기준선
+    _lab("종목", 1)
+    cb_code = ttk.Combobox(form, values=[], width=12, state="readonly")
+    cb_code.grid(row=1, column=1, sticky="w", pady=1)
+
+    # 현재가 + 틱 (col1, 좁게 — 틱 오른쪽이 콤보 오른쪽에 가깝게)
+    _lab("현재가", 2)
+    prow = tk.Frame(form)
+    prow.grid(row=2, column=1, sticky="we", pady=1)  # we: 틱을 col1 우측에 붙임
+    e_price = tk.Entry(prow, width=7, justify="right", font=T.FONT_NUM)
+    e_price.pack(side="left")
+    tk.Label(prow, text="틱").pack(side="right")  # 우측 정렬(적용 버튼과 같은 세로선)
+    e_tick = tk.Entry(prow, width=3, justify="right", font=T.FONT_NUM)
+    e_tick.insert(0, "10")
+    e_tick.pack(side="right", padx=(6, 2))
+
+    # 헤지비율 (col1, 좁게) + 적용 버튼(실행 중 설정 변경 재적용) — %·적용 우측 정렬
+    _lab("헤지비율", 3)
+    rrow = tk.Frame(form)
+    rrow.grid(row=3, column=1, sticky="we", pady=1)
+    e_ratio = tk.Entry(rrow, width=7, justify="right", font=T.FONT_NUM)
+    e_ratio.insert(0, "50")
+    e_ratio.pack(side="left")
+    btn_apply = tk.Button(rrow, text="적용", font=T.FONT_SMALL,
+                          command=lambda: do_apply())  # 실행 중에만 활성(_apply_running)
+    btn_apply.pack(side="right")
+    tk.Label(rrow, text="%").pack(side="right", padx=(2, 2))
+
+    # 오른쪽 공간(col2): 대응주문 개시 체크(종목 줄, 버튼 위) + 실행 버튼(현재가~헤지비율 걸침)
+    form.columnconfigure(2, weight=1)  # 남는 우측 폭을 col2가 흡수 → 체크·버튼 우측 정렬
+    arm_var = tk.BooleanVar(value=False)
     tk.Checkbutton(form, text="대응주문 개시", variable=arm_var).grid(
-        row=1, column=2, columnspan=2, sticky="e")
+        row=1, column=2, sticky="se", padx=(14, 8))
+    # height=1 + sticky nse: 걸친 두 행(현재가·헤지비율) 자연높이로 채우고 우측 정렬(가로 안 늘림).
+    btn_run = tk.Button(form, text="실행", width=12, height=1, font=T.FONT_STRONG)
+    btn_run.grid(row=2, column=2, rowspan=2, padx=(14, 8), sticky="nse")
 
-    # 현재가 + 틱
-    tk.Label(form, text="현재가").grid(row=2, column=0, sticky="w", pady=2)
-    e_price = tk.Entry(form, width=9, justify="right", font=T.FONT_NUM)
-    e_price.grid(row=2, column=1, sticky="w")
-    e_tick = tk.Entry(form, width=4, justify="right", font=T.FONT_NUM)
-    e_tick.grid(row=2, column=2, sticky="w", padx=(4, 0))
-    tk.Label(form, text="틱").grid(row=2, column=3, sticky="w")
-
-    # 헤지비율
-    tk.Label(form, text="헤지비율").grid(row=3, column=0, sticky="w", pady=2)
-    e_ratio = tk.Entry(form, width=9, justify="right", font=T.FONT_NUM)
-    e_ratio.grid(row=3, column=1, sticky="w")
-    tk.Label(form, text="%").grid(row=3, column=2, sticky="w")
-
-    # 실행/자동주문실행중 버튼 — 현재가·헤지비율 행 오른쪽에 크게(목업)
-    btn_run = tk.Button(form, text="실행", width=12, height=3, font=T.FONT_STRONG)
-    btn_run.grid(row=2, column=4, rowspan=2, padx=(10, 0), sticky="nsew")
-
-    # 안내 + 상태/시계
+    # 배치 주의: pack은 **나중에 pack된 위젯이 먼저 잘린다**. 안내(top)→상태바(bottom 먼저
+    # 예약)→발주내역 리스트(맨 마지막 pack) 순으로 해야, 창을 줄일 때 리스트만 줄어든다.
     tk.Label(root, text="* 삼전닉스 주식선물 신규 주문일때만 대응주문",
              fg=T.C_MUTED).pack(anchor="w", padx=8, pady=(2, 0))
     status = tk.Label(root, text="-", anchor="w", relief="groove", width=1, fg=T.C_MUTED)
-    status.pack(side="bottom", fill="x", padx=6, pady=(2, 6))
+    status.pack(side="bottom", fill="x", padx=6, pady=(2, 6))  # 하단 고정(먼저 예약)
+    _HCOLS: tuple[tuple[str, str, int, str], ...] = (
+        ("time", "시각", 64, "center"), ("code", "종목", 78, "w"),
+        ("side", "매매", 40, "center"), ("qty", "수량", 44, "e"),
+        ("price", "가격", 64, "e"), ("st", "상태", 48, "center"))
+    htf = tk.Frame(root)  # 맨 마지막 pack → 창 줄이면 이 리스트만 줄어듦
+    htf.pack(fill="both", expand=True, padx=6, pady=(2, 0))
+    hlog = ttk.Treeview(htf, columns=[c for c, *_ in _HCOLS], show="headings",
+                        height=6, selectmode="none")
+    hvsb = ttk.Scrollbar(htf, orient="vertical", command=hlog.yview)
+    hlog.configure(yscrollcommand=hvsb.set)
+    hvsb.pack(side="right", fill="y")
+    hlog.pack(side="left", fill="both", expand=True)
+    for c, title, w, a in _HCOLS:
+        hlog.heading(c, text=title)
+        hlog.column(c, width=w, anchor=cast(Any, a))
+    hlog.tag_configure("buy", foreground=T.C_BUY)    # 대응 매수(주식선물 매도 시)
+    hlog.tag_configure("sell", foreground=T.C_SELL)  # 대응 매도(주식선물 매수 시)
 
     def set_status(text: str, err: bool = False) -> None:
         status.config(text=text[:90], fg=T.C_ERR if err else T.C_MUTED)
 
     # ===== 동작 =====
     def _fx_state() -> dict[str, Any]:
-        data = state_box["data"] or {}
-        return data.get("fx_auction") or {}
+        return (state_box["data"] or {}).get("fx_auction") or {}
 
-    def do_run() -> None:
-        if not arm_var.get():  # 게이트 — 개시 체크돼야 실행
-            set_status("대응주문 개시를 체크하세요", err=True)
-            return
-        codes = _fx_state().get("codes") or []
-        idx = cb_month.current()
-        if idx < 0 or idx >= len(codes):
+    def _send_settings(label: str) -> None:
+        fx_code = cb_code.get().strip()
+        if not fx_code:
             set_status("원달러선물 종목코드 없음 — 코어 연결 확인", err=True)
             return
         try:
@@ -134,7 +156,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 "cmd": "fx_auction_start",
                 "windows": [[e_pre_s.get().strip(), e_pre_e.get().strip()],
                             [e_cls_s.get().strip(), e_cls_e.get().strip()]],
-                "fx_code": str(codes[idx]),
+                "fx_code": fx_code,
                 "price": float(e_price.get().strip()),
                 "tick": int(e_tick.get().strip()),
                 "hedge_ratio": float(e_ratio.get().strip()),  # % (코어가 /100)
@@ -142,7 +164,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         except ValueError:
             set_status("현재가·틱·헤지비율은 숫자로 입력하세요", err=True)
             return
-        send(payload, "실행")
+        send(payload, label)
+
+    def do_run() -> None:
+        if not arm_var.get():  # 게이트 — 개시 체크돼야 실행
+            set_status("대응주문 개시를 체크하세요", err=True)
+            return
+        _send_settings("실행")
+
+    def do_apply() -> None:  # 실행 중 설정 변경 재적용(코어가 설정 교체) — 실행 중에만 활성
+        _send_settings("적용")
 
     def do_stop() -> None:
         send({"cmd": "fx_auction_stop"}, "정지")
@@ -156,8 +187,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         else:
             btn_run.config(text="실행", bg=root.cget("bg"), command=do_run,
                            state=("normal" if arm_var.get() else "disabled"))
+        btn_apply.config(state="normal" if running else "disabled")  # 적용은 실행 중에만
 
-    arm_var.trace_add("write", lambda *_: _apply_running(_fx_state().get("running", False)))
+    arm_var.trace_add(
+        "write", lambda *_: _apply_running(bool(_fx_state().get("running"))))
 
     # ===== 갱신 루프 (네트워크 없음 — 폴링 결과만 읽음) =====
     def _reschedule(fn: Any, ms: int) -> None:
@@ -181,41 +214,62 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             pass
         _reschedule(drain_results, 200)
 
-    def _clock() -> None:
-        status_r.config(text=time.strftime("%H:%M:%S"))
-        _reschedule(_clock, 1000)
-
-    status_r = tk.Label(root, text="", anchor="e", fg=T.C_MUTED)
-    status_r.pack(side="bottom", anchor="e", padx=8)
-
     def refresh() -> None:
-        # 실행 상태(코어 authoritative)에 맞춰 버튼 캡션·색 갱신.
-        _apply_running(bool(_fx_state().get("running")))
+        fx = _fx_state()
+        codes = [str(c) for c in (fx.get("codes") or [])]
+        if codes != state_box.get("_codes"):  # 코드 목록 바뀜 → 콤보 갱신(선택 유지)
+            state_box["_codes"] = codes
+            cur = cb_code.get()
+            cb_code.config(values=codes)
+            want = state_box.pop("_want_code", None)  # 저장값 복원(코드 로드 후 1회)
+            if want in codes:
+                cb_code.set(want)
+            elif cur in codes:
+                cb_code.set(cur)
+            elif codes:
+                cb_code.current(0)
+        # 대응 발주 내역(최신 우선) — 바뀔 때만 다시 그림
+        hedges = fx.get("hedges") or []
+        hsig = tuple((h.get("order_id"), h.get("status")) for h in hedges)
+        if hsig != state_box.get("_hsig"):
+            state_box["_hsig"] = hsig
+            hlog.delete(*hlog.get_children())
+            for h in hedges:
+                sd = str(h.get("side"))
+                hlog.insert("", "end", tags=("buy" if sd == "buy" else "sell",),
+                            values=(h.get("time", ""), h.get("code", ""),
+                                    "매수" if sd == "buy" else "매도",
+                                    h.get("qty", ""), h.get("price", ""),
+                                    h.get("status", "")))
+        _apply_running(bool(fx.get("running")))
         _reschedule(refresh, 500)
 
-    # 저장된 입력 복원
+    # 저장된 입력 복원 (종목코드는 목록 로드 후 refresh에서 복원)
     _saved = win_state.saved_fields("fx_auction_order")
     for e, key in ((e_pre_s, "pre_s"), (e_pre_e, "pre_e"), (e_cls_s, "cls_s"),
                    (e_cls_e, "cls_e"), (e_price, "price"), (e_tick, "tick"),
                    (e_ratio, "ratio")):
-        if key in _saved:
+        if _saved.get(key):
             e.delete(0, "end")
             e.insert(0, str(_saved[key]))
-    if _saved.get("month") in (0, 1):
-        cb_month.current(int(_saved["month"]))
+    if _saved.get("code"):
+        state_box["_want_code"] = str(_saved["code"])
 
     def _persist() -> None:
         win_state.save_fields("fx_auction_order", {
             "pre_s": e_pre_s.get(), "pre_e": e_pre_e.get(),
             "cls_s": e_cls_s.get(), "cls_e": e_cls_e.get(),
             "price": e_price.get(), "tick": e_tick.get(), "ratio": e_ratio.get(),
-            "month": cb_month.current()})
+            "code": cb_code.get()})
         _reschedule(_persist, 2000)
 
+    root.update_idletasks()
+    # 최소 높이 = (트리 제외한 폼·안내·상태바) + 트리 한 줄 정도 → 트리를 거의 다 줄일 수 있음.
+    _min_h = root.winfo_reqheight() - hlog.winfo_reqheight() + 26
+    root.minsize(root.winfo_reqwidth(), max(120, _min_h))
     _apply_running(False)
     drain_results()
     refresh()
-    _clock()
     _persist()
     while True:
         try:
