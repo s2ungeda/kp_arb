@@ -109,8 +109,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 오른쪽 공간(col2): 대응주문 개시 체크(종목 줄, 버튼 위) + 실행 버튼(현재가~헤지비율 걸침)
     form.columnconfigure(2, weight=1)  # 남는 우측 폭을 col2가 흡수 → 체크·버튼 우측 정렬
     arm_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(form, text="대응주문 개시", variable=arm_var).grid(
-        row=1, column=2, sticky="se", padx=(14, 8))
+    chk_arm = tk.Checkbutton(form, text="대응주문 개시", variable=arm_var)
+    chk_arm.grid(row=1, column=2, sticky="se", padx=(14, 8))
     # height=1 + sticky nse: 걸친 두 행(현재가·헤지비율) 자연높이로 채우고 우측 정렬(가로 안 늘림).
     btn_run = tk.Button(form, text="실행", width=12, height=1, font=T.FONT_STRONG)
     btn_run.grid(row=2, column=2, rowspan=2, padx=(14, 8), sticky="nse")
@@ -180,11 +180,17 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         arm_var.set(False)  # 정지 시 개시 해제(목업)
 
     def _apply_running(running: bool) -> None:
-        # 실행중: '자동주문실행중'(노랑) → 클릭 시 정지 / 정지: '실행'(개시 체크 시만 활성)
+        # 실행중: '자동주문실행중'(노랑)+개시 체크 잠금 / 정지: '실행'+개시 체크 활성·해제
+        was = state_box.get("_running")
+        state_box["_running"] = running
         if running:
             btn_run.config(text="자동주문실행중", bg=T.C_HILITE_BG,
                            activebackground=T.C_HILITE_BG, command=do_stop, state="normal")
+            chk_arm.config(state="disabled")  # 실행 중엔 개시 체크 잠금
         else:
+            if was:  # 실행→정지 전이에서만 해제(정지 중 매 폴링마다 해제되는 것 방지)
+                arm_var.set(False)
+            chk_arm.config(state="normal")
             btn_run.config(text="실행", bg=root.cget("bg"), command=do_run,
                            state=("normal" if arm_var.get() else "disabled"))
         btn_apply.config(state="normal" if running else "disabled")  # 적용은 실행 중에만
