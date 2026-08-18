@@ -520,10 +520,25 @@ class LiveSystem:
 
         def apply_event(event: OrderEvent) -> None:
             self.order_book.on_order_event(event)
+            # [임시 진단] fx-auction 감시 흐름 확인 — 선물 접수 수신·판정 근거를 한 줄로.
+            if event.kind == "ack" and str(event.body.get("trcode1", "")).startswith("FO"):
+                import logging as _lg
+
+                from .fx_auction import parse_futures_ack as _pfa
+                _s = self.fx_auction.settings
+                _lg.getLogger("kp_arb.fx_auction").info(
+                    "선물접수 code=%s→%s org=%r running=%s now=%s ack=%s settings=%s",
+                    event.body.get("fnoIsuno"),
+                    self._resolve_fut_code(str(event.body.get("fnoIsuno", ""))),
+                    event.org_order_id, self.fx_auction.running, self._now_hms(),
+                    _pfa(event.body),
+                    (_s.windows, _s.price, _s.tick, _s.hedge_ratio) if _s else None)
             # 원달러선물 동시호가 대응 — 주식선물 신규주문이면 대응주문 발주(실행중일 때만).
             action = self.fx_auction.decide(
                 kind=event.kind, org_order_id=event.org_order_id, body=event.body)
             if action is not None:
+                import logging as _lg2
+                _lg2.getLogger("kp_arb.fx_auction").info("대응 발주 결정 %s", action)
                 task = asyncio.create_task(self._place_fx_hedge(action))
                 self._bg.add(task)
                 task.add_done_callback(self._bg.discard)

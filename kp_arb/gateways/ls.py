@@ -190,7 +190,10 @@ class LSApiGateway(LSGateway):
             self.FUTURE_ORDER_TR, body, path=self.FUTURE_PATH)
         order_id = self._parse_order_id(resp, self.FUTURE_ORDER_TR)
         order_log.logger_for(Venue.LS).info(
-            "원달러선물 발주 %s %s %d @ %s → #%s", code, side.value, qty, price, order_id)
+            "원달러선물 발주 %s %s %d @ %s → #%s | acct=%s resp=%r",  # [진단] 응답 원문
+            code, side.value, qty, price, order_id,
+            self._order_account_fields(account).get("AcntNo", "?"),
+            getattr(resp, "body", None))
         return order_id
 
     async def amend_order(
