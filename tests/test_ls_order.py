@@ -85,7 +85,8 @@ def _gateway(
     rl = RateLimiter(now=clock, default_per_second=100)
     rest = LSRestClient(BASE_URL, tm, transport, rl)
     return LSApiGateway(
-        {Account.KR_STOCK: rest, Account.KR_DERIV: rest},  # 테스트는 두 계좌 같은 mock
+        # 테스트는 세 계좌 같은 mock rest (KR_FX 포함 — 원달러선물 발주 테스트용).
+        {Account.KR_STOCK: rest, Account.KR_DERIV: rest, Account.KR_FX: rest},
         accounts=accounts,
         futures_symbols=futures_symbols,
         etf_symbols=etf_symbols,
@@ -177,6 +178,42 @@ async def test_future_cancel_uses_cfoat00300() -> None:
     blk = inblk(req, LSApiGateway.FUTURE_CANCEL_TR)
     assert blk["OrgOrdNo"] == int(oid)
     assert blk["CancQty"] == 10  # 원주문 수량
+
+
+async def test_fx_futures_uses_cfoat00100_on_kr_fx() -> None:
+    # 원달러선물 발주 — 선물옵션 TR(CFOAT00100), 콤보 종목코드를 FnoIsuNo에, 매도=BnsTpCode 1.
+    transport = OrderTransport()
+    gw = _gateway(transport)
+    oid = await gw.place_fx_futures("175V9000", Side.SELL, 2, 1420.5)
+    req = transport.requests[-1]
+    assert req["headers"]["tr_cd"] == LSApiGateway.FUTURE_ORDER_TR
+    blk = inblk(req, LSApiGateway.FUTURE_ORDER_TR)
+    assert blk["FnoIsuNo"] == "175V9000"      # 콤보 종목코드 그대로
+    assert blk["OrdQty"] == 2
+    assert blk["FnoOrdPrc"] == 1420.5
+    assert blk["BnsTpCode"] == "1"            # 매도
+    assert blk["FnoOrdprcPtnCode"] == "00"    # 지정가
+    assert oid
+
+
+async def test_fx_futures_buy_bnstpcode() -> None:
+    transport = OrderTransport()
+    gw = _gateway(transport)
+    await gw.place_fx_futures("175V9000", Side.BUY, 1, 1422.5)
+    blk = inblk(transport.requests[-1], LSApiGateway.FUTURE_ORDER_TR)
+    assert blk["BnsTpCode"] == "2"            # 매수
+
+
+async def test_fx_futures_missing_kr_fx_raises() -> None:
+    # KR_FX 미등록(선택 계좌) 환경에서 발주하면 명확히 거부.
+    transport = OrderTransport()
+    clock = _Clock()
+    tm = TokenManager("k", "s", _TokenStub(), now=clock)
+    rl = RateLimiter(now=clock, default_per_second=100)
+    rest = LSRestClient(BASE_URL, tm, transport, rl)
+    gw = LSApiGateway({Account.KR_STOCK: rest})  # KR_FX 없음
+    with pytest.raises(RestError):
+        await gw.place_fx_futures("175V9000", Side.SELL, 1, 1420.5)
 
 
 async def test_order_injects_account_number_and_password() -> None:

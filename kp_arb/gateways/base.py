@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-from ..domain.enums import Account, Underlying
+from ..domain.enums import Account, Side, Underlying
 from ..domain.models import OrderIntent, Position
 
 if TYPE_CHECKING:
@@ -33,6 +33,14 @@ class LSGateway(ABC):
     @abstractmethod
     async def get_open_orders(self, account: Account) -> Sequence[TrackedOrder]:
         """미체결 주문 스냅샷(최초 실행/온디맨드 조회용)."""
+
+    async def place_fx_futures(self, code: str, side: Side, qty: int,
+                               price: float) -> str:
+        """원달러선물 헤지 발주(KR_FX, §9.1) — 종목코드 직접 지정. 기본 미지원.
+
+        3주식 Underlying 모델 밖의 전용 경로(OrderBook 미거침). LSApiGateway/Mock가 구현.
+        """
+        raise NotImplementedError("이 게이트웨이는 원달러선물 발주를 지원하지 않는다")
 
 
 class HLGateway(ABC):

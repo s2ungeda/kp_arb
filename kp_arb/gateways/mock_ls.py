@@ -9,7 +9,7 @@ import itertools
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from ..domain.enums import Account, Venue
+from ..domain.enums import Account, Side, Venue
 from ..domain.models import OrderIntent, Position
 from ..routing import account_for
 from .base import LSGateway
@@ -22,6 +22,7 @@ class MockLSGateway(LSGateway):
     def __init__(self) -> None:
         self.connected = False
         self.placed: list[OrderIntent] = []
+        self.fx_placed: list[tuple[str, Side, int, float]] = []  # 원달러선물 발주 기록
         self._ids = itertools.count(1)
         self._positions: dict[Account, list[Position]] = {
             Account.KR_STOCK: [],
@@ -40,6 +41,11 @@ class MockLSGateway(LSGateway):
             raise ValueError(f"routing mismatch: {intent.account} != {expected}")
         self.placed.append(intent)
         return f"LS-{next(self._ids)}"
+
+    async def place_fx_futures(self, code: str, side: Side, qty: int,
+                               price: float) -> str:
+        self.fx_placed.append((code, side, qty, price))
+        return f"FX-{next(self._ids)}"
 
     async def cancel_order(self, order_id: str) -> None:
         return None

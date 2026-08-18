@@ -119,7 +119,10 @@ class LSApiGateway(LSGateway):
     ) -> LSApiGateway:
         """계좌별 키로 계좌별 토큰·REST 클라이언트를 조립. (레이트리밋은 계좌별 독립.)"""
         rest_by_account: dict[Account, LSRestClient] = {}
-        for account in _LS_ACCOUNTS:
+        load = list(_LS_ACCOUNTS)
+        if accounts.has(Account.KR_FX):  # 원달러선물 헤지 계좌(선택 §9.1) — 있으면 로드
+            load.append(Account.KR_FX)
+        for account in load:
             cred = accounts.for_account(account)
             tokens = TokenManager(cred.appkey, cred.appsecret, token_transport, now=now)
             limiter = RateLimiter(now=now)
@@ -171,6 +174,23 @@ class LSApiGateway(LSGateway):
             raise
         self._orders[order_id] = OrderContext(order_id, intent, account, body)
         order_log.order_placed(intent, order_id, getattr(resp, "body", None))
+        return order_id
+
+    async def place_fx_futures(self, code: str, side: Side, qty: int,
+                               price: float) -> str:
+        """원달러선물 지정가 발주 (KR_FX 계좌, CFOAT00100). 종목코드는 화면 콤보(근/차근).
+
+        3주식 Underlying 모델 밖의 §9.1 헤지 전용 경로 — OrderBook/OrderIntent를 안 거친다.
+        """
+        account = Account.KR_FX
+        if account not in self._rest_by_account:
+            raise RestError("KR_FX(원달러선물 헤지) 계좌 미등록 — 자격 확인 필요")
+        body = self._fx_order_body(code, side, qty, price, account)
+        resp = await self._rest_for(account).request(
+            self.FUTURE_ORDER_TR, body, path=self.FUTURE_PATH)
+        order_id = self._parse_order_id(resp, self.FUTURE_ORDER_TR)
+        order_log.logger_for(Venue.LS).info(
+            "원달러선물 발주 %s %s %d @ %s → #%s", code, side.value, qty, price, order_id)
         return order_id
 
     async def amend_order(
@@ -557,6 +577,20 @@ class LSApiGateway(LSGateway):
                 "FnoOrdPrc": intent.price if intent.price is not None else 0.0,
                 "BnsTpCode": "2" if intent.side is Side.BUY else "1",  # 1매도 2매수
                 "FnoOrdprcPtnCode": "00" if intent.order_type is OrderType.LIMIT else "03",
+            }
+        }
+
+    def _fx_order_body(self, code: str, side: Side, qty: int, price: float,
+                       account: Account) -> dict[str, Any]:
+        # 원달러선물도 선물옵션 시장(CFOAT00100) — FnoIsuNo에 콤보 종목코드를 그대로.
+        return {
+            f"{self.FUTURE_ORDER_TR}InBlock1": {
+                **self._order_account_fields(account),
+                "FnoIsuNo": code,
+                "OrdQty": int(qty),
+                "FnoOrdPrc": price,
+                "BnsTpCode": "2" if side is Side.BUY else "1",  # 1매도 2매수
+                "FnoOrdprcPtnCode": "00",  # 지정가
             }
         }
 
