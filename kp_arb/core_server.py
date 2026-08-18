@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from .domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
+from .fx_auction import FxAuctionSettings
 from .hl_merge import merge_tick_options
 from .manual_order import is_spot_stock, sellable_qty, short_sale_error
 from .routing import account_for
@@ -369,8 +370,14 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
             symbols[f"{u.value}|{inst.value}"] = entry
     fills = list(getattr(system, "fills", []))[:50]  # 최신 우선(코어 보관), 최근 50건
     cancels = list(getattr(system, "cancels", []))[:50]
+    # 원달러선물 동시호가 대응(§9.1) — 화면 콤보 코드·실행상태·발주내역.
+    fx_codes = system.fx_futures_codes() if hasattr(system, "fx_futures_codes") else []
+    fx_running = getattr(getattr(system, "fx_auction", None), "running", False)
+    fx_hedges = list(getattr(system, "fx_hedges", []))[:50]
     return {"connected": True, "symbols": symbols, "open_orders": open_orders,
-            "fills": fills, "cancels": cancels}
+            "fills": fills, "cancels": cancels,
+            "fx_auction": {"running": fx_running, "codes": fx_codes,
+                           "hedges": fx_hedges}}
 
 
 def _fx_command(fx_service: FxReportService | None, body: dict[str, Any]) -> dict[str, Any]:
@@ -517,6 +524,22 @@ async def _manual_command(
         _olog.info("수동주문 접수: %s → #%s%s", _desc, order_id,
                    f" (경고: {warn})" if warn else "")
         return _ok(order_id=order_id, warnings=[warn] if warn else [])
+    if cmd == "fx_auction_start":  # 원달러선물 동시호가 대응 감시 시작(§9.1)
+        try:
+            windows = tuple((str(a), str(b)) for a, b in (body.get("windows") or []))
+            settings = FxAuctionSettings(
+                windows=windows,
+                fx_code=str(body["fx_code"]),
+                price=float(body["price"]),
+                tick=int(body["tick"]),
+                hedge_ratio=float(body["hedge_ratio"]) / 100.0)  # % → 비율
+        except (KeyError, ValueError, TypeError) as exc:
+            return _fail([f"잘못된 대응주문 설정: {exc}"])
+        system.start_fx_auction(settings)
+        return _ok()
+    if cmd == "fx_auction_stop":
+        system.stop_fx_auction()
+        return _ok()
     return _fail([f"알 수 없는 수동 명령: {cmd!r}"])
 
 

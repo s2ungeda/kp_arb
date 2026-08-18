@@ -79,6 +79,8 @@ class _FakeSystem:
         self.leverage_calls: list[tuple[Underlying, int, bool]] = []
         self.merges: list[tuple[Underlying, int | None, int | None]] = []
         self.refreshed = 0
+        self.fx_started: list[Any] = []  # start_fx_auction 호출 기록
+        self.fx_stopped = 0
 
     async def place(self, intent: OrderIntent) -> str:
         if self._fail is not None:
@@ -106,6 +108,12 @@ class _FakeSystem:
         if self._fail is not None:
             raise self._fail
         self.leverage_calls.append((underlying, leverage, is_cross))
+
+    def start_fx_auction(self, settings: Any) -> None:
+        self.fx_started.append(settings)
+
+    def stop_fx_auction(self) -> None:
+        self.fx_stopped += 1
 
     def ws_statuses(self) -> list[WsStatus]:
         return self.ws
@@ -367,3 +375,23 @@ def test_manual_snapshot_hl_fields() -> None:
     assert hl["liq"] == 150.0  # detail이 기본 None을 덮어씀
     assert hl["leverage"] == 10.0 and hl["leverage_cross"] is True  # D: 버튼 캡션용
     assert hl["max_leverage"] == 20.0
+
+
+async def test_fx_auction_start_stop() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "fx_auction_start",
+        "windows": [["08:30", "08:46"], ["15:35", "15:46"]],
+        "fx_code": "175X9000", "price": 1421.5, "tick": 10, "hedge_ratio": 50})
+    assert r["ok"]
+    s = sys.fx_started[0]
+    assert s.fx_code == "175X9000" and s.tick == 10 and s.price == 1421.5
+    assert s.hedge_ratio == 0.5  # % → 비율 변환
+    assert s.windows == (("08:30", "08:46"), ("15:35", "15:46"))
+    r2 = await _manual_command(sys, {"cmd": "fx_auction_stop"})
+    assert r2["ok"] and sys.fx_stopped == 1
+
+
+async def test_fx_auction_start_bad_args() -> None:
+    sys = _fake_system(OrderBook())
+    r = await _manual_command(sys, {"cmd": "fx_auction_start", "windows": []})  # 인자 부족
+    assert not r["ok"] and sys.fx_started == []

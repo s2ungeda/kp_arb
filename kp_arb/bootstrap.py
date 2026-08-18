@@ -38,6 +38,7 @@ from .domain.enums import Account, Instrument, Side, Underlying, Venue
 from .domain.models import InstrumentInfo, OrderIntent, Position, Quote
 from .engine import ArbEngine
 from .etf_theory import EtfTheoryInputs, theory_after, theory_regular
+from .fx_auction import FxAuctionController, FxAuctionSettings, HedgeAction
 from .gateways.base import HLGateway
 from .gateways.hl import Mark
 from .gateways.hl_ws import HLWebSocketClient, OrderUpdate
@@ -183,6 +184,11 @@ class LiveSystem:
         self.on_fill: list[Callable[[Fill], None]] = []  # 체결통보 (OrderBook 반영 후 호출)
         self.fills: deque[dict[str, Any]] = deque(maxlen=200)  # 체결내역(최신 우선, 주문리스트)
         self.cancels: deque[dict[str, Any]] = deque(maxlen=200)  # 취소내역(최신 우선)
+        # 원달러선물 동시호가 대응주문(§9.1, DESIGN-fx-auction) — 감시 컨트롤러 + 발주 로그.
+        self.fx_hedges: deque[dict[str, Any]] = deque(maxlen=200)
+        self.fx_auction = FxAuctionController(
+            resolve_underlying=self._resolve_fut_code, now=self._now_hms,
+            targets={Underlying.SAMSUNG, Underlying.SK_HYNIX})
         self.on_fill.append(self._record_fill)  # 체결내역 보관 — 항상 기록
         self._tasks: list[asyncio.Task[None]] = []
         self._bg: set[asyncio.Task[None]] = set()  # 재연결 재동기 등 백그라운드 작업(GC 방지)
@@ -262,6 +268,47 @@ class LiveSystem:
             "underlying": it.underlying.value, "instrument": it.instrument.value,
             "side": it.side.value, "qty": it.qty, "price": it.price,  # 주문수량·주문가
         })
+
+    # --- 원달러선물 동시호가 대응주문 (§9.1, DESIGN-fx-auction) ---
+
+    def _now_hms(self) -> str:
+        import time
+        return time.strftime("%H:%M:%S")
+
+    def _resolve_fut_code(self, code: str) -> Underlying | None:
+        """주식선물 종목코드 → Underlying(감시 대상 판정). 근월물 코드 매칭."""
+        for u, sh in self.futures_symbols.items():
+            if sh == code:
+                return u
+        return None
+
+    def fx_futures_codes(self) -> list[str]:
+        """구독 중인 원달러선물 월물 코드(근·차근 순) — 화면 콤보용."""
+        return [code for code, _ in self._fx_months]
+
+    def start_fx_auction(self, settings: FxAuctionSettings) -> None:
+        """대응주문 감시 시작(화면 실행)."""
+        self.fx_auction.start(settings)
+
+    def stop_fx_auction(self) -> None:
+        """대응주문 감시 정지(화면 중지)."""
+        self.fx_auction.stop()
+
+    async def _place_fx_hedge(self, action: HedgeAction) -> None:
+        """대응주문 실제 발주(KR_FX) + 화면용 로그. 발주 실패해도 감시는 계속."""
+        import logging
+        rec = {"time": self._now_hms(), "code": action.fx_code,
+               "side": action.side.value, "qty": action.qty, "price": action.price,
+               "src": action.source_order_id}
+        try:
+            oid = await self._gw.place_fx_futures(
+                action.fx_code, action.side, action.qty, action.price)
+        except Exception:  # noqa: BLE001 - 발주 실패는 로그만, 감시 지속
+            logging.getLogger("kp_arb.fx_auction").exception(
+                "원달러선물 대응주문 실패 %s", action)
+            self.fx_hedges.appendleft({**rec, "order_id": "", "status": "실패"})
+            return
+        self.fx_hedges.appendleft({**rec, "order_id": oid, "status": "접수"})
 
     _HL_FILL_DEBOUNCE_S = 0.5  # 몰린 체결을 합쳐 조회 1회로 (사용자 확정)
 
@@ -473,6 +520,13 @@ class LiveSystem:
 
         def apply_event(event: OrderEvent) -> None:
             self.order_book.on_order_event(event)
+            # 원달러선물 동시호가 대응 — 주식선물 신규주문이면 대응주문 발주(실행중일 때만).
+            action = self.fx_auction.decide(
+                kind=event.kind, org_order_id=event.org_order_id, body=event.body)
+            if action is not None:
+                task = asyncio.create_task(self._place_fx_hedge(action))
+                self._bg.add(task)
+                task.add_done_callback(self._bg.discard)
 
         for underlying in Underlying:
             self._stock_ws.subscribe_quotes(underlying)

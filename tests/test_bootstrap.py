@@ -515,3 +515,41 @@ def test_pair_signal_est_based() -> None:
     # 수량이 커지면 est가 나빠져 진입 신호는 줄어든다 (2호가까지 파고듦)
     entry_big, _ = system.pair_signal(SAMSUNG, Instrument.KR_STOCK, 50, 50)
     assert entry_big is not None and entry is not None and entry_big < entry
+
+
+async def test_fx_auction_places_hedge_on_new_stock_future() -> None:
+    # 원달러선물 동시호가 대응: 삼성 주식선물 신규주문 접수(O01) → KR_FX 대응주문 발주.
+    from kp_arb.fx_auction import FxAuctionSettings
+    o01 = json.dumps({"header": {"tr_cd": "O01"}, "body": {
+        "fnoIsuno": "A1169000", "bnstp": "2", "ordqty": "20",
+        "ordprc": "142150", "ordno": "2224", "orgordno": "0"}})
+    system, _, _ = _system([], deriv_frames=[o01])
+    system.futures_symbols = {SAMSUNG: "A1169000"}  # 코드→종목 매칭용
+    system.start_fx_auction(FxAuctionSettings(
+        windows=(("00:00", "23:59"),), fx_code="175X9000",  # 항상 시간창 안
+        price=1421.5, tick=10, hedge_ratio=0.5))
+    await system.start()
+    await system.wait()
+    if system._bg:  # 백그라운드 발주 태스크 완료 대기
+        await asyncio.gather(*list(system._bg))
+    # 삼성 매수 20계약 @142150 → 원달러선물 매도 1계약 @1420.5
+    assert system._gw.fx_placed == [("175X9000", Side.SELL, 1, 1420.5)]
+    assert system.fx_hedges and system.fx_hedges[0]["status"] == "접수"
+
+
+async def test_fx_auction_ignores_when_stopped_or_amend() -> None:
+    # 실행 안 함 + 정정(orgordno≠0)이면 대응 안 함.
+    new = json.dumps({"header": {"tr_cd": "O01"}, "body": {
+        "fnoIsuno": "A1169000", "bnstp": "2", "ordqty": "20",
+        "ordprc": "142150", "ordno": "2224", "orgordno": "0"}})
+    amend = json.dumps({"header": {"tr_cd": "O01"}, "body": {
+        "fnoIsuno": "A1169000", "bnstp": "2", "ordqty": "20",
+        "ordprc": "142150", "ordno": "2232", "orgordno": "2224"}})  # 정정
+    system, _, _ = _system([], deriv_frames=[new, amend])
+    system.futures_symbols = {SAMSUNG: "A1169000"}
+    # start_fx_auction 호출 안 함 → 실행중 아님
+    await system.start()
+    await system.wait()
+    if system._bg:
+        await asyncio.gather(*list(system._bg))
+    assert system._gw.fx_placed == []  # 미실행이라 대응 없음
