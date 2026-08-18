@@ -1,7 +1,10 @@
 """원달러선물 동시호가 대응주문 순수 로직 테스트 (DESIGN-fx-auction.md §4)."""
-from kp_arb.domain.enums import Side
+from kp_arb.domain.enums import Side, Underlying
 from kp_arb.fx_auction import (
     FuturesAck,
+    FxAuctionController,
+    FxAuctionSettings,
+    HedgeAction,
     compute_hedge,
     hedge_price,
     hedge_qty,
@@ -112,3 +115,84 @@ def test_parse_o01_bad_or_missing_returns_none() -> None:
     assert parse_futures_ack(_o01("A1169000", "9", "1", "1.0", "1")) is None   # 매매구분 이상
     assert parse_futures_ack(_o01("A1169000", "2", "0", "1.0", "1")) is None   # 수량 0
     assert parse_futures_ack(_o01("A1169000", "2", "x", "1.0", "1")) is None   # 수량 비숫자
+
+
+# --- 감시 컨트롤러 (신규주문 → 대응 결정, 순수) ---
+
+_CODES = {"A1169000": Underlying.SAMSUNG, "A5069000": Underlying.SK_HYNIX}
+_SETTINGS = FxAuctionSettings(
+    windows=(("08:30", "08:46"), ("15:35", "15:46")),
+    fx_code="175X9000", price=1421.5, tick=10, hedge_ratio=0.5)
+
+
+def _ctrl(now: str = "08:40:00") -> FxAuctionController:
+    return FxAuctionController(
+        resolve_underlying=_CODES.get, now=lambda: now,
+        targets={Underlying.SAMSUNG, Underlying.SK_HYNIX})
+
+
+def test_decide_places_hedge_for_new_target_order() -> None:
+    c = _ctrl()
+    c.start(_SETTINGS)
+    # 삼성 매수 20계약 @142150 → 원달러선물 매도 1계약 @1420.5
+    action = c.decide(kind="ack", org_order_id=None,
+                      body=_o01("A1169000", "2", "20", "142150", "2224"))
+    assert action == HedgeAction("175X9000", Side.SELL, 1, 1420.5, "2224")
+
+
+def test_decide_none_when_not_running() -> None:
+    c = _ctrl()  # start 안 함
+    assert c.decide(kind="ack", org_order_id=None,
+                    body=_o01("A1169000", "2", "20", "142150", "1")) is None
+
+
+def test_decide_none_after_stop() -> None:
+    c = _ctrl()
+    c.start(_SETTINGS)
+    c.stop()
+    assert c.decide(kind="ack", org_order_id=None,
+                    body=_o01("A1169000", "2", "20", "142150", "1")) is None
+
+
+def test_decide_excludes_amend_and_cancel() -> None:
+    c = _ctrl()
+    c.start(_SETTINGS)
+    # 정정·취소는 org_order_id(원주문번호)가 채워져 옴 → 제외
+    assert c.decide(kind="ack", org_order_id="2222",
+                    body=_o01("A1169000", "2", "20", "142150", "2232")) is None
+
+
+def test_decide_excludes_non_ack() -> None:
+    c = _ctrl()
+    c.start(_SETTINGS)
+    assert c.decide(kind="cancel", org_order_id="2222", body={}) is None
+
+
+def test_decide_excludes_non_target_symbol() -> None:
+    c = _ctrl()
+    c.start(_SETTINGS)
+    assert c.decide(kind="ack", org_order_id=None,
+                    body=_o01("A9999000", "2", "20", "142150", "1")) is None
+
+
+def test_decide_excludes_outside_window() -> None:
+    c = _ctrl(now="09:00:00")  # 시간창 밖
+    c.start(_SETTINGS)
+    assert c.decide(kind="ack", org_order_id=None,
+                    body=_o01("A1169000", "2", "20", "142150", "1")) is None
+
+
+def test_decide_dedups_same_order() -> None:
+    c = _ctrl()
+    c.start(_SETTINGS)
+    body = _o01("A1169000", "2", "20", "142150", "2224")
+    assert c.decide(kind="ack", org_order_id=None, body=body) is not None
+    assert c.decide(kind="ack", org_order_id=None, body=body) is None  # 중복 무시
+
+
+def test_decide_skips_when_hedge_qty_zero() -> None:
+    c = _ctrl()
+    c.start(_SETTINGS)
+    # 10계약 @142150, 헤지 0.5 → 반내림 0.5 = 0 → 발주 안 함
+    assert c.decide(kind="ack", org_order_id=None,
+                    body=_o01("A1169000", "2", "10", "142150", "1")) is None

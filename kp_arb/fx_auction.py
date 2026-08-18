@@ -6,11 +6,11 @@ I/O·주문 실행은 코어(감시 태스크)와 게이트웨이 몫. 여기는
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from .domain.enums import Side
+from .domain.enums import Side, Underlying
 
 FX_TICK = 0.1          # 원달러선물 호가단위(원)
 FX_CONTRACT_USD = 10_000  # 원달러선물 1계약 = US$10,000
@@ -122,3 +122,80 @@ def parse_futures_ack(body: dict[str, Any]) -> FuturesAck | None:
         return None
     side = Side.BUY if bnstp == "2" else Side.SELL
     return FuturesAck(order_id=order_id, code=code, side=side, qty=qty, price=price)
+
+
+@dataclass(frozen=True)
+class FxAuctionSettings:
+    """화면에서 설정하는 대응주문 인자."""
+
+    windows: tuple[tuple[str, str], ...]  # (시작,종료) 구간들 (장전·마감)
+    fx_code: str                          # 원달러선물 종목코드 (콤보 선택)
+    price: float                          # 현재가 (고정)
+    tick: int                             # 주문틱 개수
+    hedge_ratio: float                    # 헤지비율 (0.5 = 50%)
+
+
+@dataclass(frozen=True)
+class HedgeAction:
+    """대응 발주 지시 — 실제 발주는 상위(LiveSystem)가 place_fx_futures로 수행."""
+
+    fx_code: str
+    side: Side
+    qty: int
+    price: float
+    source_order_id: str  # 원인이 된 주식선물 주문번호
+
+
+class FxAuctionController:
+    """동시호가 대응주문 감시 — 상태 + 신규주문 → 대응 결정(순수). 실제 발주는 상위가 한다.
+
+    resolve_underlying: 선물 종목코드 → Underlying|None (대상 판정용, LiveSystem이 주입)
+    now: () -> 'HH:MM:SS' (시간창 판정용)
+    targets: 감시할 Underlying 집합(삼성·하이닉스)
+    """
+
+    def __init__(self, resolve_underlying: Callable[[str], Underlying | None],
+                 now: Callable[[], str], targets: Collection[Underlying]) -> None:
+        self._resolve = resolve_underlying
+        self._now = now
+        self._targets = frozenset(targets)
+        self.settings: FxAuctionSettings | None = None
+        self.running = False
+        self._seen: set[str] = set()  # 대응한 주식선물 주문번호(중복 방지)
+
+    def start(self, settings: FxAuctionSettings) -> None:
+        self.settings = settings
+        self._seen.clear()
+        self.running = True
+
+    def stop(self) -> None:
+        self.running = False
+
+    def decide(self, *, kind: str, org_order_id: str | None,
+               body: dict[str, Any]) -> HedgeAction | None:
+        """주식선물 접수 → 대응주문(HedgeAction) or None. 순수(발주 안 함).
+
+        조건: 실행중 · 신규(ack + 원주문번호 없음) · 대상종목 · 시간창 · 미중복 · 수량>0.
+        """
+        s = self.settings
+        if not self.running or s is None:
+            return None
+        if kind != "ack" or org_order_id is not None:  # 신규만(정정·취소 제외)
+            return None
+        ack = parse_futures_ack(body)
+        if ack is None:
+            return None
+        u = self._resolve(ack.code)
+        if u is None or u not in self._targets:  # 대상 2종목만
+            return None
+        if not in_auction_window(self._now(), s.windows):  # 동시호가 시간창
+            return None
+        if ack.order_id in self._seen:  # 같은 주문 중복 대응 방지
+            return None
+        self._seen.add(ack.order_id)
+        fx_side, fx_px, qty = compute_hedge(
+            ack.side, ack.qty, ack.price, s.price, s.tick, s.hedge_ratio)
+        if qty <= 0:  # 반내림 0 — 발주 안 함
+            return None
+        return HedgeAction(fx_code=s.fx_code, side=fx_side, qty=qty,
+                           price=fx_px, source_order_id=ack.order_id)

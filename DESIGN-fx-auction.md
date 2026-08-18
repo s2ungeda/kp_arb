@@ -17,7 +17,7 @@
 - **신규만**: 구분/타입에 정정·취소가 없으므로 **원주문번호(`org_order_id`) 유무로 판정** — 있으면 정정/취소로 보고 **제외**, 없으면 신규.
 - 접수 이벤트의 **원본(`OrderEvent.body`)** 에서 매매구분·계약수·주문가·종목코드를 뽑는다(대상 2종목만).
   - **O01 실측 키(2026-08-18 확정)**: 종목=`fnoIsuno`(A1169000=삼성/A5069000=하이닉스), 매매=`bnstp`(2매수/1매도), 계약수=`ordqty`, 주문가=`ordprc`, 주문번호=`ordno`, 원주문=`orgordno`. 파서 `fx_auction.parse_futures_ack`.
-  - **신규/정정 구분(실측 확인)**: 신규는 `orgordno="0"`(trcode1 FO01), **정정도 O01로 오지만 `orgordno=원주문번호`(≠0, trcode1 FO02) + 별도 H01** → 기존 `OrderEvent.org_order_id`가 신규만 None이라 **추가 코드 없이 자동 제외**된다.
+  - **신규/정정/취소 구분(실측 확인 2026-08-18)**: 셋 다 O01로 온다 — 신규 `orgordno="0"`(FO01), **정정 `orgordno=원주문번호`(FO02), 취소 `orgordno=원주문번호`(FO03)** + 정정·취소는 별도 H01. 기존 `OrderEvent.org_order_id`가 **신규만 None**이라 단일 필터(`org_order_id is None`)로 **추가 코드 없이 정정·취소 자동 제외**된다.
 - 같은 주문번호(order_id)는 **1회만** 대응(중복 접수 방지).
 
 ## 4. 대응주문 계산 (순수 로직 — `fx_auction.py`)
