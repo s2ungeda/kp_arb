@@ -11,7 +11,7 @@
 - "무엇을·왜"는 이 문서에서 확정. 커넥터 **내부 구현 디테일**(LS TR 포맷, WS 재연결, OAuth2 갱신 등)은 구현 단계에서 채운다.
 - **이번 버전 핵심:** 전략 로직은 분리(플러그인)하고, FX 헤지는 외부 프로세스(#2)에 위임한다. 즉 **이 시스템은 "거래 인프라 + 전략 플러그인 슬롯 + 노출 보고"** 까지 책임진다.
 - `[OPEN]` 은 리뷰 시 결정할 미결 항목(§13).
-- **분할**: 문서가 커지면 상세를 `DESIGN-*.md`로 떼고 여기엔 제목·요약·링크만 남긴다. 링크된 `DESIGN-*.md`도 **계약의 일부**다(예: 수동 주문 = [DESIGN-manual-order.md](DESIGN-manual-order.md), 화면 공통 스타일 = [DESIGN-ui.md](DESIGN-ui.md)). 이력은 [DESIGN-history.md] 등으로 분리 가능.
+- **분할**: 문서가 커지면 상세를 `DESIGN-*.md`로 떼고 여기엔 제목·요약·링크만 남긴다. 링크된 `DESIGN-*.md`도 **계약의 일부**다(예: 수동 주문 = [DESIGN-manual-order.md](DESIGN-manual-order.md), 화면 공통 스타일 = [DESIGN-ui.md](DESIGN-ui.md), 원달러선물 동시호가 대응주문 = [DESIGN-fx-auction.md](DESIGN-fx-auction.md)). 이력은 [DESIGN-history.md] 등으로 분리 가능.
 
 ---
 

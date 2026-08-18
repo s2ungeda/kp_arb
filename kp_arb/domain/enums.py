@@ -43,6 +43,7 @@ class Instrument(StrEnum):
     KR_STOCK = "kr_stock"
     KR_ETF = "kr_etf"
     KR_STOCK_FUTURE = "kr_stock_future"  # 정규장 + 애프터마켓(~20:00, 2026-09-14~) 공용
+    KR_FX_FUTURE = "kr_fx_future"  # 원달러선물(환헤지, KR_FX 계좌) — 동시호가 대응주문 §9.1
     HL_PERP = "hl_perp"
 
     @property

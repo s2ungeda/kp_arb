@@ -7,6 +7,7 @@ _KR_ROUTING: dict[Instrument, Account] = {
     Instrument.KR_STOCK: Account.KR_STOCK,
     Instrument.KR_ETF: Account.KR_STOCK,
     Instrument.KR_STOCK_FUTURE: Account.KR_DERIV,
+    Instrument.KR_FX_FUTURE: Account.KR_FX,  # 원달러선물 환헤지 계좌 (§9.1)
 }
 
 
