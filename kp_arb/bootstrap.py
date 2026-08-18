@@ -303,10 +303,12 @@ class LiveSystem:
         try:
             oid = await self._gw.place_fx_futures(
                 action.fx_code, action.side, action.qty, action.price)
-        except Exception:  # noqa: BLE001 - 발주 실패는 로그만, 감시 지속
+        except Exception as exc:  # noqa: BLE001 - 발주 실패/거부는 로그만, 감시 지속
+            # 거부 사유(rsp_cd/rsp_msg)를 한 줄에 인라인(트레이스백은 그 아래).
             logging.getLogger("kp_arb.fx_auction").exception(
-                "원달러선물 대응주문 실패 %s", action)
-            self.fx_hedges.appendleft({**rec, "order_id": "", "status": "실패"})
+                "원달러선물 대응주문 실패/거부 %s — %s", action, exc)
+            self.fx_hedges.appendleft(
+                {**rec, "order_id": "", "status": "실패", "err": str(exc)[:120]})
             return
         self.fx_hedges.appendleft({**rec, "order_id": oid, "status": "접수"})
 
