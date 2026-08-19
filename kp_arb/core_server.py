@@ -362,6 +362,11 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
                     {"tick": s, "n_sig_figs": nsf, "mantissa": mant}
                     for s, nsf, mant in merge_tick_options(float(_ref))
                 ] if _ref else []
+                # 현재 적용 중인 머지(단일 진실=코어) — 새 창·다른 창이 콤보를 맞추는 기준.
+                _ma = (system.hl_merge_active(u)
+                       if hasattr(system, "hl_merge_active") else None)
+                entry["merge_active"] = (
+                    {"n_sig_figs": _ma[0], "mantissa": _ma[1]} if _ma is not None else None)
             if is_spot_stock(inst):
                 entry["sellable"] = sellable_qty(
                     held, pending_sell.get((u, inst), 0.0))

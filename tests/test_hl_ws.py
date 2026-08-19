@@ -53,6 +53,18 @@ def fills_frame(*, snapshot: bool = False) -> str:
     return json.dumps({"channel": "userFills", "data": data})
 
 
+def test_l2_aggregation_reports_active_merge() -> None:
+    # 코어가 스냅샷에 실어 보낼 '현재 적용 머지' — set 후 그대로 읽혀야(단일 진실).
+    client = HLWebSocketClient(FakeConnector([]))
+    client.subscribe_l2book()  # l2Book 구독돼야 머지 설정이 붙는다
+    assert client.l2_aggregation(Underlying.SAMSUNG) == (None, None)  # 원시(미설정)
+    client.set_l2_aggregation(Underlying.SAMSUNG, 5, 2)
+    assert client.l2_aggregation(Underlying.SAMSUNG) == (5, 2)
+    assert client.l2_aggregation(Underlying.SK_HYNIX) == (None, None)  # 종목별 독립
+    client.set_l2_aggregation(Underlying.SAMSUNG, None, None)  # 원시로 복귀
+    assert client.l2_aggregation(Underlying.SAMSUNG) == (None, None)
+
+
 async def test_subscribes_marks_and_fills() -> None:
     connector = FakeConnector([])
     client = HLWebSocketClient(connector)

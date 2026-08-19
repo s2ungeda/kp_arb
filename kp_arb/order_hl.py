@@ -308,12 +308,21 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         set_status(f"{cb_under.get()} 적용 — 조회 중")
 
     _merge_shown: dict[str, str | None] = {"under": None}  # 콤보에 채워진 종목(재populate 판단)
+    _merge_pending: dict[str, str | None] = {"label": None, "under": None}  # 내가 방금 바꾼 머지
 
     def _selected_symbol() -> dict[str, Any]:
         # 선택(콤보) 종목의 스냅샷 — '적' 전에도 읽을 수 있게 active가 아닌 cb_under 기준.
         under = UNDER_MAP.get(cb_under.get())
         data = state_box["data"] or {}
         return ((data.get("symbols") or {}).get(f"{under}|{INSTRUMENT}")) or {}
+
+    def _core_merge_label() -> str | None:
+        """코어가 적용 중인 머지(merge_active)에 맞는 콤보 라벨 — 단일 진실=코어. merge_map 필요."""
+        ma = _selected_symbol().get("merge_active")
+        if not ma:
+            return None
+        key = (ma.get("n_sig_figs"), ma.get("mantissa"))
+        return next((s for s, v in merge_map.items() if v == key), None)
 
     def _refresh_merge_combo() -> None:
         # 코어가 준 sym["merge_ticks"]로 콤보를 채운다('적' 전에도). 종목이 바뀌거나 처음
@@ -333,11 +342,30 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             vals.append(s)
             merge_map[s] = (t.get("n_sig_figs"), t.get("mantissa"))
         cb_merge["values"] = vals
-        want = merge_by_sym.get(under)  # 이 종목의 저장값 되살리기(없으면 최소 틱)
-        chosen = want if want in vals else vals[0]
+        # 우선순위: 코어 현재 적용값(merge_active) > 창 저장값(win_state) > 최소 틱.
+        # → 새 창은 코어 적용값을 그대로 보여준다(단일 진실).
+        want = merge_by_sym.get(under)  # 이 종목의 저장값
+        chosen = _core_merge_label() or (want if want in vals else vals[0])
         cb_merge.set(chosen)
         merge_by_sym[under] = chosen    # 표시값과 일치(자동저장이 이 dict을 씀)
         _merge_shown["under"] = under
+
+    def _sync_merge_from_core() -> None:
+        """다른 창이 바꾼 머지를 콤보에 반영(사다리는 이미 코어가 머지해 보냄 → 라벨만).
+        내가 방금 바꾼 건 코어 확인 전엔 유지 — 플리커/경합 방지."""
+        under = active["underlying"] or UNDER_MAP.get(cb_under.get())
+        if under is None or _merge_shown["under"] != under or not merge_map:
+            return
+        core_label = _core_merge_label()
+        if core_label is None:
+            return
+        if _merge_pending["label"] is not None and _merge_pending["under"] == under:
+            if core_label == _merge_pending["label"]:
+                _merge_pending["label"] = None  # 코어가 내 변경 확인 → 해제
+            return  # 확인 전엔 콤보 유지
+        if core_label != cb_merge.get():  # 다른 창이 바꿈 → 라벨 동기화
+            cb_merge.set(core_label)
+            merge_by_sym[under] = core_label
 
     def do_order() -> None:
         if not oneclick_var.get():  # 안전 잠금 — '주문' 체크돼야만 발송(사용자 확정)
@@ -449,6 +477,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def on_merge(_e: Any) -> None:
         under = active["underlying"] or UNDER_MAP[cb_under.get()]
         merge_by_sym[under] = cb_merge.get()  # 이 종목의 선택 기억(화면 저장·재적용용)
+        _merge_pending["label"] = cb_merge.get()  # 코어 확인 전까진 동기화가 덮지 않게
+        _merge_pending["under"] = under
         nsf, mant = merge_map.get(cb_merge.get(), (None, None))
         send({"cmd": "manual_hl_merge", "underlying": under,
               "n_sig_figs": nsf, "mantissa": mant}, "머지")
@@ -609,6 +639,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def refresh() -> None:
         try:
             _refresh_merge_combo()  # 호가단위 콤보 채움('적' 전에도, 선택 종목 기준)
+            _sync_merge_from_core()  # 다른 창이 바꾼 코어 머지를 콤보에 반영
             sym = active_symbol()
             dec = _hl_decimals(_ref_price(sym))
             # 잔고(=포지션)·PNL 우선, 나머지. 포맷: 진입가 3자리·PNL 1자리·마진/펀딩 0자리

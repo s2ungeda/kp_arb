@@ -766,6 +766,10 @@ class LiveSystem:
         if self._hl_ws is not None:
             self._hl_ws.set_l2_aggregation(u, n_sig_figs, mantissa)
 
+    def hl_merge_active(self, u: Underlying) -> tuple[int | None, int | None] | None:
+        """HL 현재 적용 호가단위 머지(nSigFigs, mantissa) — 스냅샷용. HL WS 없으면 None."""
+        return None if self._hl_ws is None else self._hl_ws.l2_aggregation(u)
+
     def ws_statuses(self) -> list[WsStatus]:
         """살아있는 WS 채널들의 현황(메인창 표·주문 안전차단 Phase 8-6용).
 

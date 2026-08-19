@@ -167,6 +167,17 @@ class HLWebSocketClient:
         self._depth.pop(underlying, None)  # 옛 단위 사다리 폐기
         self._control.append({"method": "subscribe", "subscription": dict(target)})
 
+    def l2_aggregation(
+        self, underlying: Underlying
+    ) -> tuple[int | None, int | None]:
+        """현재 적용 중인 l2Book 머지(nSigFigs, mantissa) — 원시(미설정)면 (None, None).
+
+        모든 창이 같은 값을 읽어 콤보를 맞추도록(단일 진실=코어) 스냅샷에 실어 보낸다.
+        """
+        coin = self._symbols.get(underlying)
+        extra = self._l2_extra.get(coin, {}) if coin is not None else {}
+        return (extra.get("nSigFigs"), extra.get("mantissa"))
+
     # --- 실행 루프 (LSWebSocketClient와 동일 패턴) ---
 
     async def run(self) -> None:
