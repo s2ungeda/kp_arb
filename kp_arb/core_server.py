@@ -662,6 +662,18 @@ def _setup_logging() -> logging.Logger:
                 olg.addHandler(_DailyFileHandler(log_dir, prefix=prefix))
             except OSError:
                 pass
+    # WS 주문 원본 로그 — 거래소별(ws_hl/ws_ls), 수신 시각 필요 → 타임스탬프 포매터.
+    for name, prefix in (("kp_arb.wsraw.hl", "ws_hl"), ("kp_arb.wsraw.ls", "ws_ls")):
+        wlg = logging.getLogger(name)
+        wlg.setLevel(logging.INFO)
+        wlg.propagate = False
+        if not any(isinstance(h, _DailyFileHandler) for h in wlg.handlers):
+            try:
+                wh = _DailyFileHandler(log_dir, prefix=prefix)
+                wh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+                wlg.addHandler(wh)
+            except OSError:
+                pass
     return logging.getLogger("kp_arb.core")
 
 

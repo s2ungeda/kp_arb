@@ -39,6 +39,24 @@ def test_hl_and_ls_use_separate_loggers() -> None:
     assert order_log.logger_for(Venue.LS).name == "kp_arb.order.ls"
 
 
+def test_ws_raw_routes_per_exchange(caplog: pytest.LogCaptureFixture) -> None:
+    # WS 주문 원본은 거래소별 로거(ws_hl/ws_ls)로 갈려 각각 파일로 남아야 한다.
+    with caplog.at_level(logging.INFO, logger="kp_arb.wsraw.hl"):
+        order_log.ws_order_raw(Venue.HYPERLIQUID, '{"channel":"orderUpdates"}')
+    with caplog.at_level(logging.INFO, logger="kp_arb.wsraw.ls"):
+        order_log.ws_order_raw(Venue.LS, '{"header":{"tr_cd":"C01"}}')
+    hl = [r for r in caplog.records if r.name == "kp_arb.wsraw.hl"]
+    ls = [r for r in caplog.records if r.name == "kp_arb.wsraw.ls"]
+    assert hl and "orderUpdates" in hl[-1].message
+    assert ls and "C01" in ls[-1].message
+
+
+def test_ws_raw_logger_names_separate() -> None:
+    assert order_log.WS_HL_LOGGER == "kp_arb.wsraw.hl"
+    assert order_log.WS_LS_LOGGER == "kp_arb.wsraw.ls"
+    assert order_log.WS_HL_LOGGER != order_log.WS_LS_LOGGER
+
+
 def test_fill_partial_then_full(caplog: pytest.LogCaptureFixture) -> None:
     # 0.14 주문에 0.054만 체결 → '부분', 누적/목표 함께 남겨 추적 가능.
     with caplog.at_level(logging.INFO, logger="kp_arb.order.hl"):

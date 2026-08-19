@@ -27,8 +27,9 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel
 
-from ..domain.enums import Instrument, Underlying
+from ..domain.enums import Instrument, Underlying, Venue
 from ..domain.models import Quote
+from ..order_log import ws_order_raw
 from ..ws_status import WsStatus
 
 QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1", "UH1"})  # KRX/NXT/통합 호가
@@ -356,10 +357,12 @@ class LSWebSocketClient:
                 for expected_handler in self.on_expected:
                     expected_handler(expected)
         elif tr_cd in FILL_TRS:
+            ws_order_raw(Venue.LS, raw)  # 체결통보(SC1/C01) 원본 상시 기록
             fill = self._parse_fill(tr_cd, msg)
             for fill_handler in self.on_fill:
                 fill_handler(fill)
         elif tr_cd in ORDER_EVENT_TRS:
+            ws_order_raw(Venue.LS, raw)  # 주문상태(접수/취소·O01/H01 등) 원본 상시 기록
             event = self._parse_order_event(tr_cd, msg)
             for event_handler in self.on_order_event:
                 event_handler(event)

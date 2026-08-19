@@ -18,11 +18,23 @@ from .domain.models import OrderIntent
 
 HL_LOGGER = "kp_arb.order.hl"
 LS_LOGGER = "kp_arb.order.ls"
+WS_HL_LOGGER = "kp_arb.wsraw.hl"  # WS 주문 원본 — ws_hl_날짜.log
+WS_LS_LOGGER = "kp_arb.wsraw.ls"  # WS 주문 원본 — ws_ls_날짜.log
 
 
 def logger_for(venue: Venue) -> logging.Logger:
     """거래소별 주문 로거 — HL은 hl_order 파일, 그 외(LS)는 ls_order 파일."""
     return logging.getLogger(HL_LOGGER if venue is Venue.HYPERLIQUID else LS_LOGGER)
+
+
+def ws_order_raw(venue: Venue, raw: str) -> None:
+    """WS 주문 관련 원본 프레임을 거래소별 파일에 **가공 없이 그대로** 남긴다.
+
+    체결·취소·주문상태 변화의 실제 수신 데이터를 사후 재구성하기 위한 것 — 파싱 전 원문.
+    호가·마크 등 시세는 대상 아님(주문 관련만). 파일: ws_hl_날짜.log / ws_ls_날짜.log.
+    """
+    logging.getLogger(
+        WS_HL_LOGGER if venue is Venue.HYPERLIQUID else WS_LS_LOGGER).info("%s", raw)
 
 
 def _fmt(intent: OrderIntent, *, with_price: bool = True) -> str:

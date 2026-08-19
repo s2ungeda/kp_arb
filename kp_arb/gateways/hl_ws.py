@@ -20,8 +20,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from ..domain.enums import Instrument, Underlying
+from ..domain.enums import Instrument, Underlying, Venue
 from ..domain.models import Quote
+from ..order_log import ws_order_raw
 from ..ws_status import WsStatus
 from .hl import Mark
 from .hl_live import HL_SYMBOLS
@@ -253,6 +254,7 @@ class HLWebSocketClient:
                         trade_handler(tick)
             return
         if channel == "orderUpdates":
+            ws_order_raw(Venue.HYPERLIQUID, raw)  # 주문상태 원본(가공 전) 상시 기록
             # data는 주문상태 목록(list) — 초기 스냅샷(모두 open)도 같은 형식(open은 무시됨).
             if isinstance(data, list):
                 for upd in self._parse_order_updates(data):
@@ -278,6 +280,7 @@ class HLWebSocketClient:
                 for quote_handler in self.on_quote:
                     quote_handler(quote)
         elif channel == "userFills":
+            ws_order_raw(Venue.HYPERLIQUID, raw)  # 체결통보 원본(스냅샷 포함) 상시 기록
             if data.get("isSnapshot"):
                 return  # 과거 체결 일괄 — 이벤트 아님
             for fill in self._parse_fills(data):
