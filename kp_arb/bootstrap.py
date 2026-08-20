@@ -51,6 +51,7 @@ from .gateways.ls_ws import (
     OrderEvent,
     TradeTick,
 )
+from .limits import DailyFilled, DailyLimitExceeded, would_exceed_daily_limit
 from .order_book import OrderBook, TrackedOrder
 from .risk import RiskManager, RiskState
 from .session import reference_instrument
@@ -190,6 +191,9 @@ class LiveSystem:
             resolve_underlying=self._resolve_fut_code, now=self._now_hms,
             targets={Underlying.SAMSUNG, Underlying.SK_HYNIX})
         self.on_fill.append(self._record_fill)  # 체결내역 보관 — 항상 기록
+        self._hl_filled = DailyFilled()  # HL 당일 체결액(USDC) — 일일 한도용(DESIGN-settings §1)
+        self.hl_daily_limit_usdc = 0.0   # HL 일일 한도(USDC, 0=무제한) — 코어가 설정에서 주입
+        self.on_fill.append(self._accumulate_hl_fill)  # HL 체결 → 당일 누적
         self._tasks: list[asyncio.Task[None]] = []
         self._bg: set[asyncio.Task[None]] = set()  # 재연결 재동기 등 백그라운드 작업(GC 방지)
         self._hl_refresh_pending = False  # 체결 후 HL 재조회 예약 여부(디바운스 코얼레싱)
@@ -274,6 +278,32 @@ class LiveSystem:
     def _now_hms(self) -> str:
         import time
         return time.strftime("%H:%M:%S")
+
+    def _today(self) -> str:
+        import time
+        return time.strftime("%Y%m%d")  # 로컬 자정 기준 — 날짜 바뀌면 당일 누적 리셋
+
+    def hl_daily_filled_today(self) -> float:
+        """HL 당일 체결액(USDC) — 스냅샷·표시용."""
+        return self._hl_filled.total(self._today())
+
+    def set_hl_daily_limit(self, usdc: float) -> None:
+        """HL 일일 체결액 한도(USDC) 반영 — 코어가 설정 변경·시동 시 호출."""
+        self.hl_daily_limit_usdc = max(0.0, usdc)
+
+    def _hl_order_notional(self, intent: OrderIntent) -> float:
+        """HL 주문 금액(USDC) = |수량| × 가격. 시장가(가격 없음)는 마크가로 추정."""
+        px = intent.price
+        if px is None:
+            mark = self.hl_mark.get(intent.underlying)
+            px = mark.price if mark is not None else 0.0
+        return abs(intent.qty) * (px or 0.0)
+
+    def _accumulate_hl_fill(self, fill: Fill) -> None:
+        """HL 체결이면 당일 체결액(USDC)에 |수량|×체결가 누적(일일 한도용)."""
+        order = self.order_book.order(fill.order_id)
+        if order is not None and order.intent.venue is Venue.HYPERLIQUID:
+            self._hl_filled.add(self._today(), abs(fill.qty) * fill.price)
 
     def _resolve_fut_code(self, code: str) -> Underlying | None:
         """주식선물 종목코드 → Underlying(감시 대상 판정). 근월물 코드 매칭."""
@@ -403,6 +433,13 @@ class LiveSystem:
             return order_id
         if self._hl is None:
             raise RuntimeError("HL gateway not configured")
+        # HL 일일 체결액 한도(DESIGN-settings §1) — 모든 HL 주문(수동·전략) 공통 하드블록.
+        notional = self._hl_order_notional(intent)
+        filled = self._hl_filled.total(self._today())
+        if would_exceed_daily_limit(filled, notional, self.hl_daily_limit_usdc):
+            raise DailyLimitExceeded(
+                f"HL 일일 한도 초과 — 당일 {filled:,.0f} + 주문 {notional:,.0f} "
+                f"> 한도 {self.hl_daily_limit_usdc:,.0f} USDC")
         order_id = await self._hl.place_order(intent)
         self.order_book.track(order_id, intent)
         place_fill = self._hl.pop_place_fill()  # 발주 즉시체결 (수량, 평균가) | None

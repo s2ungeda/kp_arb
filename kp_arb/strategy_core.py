@@ -135,14 +135,33 @@ class ScreenState:
 
 
 @dataclass
+class SoundSetting:
+    """알람 사운드 1종 — 재생 여부 + wav 파일 경로 (DESIGN-settings §2)."""
+
+    enabled: bool = False
+    path: str = ""
+
+
+@dataclass
+class GlobalSettings:
+    """전체 공통설정 — 일일 한도 + 알람 (DESIGN-settings). core_state.json에 저장."""
+
+    hl_daily_limit_usdc: float = 0.0  # HL 당일 체결액 한도(USDC). 0=무제한
+    sound_fill: SoundSetting = field(default_factory=SoundSetting)   # 주문 체결 시
+    sound_error: SoundSetting = field(default_factory=SoundSetting)  # 에러(발주 거부·실패)
+    sound_ws: SoundSetting = field(default_factory=SoundSetting)     # WS 끊김
+
+
+@dataclass
 class CoreState:
-    """코어 전체 상태 — 화면 2개 + 공통 선택."""
+    """코어 전체 상태 — 화면 2개 + 공통 선택 + 공통설정."""
 
     screens: dict[ScreenKind, ScreenState] = field(default_factory=lambda: {
         ScreenKind.AUTO_T: ScreenState(kind=ScreenKind.AUTO_T),
         ScreenKind.AUTO_M: ScreenState(kind=ScreenKind.AUTO_M),
     })
     fx_month: str = "near"  # 환율 표시용 원달러선물 월물 선택: near/next (§6.2-7)
+    settings: GlobalSettings = field(default_factory=GlobalSettings)  # 공통설정(한도·알람)
 
 
 # --- 검증 ---
@@ -278,12 +297,29 @@ def _set_from_dict(target: SpreadSet, raw: object) -> None:
         pass
 
 
+def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
+    """공통설정(한도·알람) 복원 — 값 오류는 해당 필드만 기본값."""
+    if not isinstance(raw, dict):
+        return
+    try:
+        s.hl_daily_limit_usdc = float(raw.get("hl_daily_limit_usdc", s.hl_daily_limit_usdc))
+    except (TypeError, ValueError):
+        pass
+    for name, snd in (("sound_fill", s.sound_fill), ("sound_error", s.sound_error),
+                      ("sound_ws", s.sound_ws)):
+        rs = raw.get(name)
+        if isinstance(rs, dict):
+            snd.enabled = bool(rs.get("enabled", snd.enabled))
+            snd.path = str(rs.get("path", snd.path))
+
+
 def state_from_dict(data: dict[str, object]) -> CoreState:
     """저장 스냅샷(JSON dict) → CoreState 복원. 값 오류는 해당 필드만 기본값."""
     state = CoreState()
     fx = data.get("fx_month")
     if fx in ("near", "next"):
         state.fx_month = str(fx)
+    _global_settings_from_dict(state.settings, data.get("settings"))
     screens = data.get("screens")
     if not isinstance(screens, dict):
         return state

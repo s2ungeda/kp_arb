@@ -106,6 +106,27 @@ def test_state_persistence_roundtrip(tmp_path: Path) -> None:
     assert not screen.entry_sets[0].running  # 실행 상태는 복원 안 함 (안전)
 
 
+def test_settings_global_command_and_persistence(tmp_path: Path) -> None:
+    state = CoreState()
+    res = apply_command(state, {
+        "cmd": "settings_global",
+        "hl_daily_limit_usdc": 5000.0,
+        "sound_fill": {"enabled": True, "path": "C:/s/fill.wav"},
+        "sound_ws": {"enabled": False, "path": "C:/s/ws.wav"},
+    })
+    assert res["ok"]
+    assert state.settings.hl_daily_limit_usdc == 5000.0
+    assert state.settings.sound_fill.enabled
+    # 저장·복원 왕복 — 공통설정도 core_state.json에 남는다
+    path = tmp_path / "core_state.json"
+    save_state(path, state)
+    restored = load_state(path)
+    assert restored.settings.hl_daily_limit_usdc == 5000.0
+    assert restored.settings.sound_fill.enabled
+    assert restored.settings.sound_fill.path == "C:/s/fill.wav"
+    assert not restored.settings.sound_ws.enabled
+
+
 def test_load_state_missing_or_corrupt(tmp_path: Path) -> None:
     assert load_state(tmp_path / "none.json").fx_month == "near"
     bad = tmp_path / "bad.json"

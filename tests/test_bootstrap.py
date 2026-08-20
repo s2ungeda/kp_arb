@@ -325,6 +325,35 @@ async def test_place_routes_hl_to_hl_gateway() -> None:
                                          instrument=Instrument.HL_PERP, side=Side.SELL,
                                          qty=0.1, order_type=OrderType.MARKET))
     assert oid.startswith("HL-") and len(hl_gw.placed) == 1
+
+
+async def test_hl_daily_limit_blocks_over_limit() -> None:
+    # DESIGN-settings §1 — place(길목)에서 당일 체결액 + 이 주문 금액 > 한도면 거부(수동·전략 공통).
+    from kp_arb.gateways.hl_ws import HLWebSocketClient
+    from kp_arb.gateways.mock_hl import MockHLGateway
+    from kp_arb.limits import DailyLimitExceeded
+
+    system = LiveSystem(
+        gateway=MockLSGateway(),  # type: ignore[arg-type]
+        order_book=OrderBook(),
+        session=SessionService(),
+        stock_ws=LSWebSocketClient(FakeConnector([])),
+        hl_gateway=MockHLGateway(),
+        hl_ws=HLWebSocketClient(FakeConnector([])),
+    )
+    await system.start()
+    system.set_hl_daily_limit(1000.0)
+
+    def _buy(qty: float) -> OrderIntent:
+        return OrderIntent(venue=Venue.HYPERLIQUID, underlying=SAMSUNG,
+                           instrument=Instrument.HL_PERP, side=Side.BUY, qty=qty,
+                           order_type=OrderType.LIMIT, price=1500.0)
+
+    assert await system.place(_buy(0.5))          # 0 + 750 ≤ 1000 → 통과
+    with pytest.raises(DailyLimitExceeded):
+        await system.place(_buy(1.0))             # 0 + 1500 > 1000 → 거부
+    system.set_hl_daily_limit(0.0)                # 0 = 무제한
+    assert await system.place(_buy(1.0))          # 이제 통과
     await system.wait()
 
 
