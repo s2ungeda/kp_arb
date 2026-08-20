@@ -19,6 +19,11 @@ _ALARMS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _fmt_amount(v: float) -> str:
+    """금액을 3자리 콤마로 — 지수표현(5e+09) 방지. 정수면 소수점 없음."""
+    return f"{int(v):,}" if float(v).is_integer() else f"{v:,.2f}"
+
+
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
     """공통설정 창 실행."""
     import threading
@@ -64,10 +69,29 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # HL 일일 한도
     tk.Label(form, text="HL 일일 한도(USDC)").grid(row=0, column=0, sticky="w", pady=2)
-    e_limit = tk.Entry(form, width=14, justify="right", font=T.FONT_NUM)
+    e_limit = tk.Entry(form, width=18, justify="right", font=T.FONT_NUM)
     e_limit.grid(row=0, column=1, sticky="w", padx=6, pady=2)
     tk.Label(form, text="0 = 무제한", fg=T.C_MUTED).grid(
         row=0, column=2, columnspan=2, sticky="w")
+
+    def _reformat_limit(*_ev: Any) -> None:
+        # 타이핑하면 3자리마다 콤마 자동(소수부는 그대로 보존). 저장 시엔 콤마 제거해 전송.
+        raw = e_limit.get().replace(",", "")
+        int_part, _, dec_part = raw.partition(".")
+        if int_part in ("", "-"):
+            return
+        try:
+            n = int(int_part)
+        except ValueError:
+            return
+        text = f"{n:,}" + (f".{dec_part}" if "." in raw else "")
+        if text == e_limit.get():   # 변화 없으면(방향키 등) 커서 안 건드림
+            return
+        e_limit.delete(0, "end")
+        e_limit.insert(0, text)
+        e_limit.icursor("end")
+
+    e_limit.bind("<KeyRelease>", _reformat_limit)
 
     # 알람 3줄 — [체크박스] 이벤트명  [wav 경로]  [찾아보기] [듣기]
     tk.Label(form, text="알람 (wav)").grid(row=1, column=0, sticky="w", pady=(10, 2))
@@ -101,7 +125,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     def do_save() -> None:
         try:
-            limit = float(e_limit.get().strip() or "0")
+            limit = float(e_limit.get().replace(",", "").strip() or "0")
         except ValueError:
             set_status("한도는 숫자로 입력하세요", err=True)
             return
@@ -141,7 +165,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if isinstance(settings, dict) and not state_box["loaded"]:
             state_box["loaded"] = True  # 최초 1회만 채움(사용자 편집 덮어쓰기 방지)
             e_limit.delete(0, "end")
-            e_limit.insert(0, f"{float(settings.get('hl_daily_limit_usdc', 0) or 0):g}")
+            e_limit.insert(0, _fmt_amount(float(settings.get("hl_daily_limit_usdc", 0) or 0)))
             for key, r in rows.items():
                 snd = settings.get(key) or {}
                 r["var"].set(bool(snd.get("enabled", False)))
