@@ -31,26 +31,44 @@ MASTER_ROWS = [
 ]
 
 
-def test_record_fill_tracks_known_skips_external() -> None:
-    # 체결내역 보관 — 추적 주문은 종목·방향과 함께 기록, 외부(미추적)는 스킵.
+def test_record_fill_appends_from_applied_fill() -> None:
+    # 체결내역 보관 — 실제 적용 시점(order+체결량)으로 기록(종목·방향 함께).
+    from collections import deque
+    from types import SimpleNamespace
+
+    ob = OrderBook()
+    order = ob.track("O1", OrderIntent(
+        venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.HL_PERP, side=Side.SELL, qty=0.1,
+        order_type=OrderType.LIMIT, price=163.0))
+    sys = SimpleNamespace(order_book=ob, fills=deque(maxlen=200))
+    LiveSystem._record_fill(sys, order, 0.1, 163.5, "F1")  # type: ignore[arg-type]
+    assert len(sys.fills) == 1
+    assert sys.fills[0]["side"] == "sell"
+    assert sys.fills[0]["qty"] == 0.1 and sys.fills[0]["price"] == 163.5
+
+
+def test_taker_immediate_fill_recorded_once_via_on_fill_applied() -> None:
+    # 회귀(2026-08-20): taker 즉시체결(apply_place_fill)이 체결내역에 1회 잡히고,
+    # 뒤늦은 userFills 재통보는 흡수돼 중복 안 됨 — 통보 타이밍 경합과 무관.
     from collections import deque
     from types import SimpleNamespace
 
     from kp_arb.gateways.ls_ws import Fill
 
     ob = OrderBook()
+    sys = SimpleNamespace(order_book=ob, fills=deque(maxlen=200))
+    ob.on_fill_applied.append(
+        lambda o, q, p, fid: LiveSystem._record_fill(sys, o, q, p, fid))  # type: ignore[arg-type]
     ob.track("O1", OrderIntent(
         venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
         instrument=Instrument.HL_PERP, side=Side.SELL, qty=0.1,
         order_type=OrderType.LIMIT, price=163.0))
-    sys = SimpleNamespace(order_book=ob, fills=deque(maxlen=200))
-    LiveSystem._record_fill(sys, Fill(  # type: ignore[arg-type]
-        fill_id="F1", order_id="O1", qty=0.1, price=163.0, fee=0.0, ts=1.0))
-    assert len(sys.fills) == 1
-    assert sys.fills[0]["side"] == "sell" and sys.fills[0]["qty"] == 0.1
-    LiveSystem._record_fill(sys, Fill(  # type: ignore[arg-type]
-        fill_id="F2", order_id="EXT", qty=1.0, price=1.0, fee=0.0, ts=1.0))
-    assert len(sys.fills) == 1  # 외부(미추적) 체결은 종목·방향 몰라 스킵
+    ob.apply_place_fill(Fill(fill_id="place-O1", order_id="O1", qty=0.1,
+                             price=163.5, fee=0.0, ts=0.0))
+    assert len(sys.fills) == 1 and sys.fills[0]["qty"] == 0.1  # 즉시체결 기록됨
+    ob.on_fill(Fill(fill_id="tid-1", order_id="O1", qty=0.1, price=163.5, fee=0.0, ts=0.0))
+    assert len(sys.fills) == 1  # 재통보 흡수 → 중복 없음
 
 
 def test_record_cancel_captures_time_and_intent() -> None:

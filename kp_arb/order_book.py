@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Collection, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -75,6 +75,9 @@ class OrderBook:
         self._orders: dict[str, TrackedOrder] = {}
         self._positions: dict[_PositionKey, _Pos] = {}
         self._balances: dict[Account, float] = {}
+        # 체결이 **실제 적용될 때**(즉시체결·대기체결 공용, 흡수된 재통보는 제외) 불리는
+        # 콜백 — 체결내역·누적을 타이밍 경합 없이 정확히 1회 기록하려는 용도(LiveSystem이 붙임).
+        self.on_fill_applied: list[Callable[[TrackedOrder, float, float, str], None]] = []
 
     # --- 최초/온디맨드 스냅샷 (REST 조회 결과 주입) ---
 
@@ -194,6 +197,8 @@ class OrderBook:
         self._apply_fill_to_balance(order.intent, qty, price, fee)
         order_log.order_filled(  # 거래소별 파일에 체결통보(부분/전량·누적) 기록
             order.intent, qty, price, fill_id, order.filled_qty)
+        for cb in self.on_fill_applied:  # 실제 적용 1회 — 체결내역·누적(타이밍 무관)
+            cb(order, qty, price, fill_id)
 
     def on_cancel(self, order_id: str) -> TrackedOrder | None:
         order = self._orders.get(order_id)

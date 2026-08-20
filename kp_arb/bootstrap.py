@@ -190,14 +190,16 @@ class LiveSystem:
         self.fx_auction = FxAuctionController(
             resolve_underlying=self._resolve_fut_code, now=self._now_hms,
             targets={Underlying.SAMSUNG, Underlying.SK_HYNIX})
-        self.on_fill.append(self._record_fill)  # 체결내역 보관 — 항상 기록
         self._hl_filled = DailyFilled()  # HL 당일 체결액(USDC) — 일일 한도용(DESIGN-settings §1)
         self.hl_daily_limit_usdc = 0.0   # HL 일일 한도(USDC, 0=무제한) — 코어가 설정에서 주입
-        self.on_fill.append(self._accumulate_hl_fill)  # HL 체결 → 당일 누적
         # 알람용 이벤트 카운터(메인창이 증가 감지 → 사운드) — DESIGN-settings §2·4.
         self.fill_seq = 0    # 체결마다 +1
         self.error_seq = 0   # 발주 거부·실패마다 +1
-        self.on_fill.append(lambda _f: self._bump_fill_seq())
+        # 체결내역·당일누적·seq는 **실제 체결 적용 시점**(order_book.on_fill_applied)에 1회씩.
+        # 통보(on_fill) 시점이면 taker 즉시체결은 통보가 track보다 빨라 누락(실증 2026-08-20).
+        order_book.on_fill_applied.append(self._record_fill)
+        order_book.on_fill_applied.append(self._accumulate_hl_fill)
+        order_book.on_fill_applied.append(lambda _o, _q, _p, _fid: self._bump_fill_seq())
         self._tasks: list[asyncio.Task[None]] = []
         self._bg: set[asyncio.Task[None]] = set()  # 재연결 재동기 등 백그라운드 작업(GC 방지)
         self._hl_refresh_pending = False  # 체결 후 HL 재조회 예약 여부(디바운스 코얼레싱)
@@ -241,17 +243,15 @@ class LiveSystem:
             reconcile_accounts=reconciled,
         )
 
-    def _record_fill(self, fill: Fill) -> None:
-        """체결내역 보관(주문 리스트 표시용) — 추적 주문이면 종목·방향을 안다.
+    def _record_fill(self, order: TrackedOrder, qty: float, price: float,
+                     fill_id: str) -> None:
+        """체결내역 보관(주문 리스트 표시용) — **실제 체결 적용 시점**에 1회.
 
-        OrderBook.on_fill 뒤에 불려 주문을 조회한다. 외부(미추적) 체결은 종목·방향을
-        몰라 스킵(추후 userFills raw로 확장 가능).
+        order_book.on_fill_applied에서 불린다 — 즉시체결(apply_place_fill)·대기체결 모두
+        이 지점을 지나고, 흡수된 재통보는 안 지난다 → 정확히 1회, taker도 타이밍 경합 없음.
         """
         import time as _t
 
-        order = self.order_book.order(fill.order_id)
-        if order is None:
-            return
         it = order.intent
         self.fills.appendleft({
             "time": _t.strftime("%H:%M:%S"),        # 체결시각
@@ -259,7 +259,7 @@ class LiveSystem:
             "accept_time": order.placed_at,         # 접수시각(원주문)
             "underlying": it.underlying.value, "instrument": it.instrument.value,
             "side": it.side.value,
-            "qty": fill.qty, "price": fill.price,           # 체결량·체결가
+            "qty": qty, "price": price,                     # 체결량·체결가
             "order_qty": it.qty, "order_price": it.price,   # 원주문 수량·주문가
         })
 
@@ -303,11 +303,11 @@ class LiveSystem:
             px = mark.price if mark is not None else 0.0
         return abs(intent.qty) * (px or 0.0)
 
-    def _accumulate_hl_fill(self, fill: Fill) -> None:
-        """HL 체결이면 당일 체결액(USDC)에 |수량|×체결가 누적(일일 한도용)."""
-        order = self.order_book.order(fill.order_id)
-        if order is not None and order.intent.venue is Venue.HYPERLIQUID:
-            self._hl_filled.add(self._today(), abs(fill.qty) * fill.price)
+    def _accumulate_hl_fill(self, order: TrackedOrder, qty: float, price: float,
+                            fill_id: str) -> None:
+        """HL 체결이면 당일 체결액(USDC)에 |수량|×체결가 누적 — 실제 적용 시점 1회(한도용)."""
+        if order.intent.venue is Venue.HYPERLIQUID:
+            self._hl_filled.add(self._today(), abs(qty) * price)
 
     def _bump_fill_seq(self) -> None:
         self.fill_seq += 1  # 알람용 — 메인창이 증가를 감지해 체결 사운드 재생
