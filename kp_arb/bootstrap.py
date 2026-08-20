@@ -441,6 +441,7 @@ class LiveSystem:
         if intent.venue is Venue.LS:
             order_id = await self._gw.place_order(intent)
             self.order_book.track(order_id, intent)
+            self.order_book.replay_pending(order_id)  # track 전에 온 이벤트 반영(역전 대비)
             return order_id
         if self._hl is None:
             raise RuntimeError("HL gateway not configured")
@@ -463,6 +464,9 @@ class LiveSystem:
             # 체결도 이중 반영 안 됨). 체결내역 기록·엔진 통지는 userFills가 전담.
             self.order_book.apply_place_fill(fill)
             self._schedule_hl_refresh()
+        # apply_place_fill **뒤**에 replay — track 전에 온 이벤트(체결·취소 등) 반영. 겹친
+        # 체결은 provisional_filled가 흡수해 이중 반영 없음(주문 역전 대비, LS·HL 공용).
+        self.order_book.replay_pending(order_id)
         return order_id
 
     async def amend_price(
@@ -496,6 +500,7 @@ class LiveSystem:
             update={"price": price, "qty": qty,
                     "reduce_only": reduce_only, "post_only": post_only})
         self.order_book.track(new_id, new_intent)
+        self.order_book.replay_pending(new_id)  # 새 주문번호로 track 전에 온 이벤트 반영
         if new_id != order_id:
             self.order_book.on_cancel(order_id)  # 원주문은 정정으로 소멸
         return new_id

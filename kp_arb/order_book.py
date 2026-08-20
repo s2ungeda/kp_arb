@@ -78,6 +78,9 @@ class OrderBook:
         # 체결이 **실제 적용될 때**(즉시체결·대기체결 공용, 흡수된 재통보는 제외) 불리는
         # 콜백 — 체결내역·누적을 타이밍 경합 없이 정확히 1회 기록하려는 용도(LiveSystem이 붙임).
         self.on_fill_applied: list[Callable[[TrackedOrder, float, float, str], None]] = []
+        # 미아 이벤트 버퍼(주문 역전 대비) — track 전에 온 WS 이벤트(체결·접수·취소·거부)를
+        # 주문번호별로 보관했다가 track 직후 replay. LS·HL 공용. 외부 주문은 상한으로 버려짐.
+        self._pending: dict[str, list[tuple[str, Fill | None]]] = {}
 
     # --- 최초/온디맨드 스냅샷 (REST 조회 결과 주입) ---
 
@@ -140,7 +143,10 @@ class OrderBook:
 
     def on_ack(self, order_id: str) -> TrackedOrder | None:
         order = self._orders.get(order_id)
-        if order is not None and order.status is OrderStatus.NEW:
+        if order is None:
+            self._buffer_event(order_id, "ack")  # 접수 통보가 track보다 먼저 — 보관
+            return None
+        if order.status is OrderStatus.NEW:
             order.status = OrderStatus.ACCEPTED
         return order
 
@@ -153,6 +159,7 @@ class OrderBook:
         """
         order = self._orders.get(fill.order_id)
         if order is None:
+            self._buffer_event(fill.order_id, "fill", fill)  # 체결이 track보다 먼저 — 보관
             return None
         qty = fill.qty
         if order.provisional_filled > 0:  # 발주응답 선반영분 — userFills 재통보 흡수
@@ -202,13 +209,19 @@ class OrderBook:
 
     def on_cancel(self, order_id: str) -> TrackedOrder | None:
         order = self._orders.get(order_id)
-        if order is not None and order.is_open:
+        if order is None:
+            self._buffer_event(order_id, "cancel")  # 취소 통보가 track보다 먼저 — 보관
+            return None
+        if order.is_open:
             order.status = OrderStatus.CANCELLED
         return order
 
     def on_reject(self, order_id: str) -> TrackedOrder | None:
         order = self._orders.get(order_id)
-        if order is not None and order.is_open:
+        if order is None:
+            self._buffer_event(order_id, "reject")  # 거부 통보가 track보다 먼저 — 보관
+            return None
+        if order.is_open:
             order.status = OrderStatus.REJECTED
         return order
 
@@ -223,6 +236,38 @@ class OrderBook:
         if event.kind == "reject":
             return self.on_reject(target)
         return None  # amend(정정)는 새 주문 재등록이 필요 — 상위(게이트웨이 결선)에서 처리
+
+    # --- 미아 이벤트 버퍼 (주문 역전 대비, LS·HL 공용) ---
+
+    _PENDING_CAP = 512  # 상한 — 외부(내가 안 낸) 주문 이벤트가 무한정 쌓이지 않게
+
+    def _buffer_event(self, order_id: str, kind: str, fill: Fill | None = None) -> None:
+        """track 안 된 주문번호로 온 WS 이벤트를 도착 순서대로 보관 — track 시 replay."""
+        buf = self._pending.get(order_id)
+        if buf is None:
+            if len(self._pending) >= self._PENDING_CAP:  # 가장 오래된 미아부터 버림
+                del self._pending[next(iter(self._pending))]
+            buf = self._pending[order_id] = []
+        buf.append((kind, fill))
+
+    def replay_pending(self, order_id: str) -> None:
+        """그 주문번호로 track 직후 호출 — 보관된 이벤트를 도착 순서대로 반영(역전 복구).
+
+        체결이 apply_place_fill보다 먼저 왔어도, replay를 apply_place_fill **뒤**에 두면
+        provisional_filled가 겹친 체결을 흡수해 이중 반영을 막는다.
+        """
+        events = self._pending.pop(order_id, None)
+        if not events:
+            return
+        for kind, fill in events:
+            if kind == "fill" and fill is not None:
+                self.on_fill(fill)
+            elif kind == "ack":
+                self.on_ack(order_id)
+            elif kind == "cancel":
+                self.on_cancel(order_id)
+            elif kind == "reject":
+                self.on_reject(order_id)
 
     # --- 증분 계산 (순수) ---
 

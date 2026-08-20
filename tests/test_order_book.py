@@ -272,3 +272,52 @@ def test_hl_fill_skips_balance() -> None:
     ob.on_fill(fill("1", qty=1, price=52.0))
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP) == -1
     assert ob.balance(Account.KR_STOCK) == 0.0
+
+
+# --- 주문 역전(reordering) 대비: 미아 이벤트 버퍼 + replay (LS·HL 공용) ---
+
+def test_fill_before_track_is_buffered_then_applied() -> None:
+    # 체결이 track보다 먼저 와도 track 시 replay로 반영(taker 즉시체결 누락 방지).
+    ob = OrderBook()
+    assert ob.on_fill(fill("O1", 10, 100.0)) is None   # 미아 → 버퍼
+    ob.track("O1", intent(qty=10))
+    ob.replay_pending("O1")
+    order = ob.order("O1")
+    assert order is not None and order.filled_qty == 10
+    assert order.status is OrderStatus.FILLED
+
+
+def test_cancel_before_track_is_buffered_then_applied() -> None:
+    ob = OrderBook()
+    ob.on_cancel("O2")                                  # 취소가 먼저 → 버퍼
+    ob.track("O2", intent())
+    ob.replay_pending("O2")
+    order = ob.order("O2")
+    assert order is not None and order.status is OrderStatus.CANCELLED
+
+
+def test_ack_before_track_is_buffered_then_applied() -> None:
+    ob = OrderBook()
+    ob.on_ack("O3")                                     # 접수가 먼저 → 버퍼
+    ob.track("O3", intent())
+    ob.replay_pending("O3")
+    order = ob.order("O3")
+    assert order is not None and order.status is OrderStatus.ACCEPTED
+
+
+def test_replay_absorbs_duplicate_with_provisional() -> None:
+    # 즉시체결(apply_place_fill) 뒤 replay되는 같은 체결은 provisional로 흡수 — 이중 반영 없음.
+    ob = OrderBook()
+    ob.on_fill(fill("O4", 0.1, 100.0))                  # WS 체결이 먼저 → 버퍼
+    ob.track("O4", _hl_intent(Side.SELL, 0.1))
+    ob.apply_place_fill(fill("O4", 0.1, 100.0, fill_id="place-O4"))  # 응답 즉시체결
+    ob.replay_pending("O4")                             # 버퍼된 WS 체결 → 흡수
+    order = ob.order("O4")
+    assert order is not None and order.filled_qty == 0.1   # 0.2 아님(이중 없음)
+
+
+def test_pending_buffer_is_bounded() -> None:
+    ob = OrderBook()
+    for i in range(OrderBook._PENDING_CAP + 50):        # 외부 주문 이벤트 무한 누적 방지
+        ob.on_fill(fill(f"X{i}", 1, 1.0))
+    assert len(ob._pending) <= OrderBook._PENDING_CAP
