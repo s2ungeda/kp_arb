@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any, cast
 
+from . import win_state
 from .core_client import core_request
 
 # 메인 화면 마지막 상태(코어 실행 여부·띄운 화면 목록) — gitignore
@@ -130,7 +131,8 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
 
 
 def launch_module(module: str, *args: str, console: bool = False,
-                  watch_parent: bool | None = None) -> subprocess.Popen[bytes]:
+                  watch_parent: bool | None = None,
+                  slot: int | None = None) -> subprocess.Popen[bytes]:
     """모듈(또는 배포판 exe)을 별도 프로세스로 실행.
 
     콘솔 숨김(CREATE_NO_WINDOW — cmd 창 안 뜸)이 기본. 코어도 콘솔 없이 띄우고 로그는
@@ -145,6 +147,8 @@ def launch_module(module: str, *args: str, console: bool = False,
         watch_parent = not console  # 콘솔 없는 화면은 메인 생사 감시(고아 방지)
     env = ({**os.environ, "KP_PARENT_PID": str(os.getpid())}
            if watch_parent else None)
+    if slot is not None:  # 같은 종류 창 인스턴스 구분 — win_state 키에 붙는다
+        env = {**(env if env is not None else os.environ), "KP_WIN_SLOT": str(slot)}
     return subprocess.Popen(launch_command(module, args), creationflags=flags, env=env)
 
 
@@ -169,7 +173,7 @@ def main() -> None:
     # 메뉴가 그 순간 얼어붙는다 → 뒷단 스레드가 확인하고 화면은 결과만 읽는다.
     alive_box: dict[str, Any] = {"alive": False, "ws": []}
     closing = {"flag": False}
-    launched: list[tuple[str, subprocess.Popen[bytes]]] = []
+    launched: list[tuple[str, int, subprocess.Popen[bytes]]] = []  # (token, slot, proc)
 
     # 코어 자동 재시작(Phase 8-5) — 연속 미접속이 임계 이상이면 재기동. cooldown은 시작
     # 직후 부팅 유예(초기값으로 시동 자체를 크래시로 오인하지 않게).
@@ -198,7 +202,7 @@ def main() -> None:
     def save_ui_state() -> None:
         """마지막 상태 저장 — 다음 실행 때 그대로 복원."""
         data = {"core": alive_box["alive"],
-                "screens": [m for m, p in launched if p.poll() is None]}
+                "screens": [tok for tok, _slot, p in launched if p.poll() is None]}
         try:
             UI_STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
         except OSError:
@@ -217,14 +221,25 @@ def main() -> None:
 
     threading.Thread(target=poll_core, daemon=True).start()
 
+    def _next_slot(module: str) -> int:
+        # 같은 module의 살아있는 인스턴스가 안 쓰는 가장 작은 슬롯 — 창별 위치 분리.
+        used = {slot for tok, slot, p in launched
+                if tok.split(" ", 1)[0] == module and p.poll() is None}
+        slot = 0
+        while slot in used:
+            slot += 1
+        return slot
+
     def open_screen(module: str, *args: str) -> None:
         token = " ".join([module, *args])  # ui_state 저장/복원용 식별자
-        launched.append((token, launch_module(module, *args)))
+        slot = _next_slot(module)  # 인스턴스별 슬롯 → win_state 키 분리(각 창 위치 따로)
+        launched.append((token, slot, launch_module(module, *args, slot=slot)))
 
     root = tk.Tk()
     root.title("Meme")
     root.resizable(False, False)
     root.option_add("*Font", ("Malgun Gothic", 9))
+    win_state.attach(root, "main")  # 메인창 위치 저장·복원(슬롯 없음 — 단일 인스턴스)
 
     lbl_core = tk.Label(root, text="코어: 확인 중 ...", anchor="w", width=42)
     lbl_core.pack(fill="x", padx=8, pady=(8, 2))
@@ -354,7 +369,7 @@ def main() -> None:
         save_ui_state()  # 닫기 직전 화면 목록 저장 — 다음 실행 때 다시 열림
         closing["flag"] = True
         core_request("/command", {"cmd": "shutdown"})  # 코어 안전종료(정지·취소 후)
-        for _, proc in launched:
+        for _tok, _slot, proc in launched:
             if proc.poll() is None:
                 proc.terminate()
         root.destroy()

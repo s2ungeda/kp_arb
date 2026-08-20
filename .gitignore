@@ -12,6 +12,7 @@ core_state.json
 ui_state.json
 win_state.json
 win_fields.json
+.win_state/
 ~$*.xlsx
 build/
 dist/

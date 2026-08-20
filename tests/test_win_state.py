@@ -1,4 +1,4 @@
-"""화면 위치 저장·복원 — 순수 로직 + 파일 왕복 테스트."""
+"""화면 위치·설정 저장·복원 — 순수 로직 + 키별 파일 왕복(프로세스 경합 없음)."""
 from pathlib import Path
 
 import pytest
@@ -14,48 +14,65 @@ def test_position_only_extracts_position() -> None:
     assert win_state.position_only("1x1") is None
 
 
-def test_merge_geometry_keeps_others_and_position_only() -> None:
-    store = {"autoT": "+1+1", "monitor": "+2+2"}
-    merged = win_state.merge_geometry(store, "autoM", "300x200+50+60")
-    assert merged["autoM"] == "+50+60"
-    assert merged["autoT"] == "+1+1" and merged["monitor"] == "+2+2"  # 다른 항목 보존
-    # 위치를 못 뽑으면 원본 유지(항목 추가 안 함)
-    assert win_state.merge_geometry(store, "x", "800x600") == store
+def test_storage_key_per_instance_slot() -> None:
+    # 슬롯 없으면 창 이름 그대로(단일), 슬롯 있으면 인스턴스별 키 → 서로 안 덮어씀.
+    assert win_state.storage_key("order_hl", None) == "order_hl"
+    assert win_state.storage_key("order_hl", "") == "order_hl"   # 빈 문자열도 단일 취급
+    assert win_state.storage_key("order_hl", "0") == "order_hl#0"
+    assert win_state.storage_key("order_hl", "1") == "order_hl#1"
+    assert win_state.storage_key("order_hl", "0") != win_state.storage_key("order_hl", "1")
 
 
-def test_save_and_load_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(win_state, "STATE_PATH", tmp_path / "win_state.json")
+@pytest.fixture
+def _statedir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(win_state, "_STATE_DIR", tmp_path / ".win_state")
+    monkeypatch.delenv("KP_WIN_SLOT", raising=False)  # 슬롯 없는(단일) 키로 테스트
+    return tmp_path
+
+
+def test_position_roundtrip_and_key_isolation(_statedir: Path) -> None:
     win_state.save("autoT", "300x200+11+22")
-    win_state.save("monitor", "760x600+33+44")   # 다른 화면 저장해도 autoT 보존
+    win_state.save("monitor", "760x600+33+44")   # 다른 키 — 파일이 달라 서로 안 덮어씀
     assert win_state.saved_position("autoT") == "+11+22"
     assert win_state.saved_position("monitor") == "+33+44"
     assert win_state.saved_position("none") is None
+    win_state.save("autoT", "300x200")           # 크기만 → 위치 못 뽑음 → 저장 안 함
+    assert win_state.saved_position("autoT") == "+11+22"  # 이전 값 보존
 
 
-def test_fields_save_and_load_roundtrip(
+def test_fields_and_position_coexist_in_one_key(_statedir: Path) -> None:
+    # 같은 키 파일에 위치·필드가 함께 — 서로를 지우지 않는다(한 프로세스가 순차 기록).
+    win_state.save("order_hl", "300x200+5+6")
+    win_state.save_fields("order_hl", {"under": "삼성", "tick": 3})
+    assert win_state.saved_fields("order_hl") == {"under": "삼성", "tick": 3}
+    assert win_state.saved_position("order_hl") == "+5+6"   # 필드 저장이 위치 안 지움
+    win_state.save("order_hl", "300x200+9+9")  # 위치 저장이 필드 안 지움
+    assert win_state.saved_fields("order_hl") == {"under": "삼성", "tick": 3}
+    assert win_state.saved_position("order_hl") == "+9+9"
+
+
+def test_slot_separates_instances(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(win_state, "FIELDS_PATH", tmp_path / "win_fields.json")
-    win_state.save_fields("order_hl", {"under": "하이닉스", "reduce": True, "tick": 3})
-    win_state.save_fields("order_ls", {"under": "삼성"})  # 다른 화면 보존
-    assert win_state.saved_fields("order_hl") == {"under": "하이닉스", "reduce": True, "tick": 3}
-    assert win_state.saved_fields("order_ls") == {"under": "삼성"}
-    assert win_state.saved_fields("none") == {}
+    monkeypatch.setattr(win_state, "_STATE_DIR", tmp_path / ".win_state")
+    monkeypatch.setenv("KP_WIN_SLOT", "0")
+    win_state.save("order_hl", "300x200+1+1")
+    win_state.save_fields("order_hl", {"under": "삼성"})
+    monkeypatch.setenv("KP_WIN_SLOT", "1")            # 다른 인스턴스
+    win_state.save("order_hl", "300x200+2+2")
+    assert win_state.saved_position("order_hl") == "+2+2"  # 슬롯1
+    assert win_state.saved_fields("order_hl") == {}         # 슬롯1은 아직 필드 없음
+    monkeypatch.setenv("KP_WIN_SLOT", "0")
+    assert win_state.saved_position("order_hl") == "+1+1"  # 슬롯0 그대로
+    assert win_state.saved_fields("order_hl") == {"under": "삼성"}
 
 
-def test_fields_missing_returns_empty(
+def test_missing_or_corrupt_returns_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(win_state, "FIELDS_PATH", tmp_path / "none.json")
-    assert win_state.saved_fields("order_hl") == {}
-    bad = tmp_path / "bad.json"
-    bad.write_text("{broken", encoding="utf-8")
-    monkeypatch.setattr(win_state, "FIELDS_PATH", bad)
-    assert win_state.saved_fields("order_hl") == {}
-
-
-def test_load_missing_or_corrupt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(win_state, "STATE_PATH", tmp_path / "none.json")
+    monkeypatch.setattr(win_state, "_STATE_DIR", tmp_path / ".win_state")
+    monkeypatch.delenv("KP_WIN_SLOT", raising=False)
     assert win_state.saved_position("autoT") is None
-    bad = tmp_path / "bad.json"
-    bad.write_text("{broken", encoding="utf-8")
-    monkeypatch.setattr(win_state, "STATE_PATH", bad)
-    assert win_state.saved_position("autoT") is None
+    assert win_state.saved_fields("autoT") == {}
+    (tmp_path / ".win_state").mkdir()
+    (tmp_path / ".win_state" / "autoT.json").write_text("{broken", encoding="utf-8")
+    assert win_state.saved_position("autoT") is None   # 깨진 파일 → 예외 아닌 빈 결과
+    assert win_state.saved_fields("autoT") == {}
