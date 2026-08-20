@@ -452,6 +452,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     hoga.bind("<<TreeviewSelect>>", on_hoga_click)
 
+    def _on_mode_change(*_: Any) -> None:
+        # 가격→호가 전환 순간: 주문 방향의 1호가를 자동으로 추적 대상으로 잡는다
+        # (매수→매수1호가 bids[0] / 매도→매도1호가 asks[0]). 이후는 그 레벨을 따라감.
+        if mode_var.get() != "hoga":
+            return
+        _hoga_lvl.update(side="bid" if side_var.get() == "buy" else "ask", idx=0)
+        _apply_hoga_offset()
+
+    mode_var.trace_add("write", _on_mode_change)
+
     def _on_tick_spin() -> None:
         # 틱 스핀 업/다운 → 마지막 클릭 기준에 오프셋 재적용(호가 모드에서만).
         if mode_var.get() == "hoga":
