@@ -88,6 +88,9 @@ class _FakeSystem:
         self.placed.append(intent)
         return "OID-1"
 
+    def bump_error(self) -> None:
+        self.errors = getattr(self, "errors", 0) + 1  # 발주 실패 알람 카운터(테스트용)
+
     async def cancel(self, order_id: str) -> None:
         self.cancelled.append(order_id)
 

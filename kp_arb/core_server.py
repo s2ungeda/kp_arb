@@ -535,6 +535,7 @@ async def _manual_command(
             order_id = await system.place(intent)
         except Exception as exc:  # noqa: BLE001 - 게이트웨이 거부/오류를 화면에 전달
             _olog.warning("수동주문 거부(발주): %s — %s", _desc, exc)
+            system.bump_error()  # 알람용 — 메인창이 에러 사운드 재생(DESIGN-settings §2)
             return _fail([f"주문 실패: {exc}"])
         warn = _ws_order_warning(system)  # 수동은 경고만(§2) — 발주는 됨
         _olog.info("수동주문 접수: %s → #%s%s", _desc, order_id,
@@ -578,6 +579,11 @@ def make_app(
                          else {"connected": False})
         payload["ws"] = ([s.to_dict() for s in system.ws_statuses()]
                          if system is not None else [])  # WS 세션 현황(Phase 8-3)
+        # 알람용 이벤트 카운터 + 당일 HL 체결액(메인창 사운드·설정창 표시) — DESIGN-settings §4.
+        payload["fill_seq"] = system.fill_seq if system is not None else 0
+        payload["error_seq"] = system.error_seq if system is not None else 0
+        payload["hl_daily_filled"] = (
+            system.hl_daily_filled_today() if system is not None else 0.0)
         return web.json_response(payload, dumps=_dumps)
 
     async def post_command(request: web.Request) -> web.Response:

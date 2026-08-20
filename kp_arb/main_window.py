@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any, cast
 
-from . import win_state
+from . import sound, win_state
 from .core_client import core_request
 
 # 메인 화면 마지막 상태(코어 실행 여부·띄운 화면 목록) — gitignore
@@ -125,6 +125,8 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "meme.exe"), "order_list"]
     if module == "kp_arb.fx_auction_order":
         return [str(exe_dir / "meme.exe"), "fx_auction_order"]
+    if module == "kp_arb.settings_window":
+        return [str(exe_dir / "meme.exe"), "settings"]
     if module == "kp_arb.order_panel":
         return [str(exe_dir / "meme.exe"), *args]  # autoT | autoM
     return [str(exe_dir / "meme.exe")]
@@ -208,12 +210,40 @@ def main() -> None:
         except OSError:
             pass
 
+    # 알람 사운드 — /state의 fill_seq·error_seq 증가 + WS 끊김 전이를 감지해 재생.
+    # 시동 시점 값은 기준으로만 잡고 재생 안 함(첫 관측은 None→값).
+    sound_box: dict[str, Any] = {"fill": None, "error": None, "ws": {}}
+
+    def _play_alarm(settings: dict[str, Any], key: str) -> None:
+        snd = settings.get(key) or {}
+        if snd.get("enabled") and snd.get("path"):
+            sound.play_wav(str(snd["path"]))
+
+    def check_sounds(data: dict[str, Any] | None) -> None:
+        if not data:
+            return
+        settings = data.get("settings") or {}
+        for key, seq_field in (("sound_fill", "fill"), ("sound_error", "error")):
+            seq = data.get(f"{seq_field}_seq")
+            if isinstance(seq, int):
+                prev = sound_box[seq_field]
+                if prev is not None and seq > prev:
+                    _play_alarm(settings, key)
+                sound_box[seq_field] = seq
+        for row in (data.get("ws") or []):  # WS 연결→끊김 전이마다 재생
+            name = str(row.get("name"))
+            conn = bool(row.get("connected"))
+            if sound_box["ws"].get(name) is True and not conn:
+                _play_alarm(settings, "sound_ws")
+            sound_box["ws"][name] = conn
+
     def poll_core() -> None:
         while True:
             data = core_request("/state")  # 코어 생존 + WS 세션 현황 한 번에
             alive = data is not None
             alive_box["alive"] = alive
             alive_box["ws"] = (data or {}).get("ws") or []
+            check_sounds(data)  # 알람(체결·에러·WS끊김)
             if not closing["flag"]:  # 종료 중엔 재기동·저장 안 함
                 maybe_restart_core(alive)
                 save_ui_state()
@@ -313,6 +343,9 @@ def main() -> None:
                          command=lambda: open_screen("kp_arb.order_list"))
     m_screen.add_command(label="원달러선물 동시호가 주문",
                          command=lambda: open_screen("kp_arb.fx_auction_order"))
+    m_screen.add_separator()
+    m_screen.add_command(label="공통설정",
+                         command=lambda: open_screen("kp_arb.settings_window"))
     menubar.add_cascade(label="화면", menu=m_screen)
     m_core = tk.Menu(menubar, tearoff=0)
     m_core.add_command(label="코어 시작", command=start_core)

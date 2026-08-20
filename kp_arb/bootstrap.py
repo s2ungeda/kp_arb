@@ -194,6 +194,10 @@ class LiveSystem:
         self._hl_filled = DailyFilled()  # HL 당일 체결액(USDC) — 일일 한도용(DESIGN-settings §1)
         self.hl_daily_limit_usdc = 0.0   # HL 일일 한도(USDC, 0=무제한) — 코어가 설정에서 주입
         self.on_fill.append(self._accumulate_hl_fill)  # HL 체결 → 당일 누적
+        # 알람용 이벤트 카운터(메인창이 증가 감지 → 사운드) — DESIGN-settings §2·4.
+        self.fill_seq = 0    # 체결마다 +1
+        self.error_seq = 0   # 발주 거부·실패마다 +1
+        self.on_fill.append(lambda _f: self._bump_fill_seq())
         self._tasks: list[asyncio.Task[None]] = []
         self._bg: set[asyncio.Task[None]] = set()  # 재연결 재동기 등 백그라운드 작업(GC 방지)
         self._hl_refresh_pending = False  # 체결 후 HL 재조회 예약 여부(디바운스 코얼레싱)
@@ -304,6 +308,13 @@ class LiveSystem:
         order = self.order_book.order(fill.order_id)
         if order is not None and order.intent.venue is Venue.HYPERLIQUID:
             self._hl_filled.add(self._today(), abs(fill.qty) * fill.price)
+
+    def _bump_fill_seq(self) -> None:
+        self.fill_seq += 1  # 알람용 — 메인창이 증가를 감지해 체결 사운드 재생
+
+    def bump_error(self) -> None:
+        """발주 거부·실패 알림 — 메인창이 증가를 감지해 에러 사운드 재생(DESIGN-settings §2)."""
+        self.error_seq += 1
 
     def _resolve_fut_code(self, code: str) -> Underlying | None:
         """주식선물 종목코드 → Underlying(감시 대상 판정). 근월물 코드 매칭."""

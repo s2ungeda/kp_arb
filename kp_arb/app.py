@@ -46,6 +46,9 @@ def main() -> None:
     elif arg == "fx_auction_order":
         from kp_arb.fx_auction_order import main as run
         run()
+    elif arg == "settings":
+        from kp_arb.settings_window import main as run
+        run()
     elif arg == "keys":
         from kp_arb.key_setup import main as run
         run()
