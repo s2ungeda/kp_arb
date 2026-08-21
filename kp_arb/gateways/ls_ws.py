@@ -392,23 +392,15 @@ class LSWebSocketClient:
         # 알 수 없는 tr_cd는 무시
 
     def _parse_fx_spot(self, msg: dict[str, Any]) -> float | None:
-        """CUR(현물환율) body → 환율. **응답 필드 미실측** — 실측 로그로 확인 후 확정.
+        """CUR(원달러 현물환율) body → 환율. 필드는 ``price``(현재가, 실측 2026-08-21).
 
-        후보 필드로 값 추출 시도(콤마 제거). 못 찾으면 None(로그만 남김).
+        body 예: {base_id:'USD', price:'1318.20', bid/offer, time/ctime, ...}.
         """
-        import logging
-
-        body = msg.get("body") or {}
-        # [실측] CUR 응답 원문 — 실제 환율 필드 확인 후 아래 후보를 그 필드로 확정하고 이 줄 제거.
-        logging.getLogger("kp_arb.core").info("[실측] CUR body=%r", body)
-        for field in ("환율", "price", "현재가", "curr", "cur", "rate", "usdkrw"):
-            try:
-                rate = float(str(body[field]).replace(",", ""))
-            except (KeyError, TypeError, ValueError):
-                continue
-            if rate > 0:
-                return rate
-        return None
+        try:
+            rate = float(str((msg.get("body") or {})["price"]).replace(",", ""))
+        except (KeyError, TypeError, ValueError):
+            return None
+        return rate if rate > 0 else None
 
     def _parse_fx(self, msg: dict[str, Any]) -> tuple[str, float] | None:
         # FC0 체결가 필드는 'price' 가정(실측 예정 — 다르면 on_raw로 확인). (월물코드, 가격).

@@ -130,11 +130,12 @@ async def test_subscribe_fx_spot_registers_cur() -> None:
     assert cur["header"]["tr_type"] == "3"    # 시세 등록
 
 
-def test_parse_fx_spot_extracts_numeric_field() -> None:
-    # 응답 필드는 미실측 — 후보 필드에 값이 오면 뽑고(콤마 제거), 없으면 None.
+def test_parse_fx_spot_reads_price_field() -> None:
+    # CUR 환율은 price(현재가) 필드 — 실측 2026-08-21. 콤마 제거, 없거나 0이하면 None.
     client = LSWebSocketClient(FakeConnector([]))
-    assert client._parse_fx_spot({"body": {"price": "1,390.50"}}) == 1390.5
-    assert client._parse_fx_spot({"body": {"환율": 1411}}) == 1411.0
+    assert client._parse_fx_spot(
+        {"body": {"base_id": "USD", "price": "1,318.20", "bid": "1318.30"}}) == 1318.2
+    assert client._parse_fx_spot({"body": {"price": "0"}}) is None
     assert client._parse_fx_spot({"body": {}}) is None
 
 
