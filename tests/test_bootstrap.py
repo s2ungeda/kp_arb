@@ -608,3 +608,16 @@ def test_set_carry_rates_replaces_theory_rates() -> None:
     system.set_carry_rates(fx=0.02, eq=0.04)
     assert system._carry.fx == 0.02
     assert system._carry.stock_futures == 0.04
+
+
+def test_monitor_snapshot_structure() -> None:
+    # 시세 모니터 스냅샷 — 코어가 LS/HL 표 + 괴리보드 + 환율·잔고·장운영을 조립(모니터는 렌더만).
+    from kp_arb.core_server import monitor_snapshot
+
+    assert monitor_snapshot(None, 1, 0.0, 0.0) == {"connected": False}
+    system, _, _ = _system([])
+    snap = monitor_snapshot(system, 1, 0.0, 0.0)
+    assert snap["connected"] is True
+    assert set(snap) >= {"fx", "phase", "balances", "ls", "hl", "board"}
+    assert all("theory" in r and "disp" in r for r in snap["ls"])   # LS 행: 이론가·괴리
+    assert all("mark" in r and "oracle" in r for r in snap["hl"])   # HL 행: 마크·오라클

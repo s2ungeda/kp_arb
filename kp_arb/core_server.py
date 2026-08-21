@@ -562,6 +562,81 @@ async def _manual_command(
     return _fail([f"알 수 없는 수동 명령: {cmd!r}"])
 
 
+_LS_MON_INSTS = (Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE)
+
+
+def _disp_pct(price: float | None, base: float | None) -> float | None:
+    """(가격 − 기준) ÷ 기준 × 100. 입력 없거나 기준 0이면 None."""
+    if price is None or base is None or base == 0:
+        return None
+    return (price - base) / base * 100.0
+
+
+def monitor_snapshot(
+    system: LiveSystem | None, kr_qty: int, en_thr: float, ex_thr: float
+) -> dict[str, Any]:
+    """시세 모니터 화면용 스냅샷 — LS/HL 표 + 괴리보드(est 포함) + 환율·잔고·장운영.
+
+    est(진입/청산 예상체결·주문가)는 화면 입력(수량·기준%)을 코어가 받아 계산 —
+    로직(est_pair_prices)을 코어에 한 벌만 둔다. 모니터는 이 스냅샷을 렌더만 한다.
+    """
+    if system is None:
+        return {"connected": False}
+    from .domain.enums import Account
+
+    fx_used, fx_src = system.usdkrw_effective()
+    out: dict[str, Any] = {
+        "connected": True,
+        "fx": {"used": fx_used, "src": fx_src, "futures": system.usdkrw_futures},
+        "phase": system.session.phase_for(Underlying.SAMSUNG).value,
+        "balances": {"stock": system.order_book.balance(Account.KR_STOCK),
+                     "deriv": system.order_book.balance(Account.KR_DERIV)},
+        "ls": [], "hl": [], "board": [],
+    }
+
+    def _merged(u: Underlying, inst: Instrument) -> tuple[Any, Any, Any, Any]:
+        cands = [q for m in ("uni", "krx", "nxt")
+                 if (q := system.quotes.get((u, inst, m))) is not None]
+        if not cands:
+            return None, None, None, None
+        ba = min(cands, key=lambda q: q.ask)   # 매도는 낮은 쪽, 매수는 높은 쪽
+        bb = max(cands, key=lambda q: q.bid)
+        return ba.ask, ba.ask_qty, bb.bid, bb.bid_qty
+
+    for u in Underlying:
+        for inst in _LS_MON_INSTS:
+            ask, ask_qty, bid, bid_qty = _merged(u, inst)
+            last = (system.trades.get((u, inst, "uni"))
+                    or system.trades.get((u, inst, "krx")))
+            theory = (system.stock_futures_theory(u)
+                      if inst is Instrument.KR_STOCK_FUTURE else None)
+            out["ls"].append({
+                "underlying": u.value, "instrument": inst.value,
+                "ask": ask, "ask_qty": ask_qty, "bid": bid, "bid_qty": bid_qty,
+                "last": last, "expected": system.expected_prices.get((u, inst)),
+                "theory": theory, "disp": _disp_pct(last, theory)})
+        hq = system.quotes.get((u, Instrument.HL_PERP, "hl"))
+        mk = system.hl_mark.get(u)
+        out["hl"].append({
+            "underlying": u.value,
+            "ask": hq.ask if hq else None, "bid": hq.bid if hq else None,
+            "last": system.trades.get((u, Instrument.HL_PERP, "hl")),
+            "oracle": mk.oracle if mk is not None else None,
+            "mark": mk.price if mk is not None else None,
+            "funding_next": system.hl_funding_rate.get(u)})
+
+    for (u, inst), p in system.disparity_board().items():
+        est_bid, est_ask, px_en, px_ex = system.est_pair_prices(
+            u, inst, kr_qty, en_thr, ex_thr)
+        out["board"].append({
+            "underlying": u.value, "instrument": inst.value,
+            "entry": p.spread.entry, "exit": p.spread.exit,
+            "hl_last_d": p.hl_last, "kr_last_d": p.kr_last,
+            "est_bid": est_bid, "est_ask": est_ask,
+            "px_entry": px_en, "px_exit": px_ex})
+    return out
+
+
 def make_app(
     state: CoreState,
     on_shutdown: Callable[[], None] | None = None,
@@ -621,9 +696,20 @@ def make_app(
         # 수동 주문창 전용 폴링(호가·미체결·포지션·잔고) — /state를 무겁게 안 하려 분리.
         return web.json_response(manual_snapshot(system), dumps=_dumps)
 
+    async def get_monitor(request: web.Request) -> web.Response:
+        # 시세 모니터 전용 — est 입력(수량·기준%)을 쿼리로 받아 괴리보드 est까지 계산.
+        try:
+            qty = int(request.query.get("qty", "1"))
+            en = float(request.query.get("en", "0")) / 100.0
+            ex = float(request.query.get("ex", "0")) / 100.0
+        except ValueError:
+            qty, en, ex = 1, 0.0, 0.0
+        return web.json_response(monitor_snapshot(system, qty, en, ex), dumps=_dumps)
+
     app = web.Application()
     app.router.add_get("/state", get_state)
     app.router.add_get("/manual_state", get_manual_state)
+    app.router.add_get("/monitor", get_monitor)
     app.router.add_post("/command", post_command)
     return app
 
