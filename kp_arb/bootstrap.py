@@ -167,6 +167,8 @@ class LiveSystem:
         # HL 마크(+오라클)·펀딩률 최신값 — 수동주문창 잔고표(B). WS로 실시간 갱신.
         self.hl_mark: dict[Underlying, Mark] = {}
         self.hl_funding_rate: dict[Underlying, float] = {}
+        # 배경 상시 태스크(괴리 CSV 등) — wait()가 기다리는 스트리밍 태스크와 분리, stop()이 취소.
+        self._aux_tasks: list[asyncio.Task[None]] = []
         # HL 포지션 상세(마진·누적펀딩·청산가·레버리지) — clearinghouseState에서 refresh 때 채움.
         self.hl_detail: dict[Underlying, dict[str, Any]] = {}
         # 종목정보(틱·승수·szDecimals·maxLeverage·만기) — 시동 시 1회 조회·보관 (§5.10).
@@ -703,6 +705,8 @@ class LiveSystem:
         # 시동 REST 조회들은 **순차 실행** — 동시에 나가면 서버 계정당 초당 한도에
         # 걸려 일부(t1901 등)가 실패한다(운영 실측). 환율 폴링은 그 뒤에 시작.
         self._tasks = [asyncio.create_task(self._startup_queries())]
+        # 괴리 분포 CSV는 무한 배경 기록 — wait()(스트리밍 소진 대기) 대상이 아니라 aux로 둔다.
+        self._aux_tasks = [asyncio.create_task(self._spread_csv_loop())]
         # run 자체가 아니라 **팩토리(.run)**를 넘긴다 — 재시작 때 새 코루틴을 만들어야 하므로.
         self._tasks.append(asyncio.create_task(self._guarded_ws("주식", self._stock_ws.run)))
         if self._deriv_ws is not None:
@@ -1051,6 +1055,63 @@ class LiveSystem:
         base_after = self.trades.get((underlying, Instrument.KR_STOCK, "uni"))
         return theory_after(inputs, rate_krx, base_close, base_after)
 
+    # 괴리 분포 CSV — 임계값 결정용. 모니터 화면이 아니라 코어가 상시 기록(화면 무관).
+    def _spread_csv_rows(self, hhmmss: str) -> list[tuple[str, ...]]:
+        """CSV 한 줄씩(진입/청산 중 하나라도 있는 쌍만) — 파일 I/O 없는 순수 조립."""
+        kind = {Instrument.KR_STOCK: "S", Instrument.KR_STOCK_FUTURE: "SF",
+                Instrument.KR_ETF: "ETF"}
+
+        def _pct(v: float | None) -> str:
+            return f"{v * 100:.3f}" if v is not None else "-"
+
+        board = self.disparity_board()
+        fx, _ = self.usdkrw_effective()  # 환산에 실제 쓴 환율(주간 현물/야간 이론)
+        return [
+            (hhmmss, u.value, kind[inst],
+             _pct(p.hl.ask), _pct(p.hl.bid), _pct(p.kr.ask), _pct(p.kr.bid),
+             _pct(p.spread.entry), _pct(p.spread.exit),
+             f"{fx:.4f}" if fx is not None else "-",
+             (f"{s:.0f}" if (s := self.stock_last(u)) is not None else "-"),
+             _pct(p.hl_last), _pct(p.kr_last))
+            for (u, inst), p in board.items()
+            if p.spread.entry is not None or p.spread.exit is not None
+        ]
+
+    def _write_spread_csv(self) -> None:
+        """진입/청산 괴리 1줄씩을 logs/spread_YYYYMMDD.csv에 덧붙인다(있는 쌍만)."""
+        import csv
+        import time
+        from pathlib import Path
+
+        lines = self._spread_csv_rows(time.strftime("%H:%M:%S"))
+        if not lines:
+            return
+        log_dir = Path(__file__).resolve().parent.parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        path = log_dir / f"spread_{time.strftime('%Y%m%d')}.csv"
+        new_file = not path.exists()
+        try:
+            with path.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if new_file:
+                    writer.writerow(["time", "underlying", "pair",
+                                     "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
+                                     "entry", "exit", "usdkrw_used", "base_last",
+                                     "hl_last_d", "kr_last_d"])
+                writer.writerows(lines)
+        except OSError:
+            pass  # 엑셀 등이 파일을 잠근 상태 — 이번 기록만 건너뛰고 풀리면 재개
+
+    async def _spread_csv_loop(self) -> None:
+        """1초 간격 괴리 분포 기록. 어떤 예외도 루프를 멈추지 않는다."""
+        while True:
+            await asyncio.sleep(1.0)
+            try:
+                self._write_spread_csv()
+            except Exception:  # noqa: BLE001 - 기록 실패로 코어 루프를 죽이지 않는다
+                import logging
+                logging.getLogger("kp_arb.core").exception("괴리 CSV 기록 실패")
+
     async def _startup_queries(self) -> None:
         """시동 일괄 조회를 순서대로 — ETF 이론가 입력 → 초기 가격 → 상시 루프.
 
@@ -1143,10 +1204,11 @@ class LiveSystem:
         await asyncio.gather(*self._tasks)
 
     async def stop(self) -> None:
-        for task in self._tasks:
+        for task in (*self._tasks, *self._aux_tasks):
             task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.gather(*self._tasks, *self._aux_tasks, return_exceptions=True)
         self._tasks = []
+        self._aux_tasks = []
 
 
 async def bootstrap_live(

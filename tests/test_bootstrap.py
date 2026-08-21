@@ -621,3 +621,33 @@ def test_monitor_snapshot_structure() -> None:
     assert set(snap) >= {"fx", "phase", "balances", "ls", "hl", "board"}
     assert all("theory" in r and "disp" in r for r in snap["ls"])   # LS 행: 이론가·괴리
     assert all("mark" in r and "oracle" in r for r in snap["hl"])   # HL 행: 마크·오라클
+
+
+def test_spread_csv_rows() -> None:
+    # 코어가 상시 기록하는 괴리 분포 CSV — 진입/청산이 있는 쌍만, 13열 고정.
+    from kp_arb.domain.enums import SessionPhase
+    from kp_arb.domain.models import Quote
+    from kp_arb.etf_theory import EtfTheoryInputs
+
+    system, _, _ = _system([])
+    assert system._spread_csv_rows("09:00:00") == []  # 데이터 없으면 빈 목록
+
+    system.futures_symbols[SAMSUNG] = "A1167000"
+    system.futures_expiry[SAMSUNG] = 202612
+    system.usdkrw_theory = 1_500.0
+    system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] = 300_000.0
+    system.stock_change_pct[(SAMSUNG, "krx")] = 0.0
+    system.session.seed_phase(SessionPhase.REGULAR)
+    system.etf_theory[SAMSUNG] = EtfTheoryInputs(prev_nav=20_000.0, leverage=2.0)
+    system.quotes[(SAMSUNG, Instrument.HL_PERP, "hl")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.HL_PERP,
+        bid=201.0, ask=202.0, ts=0.0, market="hl")
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK_FUTURE, "krx")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        bid=301_000.0, ask=302_000.0, ts=0.0)
+
+    rows = system._spread_csv_rows("09:00:00")
+    assert rows, "진입/청산이 있으면 최소 한 줄"
+    sf = next(r for r in rows if r[2] == "SF")
+    assert sf[0] == "09:00:00" and sf[1] == SAMSUNG.value  # 시각·기초
+    assert len(sf) == 13  # time..kr_last_d 13열
