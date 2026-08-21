@@ -119,6 +119,25 @@ async def test_subscribe_sends_register_for_all_trs() -> None:
     assert sc1["header"]["tr_type"] == "1"   # 계좌 이벤트 등록(실측 — "3"이면 미수신)
 
 
+async def test_subscribe_fx_spot_registers_cur() -> None:
+    session = FakeConnection([])
+    client = LSWebSocketClient(FakeConnector([session]))
+    client.subscribe_fx_spot()
+    await client.run()
+    cur = next(json.loads(m) for m in session.sent
+               if json.loads(m)["body"]["tr_cd"] == "CUR")
+    assert cur["body"]["tr_key"] == "USD "   # 통화코드 + 공백 패딩(사용자 확정)
+    assert cur["header"]["tr_type"] == "3"    # 시세 등록
+
+
+def test_parse_fx_spot_extracts_numeric_field() -> None:
+    # 응답 필드는 미실측 — 후보 필드에 값이 오면 뽑고(콤마 제거), 없으면 None.
+    client = LSWebSocketClient(FakeConnector([]))
+    assert client._parse_fx_spot({"body": {"price": "1,390.50"}}) == 1390.5
+    assert client._parse_fx_spot({"body": {"환율": 1411}}) == 1411.0
+    assert client._parse_fx_spot({"body": {}}) is None
+
+
 async def test_reconnect_resubscribes_and_recovers() -> None:
     # 1세션: 프레임1 방출 후 끊김. 2세션: 프레임1 정상.
     s1 = FakeConnection([quote_frame(bid=1), quote_frame(bid=2)], fail_after=1)

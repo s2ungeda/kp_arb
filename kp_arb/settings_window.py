@@ -181,7 +181,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             e_limit.delete(0, "end")
             e_limit.insert(0, _fmt_amount(float(settings.get("hl_daily_limit_usdc", 0) or 0)))
             e_fx_rate.delete(0, "end")
-            e_fx_rate.insert(0, f"{float(settings.get('fx_carry_rate', 0.015) or 0) * 100:g}")
+            e_fx_rate.insert(0, f"{float(settings.get('fx_carry_rate', 0.010) or 0) * 100:g}")
             e_eq_rate.delete(0, "end")
             e_eq_rate.insert(0, f"{float(settings.get('eq_carry_rate', 0.030) or 0) * 100:g}")
             for key, r in rows.items():

@@ -217,7 +217,7 @@ class CarryRates(BaseModel):
     """캐리 이론가 연이자율 (DESIGN §6.1 — 전략 조정 대상이라 설정으로 노출)."""
 
     stock_futures: float = 0.030  # 주식선물 이론가 (배당 무시 비용캐리) — 기본 3.0%
-    fx: float = 0.015             # 원달러선물 → 현물환율 환산 (금리차) — 기본 1.5%
+    fx: float = 0.010             # 원달러선물 → 현물환율 환산 (금리차) — 기본 1.0%
 
 
 class FxSpotWindow(BaseModel):

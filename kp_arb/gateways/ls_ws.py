@@ -37,6 +37,7 @@ FUTURES_QUOTE_TR = "JH0"   # 주식선물 호가 (body 필드는 H1_와 동일 �
 STOCK_TRADE_TRS: tuple[str, ...] = ("S3_", "NS3", "US3")  # 체결: KRX/NXT/통합
 FUTURES_TRADE_TR = "JC0"   # 주식선물 체결 (동일 가정)
 FX_TRADE_TR = "FC0"        # 통화선물 체결 — K200선물 계열 TR로 수신 가능(사용자 확인, 실측 예정)
+FX_SPOT_TR = "CUR"         # 원달러 현물환율 실시간(투자정보) — tr_key="USD "(통화코드+공백 패딩)
 EXPECTED_TRS: tuple[str, ...] = ("YS3", "NYS", "UYS", "YJC")  # 예상체결: KRX/NXT/통합/선물
 # NXT 시세는 전용 TR(NH1/NS3)이 아니라 **통합 TR(UH1/US3/UYS)**로 온다(RTD 실측 이관).
 # 통합 TR의 tr_key는 "U"+6자리코드+공백3(총 10자). 모의(29443)는 U/N계열 미중계 —
@@ -202,6 +203,7 @@ class LSWebSocketClient:
         self.on_market_status: list[Callable[[MarketStatus], None]] = []
         # 통화선물 체결가 (FC0) — (월물코드, 가격). 근/차근 구분 위해 코드 동반(§9.1).
         self.on_fx_price: list[Callable[[str, float], None]] = []
+        self.on_fx_spot: list[Callable[[float], None]] = []  # 원달러 현물환율(원/달러) 실시간
         self._fx_codes: set[str] = set()
         self.on_raw: list[Callable[[str], None]] = []  # 진단: 모든 원시 프레임
         # 재연결(최초 연결 제외) 후 재구독까지 끝나면 발화 — OrderBook 재스냅샷용(Phase 8-4).
@@ -230,6 +232,13 @@ class LSWebSocketClient:
         """통화선물(원달러) 체결 구독 → on_fx_price. 환율이론가 계산용 (DESIGN §6.1)."""
         self._fx_codes.add(code)
         self._add(FX_TRADE_TR, code)
+
+    def subscribe_fx_spot(self) -> None:
+        """원달러 현물환율(CUR) 실시간 구독 → on_fx_spot. tr_key='USD '(통화코드+공백 패딩).
+
+        주간 HL 환산에 쓰는 현물환율을 LS 실시간으로 받는다(엑셀 시세!G1 LS현물CUR).
+        """
+        self._add(FX_SPOT_TR, "USD ")
 
     def subscribe_trades(self, underlying: Underlying) -> None:
         """주식·ETF 체결(현재가)·예상체결 구독 — KRX(S3_/YS3) + 통합(US3/UYS, NXT 포함)."""
@@ -375,7 +384,31 @@ class LSWebSocketClient:
             if fx is not None:
                 for fx_handler in self.on_fx_price:
                     fx_handler(*fx)
+        elif tr_cd == FX_SPOT_TR:
+            spot = self._parse_fx_spot(msg)
+            if spot is not None:
+                for spot_handler in self.on_fx_spot:
+                    spot_handler(spot)
         # 알 수 없는 tr_cd는 무시
+
+    def _parse_fx_spot(self, msg: dict[str, Any]) -> float | None:
+        """CUR(현물환율) body → 환율. **응답 필드 미실측** — 실측 로그로 확인 후 확정.
+
+        후보 필드로 값 추출 시도(콤마 제거). 못 찾으면 None(로그만 남김).
+        """
+        import logging
+
+        body = msg.get("body") or {}
+        # [실측] CUR 응답 원문 — 실제 환율 필드 확인 후 아래 후보를 그 필드로 확정하고 이 줄 제거.
+        logging.getLogger("kp_arb.core").info("[실측] CUR body=%r", body)
+        for field in ("환율", "price", "현재가", "curr", "cur", "rate", "usdkrw"):
+            try:
+                rate = float(str(body[field]).replace(",", ""))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if rate > 0:
+                return rate
+        return None
 
     def _parse_fx(self, msg: dict[str, Any]) -> tuple[str, float] | None:
         # FC0 체결가 필드는 'price' 가정(실측 예정 — 다르면 on_raw로 확인). (월물코드, 가격).

@@ -151,6 +151,7 @@ class LiveSystem:
         self.usdkrw_futures: float | None = None  # 원달러선물 현재가 원값(표시용)
         # 외환현물(주간 07:00~18:10 HL 환산용 — 엑셀 시세!N6/O6, 2026-08-21) + 사용 시간대
         self.usdkrw_spot: float | None = None
+        self._fx_spot_ts = 0.0  # 마지막 LS 현물환율(CUR) 수신 시각 — Naver 백업 억제용
         self._fx_spot_window = (parse_hhmm(fx_spot_window[0]), parse_hhmm(fx_spot_window[1]))
         self._hl = hl_gateway
         self._hl_ws = hl_ws
@@ -618,6 +619,9 @@ class LiveSystem:
             for code, _ in self._fx_months:
                 self._stock_ws.subscribe_fx(code)
             self._stock_ws.on_fx_price.append(self._apply_fx_price)
+        # 원달러 현물환율(CUR) 실시간 — 주간 HL 환산 본선(엑셀 LS현물CUR). Naver는 백업.
+        self._stock_ws.subscribe_fx_spot()
+        self._stock_ws.on_fx_spot.append(self._apply_fx_spot)
         self._stock_ws.on_quote.append(fan_quote)
         self._stock_ws.on_trade.append(fan_trade)
         self._stock_ws.on_expected.append(fan_expected)
@@ -733,6 +737,15 @@ class LiveSystem:
         self.usdkrw_futures = price
         self.usdkrw_theory = carry_theory(price, days, self._carry.fx)
 
+    def _apply_fx_spot(self, rate: float) -> None:
+        """원달러 현물환율(CUR) 실시간 수신 → HL 환산 본선 환율. Naver 백업은 이걸로 억제."""
+        import time as _t
+
+        if rate <= 0:
+            return
+        self.usdkrw_spot = rate
+        self._fx_spot_ts = _t.monotonic()
+
     async def _fx_loop(self) -> None:
         """환율 예비 갱신 — 시동 직후 초기값 + 30초 간격 확인 조회(t2111).
 
@@ -758,7 +771,9 @@ class LiveSystem:
                     price = await self._gw.get_fx_futures_price(code)
                     if price is not None:
                         self._apply_fx_price(code, price)  # code=최근월물
-                if in_spot:  # 외환현물 창 — HL 환산 본선 환율 (네이버 하나은행 고시)
+                # 외환현물 시간대 — 본선은 LS 실시간(CUR). 그게 60초+ 조용할 때만 네이버 백업.
+                import time as _t
+                if in_spot and _t.monotonic() - self._fx_spot_ts > 60:
                     from .gateways.fx_spot import fetch_usdkrw_spot
 
                     spot = await fetch_usdkrw_spot()

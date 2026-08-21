@@ -147,7 +147,7 @@ class GlobalSettings:
     """전체 공통설정 — 일일 한도 + 알람 (DESIGN-settings). core_state.json에 저장."""
 
     hl_daily_limit_usdc: float = 0.0  # HL 당일 체결액 한도(USDC). 0=무제한
-    fx_carry_rate: float = 0.015      # 환율이론가 연이자율(기본 1.5%) — 원달러선물→현물 환산
+    fx_carry_rate: float = 0.010      # 환율이론가 연이자율(기본 1.0%) — 원달러선물→현물 환산
     eq_carry_rate: float = 0.030      # 주식선물 이론가 연이자율(기본 3.0%)
     sound_fill: SoundSetting = field(default_factory=SoundSetting)   # 주문 체결 시
     sound_error: SoundSetting = field(default_factory=SoundSetting)  # 에러(발주 거부·실패)

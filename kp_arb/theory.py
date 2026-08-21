@@ -1,7 +1,7 @@
 """캐리 이론가·만기 계산 — 순수 로직 (DESIGN §6.1 전략 v0.1).
 
 - 주식선물 이론가 = 기초 주식 현재가 × (1 + 연 3.0% × 잔존일/365) — 배당 무시 (공통설정)
-- 환율이론가   = 원달러선물 현재가 × (1 + 연 1.5% × 잔존일/365) — 현물환율 환산
+- 환율이론가   = 원달러선물 현재가 × (1 + 연 1.0% × 잔존일/365) — 현물환율 환산 (공통설정)
 - 만기(최종거래일): 주식/지수선물 = 둘째 목요일, 미국달러선물 = 셋째 월요일
 """
 from __future__ import annotations
@@ -10,7 +10,7 @@ import re
 from datetime import date, datetime, time, timedelta
 
 EQ_CARRY_RATE = 0.030   # 주식선물 캐리 연이자율 기본(공통설정에서 사용자 조정)
-FX_CARRY_RATE = 0.015   # 환율(통화선물→현물) 환산 연이자율 기본(공통설정에서 사용자 조정)
+FX_CARRY_RATE = 0.010   # 환율(통화선물→현물) 환산 연이자율 기본(공통설정에서 사용자 조정)
 
 
 def nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
