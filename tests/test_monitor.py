@@ -1,91 +1,71 @@
-"""모니터 데이터 수집부(MonitorState) 테스트 — 창(tkinter)은 수동 확인."""
-from kp_arb.domain.enums import Instrument, Underlying
-from kp_arb.domain.models import Quote
-from kp_arb.gateways.hl import Mark
-from kp_arb.gateways.ls_ws import ExpectedPrice, TradeTick
-from kp_arb.monitor import MonitorState, funding_countdown
+"""모니터 렌더부 테스트 — 코어 /monitor 스냅샷(dict)을 표 행으로 그리는 순수 함수.
 
-SAMSUNG = Underlying.SAMSUNG
+창(tkinter)은 수동 확인. 값 계산은 코어(monitor_snapshot)가 하므로 여기선 포맷만 검증.
+"""
+from kp_arb.monitor import board_rows, funding_countdown, hl_rows, ls_rows
 
 
-def q(instrument: Instrument, bid: float, ask: float, *,
-      bid_qty: float = 100, ask_qty: float = 50, market: str = "krx") -> Quote:
-    return Quote(underlying=SAMSUNG, instrument=instrument, bid=bid, ask=ask,
-                 ts=1.0, bid_qty=bid_qty, ask_qty=ask_qty, market=market)
-
-
-def test_ls_rows_shape_and_values() -> None:
-    state = MonitorState()
-    state.on_quote(q(Instrument.KR_STOCK, 292_500, 293_000))
-    state.on_trade(TradeTick(underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
-                             price=292_800))
-    state.on_expected(ExpectedPrice(underlying=SAMSUNG, price=292_700))
-
-    rows = state.ls_rows()
-    assert len(rows) == 6  # 3종목 × (주식/선물) — ETF는 취급 제외
-    stock = rows[0]
+def test_ls_rows_format_and_name_dedup() -> None:
+    snap = {"ls": [
+        {"underlying": "samsung", "instrument": "kr_stock",
+         "ask": 293_000, "ask_qty": 50, "bid": 292_500, "bid_qty": 100,
+         "last": 292_800, "expected": 292_700, "theory": None, "disp": None},
+        {"underlying": "samsung", "instrument": "kr_stock_future",
+         "ask": None, "ask_qty": None, "bid": None, "bid_qty": None,
+         "last": 296_435, "expected": None, "theory": 293_500.0, "disp": 1.0},
+    ]}
+    rows = ls_rows(snap)
     # (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상가, 이론가, 괴리율%)
-    assert stock == ("삼성전자 주식", "50", "293,000", "292,800",
-                     "292,500", "100", "292,700", "-", "-")
-    assert rows[1][0] == "선물" and rows[1][2] == "-"  # 미수신은 '-'
+    assert rows[0] == ("삼성전자 주식", "50", "293,000", "292,800",
+                       "292,500", "100", "292,700", "-", "-")
+    assert rows[1][0] == "선물"          # 같은 종목 → 이름 생략, 종류만
+    assert rows[1][2] == "-"             # 미수신은 '-'
+    assert rows[1][7] == "293,500.00"    # 선물 이론가 (소수 2자리 — 엑셀과 동일)
+    assert rows[1][8] == "+1.00"         # 괴리율%(코어 계산)
 
 
-def test_ls_rows_theory_and_disparity() -> None:
-    # 이론가는 선물 행에 표시, 괴리율 = (현재가-이론가)/이론가×100.
-    state = MonitorState()
-    state.on_trade(TradeTick(underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
-                             price=296_435))
-    rows = state.ls_rows({(SAMSUNG, Instrument.KR_STOCK_FUTURE): 293_500.0})
-    assert rows[0][7] == "-"                     # 주식: 이론가 없음
-    assert rows[1][7] == "293,500.00"            # 선물 이론가 (소수 2자리 — 엑셀과 동일)
-    assert rows[1][8] == "+1.00"                 # (296435-293500)/293500 = +1.00%
-
-
-def test_krx_nxt_quotes_merged_like_hts() -> None:
-    # 통합 시세: 매수는 높은 쪽(NXT), 매도는 낮은 쪽(KRX)을 선택.
-    state = MonitorState()
-    state.on_quote(q(Instrument.KR_STOCK, 292_500, 293_000, market="krx",
-                     bid_qty=100, ask_qty=50))
-    state.on_quote(q(Instrument.KR_STOCK, 292_550, 293_050, market="nxt",
-                     bid_qty=30, ask_qty=20))
-
-    stock = state.ls_rows()[0]
-    # (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상체결가)
-    assert stock[2] == "293,000" and stock[1] == "50"   # 매도: KRX가 더 낮음
-    assert stock[4] == "292,550" and stock[5] == "30"   # 매수: NXT가 더 높음
-
-
-def test_hl_rows_include_funding_and_countdown() -> None:
-    state = MonitorState()
-    state.on_quote(q(Instrument.HL_PERP, 184.55, 184.65, bid_qty=12.5, ask_qty=3.2,
-                     market="hl"))
-    state.on_trade(TradeTick(underlying=SAMSUNG, instrument=Instrument.HL_PERP,
-                             price=184.60, market="hl"))
-    state.on_mark(Mark(underlying=SAMSUNG, price=184.62, oracle=184.70))
-    state.on_funding(SAMSUNG, 0.0001841)
-    state.funding_prev[SAMSUNG] = 0.0001595
-
-    rows = state.hl_rows(now_epoch=3600 * 10 + 3540)  # 정각 60초 전
-    assert len(rows) == 3
-    samsung = rows[0]
+def test_hl_rows_format_funding_and_countdown() -> None:
+    lvo = (184.60 - 184.70) / 184.70 * 100  # 현-오라클%
+    mvo = (184.62 - 184.70) / 184.70 * 100  # 마크-오라클%
+    snap = {"hl": [
+        {"underlying": "samsung", "ask": 184.65, "bid": 184.55, "last": 184.60,
+         "oracle": 184.70, "mark": 184.62, "last_vs_oracle": lvo, "mark_vs_oracle": mvo,
+         "funding_prev": 0.0001595, "funding_next": 0.0001841},
+    ]}
+    rows = hl_rows(snap, now_epoch=3600 * 10 + 3540)  # 정각 60초 전
+    s = rows[0]
     # (종목,매도가,현재가,오라클,매수가,마크,현-오라클%,마크-오라클%,펀딩전,펀딩피,남은시간)
-    assert samsung[0] == "삼성전자"
-    assert samsung[1] == "184.65" and samsung[4] == "184.55"  # 매도/매수
-    assert samsung[2] == "184.60"  # 현재가 = 체결가 (마크 아님)
-    assert samsung[3] == "184.70"  # 오라클(지수가) — 현재가 바로 오른쪽
-    assert samsung[5] == "184.62"  # 마크 = 기준가, 별도 컬럼
-    assert samsung[6] == "-0.054"  # 현-오라클% = (184.60-184.70)/184.70×100
-    assert samsung[7] == "-0.043"  # 마크-오라클% = (184.62-184.70)/184.70×100
-    assert samsung[8] == "0.0159%" and samsung[9] == "0.0184%"  # 펀딩 직전/예정
-    assert samsung[10] == "01:00"                             # 남은시간
+    assert s[0] == "삼성전자"
+    assert s[1] == "184.65" and s[4] == "184.55"  # 매도/매수
+    assert s[2] == "184.60"                       # 현재가 = 체결가
+    assert s[3] == "184.70" and s[5] == "184.62"  # 오라클 / 마크
+    assert s[6] == "-0.054" and s[7] == "-0.043"  # 오라클 대비 %(코어 계산)
+    assert s[8] == "0.0159%" and s[9] == "0.0184%"  # 펀딩 직전/예정
+    assert s[10] == "01:00"                       # 남은시간
 
 
-def test_hl_last_price_empty_without_trades() -> None:
-    # 체결이 아직 없으면 현재가는 '-' (마크로 대체하지 않음 — 개념 구분).
-    state = MonitorState()
-    state.on_mark(Mark(underlying=SAMSUNG, price=184.62))
-    samsung = state.hl_rows()[0]
-    assert samsung[2] == "-" and samsung[5] == "184.62"  # 현재가 '-', 마크는 표시
+def test_hl_rows_missing_values_dash() -> None:
+    snap = {"hl": [
+        {"underlying": "hyundai", "ask": None, "bid": None, "last": None,
+         "oracle": None, "mark": 184.62, "last_vs_oracle": None,
+         "mark_vs_oracle": None, "funding_prev": None, "funding_next": None},
+    ]}
+    s = hl_rows(snap, now_epoch=0)[0]
+    assert s[2] == "-" and s[5] == "184.62"       # 현재가 '-', 마크는 표시
+    assert s[6] == "-" and s[8] == "-"            # 괴리·펀딩 미수신 '-'
+
+
+def test_board_rows_pct_and_est() -> None:
+    snap = {"board": [
+        {"underlying": "samsung", "instrument": "kr_stock_future",
+         "entry": 0.005, "exit": 0.010, "hl_last_d": 0.0, "kr_last_d": 0.0,
+         "est_bid": 184.1234, "est_ask": 184.5678, "px_entry": 301_500, "px_exit": 303_000},
+    ]}
+    r = board_rows(snap)[0]
+    assert r[0] == "삼성전자-선물"
+    assert r[1] == "0.500" and r[2] == "1.000"    # 소수→% (×100, 소수 3자리)
+    assert r[3] == "184.1234" and r[4] == "184.5678"  # est (USD, 소수 4자리)
+    assert r[5] == "301,500" and r[6] == "303,000"    # 주문가 (원)
 
 
 def test_funding_countdown_wraps_hourly() -> None:

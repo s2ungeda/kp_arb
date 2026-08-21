@@ -1,41 +1,30 @@
-"""시세 모니터 — 취급 종목 전체를 한눈에 보는 컴팩트 데스크톱 창.
+"""시세 모니터 — 코어(/monitor)를 읽어 그리는 얇은 클라이언트.
 
     python -m kp_arb.monitor
 
-- 창은 tkinter(파이썬 기본 포함 — 추가 설치 없음). '항상 위'는 체크박스로 선택.
-- 데이터는 LiveSystem(백그라운드 스레드의 asyncio)에서 실시간 수신,
-  화면은 0.3초마다 최신값을 읽어 갱신(읽기 전용 — 주문 없음).
+- 데이터는 코어(127.0.0.1:8787)의 /monitor 스냅샷에서 폴링(읽기 전용). 코어가 LS/HL 표와
+  괴리 보드(진입/청산·예상체결·주문가)를 조립해 내려주고, 이 창은 렌더·입력만 한다.
+- 네트워크는 뒷단 스레드가 하고, 화면은 after()로 저장된 결과만 읽는다(창 안 얼게 —
+  CLAUDE.md: 화면 스레드에서 네트워크 호출 금지).
 
-표 구성(사용자 명세):
-- LS: 종목 | 매도잔량 | 매도가 | 현재가 | 매수가 | 매수잔량 | 예상가 | 이론가(선물) | 괴리율%
+표 구성:
+- LS: 종목 | 매도잔량 | 매도가 | 현재가 | 매수가 | 매수잔량 | 예상체결가 | 이론가(선물) | 괴리율%
 - HL: 종목 | 매도가 | 현재가 | 오라클 | 매수가 | 마크 | 현-오라클% | 마크-오라클%
       | 펀딩전 | 펀딩피 | 남은시간
-- 하단: 장운영상태 · 계좌 잔고 · 마지막 수신 시각
+- 괴리 보드: 쌍 | 진입 | 청산 | 진입 est | 청산 est | 진입 주문가 | 청산 주문가
+- 하단: 장운영상태 · 환율 · 계좌 잔고 · 마지막 수신 시각
 """
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from typing import Any
 
 from . import win_state
-from .domain.enums import Account, Instrument, Underlying
-from .domain.models import Quote
-from .etf_theory import disparity_pct
-from .gateways.hl import Mark
-from .gateways.ls_ws import ExpectedPrice, TradeTick
+from .core_client import core_request, watch_parent_exit
+from .domain.enums import Underlying
 
-_NAMES = {
-    Underlying.SAMSUNG: "삼성전자",
-    Underlying.SK_HYNIX: "SK하이닉스",
-    Underlying.HYUNDAI: "현대차",
-}
-_KIND = {
-    Instrument.KR_STOCK: "주식",
-    Instrument.KR_STOCK_FUTURE: "선물",
-    Instrument.KR_ETF: "ETF",
-}
-# ETF는 취급 제외(2026-07-13) — 표시 기본은 주식+선물만.
-_LS_INSTRUMENTS = (Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE)
+_NAMES = {"samsung": "삼성전자", "sk_hynix": "SK하이닉스", "hyundai": "현대차"}
+_KIND = {"kr_stock": "주식", "kr_stock_future": "선물", "kr_etf": "ETF"}
 
 FUNDING_INTERVAL_S = 3600  # HL 펀딩은 매시 정각
 
@@ -46,192 +35,104 @@ def _fmt(value: float | None, *, decimals: int = 0) -> str:
     return f"{value:,.{decimals}f}"
 
 
+def _pct(value: float | None) -> str:
+    """소수 비율(0.0123)을 % 문자열로 — 괴리 보드용(코어가 소수로 내려줌)."""
+    return f"{value * 100:.3f}" if value is not None else "-"
+
+
 def funding_countdown(now_epoch: float) -> str:
     """다음 펀딩(매시 정각)까지 남은 mm:ss."""
     remain = FUNDING_INTERVAL_S - int(now_epoch) % FUNDING_INTERVAL_S
     return f"{remain // 60:02d}:{remain % 60:02d}"
 
 
-@dataclass
-class MonitorState:
-    """실시간 콜백이 채우고 화면이 읽는 최신값 저장소(읽기 전용 표시용).
-
-    호가는 시장(KRX/NXT)별로 보관하고, 표시는 HTS처럼 **통합**(두 시장 중
-    더 좋은 호가 — 매수는 높은 쪽, 매도는 낮은 쪽)으로 계산한다.
-    """
-
-    quotes: dict[tuple[Underlying, Instrument, str], Quote] = field(default_factory=dict)
-    trades: dict[tuple[Underlying, Instrument], float] = field(default_factory=dict)
-    expected: dict[tuple[Underlying, Instrument], float] = field(default_factory=dict)
-    marks: dict[Underlying, float] = field(default_factory=dict)
-    oracles: dict[Underlying, float] = field(default_factory=dict)  # HL 오라클(지수가)
-    funding_next: dict[Underlying, float] = field(default_factory=dict)  # 예정(펀딩피)
-    funding_prev: dict[Underlying, float] = field(default_factory=dict)  # 직전
-    last_update: float = 0.0
-
-    # --- 실시간 콜백 ---
-
-    def on_quote(self, quote: Quote) -> None:
-        self.quotes[(quote.underlying, quote.instrument, quote.market)] = quote
-        self.last_update = time.time()
-
-    def merged_quote(
-        self, underlying: Underlying, instrument: Instrument
-    ) -> tuple[float | None, float | None, float | None, float | None]:
-        """통합(uni)·KRX·NXT 중 최우선호가: (매도가, 매도잔량, 매수가, 매수잔량)."""
-        candidates = [
-            q for m in ("uni", "krx", "nxt")
-            if (q := self.quotes.get((underlying, instrument, m))) is not None
-        ]
-        if not candidates:
-            return None, None, None, None
-        best_ask = min(candidates, key=lambda q: q.ask)   # 매도는 낮은 쪽이 우선
-        best_bid = max(candidates, key=lambda q: q.bid)   # 매수는 높은 쪽이 우선
-        return best_ask.ask, best_ask.ask_qty, best_bid.bid, best_bid.bid_qty
-
-    def on_trade(self, tick: TradeTick) -> None:
-        self.trades[(tick.underlying, tick.instrument)] = tick.price
-        self.last_update = time.time()
-
-    def on_expected(self, expected: ExpectedPrice) -> None:
-        self.expected[(expected.underlying, expected.instrument)] = expected.price
-        self.last_update = time.time()
-
-    def on_mark(self, mark: Mark) -> None:
-        self.marks[mark.underlying] = mark.price
-        if mark.oracle is not None:
-            self.oracles[mark.underlying] = mark.oracle
-        self.last_update = time.time()
-
-    def on_funding(self, underlying: Underlying, rate: float) -> None:
-        self.funding_next[underlying] = rate
-
-    # --- 화면 행 ---
-
-    def ls_rows(
-        self,
-        theory: dict[tuple[Underlying, Instrument], float | None] | None = None,
-        instruments: tuple[Instrument, ...] = _LS_INSTRUMENTS,
-    ) -> list[tuple[str, ...]]:
-        """LS 표: (종목, 매도잔량, 매도가, 현재가, 매수가, 매수잔량, 예상가, 이론가, 괴리율%).
-
-        이론가는 선물(캐리 합성)·ETF(iNAV) 행에 표시 — LiveSystem과 공용 계산.
-        괴리율 = (현재가 − 이론가) ÷ 이론가 × 100. 미취급 상품은 instruments로 제외.
-        """
-        rows: list[tuple[str, ...]] = []
-        for u in Underlying:
-            name = _NAMES[u]
-            for inst in instruments:
-                ask, ask_qty, bid, bid_qty = self.merged_quote(u, inst)  # KRX+NXT 통합
-                trade = self.trades.get((u, inst))
-                expected = self.expected.get((u, inst))  # 주식·선물·ETF 모두
-                inst_theory = (theory or {}).get((u, inst))
-                disp = disparity_pct(trade, inst_theory)
-                rows.append((
-                    f"{name} {_KIND[inst]}".strip(),
-                    _fmt(ask_qty),
-                    _fmt(ask),
-                    _fmt(trade),
-                    _fmt(bid),
-                    _fmt(bid_qty),
-                    _fmt(expected),
-                    _fmt(inst_theory, decimals=2),  # 엑셀과 동일 소수 2자리
-                    f"{disp:+.2f}" if disp is not None else "-",
-                ))
-                name = ""  # 같은 종목은 첫 행에만 이름
-        return rows
-
-    def hl_rows(self, now_epoch: float | None = None) -> list[tuple[str, ...]]:
-        """HL 표 행 — 현재가는 실제 체결가, 마크(청산·펀딩 기준가)는 별도 컬럼.
-
-        (종목, 매도가, 현재가, 오라클, 매수가, 마크, 현-오라클%, 마크-오라클%,
-         펀딩전, 펀딩피, 남은시간). 오라클 대비 비율 = (값 − 오라클) ÷ 오라클 × 100.
-        """
-        now = now_epoch if now_epoch is not None else time.time()
-        countdown = funding_countdown(now)
-        rows: list[tuple[str, ...]] = []
-        for u in Underlying:
-            quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
-            prev = self.funding_prev.get(u)
-            nxt = self.funding_next.get(u)
-            last = self.trades.get((u, Instrument.HL_PERP))
-            mark = self.marks.get(u)
-            oracle = self.oracles.get(u)
-            last_vs_oracle = disparity_pct(last, oracle)
-            mark_vs_oracle = disparity_pct(mark, oracle)
-            rows.append((
-                _NAMES[u],
-                _fmt(quote.ask if quote else None, decimals=2),
-                _fmt(last, decimals=2),               # 현재가 = 체결가만
-                _fmt(oracle, decimals=2),             # 오라클(지수가, 엑셀 C7)
-                _fmt(quote.bid if quote else None, decimals=2),
-                _fmt(mark, decimals=2),               # 마크(기준가) 별도 표시
-                f"{last_vs_oracle:+.3f}" if last_vs_oracle is not None else "-",
-                f"{mark_vs_oracle:+.3f}" if mark_vs_oracle is not None else "-",
-                f"{prev * 100:.4f}%" if prev is not None else "-",
-                f"{nxt * 100:.4f}%" if nxt is not None else "-",
-                countdown,
-            ))
-        return rows
+def ls_rows(snap: dict[str, Any]) -> list[tuple[str, ...]]:
+    """LS 표 행 — 코어 스냅샷 그대로 렌더. 같은 종목은 첫 행(주식)에만 이름."""
+    rows: list[tuple[str, ...]] = []
+    last_u: str | None = None
+    for r in snap.get("ls", []):
+        u, inst = r["underlying"], r["instrument"]
+        name = _NAMES.get(u, u) if u != last_u else ""
+        last_u = u
+        disp = r.get("disp")
+        rows.append((
+            f"{name} {_KIND.get(inst, inst)}".strip(),
+            _fmt(r.get("ask_qty")), _fmt(r.get("ask")), _fmt(r.get("last")),
+            _fmt(r.get("bid")), _fmt(r.get("bid_qty")), _fmt(r.get("expected")),
+            _fmt(r.get("theory"), decimals=2),               # 엑셀과 동일 소수 2자리
+            f"{disp:+.2f}" if disp is not None else "-",      # 괴리율%(코어 계산)
+        ))
+    return rows
 
 
-def main() -> None:
-    """창 실행 — LiveSystem을 뒤에서 돌리고 두 표를 주기 갱신."""
-    import asyncio
+def hl_rows(snap: dict[str, Any], now_epoch: float | None = None) -> list[tuple[str, ...]]:
+    """HL 표 행 — 현/마크의 오라클 대비 %와 펀딩은 코어 스냅샷 값을 그대로 표시."""
+    now = now_epoch if now_epoch is not None else time.time()
+    countdown = funding_countdown(now)
+    rows: list[tuple[str, ...]] = []
+    for r in snap.get("hl", []):
+        lvo, mvo = r.get("last_vs_oracle"), r.get("mark_vs_oracle")
+        prev, nxt = r.get("funding_prev"), r.get("funding_next")
+        rows.append((
+            _NAMES.get(r["underlying"], r["underlying"]),
+            _fmt(r.get("ask"), decimals=2), _fmt(r.get("last"), decimals=2),
+            _fmt(r.get("oracle"), decimals=2), _fmt(r.get("bid"), decimals=2),
+            _fmt(r.get("mark"), decimals=2),
+            f"{lvo:+.3f}" if lvo is not None else "-",
+            f"{mvo:+.3f}" if mvo is not None else "-",
+            f"{prev * 100:.4f}%" if prev is not None else "-",
+            f"{nxt * 100:.4f}%" if nxt is not None else "-",
+            countdown,
+        ))
+    return rows
+
+
+def board_rows(snap: dict[str, Any]) -> list[tuple[str, ...]]:
+    """괴리 보드 행 — 진입/청산은 소수→%, est(USD)·주문가(원)는 코어 계산값."""
+    rows: list[tuple[str, ...]] = []
+    for r in sorted(snap.get("board", []),
+                    key=lambda x: (x["underlying"], x["instrument"])):
+        name = _NAMES.get(r["underlying"], r["underlying"])
+        kind = _KIND.get(r["instrument"], r["instrument"])
+        rows.append((
+            f"{name}-{kind}",
+            _pct(r.get("entry")), _pct(r.get("exit")),
+            _fmt(r.get("est_bid"), decimals=4), _fmt(r.get("est_ask"), decimals=4),
+            _fmt(r.get("px_entry"), decimals=0), _fmt(r.get("px_exit"), decimals=0),
+        ))
+    return rows
+
+
+def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
+    """창 실행 — 코어 /monitor를 뒷단 스레드로 폴링, 화면은 그 결과만 그린다."""
+    import queue
     import threading
     import tkinter as tk
     from collections.abc import Callable
     from tkinter import ttk
 
-    try:
-        from dotenv import load_dotenv
+    watch_parent_exit()  # 메인이 죽으면 이 창도 종료(고아 방지)
 
-        load_dotenv()
-    except ImportError:
-        pass
+    state_box: dict[str, Any] = {"data": None, "ts": 0.0}
+    params: dict[str, Any] = {"qty": 1, "en": 0.0, "ex": 0.0}  # UI가 갱신, 폴러가 읽음
+    jobs: queue.Queue[dict[str, Any]] = queue.Queue()
 
-    from .bootstrap import LiveSystem, bootstrap_live
-    from .core_client import watch_parent_exit
+    def poller() -> None:
+        while True:
+            q = params  # 평범한 dict 읽기(UI 스레드가 갱신) — 한 틱 지연은 무해
+            snap = core_request(
+                f"/monitor?qty={q['qty']}&en={q['en']}&ex={q['ex']}", timeout=2.0)
+            if snap is not None:
+                state_box["data"] = snap
+                state_box["ts"] = time.time()
+            time.sleep(0.3)
 
-    watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
+    def sender() -> None:  # 호가단위 머지 명령 전송(네트워크는 뒷단)
+        while True:
+            core_request("/command", jobs.get(), timeout=5.0)
 
-    state = MonitorState()
-    system_ref: dict[str, LiveSystem] = {}
-
-    def run_live() -> None:
-        async def _prev_funding_loop(system: LiveSystem) -> None:
-            hl = system._hl  # noqa: SLF001 - 모니터 전용 읽기 접근
-            if hl is None or not hasattr(hl, "get_prev_funding"):
-                return
-            while True:
-                for u in Underlying:
-                    try:
-                        state.funding_prev[u] = await hl.get_prev_funding(u)
-                    except Exception:  # noqa: BLE001 - 표시용, 실패해도 계속
-                        pass
-                await asyncio.sleep(FUNDING_INTERVAL_S / 4)
-
-        async def _run() -> None:
-            import aiohttp
-
-            async with aiohttp.ClientSession() as http:
-                system = await bootstrap_live(http)
-                system_ref["system"] = system
-                system.on_quote.append(state.on_quote)
-                system.on_trade.append(state.on_trade)
-                system.on_expected.append(state.on_expected)
-                system.on_mark.append(state.on_mark)
-                system.on_funding.append(state.on_funding)
-                await system.start()  # 초기 가격 시딩은 LiveSystem이 담당(합성 체결로 수신)
-                funding_task = asyncio.create_task(_prev_funding_loop(system))
-                try:
-                    await system.wait()
-                finally:
-                    funding_task.cancel()
-
-        asyncio.run(_run())
-
-    threading.Thread(target=run_live, daemon=True).start()
+    threading.Thread(target=poller, daemon=True).start()
+    threading.Thread(target=sender, daemon=True).start()
 
     root = tk.Tk()
     root.title("시세")
@@ -239,7 +140,6 @@ def main() -> None:
     win_state.attach(root, "monitor")  # 마지막 창 위치 복원·저장
     font = ("Malgun Gothic", 9)
 
-    # 항상 위 — 창이 커져서 기본은 해제, 필요할 때 체크로 켠다.
     topmost_var = tk.BooleanVar(value=False)
     tk.Checkbutton(
         root, text="항상 위", font=font, variable=topmost_var,
@@ -249,11 +149,7 @@ def main() -> None:
     def make_grid(
         title: str, cols: list[tuple[str, int, str]]
     ) -> Callable[[list[tuple[str, ...]]], None]:
-        """라벨 격자 표 하나 만들고 채우기 함수 반환 — (제목, 글자폭, 글자색) 열 정의.
-
-        셀 사이 1px 간격으로 배경(회색)이 비쳐 표 테두리처럼 보이고,
-        열별 글자색(예: 진입 빨강/청산 파랑)을 지원한다.
-        """
+        """라벨 격자 표 하나 만들고 채우기 함수 반환 — (제목, 글자폭, 글자색) 열 정의."""
         tk.Label(root, text=title, anchor="w", font=font).pack(fill="x", padx=4)
         frame = tk.Frame(root, bg="#c8c8c8", bd=1, relief="solid")
         frame.pack(fill="x", padx=6, pady=(2, 4))
@@ -296,7 +192,8 @@ def main() -> None:
         ("현-오라클%", 9, "black"), ("마크-오라클%", 10, "black"),
         ("펀딩전", 8, "black"), ("펀딩피", 8, "black"), ("남은시간", 7, "black"),
     ])
-    # HL 호가단위 머지(종목별) — 서버 재구독. est·사다리에 적용, 1호가 표시는 원시 유지.
+
+    # HL 호가단위 머지(종목별) — 코어에 재구독 명령. est·사다리에 적용, 1호가 표시는 원시 유지.
     # 배수는 최소 호가단위 기준(184달러대: 원시 0.01 → 2배 0.02, 5배 0.05, 10배 0.1, 100배 1)
     agg_choices = {"원시": (None, None), "2배": (5, 2), "5배": (5, 5),
                    "10배": (4, None), "100배": (3, None)}
@@ -306,22 +203,20 @@ def main() -> None:
 
     def agg_handler(u: Underlying, combo: ttk.Combobox) -> Callable[[object], None]:
         def _apply(_event: object) -> None:
-            system = system_ref.get("system")
-            if system is None:
-                return
             n_sig_figs, mantissa = agg_choices[combo.get()]
-            system.set_hl_aggregation(u, n_sig_figs, mantissa)
+            jobs.put({"cmd": "manual_hl_merge", "underlying": u.value,
+                      "n_sig_figs": n_sig_figs, "mantissa": mantissa})
         return _apply
 
     for agg_u in Underlying:
-        tk.Label(agg_row, text=_NAMES[agg_u], font=font).pack(side="left", padx=(8, 2))
+        tk.Label(agg_row, text=_NAMES[agg_u.value], font=font).pack(side="left", padx=(8, 2))
         agg_combo = ttk.Combobox(agg_row, values=list(agg_choices), width=5,
                                  state="readonly", font=font)
         agg_combo.set("원시")
         agg_combo.pack(side="left")
         agg_combo.bind("<<ComboboxSelected>>", agg_handler(agg_u, agg_combo))
 
-    # est-pr 계산 입력 — 수량(국내: 주식 쌍=주 1:1, 선물 쌍=계약 1:10 환산)·기준값(%) (§6.2-4)
+    # est 입력 — 수량(국내: 주식 쌍=주 1:1, 선물 쌍=계약 1:10 환산)·기준값(%). 코어가 계산.
     est_input = tk.Frame(root)
     est_input.pack(fill="x", padx=4, pady=(4, 0))
     tk.Label(est_input, text="수량(주식=주·선물=계약)", font=font).pack(side="left")
@@ -339,142 +234,57 @@ def main() -> None:
     tk.Label(est_input, text="(LS주문가 = 기준값이 체결로 보장되는 maker 가격)",
              font=font, fg="gray40").pack(side="left")
 
-    # 구성요소(HL/국내 매도·매수 disp)·순진입/순청산은 화면 제외 — CSV에는 계속 기록.
     fill_board = make_grid(
         "괴리 보드 (%) — 진입=HL매수d−국내매수d(국내 maker)", [
             ("쌍", 13, "black"),
-            ("진입", 8, "red"),
-            ("청산", 8, "blue"),
-            ("진입 est", 10, "red"),    # HL est-pr 평균 체결가 (USD, 소수 4자리)
-            ("청산 est", 10, "blue"),   # 청산: 매도호가 방향
-            ("진입 주문가", 10, "darkred"),   # 역산 LS maker 주문가 (원)
-            ("청산 주문가", 10, "darkblue"),
+            ("진입", 8, "red"), ("청산", 8, "blue"),
+            ("진입 est", 10, "red"), ("청산 est", 10, "blue"),   # HL est-pr 평균 체결가(USD)
+            ("진입 주문가", 10, "darkred"), ("청산 주문가", 10, "darkblue"),  # 역산 LS maker(원)
         ])
 
     status = tk.Label(root, text="연결 중 ...", anchor="w", font=font)
     status.pack(fill="x", padx=4, pady=(0, 4))
 
-    def pct(value: float | None) -> str:
-        return f"{value * 100:.3f}" if value is not None else "-"
-
-    _PAIR_KIND = {
-        Instrument.KR_STOCK: "S",  # 주식 쌍 — 방향 A(주식 매수+HL 숏) 전용, 잔고 보유 시
-        Instrument.KR_STOCK_FUTURE: "SF",
-        Instrument.KR_ETF: "ETF",
-    }
-
-    def _est_inputs() -> tuple[int, float, float]:
-        """est 입력칸 읽기 — 수량은 국내 단위(주/계약), 오타는 기본값. %→소수 환산."""
+    def _read_params() -> None:
+        """UI 스레드에서 입력칸을 읽어 params 갱신(폴러가 다음 폴에 사용)."""
         try:
-            sets_count = max(0, int(ent_sets.get().strip() or 0))
+            params["qty"] = max(0, int(ent_sets.get().strip() or 0))
         except ValueError:
-            sets_count = 1
-        def _pct(entry: tk.Entry) -> float:
+            params["qty"] = 1
+        for key, entry in (("en", ent_s_en), ("ex", ent_s_ex)):
             try:
-                return float(entry.get().strip() or 0.0) / 100.0
+                params[key] = float(entry.get().strip() or 0.0)
             except ValueError:
-                return 0.0
-        return sets_count, _pct(ent_s_en), _pct(ent_s_ex)
-
-    def board_rows(system: object) -> list[tuple[str, ...]]:
-        from .bootstrap import LiveSystem
-
-        assert isinstance(system, LiveSystem)
-        sets_count, s_en, s_ex = _est_inputs()
-        rows: list[tuple[str, ...]] = []
-        for (u, inst), pair in sorted(
-            system.disparity_board().items(), key=lambda kv: (kv[0][0].value, kv[0][1].value)
-        ):
-            est_bid, est_ask, px_en, px_ex = system.est_pair_prices(
-                u, inst, sets_count, s_en, s_ex)
-            rows.append((
-                f"{_NAMES[u]}-{_PAIR_KIND[inst]}",
-                pct(pair.spread.entry), pct(pair.spread.exit),  # K22/K24
-                _fmt(est_bid, decimals=4), _fmt(est_ask, decimals=4),
-                _fmt(px_en, decimals=0), _fmt(px_ex, decimals=0),
-            ))
-        return rows
-
-    last_csv = {"t": 0.0}
-
-    def record_spreads(system: object) -> None:
-        """1초 간격으로 스프레드를 CSV에 기록 — 임계값 결정용 분포 데이터."""
-        import csv
-        from pathlib import Path
-
-        from .bootstrap import LiveSystem
-
-        assert isinstance(system, LiveSystem)
-        now = time.time()
-        if now - last_csv["t"] < 1.0:
-            return
-        last_csv["t"] = now
-        board = system.disparity_board()
-        fx, _ = system.usdkrw_effective()  # 환산에 실제 쓴 환율 (주간 현물/야간 이론)
-        lines = [
-            (f"{time.strftime('%H:%M:%S', time.localtime(now))}",
-             u.value, _PAIR_KIND[inst],
-             pct(p.hl.ask), pct(p.hl.bid), pct(p.kr.ask), pct(p.kr.bid),
-             pct(p.spread.entry), pct(p.spread.exit),
-             f"{fx:.4f}" if fx is not None else "-",          # 사용 환율 (주간 스팟=엑셀 D65)
-             _fmt(system.stock_last(u), decimals=0),          # 기초 현재가 (엑셀 D60/D58)
-             pct(p.hl_last),                                  # HL 현재가 괴리 (메인 I22)
-             pct(p.kr_last))                                  # 국내 현재가 괴리 (메인 K19/M19)
-            for (u, inst), p in board.items()
-            if p.spread.entry is not None or p.spread.exit is not None
-        ]
-        if not lines:
-            return
-        log_dir = Path(__file__).resolve().parent.parent / "logs"
-        log_dir.mkdir(exist_ok=True)
-        path = log_dir / f"spread_{time.strftime('%Y%m%d')}.csv"
-        new_file = not path.exists()
-        try:
-            with path.open("a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                if new_file:
-                    writer.writerow(["time", "underlying", "pair",
-                                     "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
-                                     "entry", "exit", "usdkrw_used", "base_last",
-                                     "hl_last_d", "kr_last_d"])
-                writer.writerows(lines)
-        except OSError:
-            pass  # 파일을 엑셀 등이 잠근 상태 — 이번 기록은 건너뛰고 풀리면 재개
+                params[key] = 0.0
 
     def refresh() -> None:
-        # 어떤 예외가 나도 다음 갱신 예약(finally)은 반드시 실행 —
-        # 갱신 1회 실패로 화면이 통째로 멈추던 문제 방지.
+        # 어떤 예외가 나도 다음 갱신 예약(finally)은 반드시 실행 — 1회 실패로 화면이 멈추지 않게.
         try:
-            system = system_ref.get("system")
-            theory = None
-            if system is not None:
-                theory = {
-                    (u, Instrument.KR_STOCK_FUTURE): system.stock_futures_theory(u)
-                    for u in Underlying
-                }
-            fill_ls(state.ls_rows(theory))
-            fill_hl(state.hl_rows())
-            if system is not None:
-                fill_board(board_rows(system))
-                record_spreads(system)
-                phase = system.session.phase_for(Underlying.SAMSUNG).value
-                stock = system.order_book.balance(Account.KR_STOCK)
-                deriv = system.order_book.balance(Account.KR_DERIV)
-                age = time.time() - state.last_update if state.last_update else -1
-                fresh = f"{age:.0f}s 전" if age >= 0 else "-"
-                fx_used, fx_src = system.usdkrw_effective()
-                fx_fut = system.usdkrw_futures
-                fx_text = "환율 -"
-                if fx_used is not None:
-                    fut = f" (선물 {fx_fut:,.1f})" if fx_fut is not None else ""
-                    fx_text = f"환율[{fx_src}] {fx_used:,.2f}{fut}"
-                status.config(text=f"장운영: {phase} | {fx_text} | 주식 {stock:,.0f} | "
-                                   f"선물 {deriv:,.0f} | 수신 {fresh}")
+            _read_params()
+            snap = state_box.get("data")
+            if not snap or not snap.get("connected"):
+                status.config(text="코어 미접속 — 재시도 중 ...")
+                return
+            fill_ls(ls_rows(snap))
+            fill_hl(hl_rows(snap))
+            fill_board(board_rows(snap))
+            fx = snap.get("fx") or {}
+            bal = snap.get("balances") or {}
+            used, src, fut = fx.get("used"), fx.get("src"), fx.get("futures")
+            fx_text = "환율 -"
+            if used is not None:
+                tail = f" (선물 {fut:,.1f})" if fut is not None else ""
+                fx_text = f"환율[{src}] {used:,.2f}{tail}"
+            age = time.time() - state_box["ts"] if state_box["ts"] else -1
+            fresh = f"{age:.0f}s 전" if age >= 0 else "-"
+            status.config(
+                text=f"장운영: {snap.get('phase', '-')} | {fx_text} | "
+                     f"주식 {bal.get('stock', 0):,.0f} | 선물 {bal.get('deriv', 0):,.0f} | "
+                     f"수신 {fresh}")
         except tk.TclError:
             return  # 창이 닫히는 중 — 다음 예약 없이 조용히 종료
         except Exception:  # noqa: BLE001 - 1회 실패는 기록만 하고 계속
             import logging
-
             logging.getLogger("kp_arb.monitor").exception("화면 갱신 실패 — 계속")
         finally:
             try:
@@ -483,8 +293,7 @@ def main() -> None:
                 pass  # 창 닫힘 — 갱신 루프 종료
 
     refresh()
-    # 콘솔로 Ctrl-C 신호가 흘러들어도(직접 누르지 않아도 생김 — 콘솔 복사 시도,
-    # 창 닫기 과정 등) 화면을 죽이지 않는다. 종료는 창 닫기(X)로.
+    # 콘솔로 Ctrl-C 신호가 흘러들어도(창 닫기 과정 등) 화면을 죽이지 않는다. 종료는 창 닫기(X)로.
     while True:
         try:
             root.mainloop()

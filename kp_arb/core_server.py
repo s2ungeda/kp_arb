@@ -617,12 +617,16 @@ def monitor_snapshot(
                 "theory": theory, "disp": _disp_pct(last, theory)})
         hq = system.quotes.get((u, Instrument.HL_PERP, "hl"))
         mk = system.hl_mark.get(u)
+        hl_last = system.trades.get((u, Instrument.HL_PERP, "hl"))
+        oracle = mk.oracle if mk is not None else None
+        mark = mk.price if mk is not None else None
         out["hl"].append({
             "underlying": u.value,
             "ask": hq.ask if hq else None, "bid": hq.bid if hq else None,
-            "last": system.trades.get((u, Instrument.HL_PERP, "hl")),
-            "oracle": mk.oracle if mk is not None else None,
-            "mark": mk.price if mk is not None else None,
+            "last": hl_last, "oracle": oracle, "mark": mark,
+            "last_vs_oracle": _disp_pct(hl_last, oracle),  # (현재가−오라클)/오라클
+            "mark_vs_oracle": _disp_pct(mark, oracle),
+            "funding_prev": system.hl_funding_prev.get(u),
             "funding_next": system.hl_funding_rate.get(u)})
 
     for (u, inst), p in system.disparity_board().items():

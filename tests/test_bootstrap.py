@@ -623,6 +623,25 @@ def test_monitor_snapshot_structure() -> None:
     assert all("mark" in r and "oracle" in r for r in snap["hl"])   # HL 행: 마크·오라클
 
 
+def test_monitor_snapshot_merges_krx_nxt() -> None:
+    # HTS처럼 통합: 매수는 높은 쪽(NXT), 매도는 낮은 쪽(KRX)을 코어가 골라 내려준다.
+    from kp_arb.core_server import monitor_snapshot
+    from kp_arb.domain.models import Quote
+
+    system, _, _ = _system([])
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK, "krx")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
+        bid=292_500, ask=293_000, ts=1.0, bid_qty=100, ask_qty=50, market="krx")
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK, "nxt")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
+        bid=292_550, ask=293_050, ts=1.0, bid_qty=30, ask_qty=20, market="nxt")
+
+    stock = next(r for r in monitor_snapshot(system, 1, 0.0, 0.0)["ls"]
+                 if r["underlying"] == "samsung" and r["instrument"] == "kr_stock")
+    assert stock["ask"] == 293_000 and stock["ask_qty"] == 50   # 매도: KRX가 낮음
+    assert stock["bid"] == 292_550 and stock["bid_qty"] == 30   # 매수: NXT가 높음
+
+
 def test_spread_csv_rows() -> None:
     # 코어가 상시 기록하는 괴리 분포 CSV — 진입/청산이 있는 쌍만, 13열 고정.
     from kp_arb.domain.enums import SessionPhase

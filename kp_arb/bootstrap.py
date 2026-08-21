@@ -166,7 +166,8 @@ class LiveSystem:
         self.trades: dict[tuple[Underlying, Instrument, str], float] = {}
         # HL 마크(+오라클)·펀딩률 최신값 — 수동주문창 잔고표(B). WS로 실시간 갱신.
         self.hl_mark: dict[Underlying, Mark] = {}
-        self.hl_funding_rate: dict[Underlying, float] = {}
+        self.hl_funding_rate: dict[Underlying, float] = {}  # 예정(다음) 펀딩률
+        self.hl_funding_prev: dict[Underlying, float] = {}  # 직전 확정 펀딩률(REST 조회)
         # 배경 상시 태스크(괴리 CSV 등) — wait()가 기다리는 스트리밍 태스크와 분리, stop()이 취소.
         self._aux_tasks: list[asyncio.Task[None]] = []
         # HL 포지션 상세(마진·누적펀딩·청산가·레버리지) — clearinghouseState에서 refresh 때 채움.
@@ -705,8 +706,9 @@ class LiveSystem:
         # 시동 REST 조회들은 **순차 실행** — 동시에 나가면 서버 계정당 초당 한도에
         # 걸려 일부(t1901 등)가 실패한다(운영 실측). 환율 폴링은 그 뒤에 시작.
         self._tasks = [asyncio.create_task(self._startup_queries())]
-        # 괴리 분포 CSV는 무한 배경 기록 — wait()(스트리밍 소진 대기) 대상이 아니라 aux로 둔다.
-        self._aux_tasks = [asyncio.create_task(self._spread_csv_loop())]
+        # 무한 배경 기록/조회 — wait()(스트리밍 소진 대기) 대상이 아니라 aux로 둔다.
+        self._aux_tasks = [asyncio.create_task(self._spread_csv_loop()),
+                           asyncio.create_task(self._prev_funding_loop())]
         # run 자체가 아니라 **팩토리(.run)**를 넘긴다 — 재시작 때 새 코루틴을 만들어야 하므로.
         self._tasks.append(asyncio.create_task(self._guarded_ws("주식", self._stock_ws.run)))
         if self._deriv_ws is not None:
@@ -1101,6 +1103,19 @@ class LiveSystem:
                 writer.writerows(lines)
         except OSError:
             pass  # 엑셀 등이 파일을 잠근 상태 — 이번 기록만 건너뛰고 풀리면 재개
+
+    async def _prev_funding_loop(self) -> None:
+        """직전 확정 펀딩률을 15분 간격 REST 조회 — 모니터 '펀딩전' 표시용(코어 보관)."""
+        hl = self._hl
+        if hl is None or not hasattr(hl, "get_prev_funding"):
+            return  # 목/HL 미연결 — 펀딩전 없음
+        while True:
+            for u in Underlying:
+                try:
+                    self.hl_funding_prev[u] = await hl.get_prev_funding(u)
+                except Exception:  # noqa: BLE001 - 표시용, 실패해도 계속
+                    pass
+            await asyncio.sleep(900.0)  # 펀딩 주기(1시간)의 1/4
 
     async def _spread_csv_loop(self) -> None:
         """1초 간격 괴리 분포 기록. 어떤 예외도 루프를 멈추지 않는다."""
