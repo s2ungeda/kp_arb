@@ -93,10 +93,20 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     e_limit.bind("<KeyRelease>", _reformat_limit)
 
+    # 이론가 연이자율(공통설정) — 화면은 %, 저장은 비율(/100). 환율=fx / 주식선물=eq.
+    tk.Label(form, text="환율 이자율(%)").grid(row=1, column=0, sticky="w", pady=2)
+    e_fx_rate = tk.Entry(form, width=8, justify="right", font=T.FONT_NUM)
+    e_fx_rate.grid(row=1, column=1, sticky="w", padx=6, pady=2)
+    tk.Label(form, text="환율이론가", fg=T.C_MUTED).grid(row=1, column=2, sticky="w")
+    tk.Label(form, text="주식선물 이자율(%)").grid(row=2, column=0, sticky="w", pady=2)
+    e_eq_rate = tk.Entry(form, width=8, justify="right", font=T.FONT_NUM)
+    e_eq_rate.grid(row=2, column=1, sticky="w", padx=6, pady=2)
+    tk.Label(form, text="주식선물 이론가", fg=T.C_MUTED).grid(row=2, column=2, sticky="w")
+
     # 알람 3줄 — [체크박스] 이벤트명  [wav 경로]  [찾아보기] [듣기]
-    tk.Label(form, text="알람 (wav)").grid(row=1, column=0, sticky="w", pady=(10, 2))
+    tk.Label(form, text="알람 (wav)").grid(row=3, column=0, sticky="w", pady=(10, 2))
     rows: dict[str, dict[str, Any]] = {}
-    for i, (key, name) in enumerate(_ALARMS, start=2):
+    for i, (key, name) in enumerate(_ALARMS, start=4):
         var = tk.BooleanVar(value=False)
         tk.Checkbutton(form, text=name, variable=var, width=10, anchor="w").grid(
             row=i, column=0, sticky="w", pady=1)
@@ -126,10 +136,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def do_save() -> None:
         try:
             limit = float(e_limit.get().replace(",", "").strip() or "0")
+            fx_rate = float(e_fx_rate.get().strip() or "0") / 100.0   # % → 비율
+            eq_rate = float(e_eq_rate.get().strip() or "0") / 100.0
         except ValueError:
-            set_status("한도는 숫자로 입력하세요", err=True)
+            set_status("한도·이자율은 숫자로 입력하세요", err=True)
             return
-        payload: dict[str, Any] = {"cmd": "settings_global", "hl_daily_limit_usdc": limit}
+        payload: dict[str, Any] = {
+            "cmd": "settings_global", "hl_daily_limit_usdc": limit,
+            "fx_carry_rate": fx_rate, "eq_carry_rate": eq_rate}
         for key, r in rows.items():
             payload[key] = {"enabled": bool(r["var"].get()),
                             "path": r["entry"].get().strip()}
@@ -166,6 +180,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             state_box["loaded"] = True  # 최초 1회만 채움(사용자 편집 덮어쓰기 방지)
             e_limit.delete(0, "end")
             e_limit.insert(0, _fmt_amount(float(settings.get("hl_daily_limit_usdc", 0) or 0)))
+            e_fx_rate.delete(0, "end")
+            e_fx_rate.insert(0, f"{float(settings.get('fx_carry_rate', 0.015) or 0) * 100:g}")
+            e_eq_rate.delete(0, "end")
+            e_eq_rate.insert(0, f"{float(settings.get('eq_carry_rate', 0.030) or 0) * 100:g}")
             for key, r in rows.items():
                 snd = settings.get(key) or {}
                 r["var"].set(bool(snd.get("enabled", False)))

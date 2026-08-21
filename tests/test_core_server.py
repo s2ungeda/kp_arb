@@ -111,17 +111,20 @@ def test_settings_global_command_and_persistence(tmp_path: Path) -> None:
     res = apply_command(state, {
         "cmd": "settings_global",
         "hl_daily_limit_usdc": 5000.0,
+        "fx_carry_rate": 0.02, "eq_carry_rate": 0.04,
         "sound_fill": {"enabled": True, "path": "C:/s/fill.wav"},
         "sound_ws": {"enabled": False, "path": "C:/s/ws.wav"},
     })
     assert res["ok"]
     assert state.settings.hl_daily_limit_usdc == 5000.0
+    assert state.settings.fx_carry_rate == 0.02 and state.settings.eq_carry_rate == 0.04
     assert state.settings.sound_fill.enabled
     # 저장·복원 왕복 — 공통설정도 core_state.json에 남는다
     path = tmp_path / "core_state.json"
     save_state(path, state)
     restored = load_state(path)
     assert restored.settings.hl_daily_limit_usdc == 5000.0
+    assert restored.settings.fx_carry_rate == 0.02 and restored.settings.eq_carry_rate == 0.04
     assert restored.settings.sound_fill.enabled
     assert restored.settings.sound_fill.path == "C:/s/fill.wav"
     assert not restored.settings.sound_ws.enabled

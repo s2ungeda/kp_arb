@@ -128,7 +128,7 @@ class LiveSystem:
         fx_months: list[tuple[str, int]] | None = None,
         carry_rates: CarryRates | None = None,
         fees: FeeRates | None = None,
-        fx_spot_window: tuple[str, str] = ("07:50", "18:10"),
+        fx_spot_window: tuple[str, str] = ("07:00", "18:10"),
     ) -> None:
         self._gw = gateway
         # 취급 종목코드 (공개 — UI/도구가 상품 가용성 판단에 사용. 예: 현대차 ETF 없음)
@@ -149,7 +149,7 @@ class LiveSystem:
         # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — WS(FC0) 실시간 + 예비 조회 갱신.
         self.usdkrw_theory: float | None = None
         self.usdkrw_futures: float | None = None  # 원달러선물 현재가 원값(표시용)
-        # 외환현물(주간 07:50~18:10 HL 환산용 — 사용자 확정 2026-07-20) + 사용 창
+        # 외환현물(주간 07:00~18:10 HL 환산용 — 엑셀 시세!N6/O6, 2026-08-21) + 사용 시간대
         self.usdkrw_spot: float | None = None
         self._fx_spot_window = (parse_hhmm(fx_spot_window[0]), parse_hhmm(fx_spot_window[1]))
         self._hl = hl_gateway
@@ -294,6 +294,13 @@ class LiveSystem:
     def set_hl_daily_limit(self, usdc: float) -> None:
         """HL 일일 체결액 한도(USDC) 반영 — 코어가 설정 변경·시동 시 호출."""
         self.hl_daily_limit_usdc = max(0.0, usdc)
+
+    def set_carry_rates(self, fx: float, eq: float) -> None:
+        """이론가 연이자율 반영(환율=fx / 주식선물=eq) — 코어가 공통설정에서 주입.
+
+        이후 환율이론가(usdkrw_theory)·주식선물 이론가가 이 값으로 계산된다.
+        """
+        self._carry = CarryRates(stock_futures=eq, fx=fx)
 
     def _hl_order_notional(self, intent: OrderIntent) -> float:
         """HL 주문 금액(USDC) = |수량| × 가격. 시장가(가격 없음)는 마크가로 추정."""

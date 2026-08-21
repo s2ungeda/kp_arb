@@ -216,14 +216,14 @@ class SymbolConfig(BaseModel):
 class CarryRates(BaseModel):
     """캐리 이론가 연이자율 (DESIGN §6.1 — 전략 조정 대상이라 설정으로 노출)."""
 
-    stock_futures: float = 0.035  # 주식선물 이론가 (배당 무시 비용캐리)
-    fx: float = 0.015             # 원달러선물 → 현물환율 환산 (금리차)
+    stock_futures: float = 0.030  # 주식선물 이론가 (배당 무시 비용캐리) — 기본 3.0%
+    fx: float = 0.015             # 원달러선물 → 현물환율 환산 (금리차) — 기본 1.5%
 
 
 class FxSpotWindow(BaseModel):
     """외환현물 사용 시간대 (DESIGN §6.1 — 창 안은 현물, 밖은 선물이론가로 HL 환산)."""
 
-    start: str = "07:50"
+    start: str = "07:00"
     end: str = "18:10"
 
 

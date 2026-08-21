@@ -177,10 +177,12 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
                 parse_operating_hours(hours)  # 틀리면 ValueError → 거부
                 s.operating_hours = hours
             return _ok()
-        if cmd == "settings_global":  # 전체 공통설정(일일 한도·알람) — DESIGN-settings §4
+        if cmd == "settings_global":  # 전체 공통설정(일일 한도·이자율·알람) — DESIGN-settings §4
             g = state.settings
             g.hl_daily_limit_usdc = float(
                 body.get("hl_daily_limit_usdc", g.hl_daily_limit_usdc))
+            g.fx_carry_rate = float(body.get("fx_carry_rate", g.fx_carry_rate))
+            g.eq_carry_rate = float(body.get("eq_carry_rate", g.eq_carry_rate))
             for name, snd in (("sound_fill", g.sound_fill),
                               ("sound_error", g.sound_error), ("sound_ws", g.sound_ws)):
                 raw = body.get(name)
@@ -569,8 +571,9 @@ def make_app(
     fx_service: FxReportService | None = None,
 ) -> web.Application:
     """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅."""
-    if system is not None:  # 저장된 HL 일일 한도를 시동 시 LiveSystem에 주입
+    if system is not None:  # 저장된 공통설정을 시동 시 LiveSystem에 주입
         system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)
+        system.set_carry_rates(state.settings.fx_carry_rate, state.settings.eq_carry_rate)
 
     async def get_state(_request: web.Request) -> web.Response:
         payload = snapshot(state)
@@ -607,6 +610,8 @@ def make_app(
             save()  # 입력값 저장 — 재시작 시 복원 (§6.2-0)
         if payload.get("cmd") == "settings_global" and result.get("ok") and system:
             system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)  # 한도 즉시 반영
+            system.set_carry_rates(  # 이자율 즉시 반영(이론가 재계산에 반영)
+                state.settings.fx_carry_rate, state.settings.eq_carry_rate)
         if payload.get("cmd") == "shutdown" and result.get("ok") and on_shutdown:
             # 응답을 먼저 보내고 잠시 뒤 종료 (화면이 결과를 받을 시간)
             asyncio.get_running_loop().call_later(0.2, on_shutdown)

@@ -600,3 +600,11 @@ async def test_fx_auction_ignores_when_stopped_or_amend() -> None:
     if system._bg:
         await asyncio.gather(*list(system._bg))
     assert system._gw.fx_placed == []  # 미실행이라 대응 없음
+
+
+def test_set_carry_rates_replaces_theory_rates() -> None:
+    # 공통설정 이자율 주입 — 환율(fx)·주식선물(eq) 연이자율이 이론가 계산에 반영된다.
+    system, _, _ = _system([])
+    system.set_carry_rates(fx=0.02, eq=0.04)
+    assert system._carry.fx == 0.02
+    assert system._carry.stock_futures == 0.04
