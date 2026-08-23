@@ -280,7 +280,7 @@ async def test_l2book_depth_max_20() -> None:
 
 
 async def test_bbo_scalar_fast_ladder_from_l2book() -> None:
-    # 스칼라 bid/ask는 bbo(빠름), 사다리는 정합적 l2Book 그대로(대칭·크로스 없음).
+    # 스칼라 bid/ask는 bbo(빠름), 호가창은 정합적 l2Book 그대로(대칭·크로스 없음).
     client = HLWebSocketClient(FakeConnector([l2book_frame(), bbo_frame()]))
     quotes = []
     client.on_quote.append(quotes.append)
@@ -343,7 +343,7 @@ def test_l2_aggregation_resubscribe() -> None:
 
 
 def test_bbo_keeps_merged_ladder_intact() -> None:
-    # 머지 구독 중엔 원시 1호가(bbo)를 머지 사다리에 섞지 않는다 (단위가 다름).
+    # 머지 구독 중엔 원시 1호가(bbo)를 머지 호가창에 섞지 않는다 (단위가 다름).
     client = HLWebSocketClient(connector=None)  # type: ignore[arg-type]
     coin = client._symbols[Underlying.SK_HYNIX]
     client._l2_extra[coin] = {"nSigFigs": 5, "mantissa": 5}
@@ -354,5 +354,5 @@ def test_bbo_keeps_merged_ladder_intact() -> None:
         {"px": "184.12", "sz": "1"}, {"px": "184.13", "sz": "2"}]})
     assert quote is not None
     assert quote.bid == 184.12                 # 1호가 표시는 bbo 원시
-    assert quote.bids == [(184.1, 5.0)]        # 사다리는 머지 그대로 (스플라이스 없음)
+    assert quote.bids == [(184.1, 5.0)]        # 호가창은 머지 그대로 (스플라이스 없음)
     assert quote.asks == [(184.15, 7.0)]

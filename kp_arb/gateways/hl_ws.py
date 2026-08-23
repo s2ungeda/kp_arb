@@ -164,7 +164,7 @@ class HLWebSocketClient:
                 extra["mantissa"] = mantissa
         target.update(extra)
         self._l2_extra[coin] = extra
-        self._depth.pop(underlying, None)  # 옛 단위 사다리 폐기
+        self._depth.pop(underlying, None)  # 옛 단위 호가창 폐기
         self._control.append({"method": "subscribe", "subscription": dict(target)})
 
     def l2_aggregation(
@@ -327,9 +327,9 @@ class HLWebSocketClient:
             return None
         top_bid = (float(bid["px"]), float(bid.get("sz", 0) or 0))
         top_ask = (float(ask["px"]), float(ask.get("sz", 0) or 0))
-        # 스칼라 bid/ask(위)는 bbo(빠름). **사다리(bids/asks)는 자체 정합적인 l2Book만**
+        # 스칼라 bid/ask(위)는 bbo(빠름). **호가창(bids/asks)은 자체 정합적인 l2Book만**
         # 쓴다 — 신선한 bbo 1호가를 스테일 l2에 섞으면 크로스(매도<매수)나 한쪽 단계 소실이
-        # 생긴다(실측). 사다리는 l2Book 프레임 단위로 갱신(대칭·정합, 갱신율은 l2 피드에 의존).
+        # 생긴다(실측). 호가창은 l2Book 프레임 단위로 갱신(대칭·정합, 갱신율은 l2 피드에 의존).
         depth = self._depth.get(underlying)
         bids = depth[0] if depth is not None else None
         asks = depth[1] if depth is not None else None

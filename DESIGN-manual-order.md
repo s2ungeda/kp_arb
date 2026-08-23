@@ -12,7 +12,7 @@
 
 **HL/LS는 UI가 크게 달라 화면을 분리한다**(확정 2026-08-05) — **HL 전용 `order_hl`**(먼저 구현, main.bat 메뉴 "HL 일반주문"), **LS 전용 `order_ls`**(후속). **코어 명령(`manual_*`)·스냅샷(`/manual_state`)은 두 화면 공용.** 아래 §1은 HL 창 기준(LS 창은 공매도·계좌 표시 등이 달라 별도 확정).
 
-**경계 재설정**: 델파이 원본은 화면이 직접 엔진(TradeCore/ApiManager/QuoteBroker/TradeBroker)에 붙어 주문했다. 우리는 그 능력을 **코어**가 갖고(이미 있음: `place_order`/`cancel_order`, `get_open_orders`/`get_positions`/`get_balance`, 호가 사다리 `quote.bids/asks`), 화면은 입력·표시만 한다.
+**경계 재설정**: 델파이 원본은 화면이 직접 엔진(TradeCore/ApiManager/QuoteBroker/TradeBroker)에 붙어 주문했다. 우리는 그 능력을 **코어**가 갖고(이미 있음: `place_order`/`cancel_order`, `get_open_orders`/`get_positions`/`get_balance`, 호가창 `quote.bids/asks`), 화면은 입력·표시만 한다.
 
 ### 1) HL 창(`order_hl`) 구조 (확정 2026-08-05, 개정 2026-08-06)
 
@@ -259,7 +259,7 @@ HL 웹이나 다른 데서 거래하면 이 화면에 안 잡힌다.
 
 ### 3) 수량 단위
 
-수동은 **다리 하나씩**이라 그 거래소 **네이티브 단위**로 입력(자동의 1:10 페어 환산과 다름): LS 주식=주, LS 주식선물=계약, HL=계약. ('세트'·페어 환산 없음 — 페어 수량 규칙은 §6.2-3 자동 전용.)
+수동은 **한 쪽씩**이라 그 거래소 **네이티브 단위**로 입력(자동의 1:10 페어 환산과 다름): LS 주식=주, LS 주식선물=계약, HL=계약. ('세트'·페어 환산 없음 — 페어 수량 규칙은 §6.2-3 자동 전용.)
 
 ### 4) 코어 신규 명령 (화면 → 코어, `POST /command`)
 
@@ -272,7 +272,7 @@ HL 웹이나 다른 데서 거래하면 이 화면에 안 잡힌다.
 - **[신규]** `manual_leverage` {underlying, is_cross, leverage} → `updateLeverage`. **주문과 별개** (§1-3).
 - **[신규·나중]** `hl_dex_abstraction` {enabled} → `userDexAbstraction`. **계정 단위라 주문창이 아니라 설정 화면에 둔다.** 이 창의 개발 범위 밖.
 - **[신규]** `manual_price_guard` {pct} → 주문가 제한 폭(§1-2) 설정.
-- `GET /manual_state` (별도 엔드포인트 — /state를 무겁게 안 하려 분리): 취급 종목별 **호가 사다리·포지션·평균단가·평가손익·평가금액·청산가·매도가능·잔고·틱** + **전체 미체결**. OrderBook·`quotes` 메모리 읽기(조회 폴링 없음). 화면 뒷단 스레드가 폴링해 표시.
+- `GET /manual_state` (별도 엔드포인트 — /state를 무겁게 안 하려 분리): 취급 종목별 **호가창·포지션·평균단가·평가손익·평가금액·청산가·매도가능·잔고·틱** + **전체 미체결**. OrderBook·`quotes` 메모리 읽기(조회 폴링 없음). 화면 뒷단 스레드가 폴링해 표시.
   **[신규]** `position_value` · `unrealized_pnl` · `margin_used` · `cum_funding` · `oracle` · `funding_countdown`
   + `leverage` {type, value} · `max_leverage` 추가 (§1-1, §1-3). 전부 `clearinghouseState` 한 번으로 나온다.
 

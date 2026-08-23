@@ -278,7 +278,7 @@ def _first(mapping: dict[Any, Any], keys: list[Any]) -> Any:
 
 
 def _ladder(quote: Quote | None, asks: bool) -> list[list[float]]:
-    """Quote에서 호가 사다리 [[가격, 잔량], ...] — 정렬(매도 오름/매수 내림)·중복가격 병합.
+    """Quote에서 호가창 [[가격, 잔량], ...] — 정렬(매도 오름/매수 내림)·중복가격 병합.
 
     HL 원시 피드가 정렬 안 되거나 같은 가격을 중복 제시할 수 있어, 여기서 가격별로
     잔량을 합치고 정렬한다(안 그러면 틱·현재가 강조가 틀어진다). 다단계 없으면 1호가로.

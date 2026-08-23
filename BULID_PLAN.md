@@ -1,6 +1,6 @@
 # BUILD_PLAN.md — 단계별 작업 명령 (Claude Code)
 
-skeleton(green baseline)에서 시작해 위로 쌓는 작업 사다리. **한 번에 한 블록**만 클로드 코드에 복붙해 진행한다.
+skeleton(green baseline)에서 시작해 위로 쌓는 작업 단계. **한 번에 한 블록**만 클로드 코드에 복붙해 진행한다.
 
 ## 사용법
 - 한 블록 = 한 작업. 끝나면 `check.sh`가 green인지 보고받고, **green이면 git 커밋**(체크포인트) 후 다음 블록.
@@ -274,7 +274,7 @@ mock 게이트웨이 + NoopStrategy로 시세 수신→MarketState→리스크�
 ### 장기
 
 - 새벽 일일 갱신(24시간 무중단 시) · 웹 화면(aiohttp) · 리눅스/도쿄 이전(systemd)
-- 도쿄 이전 전 확인: **LS API 해외 IP 접속 허용 여부**(차단 시 LS 다리 국내 분리 필요 — 구조 영향 큼).
+- 도쿄 이전 전 확인: **LS API 해외 IP 접속 허용 여부**(차단 시 LS 쪽 국내 분리 필요 — 구조 영향 큼).
   이전 방식: 코어만 서버 + 화면은 SSH 터널(코드 수정 0) → 장기 웹 화면. 키는 서버 .env/systemd 환경변수.
 
 ---

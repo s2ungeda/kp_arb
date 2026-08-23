@@ -344,7 +344,7 @@ def test_manual_snapshot_shape() -> None:
     snap = manual_snapshot(sys)
     assert snap["connected"]
     sam = snap["symbols"]["samsung|kr_stock"]
-    assert sam["asks"] == [[80000, 20], [80100, 8]]      # 다단계 사다리
+    assert sam["asks"] == [[80000, 20], [80100, 8]]      # 다단계 호가창
     assert sam["bids"][0] == [79900, 10]
     assert sam["position"] == 100
     assert sam["avg_price"] == 80000

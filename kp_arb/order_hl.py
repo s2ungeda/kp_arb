@@ -351,7 +351,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         _merge_shown["under"] = under
 
     def _sync_merge_from_core() -> None:
-        """다른 창이 바꾼 머지를 콤보에 반영(사다리는 이미 코어가 머지해 보냄 → 라벨만).
+        """다른 창이 바꾼 머지를 콤보에 반영(호가창은 이미 코어가 머지해 보냄 → 라벨만).
         내가 방금 바꾼 건 코어 확인 전엔 유지 — 플리커/경합 방지."""
         under = active["underlying"] or UNDER_MAP.get(cb_under.get())
         if under is None or _merge_shown["under"] != under or not merge_map:
