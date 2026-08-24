@@ -11,7 +11,7 @@
 - "무엇을·왜"는 이 문서에서 확정. 커넥터 **내부 구현 디테일**(LS TR 포맷, WS 재연결, OAuth2 갱신 등)은 구현 단계에서 채운다.
 - **이번 버전 핵심:** 전략 로직은 분리(플러그인)하고, FX 헤지는 외부 프로세스(#2)에 위임한다. 즉 **이 시스템은 "거래 인프라 + 전략 플러그인 슬롯 + 노출 보고"** 까지 책임진다.
 - `[OPEN]` 은 리뷰 시 결정할 미결 항목(§13).
-- **분할**: 문서가 커지면 상세를 `DESIGN-*.md`로 떼고 여기엔 제목·요약·링크만 남긴다. 링크된 `DESIGN-*.md`도 **계약의 일부**다(예: 수동 주문 = [DESIGN-manual-order.md](DESIGN-manual-order.md), 화면 공통 스타일 = [DESIGN-ui.md](DESIGN-ui.md), 원달러선물 동시호가 대응주문 = [DESIGN-fx-auction.md](DESIGN-fx-auction.md), 전체 공통설정(일일 한도·알람) = [DESIGN-settings.md](DESIGN-settings.md)). 이력은 [DESIGN-history.md] 등으로 분리 가능.
+- **분할**: 문서가 커지면 상세를 `DESIGN-*.md`로 떼고 여기엔 제목·요약·링크만 남긴다. 링크된 `DESIGN-*.md`도 **계약의 일부**다(예: 수동 주문 = [DESIGN-manual-order.md](DESIGN-manual-order.md), 화면 공통 스타일 = [DESIGN-ui.md](DESIGN-ui.md), 원달러선물 동시호가 대응주문 = [DESIGN-fx-auction.md](DESIGN-fx-auction.md), 전체 공통설정(일일 한도·알람) = [DESIGN-settings.md](DESIGN-settings.md), 자동T 전략 = [DESIGN-auto-t.md](DESIGN-auto-t.md)). 이력은 [DESIGN-history.md] 등으로 분리 가능.
 
 ---
 
@@ -37,7 +37,7 @@
 
 **Non-goals**
 - 저지연/HFT 아님. 생산성 우선.
-- 주식(spot) 공매도 미사용 — 숏은 주식선물·야간선물 매도 / 인버스 ETF.
+- 주식(spot) 공매도는 기본 미사용(숏은 주식선물 매도 / 인버스 ETF) — **단 자동T 역방향은 대차 공매도(대주) 허용**(설정 옵션, 2026-08-24 — [DESIGN-auto-t.md](DESIGN-auto-t.md)).
 - **FX 헤지 주문은 본 시스템이 하지 않음** — 외부 #2가 수행.
 - 구체 전략 로직은 본 버전 범위 밖(인터페이스만 고정).
 - 멀티 거래소 동시 운용은 v2.
@@ -51,7 +51,7 @@
 | 대상 underlying | 삼성·SK하이닉스·현대차 3종 | HL HIP-3 perp 상장 확인(Trade.xyz, Presto MM) |
 | 국내 instrument | 주식 · 단일종목 ETF · 주식선물 · 야간선물 | 세션·비용·방향 따라 선택 |
 | **국내 계좌** | **주식계좌 1개 + 선물옵션계좌 1개(총 2개)**. 주식·ETF→주식계좌 / 주식선물·야간선물→선물옵션계좌(야간선물도 **동일 계좌**) | 한국 시장 구조(현물/파생 분리) |
-| 국내 쪽 방향 | spot/ETF 롱 전용(공매도 X). 숏은 선물 매도 / 인버스 ETF | 공매도 미사용 + 양방향 가능 |
+| 국내 쪽 방향 | spot/ETF 롱 + **자동T 역방향은 대주(대차 공매도) 허용**(2026-08-24). 그 외 숏은 선물 매도 / 인버스 ETF | 대주는 설정창 옵션 — [DESIGN-auto-t.md](DESIGN-auto-t.md) |
 | HL 진영 | Trade.xyz HIP-3 perp, USDC, 에이전트 서명, 펀딩 | 기존 3계층 지갑 재사용 |
 | 세션 판별 | LS 장운영데이터(JIF 실시간 + 휴장일)로 instrument별 판별 | 휴장·VI·동시호가 대응 |
 | **전략 로직** | **미정. ArbEngine은 Strategy 인터페이스 뒤 플러그인** | 인프라를 전략 비종속으로 구축 |
@@ -232,7 +232,7 @@
 
 ### 6.2 주문 화면 + 주문 규칙 (확정 2026-07-20, 전면 개정 2026-07-22 — 원본 주문화면0722.xlsx)
 
-화면은 코어에 명령만 보내고 판단·주문·기록은 코어(§12 "코어 하나 + 여러 화면").
+화면은 코어에 명령만 보내고 판단·주문·기록은 코어(§12 "코어 하나 + 여러 화면"). **자동T 상세는 → [DESIGN-auto-t.md](DESIGN-auto-t.md)**(정방향/역방향·대주·RT선진입·체결차·용어 사전 — 작성 중).
 
 **0) 화면 구조** (확정 2026-07-22): 코어 1프로세스 + 화면 3종(각각 별도 프로세스).
 
