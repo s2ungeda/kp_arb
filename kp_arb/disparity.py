@@ -1,10 +1,11 @@
 """상대호가 괴리(disp)·진입/청산 스프레드 — 순수 로직 (DESIGN §6.1, 원본 meme.xlsx).
 
 - disp = (환산가 − 기준가) ÷ 기준가. 매도호가/매수호가 각각.
-- 방향 A(국내 롱 + HL 숏), **국내 다리는 maker**(같은 방향 호가에 걸어 체결 대기 —
-  자동2 모드와 일치) 기준 (엑셀 개정판 메인!L12/L14, 2026-07-13):
-    진입(en) = HL 매수호가disp − 국내 매수호가disp   (국내 bid에 걸어 매수, HL bid에 매도)
-    청산(ex) = HL 매도호가disp − 국내 매도호가disp   (국내 ask에 걸어 매도, HL ask에 환매수)
+- 신호는 **발주 수량 기준 est-price 괴리**(양쪽, 개정 2026-08-24 — 1호가에서 변경).
+- 방향 A(국내 롱 + HL 숏), **국내 쪽은 maker**(같은 방향 호가에 걸어 체결 대기 —
+  자동2 모드와 일치) 기준:
+    진입(en) = HL 매수 est disp − 국내 매수 est disp   (국내 bid에 걸어 매수, HL bid에 매도)
+    청산(ex) = HL 매도 est disp − 국내 매도 est disp   (국내 ask에 걸어 매도, HL ask에 환매수)
   방향 B(국내 숏[선물만] + HL 롱)는 부호 반대(진입_B = −청산_A, 청산_B = −진입_A).
 """
 from __future__ import annotations
@@ -79,12 +80,34 @@ def side_disp(
     return SideDisp(ask=disp(ask_price, base), bid=disp(bid_price, base))
 
 
+def est_side_disp(
+    bids: Sequence[tuple[float, float]] | None,
+    asks: Sequence[tuple[float, float]] | None,
+    qty: float,
+    base: float | None,
+    fx: float | None = None,
+) -> SideDisp:
+    """발주 수량만큼 호가창을 쓸어담은 **est-price**의 매수/매도 괴리 (DESIGN §6.1-2).
+
+    매수 괴리 = est_price(매수호가창, 수량)의 기준가 대비 괴리, 매도도 동일.
+    fx가 있으면 est가에 곱해 환산(HL 쪽), None이면 그대로(국내 쪽).
+    호가창이 비거나 수량 0 이하면 est=None → 괴리 None. 단일 단계 호가창은 1호가로 축약.
+    """
+    def _d(levels: Sequence[tuple[float, float]] | None) -> float | None:
+        price = est_price(list(levels or []), qty)
+        if price is None:
+            return None
+        return disp(price * fx if fx is not None else price, base)
+
+    return SideDisp(ask=_d(asks), bid=_d(bids))
+
+
 @dataclass(frozen=True)
 class PairSpread:
     """HL vs 국내 상대(주식선물) 한 쌍의 진입/청산 스프레드 (방향 A, 국내 maker 기준)."""
 
-    entry: float | None  # HL bid disp − 국내 bid disp (벌어질수록 진입 매력) — 메인!L12
-    exit: float | None   # HL ask disp − 국내 ask disp (좁혀지면/음수면 청산) — 메인!L14
+    entry: float | None  # HL bid est disp − 국내 bid est disp (벌어질수록 진입 매력)
+    exit: float | None   # HL ask est disp − 국내 ask est disp (좁혀지면/음수면 청산)
 
 
 def pair_spread(hl: SideDisp, kr: SideDisp) -> PairSpread:
@@ -99,7 +122,7 @@ def net_entry(spread: PairSpread, fee_rate: float) -> float | None:
     "지금 진입해서 괴리가 0으로 완전 수렴했을 때 남는 기대 %".
     유도: 실현수익 = 진입값(t0) − 청산값(수렴 시). 중간가 괴리가 0으로 수렴하면
     청산값 ≈ (청산−진입)/2 (같은 시점 청산−진입 = HL호가폭 − 국내호가폭 —
-    국내 다리는 maker라 국내 폭은 벌고 HL 폭은 낸다. 호가폭 유지 가정).
+    국내 쪽은 maker라 국내 폭은 벌고 HL 폭은 낸다. 호가폭 유지 가정).
     """
     if spread.entry is None or spread.exit is None:
         return None

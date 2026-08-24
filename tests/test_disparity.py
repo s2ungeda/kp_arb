@@ -6,6 +6,7 @@ from kp_arb.disparity import (
     SideDisp,
     disp,
     est_price,
+    est_side_disp,
     maker_price_for_spread,
     pair_spread,
     side_disp,
@@ -36,6 +37,33 @@ def test_est_price_partial_and_invalid() -> None:
     assert est_price([], 10) is None
     assert est_price([(100.0, 5)], 0) is None   # 수량 0/음수는 무효
     assert est_price([(100.0, 5)], -1) is None
+
+
+def test_est_side_disp_uses_estprice() -> None:
+    # 신호(진입/청산)는 발주 수량 est-price 괴리 (DESIGN §6.1-2).
+    bids = [(100.0, 5.0), (99.0, 10.0)]   # 수량 10 → 100×5+99×5=99.5
+    asks = [(101.0, 5.0), (102.0, 10.0)]  # 수량 10 → 101×5+102×5=101.5
+    sd = est_side_disp(bids, asks, 10, 100.0)
+    assert sd.bid == pytest.approx(-0.005)  # (99.5-100)/100
+    assert sd.ask == pytest.approx(0.015)   # (101.5-100)/100
+
+
+def test_est_side_disp_fx_and_empty() -> None:
+    # fx 곱해 환산(HL 쪽): est 100 × 1500 / 기준 150,000 → disp 0
+    sd = est_side_disp([(100.0, 10.0)], [(100.0, 10.0)], 5, 150_000.0, fx=1500.0)
+    assert sd.bid == pytest.approx(0.0) and sd.ask == pytest.approx(0.0)
+    # 빈 호가창·수량 0 → None
+    empty = est_side_disp(None, None, 5, 100.0)
+    assert empty.bid is None and empty.ask is None
+    zero = est_side_disp([(100.0, 5.0)], [(101.0, 5.0)], 0, 100.0)
+    assert zero.bid is None and zero.ask is None
+
+
+def test_est_side_disp_single_level_equals_bbo() -> None:
+    # 단일 단계 호가창 est = 1호가 → side_disp(1호가)와 동일(수량 커도).
+    est = est_side_disp([(99.0, 3.0)], [(101.0, 3.0)], 999, 100.0)
+    bbo = side_disp(101.0, 99.0, 100.0)
+    assert est.bid == pytest.approx(bbo.bid) and est.ask == pytest.approx(bbo.ask)
 
 
 def test_disp_basic() -> None:

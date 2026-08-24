@@ -235,6 +235,13 @@ class FeeRates(BaseModel):
     stock_future: float = 0.00042  # HL+주식선물 쌍 왕복
 
 
+class DisparityConfig(BaseModel):
+    """괴리 보드 관련 인자 (DESIGN §6.1)."""
+
+    # CSV 분포 기록 기준 국내 수량(주식=주/선물=계약) — 화면 없을 때 est 스프레드용
+    ref_qty: int = 1
+
+
 class AppConfig(BaseModel):
     """config.yaml 전체. 종목 매핑 + ETF 승수 + 이론가·수수료 인자."""
 
@@ -243,6 +250,7 @@ class AppConfig(BaseModel):
     carry_rates: CarryRates = CarryRates()
     fees: FeeRates = FeeRates()
     fx_spot_window: FxSpotWindow = FxSpotWindow()
+    disparity: DisparityConfig = DisparityConfig()
 
     def etf_symbols(self) -> dict[Underlying, str]:
         return {u: s.etf for u, s in self.symbols.items() if s.etf is not None}

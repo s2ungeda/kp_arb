@@ -508,7 +508,7 @@ def test_disparity_board_computes_pairs() -> None:
         bid=299_500.0, ask=300_500.0, ts=0.0,
     )
 
-    board = system.disparity_board()
+    board = system.disparity_board(1)  # 1호가만 있어 est=1호가로 축약(수치 동일)
 
     sf = board[(SAMSUNG, Instrument.KR_STOCK_FUTURE)]
     # HL 환산: bid 301,500 / ask 303,000, 기초 300,000 → disp +0.5% / +1.0%
@@ -531,6 +531,36 @@ def test_disparity_board_computes_pairs() -> None:
     assert st.kr.ask is not None and abs(st.kr.ask - (500 / 300_000)) < 1e-12
     assert st.spread.entry == st.hl.bid - st.kr.bid  # 진입 공식 동일 (maker 기준)
     assert st.kr_last is not None and abs(st.kr_last) < 1e-12  # 현재가 괴리는 항상 0
+
+
+def test_disparity_board_est_is_quantity_dependent() -> None:
+    # 신호 = 발주 수량 기준 est-price. 큰 수량은 깊은 호가를 먹어 스프레드가 달라진다(§6.1-2).
+    from kp_arb.domain.enums import SessionPhase
+    from kp_arb.domain.models import Quote
+
+    system, _, _ = _system([])
+    system.futures_symbols[SAMSUNG] = "A1167000"
+    system.futures_expiry[SAMSUNG] = 202612
+    system.usdkrw_theory = 1_500.0
+    system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] = 300_000.0
+    system.stock_change_pct[(SAMSUNG, "krx")] = 0.0
+    system.session.seed_phase(SessionPhase.REGULAR)
+    # 1호가는 얕고(잔량 1), 2호가는 깊다(잔량 100) — 큰 수량이면 2호가까지 먹는다.
+    system.quotes[(SAMSUNG, Instrument.HL_PERP, "hl")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.HL_PERP, bid=201.0, ask=202.0,
+        ts=0.0, market="hl", bids=[(201.0, 1.0), (200.0, 100.0)],
+        asks=[(202.0, 1.0), (203.0, 100.0)])
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK_FUTURE, "krx")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        bid=301_000.0, ask=302_000.0, ts=0.0,
+        bids=[(301_000.0, 1.0), (300_000.0, 100.0)],
+        asks=[(302_000.0, 1.0), (303_000.0, 100.0)])
+
+    small = system.disparity_board(1)[(SAMSUNG, Instrument.KR_STOCK_FUTURE)]
+    big = system.disparity_board(50)[(SAMSUNG, Instrument.KR_STOCK_FUTURE)]
+    assert small.spread.entry is not None and big.spread.entry is not None
+    assert small.spread.entry != big.spread.entry   # 수량 종속 = est 반영 증거
+    assert small.spread.exit != big.spread.exit
 
 
 def test_pair_signal_est_based() -> None:

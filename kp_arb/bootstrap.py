@@ -25,14 +25,13 @@ from . import order_log
 from .config import CarryRates, FeeRates, LSAccounts
 from .disparity import (
     PairBoard,
-    SideDisp,
     disp,
     est_price,
+    est_side_disp,
     maker_price_for_spread,
     net_entry,
     net_exit,
     pair_spread,
-    side_disp,
 )
 from .domain.enums import Account, Instrument, Side, Underlying, Venue
 from .domain.models import InstrumentInfo, OrderIntent, Position, Quote
@@ -129,6 +128,7 @@ class LiveSystem:
         carry_rates: CarryRates | None = None,
         fees: FeeRates | None = None,
         fx_spot_window: tuple[str, str] = ("07:00", "18:10"),
+        board_ref_qty: int = 1,
     ) -> None:
         self._gw = gateway
         # 취급 종목코드 (공개 — UI/도구가 상품 가용성 판단에 사용. 예: 현대차 ETF 없음)
@@ -146,6 +146,7 @@ class LiveSystem:
         # 캐리 이론가 연이자율·왕복 수수료 — config.yaml 조정 대상
         self._carry = carry_rates if carry_rates is not None else CarryRates()
         self._fees = fees if fees is not None else FeeRates()
+        self._board_ref_qty = board_ref_qty  # CSV 분포 기록 기준 수량(화면 없을 때 est용)
         # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — WS(FC0) 실시간 + 예비 조회 갱신.
         self.usdkrw_theory: float | None = None
         self.usdkrw_futures: float | None = None  # 원달러선물 현재가 원값(표시용)
@@ -828,14 +829,26 @@ class LiveSystem:
         return (self.trades.get((underlying, Instrument.KR_STOCK, "uni"))
                 or self.trades.get((underlying, Instrument.KR_STOCK, "krx")))
 
-    def _hl_disp(self, underlying: Underlying) -> SideDisp:
-        """HL 호가를 환율(주간 현물/야간 선물이론가)로 원화 환산 → 주식 현재가 대비 괴리."""
-        quote = self.quotes.get((underlying, Instrument.HL_PERP, "hl"))
-        fx, _ = self.usdkrw_effective()
-        base = self.stock_last(underlying)
-        if quote is None or fx is None:
-            return side_disp(None, None, base)
-        return side_disp(quote.ask * fx, quote.bid * fx, base)
+    @staticmethod
+    def _levels(
+        quote: Quote | None,
+    ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """Quote에서 (매수호가창, 매도호가창) — 다단계 없으면 1호가 단일 단계로 축약."""
+        if quote is None:
+            return [], []
+        bids = list(quote.bids) if quote.bids else [(quote.bid, quote.bid_qty or 1.0)]
+        asks = list(quote.asks) if quote.asks else [(quote.ask, quote.ask_qty or 1.0)]
+        return bids, asks
+
+    def _ls_depth_quote(
+        self, underlying: Underlying, instrument: Instrument
+    ) -> Quote | None:
+        """국내 호가창 Quote — 통합(uni, NXT 포함) 우선 → KRX → NXT."""
+        for m in ("uni", "krx", "nxt"):
+            q = self.quotes.get((underlying, instrument, m))
+            if q is not None:
+                return q
+        return None
 
     def set_hl_aggregation(
         self, u: Underlying, n_sig_figs: int | None, mantissa: int | None = None
@@ -939,37 +952,43 @@ class LiveSystem:
                                     kr_ask, kr_bid, tick)
         return est_bid, est_ask, px_entry, px_exit
 
-    def disparity_board(self) -> dict[tuple[Underlying, Instrument], PairBoard]:
-        """HL vs 국내 상대(주식선물/ETF)별 괴리·진입/청산 스프레드 (DESIGN §6.1)."""
+    def disparity_board(
+        self, kr_qty: int
+    ) -> dict[tuple[Underlying, Instrument], PairBoard]:
+        """HL vs 국내 상대별 괴리·진입/청산 스프레드 (DESIGN §6.1). 신호는 **est-price 기반**.
+
+        kr_qty = 발주 국내 수량(주식=주/선물=계약). HL 수량 = kr_qty × (SF 10 / 주식 1).
+        진입/청산 = 그 수량만큼 양쪽 호가창을 쓸어담은 est가의 괴리차. 수량 0이면 스프레드 None.
+        화면은 입력 수량, CSV 분포 기록은 config `disparity.ref_qty`를 넣는다.
+        """
         board: dict[tuple[Underlying, Instrument], PairBoard] = {}
+        fx, _ = self.usdkrw_effective()
+        fees = {
+            Instrument.KR_STOCK: self._fees.stock,
+            Instrument.KR_STOCK_FUTURE: self._fees.stock_future,
+            Instrument.KR_ETF: self._fees.etf,
+        }
         for u in Underlying:
-            hl = self._hl_disp(u)
+            stock = self.stock_last(u)
+            hl_bids, hl_asks = self._levels(self.quotes.get((u, Instrument.HL_PERP, "hl")))
             # HL 현재가(체결) 괴리 — 엑셀 시세!AD열(메인 I22)
             hl_px = self.trades.get((u, Instrument.HL_PERP, "hl"))
-            fx, _ = self.usdkrw_effective()
             hl_last = disp(
-                hl_px * fx if hl_px is not None and fx is not None else None,
-                self.stock_last(u),
-            )
+                hl_px * fx if hl_px is not None and fx is not None else None, stock)
             # 주식 쌍의 기준가 = 자기 현재가 (HL disp가 이미 주식 현재가 대비 —
             # 옛 엑셀 현대차 행 AE62/AF62 패턴). 방향은 A(주식 매수+HL 숏) 전용(공매도 금지).
             targets: list[tuple[Instrument, float | None]] = [
-                (Instrument.KR_STOCK, self.stock_last(u)),
+                (Instrument.KR_STOCK, stock),
             ]
             if u in self.futures_symbols:
-                targets.append(
-                    (Instrument.KR_STOCK_FUTURE, self.stock_futures_theory(u))
-                )
+                targets.append((Instrument.KR_STOCK_FUTURE, self.stock_futures_theory(u)))
             if u in self.etf_symbols:
                 targets.append((Instrument.KR_ETF, self.etf_theory_price(u)))
-            fees = {
-                Instrument.KR_STOCK: self._fees.stock,
-                Instrument.KR_STOCK_FUTURE: self._fees.stock_future,
-                Instrument.KR_ETF: self._fees.etf,
-            }
             for instrument, base in targets:
-                ask, bid = self._best_quote(u, instrument)
-                kr = side_disp(ask, bid, base)
+                mult = 10.0 if instrument is Instrument.KR_STOCK_FUTURE else 1.0
+                hl = est_side_disp(hl_bids, hl_asks, kr_qty * mult, stock, fx)
+                kr_bids, kr_asks = self._levels(self._ls_depth_quote(u, instrument))
+                kr = est_side_disp(kr_bids, kr_asks, float(kr_qty), base)
                 kr_last_px = (self.trades.get((u, instrument, "uni"))
                               or self.trades.get((u, instrument, "krx")))
                 spread = pair_spread(hl, kr)
@@ -1066,7 +1085,7 @@ class LiveSystem:
         def _pct(v: float | None) -> str:
             return f"{v * 100:.3f}" if v is not None else "-"
 
-        board = self.disparity_board()
+        board = self.disparity_board(self._board_ref_qty)  # 기준 수량(config) est 스프레드
         fx, _ = self.usdkrw_effective()  # 환산에 실제 쓴 환율(주간 현물/야간 이론)
         return [
             (hhmmss, u.value, kind[inst],
@@ -1324,6 +1343,7 @@ async def bootstrap_live(
         carry_rates=config.carry_rates,
         fees=config.fees,
         fx_spot_window=(config.fx_spot_window.start, config.fx_spot_window.end),
+        board_ref_qty=config.disparity.ref_qty,
     )
 
 

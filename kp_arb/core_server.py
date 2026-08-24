@@ -629,7 +629,7 @@ def monitor_snapshot(
             "funding_prev": system.hl_funding_prev.get(u),
             "funding_next": system.hl_funding_rate.get(u)})
 
-    for (u, inst), p in system.disparity_board().items():
+    for (u, inst), p in system.disparity_board(kr_qty).items():
         est_bid, est_ask, px_en, px_ex = system.est_pair_prices(
             u, inst, kr_qty, en_thr, ex_thr)
         out["board"].append({
