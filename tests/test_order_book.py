@@ -321,3 +321,28 @@ def test_pending_buffer_is_bounded() -> None:
     for i in range(OrderBook._PENDING_CAP + 50):        # 외부 주문 이벤트 무한 누적 방지
         ob.on_fill(fill(f"X{i}", 1, 1.0))
     assert len(ob._pending) <= OrderBook._PENDING_CAP
+
+
+def test_float_accumulated_fills_reach_filled() -> None:
+    # 실증 버그: HL 체결이 잘게 쪼개져 합이 부동소수점상 주문수량에 한 톨 못 미쳐도
+    # (0.7+0.2+0.1 = 0.9999999999999999 < 1.0) '전량 체결'로 판정돼야 한다.
+    ob = OrderBook()
+    ob.track("F", intent(side=Side.SELL, qty=1.0))
+    for i, q in enumerate((0.7, 0.2, 0.1)):
+        ob.on_fill(fill("F", q, 1177.5, fill_id=f"f{i}"))
+    order = ob.order("F")
+    assert order is not None
+    assert order.filled_qty < 1.0                       # 실제 누적은 1.0 미만(부동소수점)
+    assert order.status is OrderStatus.FILLED           # 그래도 전량으로 판정
+    assert order.remaining_qty == 0.0
+    assert not order.is_open                             # 미체결 목록에서 빠진다
+
+
+def test_genuine_partial_stays_partial() -> None:
+    # 톨러런스가 진짜 부분체결을 가리지 않는다 — 6/10은 그대로 PARTIAL.
+    ob = OrderBook()
+    ob.track("P", intent(side=Side.SELL, qty=10))
+    ob.on_fill(fill("P", 6, 100.0))
+    order = ob.order("P")
+    assert order is not None
+    assert order.status is OrderStatus.PARTIAL and order.remaining_qty == 4.0

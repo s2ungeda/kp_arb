@@ -83,7 +83,7 @@ def order_amend_rejected(venue: Venue, order_id: str, error: object,
 def order_filled(intent: OrderIntent, fill_qty: float, fill_price: float,
                  fill_id: str, cum_qty: float) -> None:
     """체결통보(WS) — 부분/전량 + 누적/목표 수량(주문이 어디로 갔는지 추적)."""
-    kind = "전량" if cum_qty >= intent.qty else "부분"
+    kind = "전량" if cum_qty >= intent.qty - 1e-6 else "부분"  # 부동소수점 톨러런스
     logger_for(intent.venue).info(
         "체결(%s) %s %g @ %s [체결#%s] 누적 %g/%g",
         kind, _fmt(intent, with_price=False), fill_qty, fill_price,

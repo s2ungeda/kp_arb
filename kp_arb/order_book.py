@@ -36,6 +36,11 @@ _OPEN: frozenset[OrderStatus] = frozenset(
     {OrderStatus.NEW, OrderStatus.ACCEPTED, OrderStatus.PARTIAL}
 )
 
+# 체결 완료 판정 톨러런스 — HL은 체결이 잘게 쪼개져 와(55.712·0.022…) 합이 부동소수점상
+# 주문수량에 한 톨 못 미친다(99.99999…). 이 잔여 이하는 '전량 체결'로 본다. 국내 최소단위
+# (주식 1주·HL 0.001)보다 훨씬 작아 실제 부분체결은 가리지 않는다.
+_FILL_EPS = 1e-6
+
 _PositionKey = tuple[Underlying, Instrument, Account | None]
 
 
@@ -58,7 +63,8 @@ class TrackedOrder:
 
     @property
     def remaining_qty(self) -> float:
-        return max(0.0, self.intent.qty - self.filled_qty)
+        rem = self.intent.qty - self.filled_qty
+        return 0.0 if rem <= _FILL_EPS else rem  # 부동소수점 잔여는 0으로(완료로 봄)
 
 
 @dataclass
@@ -197,8 +203,8 @@ class OrderBook:
             (order.avg_fill_price * order.filled_qty + price * qty) / total
         )
         order.filled_qty = total
-        order.status = (
-            OrderStatus.FILLED if total >= order.intent.qty else OrderStatus.PARTIAL
+        order.status = (  # 톨러런스 판정 — 부동소수점으로 한 톨 모자라도 전량 처리(remaining_qty)
+            OrderStatus.FILLED if order.remaining_qty <= 0.0 else OrderStatus.PARTIAL
         )
         self._apply_fill_to_position(order.intent, qty, price)
         self._apply_fill_to_balance(order.intent, qty, price, fee)
