@@ -185,62 +185,70 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # ===================== 방향 섹션 2개 =====================
     def build_section(dtag: str, name: str, en_col: str, ex_col: str,
                       acc_rows: tuple[Any, ...]) -> None:
-        sec = tk.LabelFrame(root, text=name, fg="black")
-        sec.pack(fill="x", padx=2, pady=(1, 2), anchor="w")
+        sec = tk.Frame(root, relief="groove", bd=2)  # 그룹박스 대신 얇은 테두리 프레임
+        sec.pack(fill="x", padx=2, pady=(1, 3), anchor="w")
         grid = tk.Frame(sec)
-        grid.pack(padx=1, pady=1, anchor="w")
+        grid.pack(padx=3, pady=2, anchor="w")
         heads = ("목표수량", "1회주문", en_col, "실행", ex_col, "실행",
                  "설정", "RT선진입", "체결차", "초")
-        for c, h in enumerate(heads):
-            tk.Label(grid, text=h, fg="gray25").grid(
-                row=0, column=c, padx=1, sticky="nsew")
-        # 매매결과(진입/청산) — 같은 그리드의 오른쪽 컬럼(라인 자동 정렬). 헤더 행에 라벨+clear.
-        base = len(heads)
+        nset = len(heads)
+
+        # row0: 방향 제목(세트 컬럼 span) + 매매결과 헤더(진입/청산 라벨 + clear)
+        tk.Label(grid, text=name, font=T.FONT_NUM).grid(
+            row=0, column=0, columnspan=nset, sticky="w", pady=(0, 2))
         ttk.Separator(grid, orient="vertical").grid(  # 세트|매매결과 구분(박스 대신 세로선)
-            row=0, column=base, rowspan=5, sticky="ns", padx=5)
+            row=0, column=nset, rowspan=5, sticky="ns", padx=5)
         acc_cols: dict[str, tuple[int, int, tuple[str, ...]]] = {}
         for gi, (glabel, comps) in enumerate(acc_rows):
-            lcol, vcol = base + 1 + gi * 2, base + 2 + gi * 2
+            lcol, vcol = nset + 1 + gi * 2, nset + 2 + gi * 2
             acc_cols[glabel] = (lcol, vcol, comps)
             tk.Label(grid, text=glabel, fg="gray25").grid(
-                row=0, column=lcol, padx=(10, 0), sticky="w")
+                row=0, column=lcol, padx=(8, 0), sticky="e")
             tk.Button(grid, text="clear", width=4, padx=0, pady=0, bd=1,
                       highlightthickness=0, font=T.FONT_SMALL,
                       command=partial(clear_acc, dtag, glabel)).grid(
                 row=0, column=vcol, padx=1, pady=1, sticky="nsew")
+
+        # row1: 컬럼 헤더 (매매결과 Sprd가 이 행과 정렬)
+        for c, h in enumerate(heads):
+            tk.Label(grid, text=h, fg="gray25").grid(
+                row=1, column=c, padx=1, sticky="nsew")
+
+        # rows 2~4: 세트 3줄
         for i in range(3):
+            r = i + 2
             w = sets[(dtag, i)]
             lbl_tg = tk.Label(grid, text="-", width=7, anchor="e", bg="#fffbcc",
                               relief="solid", bd=1)  # 목표수량(세트설정에서만)
-            lbl_tg.grid(row=i + 1, column=0, padx=1, pady=1, sticky="nsew")
+            lbl_tg.grid(row=r, column=0, padx=1, pady=1, sticky="nsew")
             lbl_per = tk.Label(grid, text="-", width=6, anchor="e", bg="#f0f0f0",
                                relief="solid", bd=1)  # 1회주문수량(세트설정)
-            lbl_per.grid(row=i + 1, column=1, padx=1, pady=1, sticky="nsew")
+            lbl_per.grid(row=r, column=1, padx=1, pady=1, sticky="nsew")
             e_en = tk.Entry(grid, width=6, justify="right", validate="key",
                             validatecommand=vcmd_dec)  # 진입 기준값(인라인 수정)
-            e_en.grid(row=i + 1, column=2, padx=1, pady=1, sticky="nsew")
+            e_en.grid(row=r, column=2, padx=1, pady=1, sticky="nsew")
             btn_en = tk.Button(grid, text="진입", width=4, padx=0, pady=0,
                                bd=1, highlightthickness=0)
-            btn_en.grid(row=i + 1, column=3, padx=1, pady=1, sticky="nsew")
+            btn_en.grid(row=r, column=3, padx=1, pady=1, sticky="nsew")
             e_ex = tk.Entry(grid, width=6, justify="right", validate="key",
                             validatecommand=vcmd_dec)  # 청산 기준값(인라인 수정)
-            e_ex.grid(row=i + 1, column=4, padx=1, pady=1, sticky="nsew")
+            e_ex.grid(row=r, column=4, padx=1, pady=1, sticky="nsew")
             btn_ex = tk.Button(grid, text="청산", width=4, padx=0, pady=0,
                                bd=1, highlightthickness=0)
-            btn_ex.grid(row=i + 1, column=5, padx=1, pady=1, sticky="nsew")
+            btn_ex.grid(row=r, column=5, padx=1, pady=1, sticky="nsew")
             btn_set = tk.Button(grid, text="설정", width=4, padx=0, pady=0,
                                 bd=1, highlightthickness=0,
                                 command=partial(open_set_dialog, dtag, i))
-            btn_set.grid(row=i + 1, column=6, padx=1, pady=1, sticky="nsew")
+            btn_set.grid(row=r, column=6, padx=1, pady=1, sticky="nsew")
             lbl_rt = tk.Label(grid, text="-", width=7, anchor="e", bg="white",
                               relief="solid", bd=1)  # RT선진입(세트별)
-            lbl_rt.grid(row=i + 1, column=7, padx=1, pady=1, sticky="nsew")
+            lbl_rt.grid(row=r, column=7, padx=1, pady=1, sticky="nsew")
             lbl_diff = tk.Label(grid, text="-", width=6, anchor="e", bg="white",
                                 relief="solid", bd=1)  # 체결차(세트별)
-            lbl_diff.grid(row=i + 1, column=8, padx=1, pady=1, sticky="nsew")
+            lbl_diff.grid(row=r, column=8, padx=1, pady=1, sticky="nsew")
             lbl_sec = tk.Label(grid, text="-", width=4, anchor="e", bg="#f0f0f0",
                                relief="solid", bd=1)  # 전환딜레이 초(세트설정)
-            lbl_sec.grid(row=i + 1, column=9, padx=1, pady=1, sticky="nsew")
+            lbl_sec.grid(row=r, column=9, padx=1, pady=1, sticky="nsew")
             w.update({"tg": lbl_tg, "per_lbl": lbl_per, "e_en": e_en, "e_ex": e_ex,
                       "btn_en": btn_en, "btn_ex": btn_ex, "rt": lbl_rt,
                       "diff": lbl_diff, "sec": lbl_sec,
@@ -248,12 +256,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             btn_en.config(command=partial(toggle_run, dtag, i, "en"))
             btn_ex.config(command=partial(toggle_run, dtag, i, "ex"))
 
-        # 매매결과 값 — 세트 행과 같은 행에(-HP/+S/-환 = 1~3행), Sprd = 4행. 라인 자동 정렬.
+        # 매매결과 값 — Sprd=row1(컬럼헤더 줄), -HP/+S/-환=row2~4(세트1~3). 탑·끝 라인 정렬.
         for glabel, (lcol, vcol, comps) in acc_cols.items():
             labels: dict[str, tk.Label] = {}
-            for ri, comp in enumerate((*comps, "Sprd")):
+            for ri, comp in enumerate(("Sprd", *comps)):
                 tk.Label(grid, text=comp, fg="gray30", font=T.FONT_SMALL).grid(
-                    row=ri + 1, column=lcol, padx=(10, 0), sticky="e")
+                    row=ri + 1, column=lcol, padx=(8, 0), sticky="e")
                 v = tk.Label(grid, text="-", width=6, anchor="e", bg="white",
                              relief="solid", bd=1)
                 v.grid(row=ri + 1, column=vcol, padx=1, pady=1, sticky="nsew")
