@@ -30,9 +30,8 @@ def main() -> None:
     elif arg == "monitor":
         from kp_arb.monitor import main as run
         run()
-    elif arg in ("autoT", "autoM"):
-        sys.argv = [sys.argv[0], arg]  # order_panel은 argv[1]로 화면 종류를 읽는다
-        from kp_arb.order_panel import main as run
+    elif arg == "autoT":
+        from kp_arb.order_autot import main as run
         run()
     elif arg == "fx_monitor":
         from kp_arb.fx_monitor import main as run

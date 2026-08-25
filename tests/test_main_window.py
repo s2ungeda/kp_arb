@@ -63,8 +63,8 @@ def test_restart_gives_up_after_max() -> None:
 def test_launch_command_dev() -> None:
     cmd = launch_command("kp_arb.monitor", ())
     assert cmd[0] == sys.executable and cmd[1:] == ["-m", "kp_arb.monitor"]
-    cmd = launch_command("kp_arb.order_panel", ("autoT",))
-    assert cmd[-1] == "autoT"
+    cmd = launch_command("kp_arb.order_autot", ())
+    assert cmd[1:] == ["-m", "kp_arb.order_autot"]
 
 
 def test_launch_command_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -73,7 +73,7 @@ def test_launch_command_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
     assert launch_command("kp_arb.core_server", ())[0].endswith("meme-core.exe")
     assert launch_command("kp_arb.core_server", ())[-1] == "core"
     assert launch_command("kp_arb.monitor", ())[-1] == "monitor"
-    assert launch_command("kp_arb.order_panel", ("autoM",))[-1] == "autoM"
+    assert launch_command("kp_arb.order_autot", ())[-1] == "autoT"
     assert launch_command("kp_arb.main_window", ())[0].endswith("meme.exe")
 
 

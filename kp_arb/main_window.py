@@ -127,8 +127,8 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "meme.exe"), "fx_auction_order"]
     if module == "kp_arb.settings_window":
         return [str(exe_dir / "meme.exe"), "settings"]
-    if module == "kp_arb.order_panel":
-        return [str(exe_dir / "meme.exe"), *args]  # autoT | autoM
+    if module == "kp_arb.order_autot":
+        return [str(exe_dir / "meme.exe"), "autoT"]
     return [str(exe_dir / "meme.exe")]
 
 
@@ -329,10 +329,8 @@ def main() -> None:
 
     menubar = tk.Menu(root)
     m_screen = tk.Menu(menubar, tearoff=0)
-    m_screen.add_command(label="자동T 주문 (HL-주식)",
-                         command=lambda: open_screen("kp_arb.order_panel", "autoT"))
-    m_screen.add_command(label="자동M 주문 (HL-주식선물)",
-                         command=lambda: open_screen("kp_arb.order_panel", "autoM"))
+    m_screen.add_command(label="바로쏴 (자동T)",
+                         command=lambda: open_screen("kp_arb.order_autot"))
     m_screen.add_command(label="시세 모니터",
                          command=lambda: open_screen("kp_arb.monitor"))
     m_screen.add_command(label="FX 노출 감시",
