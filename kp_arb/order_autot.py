@@ -92,7 +92,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         watch_parent_exit()  # 메인이 죽으면 이 창도 종료(고아 방지)
     root = tk.Tk()
     root.title("바로쏴 (자동T)")
-    root.resizable(False, False)
+    root.resizable(True, True)  # 창 크기 조절 가능 — 컨트롤은 좌상단 고정(안 늘어남)
     win_state.attach(root, "autoT")
     T.apply_base(root)
     root.option_add("*Font", T.FONT_BASE_LG)  # 큰 화면 — 일반주문창(order_hl)과 같은 11pt
@@ -188,42 +188,45 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         sec = tk.LabelFrame(root, text=name, fg="black")
         sec.pack(fill="x", padx=2, pady=(1, 2))
         grid = tk.Frame(sec)
-        grid.grid(row=0, column=0, sticky="nw")
+        grid.grid(row=0, column=0, sticky="nw")  # 좌상단 고정 — 리사이즈해도 컨트롤 안 늘어남
         heads = ("목표수량", "1회주문", en_col, "실행", ex_col, "실행",
                  "설정", "RT선진입", "체결차", "초")
         for c, h in enumerate(heads):
             tk.Label(grid, text=h, fg="gray25").grid(
-                row=0, column=c, padx=1, sticky="ew")
+                row=0, column=c, padx=1, sticky="nsew")
         for i in range(3):
             w = sets[(dtag, i)]
             lbl_tg = tk.Label(grid, text="-", width=7, anchor="e", bg="#fffbcc",
                               relief="solid", bd=1)  # 목표수량(세트설정에서만)
-            lbl_tg.grid(row=i + 1, column=0, padx=1, pady=1, sticky="ew")
+            lbl_tg.grid(row=i + 1, column=0, padx=1, pady=1, sticky="nsew")
             lbl_per = tk.Label(grid, text="-", width=6, anchor="e", bg="#f0f0f0",
                                relief="solid", bd=1)  # 1회주문수량(세트설정)
-            lbl_per.grid(row=i + 1, column=1, padx=1, pady=1, sticky="ew")
+            lbl_per.grid(row=i + 1, column=1, padx=1, pady=1, sticky="nsew")
             e_en = tk.Entry(grid, width=6, justify="right", validate="key",
                             validatecommand=vcmd_dec)  # 진입 기준값(인라인 수정)
-            e_en.grid(row=i + 1, column=2, padx=1, pady=1, sticky="ew")
-            btn_en = tk.Button(grid, text="진입", width=4)
-            btn_en.grid(row=i + 1, column=3, padx=1)
+            e_en.grid(row=i + 1, column=2, padx=1, pady=1, sticky="nsew")
+            btn_en = tk.Button(grid, text="진입", width=4, padx=0, pady=0,
+                               bd=1, highlightthickness=0)
+            btn_en.grid(row=i + 1, column=3, padx=1, pady=1, sticky="nsew")
             e_ex = tk.Entry(grid, width=6, justify="right", validate="key",
                             validatecommand=vcmd_dec)  # 청산 기준값(인라인 수정)
-            e_ex.grid(row=i + 1, column=4, padx=1, pady=1, sticky="ew")
-            btn_ex = tk.Button(grid, text="청산", width=4)
-            btn_ex.grid(row=i + 1, column=5, padx=1)
-            btn_set = tk.Button(grid, text="설정", width=4,
+            e_ex.grid(row=i + 1, column=4, padx=1, pady=1, sticky="nsew")
+            btn_ex = tk.Button(grid, text="청산", width=4, padx=0, pady=0,
+                               bd=1, highlightthickness=0)
+            btn_ex.grid(row=i + 1, column=5, padx=1, pady=1, sticky="nsew")
+            btn_set = tk.Button(grid, text="설정", width=4, padx=0, pady=0,
+                                bd=1, highlightthickness=0,
                                 command=partial(open_set_dialog, dtag, i))
-            btn_set.grid(row=i + 1, column=6, padx=1)
+            btn_set.grid(row=i + 1, column=6, padx=1, pady=1, sticky="nsew")
             lbl_rt = tk.Label(grid, text="-", width=7, anchor="e", bg="white",
                               relief="solid", bd=1)  # RT선진입(세트별)
-            lbl_rt.grid(row=i + 1, column=7, padx=1, pady=1, sticky="ew")
+            lbl_rt.grid(row=i + 1, column=7, padx=1, pady=1, sticky="nsew")
             lbl_diff = tk.Label(grid, text="-", width=6, anchor="e", bg="white",
                                 relief="solid", bd=1)  # 체결차(세트별)
-            lbl_diff.grid(row=i + 1, column=8, padx=1, pady=1, sticky="ew")
+            lbl_diff.grid(row=i + 1, column=8, padx=1, pady=1, sticky="nsew")
             lbl_sec = tk.Label(grid, text="-", width=4, anchor="e", bg="#f0f0f0",
                                relief="solid", bd=1)  # 전환딜레이 초(세트설정)
-            lbl_sec.grid(row=i + 1, column=9, padx=1, pady=1, sticky="ew")
+            lbl_sec.grid(row=i + 1, column=9, padx=1, pady=1, sticky="nsew")
             w.update({"tg": lbl_tg, "per_lbl": lbl_per, "e_en": e_en, "e_ex": e_ex,
                       "btn_en": btn_en, "btn_ex": btn_ex, "rt": lbl_rt,
                       "diff": lbl_diff, "sec": lbl_sec,
@@ -233,7 +236,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
         # 누적결과(진입/청산별) — 오른쪽. clear 버튼 + -HP/+S/-환(또는 부호반대) + Sprd
         acc = tk.Frame(sec)
-        acc.grid(row=0, column=1, sticky="n", padx=(6, 0))
+        acc.grid(row=0, column=1, sticky="nw", padx=(6, 0))
         for gi, (glabel, comps) in enumerate(acc_rows):
             box = tk.LabelFrame(acc, text=glabel)
             box.grid(row=0, column=gi, padx=2)
@@ -246,7 +249,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     row=ri + 1, column=0, sticky="e")
                 v = tk.Label(box, text="-", width=6, anchor="e", bg="white",
                              relief="solid", bd=1)
-                v.grid(row=ri + 1, column=1, padx=0, pady=0, sticky="ew")
+                v.grid(row=ri + 1, column=1, padx=1, pady=1, sticky="nsew")
                 labels[comp] = v
             sets[(dtag, 0)].setdefault("_acc", {})[glabel] = labels  # 방향당 1묶음(세트0에 보관)
 
