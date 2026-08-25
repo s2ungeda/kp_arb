@@ -196,9 +196,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 row=0, column=c, padx=1, sticky="nsew")
         # 매매결과(진입/청산) — 같은 그리드의 오른쪽 컬럼(라인 자동 정렬). 헤더 행에 라벨+clear.
         base = len(heads)
+        ttk.Separator(grid, orient="vertical").grid(  # 세트|매매결과 구분(박스 대신 세로선)
+            row=0, column=base, rowspan=5, sticky="ns", padx=5)
         acc_cols: dict[str, tuple[int, int, tuple[str, ...]]] = {}
         for gi, (glabel, comps) in enumerate(acc_rows):
-            lcol, vcol = base + gi * 2, base + gi * 2 + 1
+            lcol, vcol = base + 1 + gi * 2, base + 2 + gi * 2
             acc_cols[glabel] = (lcol, vcol, comps)
             tk.Label(grid, text=glabel, fg="gray25").grid(
                 row=0, column=lcol, padx=(10, 0), sticky="w")
