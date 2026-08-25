@@ -75,6 +75,7 @@ _ACC_ROWS_REV = (("진입", ("+HP", "-S", "+환")), ("청산", ("-HP", "+S", "+�
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
     """자동T 화면 실행."""
     import queue
+    import sys
     import threading
     import time
     import tkinter as tk
@@ -84,7 +85,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     from . import win_state
     from .core_client import core_request, watch_parent_exit
 
-    watch_parent_exit()  # 메인이 죽으면 이 창도 종료(고아 방지)
+    # UI만 확인하는 미리보기 — 코어 접속·부모감시 없이 레이아웃만 띄운다.
+    preview = "--preview" in sys.argv
+    if not preview:
+        watch_parent_exit()  # 메인이 죽으면 이 창도 종료(고아 방지)
     root = tk.Tk()
     root.title("바로쏴 (자동T)")
     root.resizable(False, False)
@@ -109,8 +113,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             state_box["data"] = core_request("/state", timeout=2.0)
             time.sleep(1.0)
 
-    threading.Thread(target=sender, daemon=True).start()
-    threading.Thread(target=poller, daemon=True).start()
+    if not preview:  # 미리보기는 네트워크 스레드 없이 레이아웃만
+        threading.Thread(target=sender, daemon=True).start()
+        threading.Thread(target=poller, daemon=True).start()
 
     def send(payload: dict[str, Any], label: str) -> None:
         jobs.put(({**payload, "screen": "autoT"}, label))
@@ -402,7 +407,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         acc_rows = _ACC_ROWS_FWD if dtag == "fwd" else _ACC_ROWS_REV
         build_section(dtag, f"{name}  ({en_lbl} / {ex_lbl})", en_col, ex_col, acc_rows)
 
-    status = tk.Label(root, text="코어 확인 중 ...", anchor="w", relief="groove")
+    status = tk.Label(root, anchor="w", relief="groove",
+                      text="UI 미리보기 — 코어 미연결" if preview else "코어 확인 중 ...")
     status.pack(fill="x", padx=4, pady=(2, 4))
 
     refresh_common_bar()
@@ -422,8 +428,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             pass
         _reschedule(drain, 200)
 
+    preview_mon = {"fwd_en": "-0.82", "fwd_ex": "-0.52", "rev_en": "0.12", "rev_ex": "0.23"}
+
     def refresh() -> None:
         try:
+            if preview:  # 정적 — 목업 대조용 샘플 수치, 갱신 루프 없음
+                for key, lbl in mon.items():
+                    lbl.config(text=preview_mon.get(key, "-"))
+                return
             connected = isinstance(state_box["data"], dict)
             show = parse_qty(ent_refqty.get()) > 0  # 기준수량>0일 때만 모니터 수치
             for lbl in mon.values():
