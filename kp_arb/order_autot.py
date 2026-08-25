@@ -185,16 +185,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # ===================== 방향 섹션 2개 =====================
     def build_section(dtag: str, name: str, en_col: str, ex_col: str,
                       acc_rows: tuple[Any, ...]) -> None:
-        sec = tk.Frame(root, relief="groove", bd=2)  # 그룹박스 대신 얇은 테두리 프레임
-        sec.pack(fill="x", padx=2, pady=(1, 3), anchor="w")
-        grid = tk.Frame(sec)
-        grid.pack(padx=3, pady=2, anchor="w")
+        grid = tk.Frame(root)  # 그룹박스 없음 — 매매결과가 박스에 갇히지 않음, 정렬은 통합 그리드로
+        grid.pack(fill="x", padx=4, pady=(1, 2), anchor="w")
         heads = ("목표수량", "1회주문", en_col, "실행", ex_col, "실행",
                  "설정", "RT선진입", "체결차", "초")
         nset = len(heads)
 
         # row0: 방향 제목(세트 컬럼 span) + 매매결과 헤더(진입/청산 라벨 + clear)
-        tk.Label(grid, text=name, font=T.FONT_NUM).grid(
+        tk.Label(grid, text=name, font=T.FONT_NUM_LG).grid(
             row=0, column=0, columnspan=nset, sticky="w", pady=(0, 2))
         ttk.Separator(grid, orient="vertical").grid(  # 세트|매매결과 구분(박스 대신 세로선)
             row=0, column=nset, rowspan=5, sticky="ns", padx=5)
@@ -425,7 +423,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     tk.Button(bar2, text="설정", command=open_common_dialog).pack(side="right")
 
-    for dtag, name, en_lbl, ex_lbl, en_col, ex_col in _DIRECTIONS:
+    for di, (dtag, name, en_lbl, ex_lbl, en_col, ex_col) in enumerate(_DIRECTIONS):
+        if di > 0:  # 방향 사이 가로 구분선(박스 대신)
+            ttk.Separator(root, orient="horizontal").pack(fill="x", padx=4, pady=2)
         acc_rows = _ACC_ROWS_FWD if dtag == "fwd" else _ACC_ROWS_REV
         build_section(dtag, f"{name}  ({en_lbl} / {ex_lbl})", en_col, ex_col, acc_rows)
 
