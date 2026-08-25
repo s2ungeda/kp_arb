@@ -82,6 +82,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     from collections.abc import Callable
     from tkinter import ttk
 
+    from . import ui_theme as T
     from . import win_state
     from .core_client import core_request, watch_parent_exit
 
@@ -93,7 +94,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     root.title("바로쏴 (자동T)")
     root.resizable(False, False)
     win_state.attach(root, "autoT")
-    root.option_add("*Font", ("Malgun Gothic", 9))
+    T.apply_base(root)
+    root.option_add("*Font", T.FONT_BASE_LG)  # 큰 화면 — 일반주문창(order_hl)과 같은 11pt
     vcmd_int = (root.register(is_int_text), "%P")
     vcmd_dec = (root.register(is_decimal_text), "%P")
     vcmd_time = (root.register(is_time_text), "%P")
@@ -161,9 +163,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     mon: dict[str, tk.Label] = {}
     for tag, name in (("fwd", "정방향"), ("rev", "역방향")):
         tk.Label(top, text=name).pack(side="left", padx=(6, 2))
-        for side, color in (("en", "red"), ("ex", "blue")):
+        for side, color in (("en", T.C_BUY), ("ex", T.C_SELL)):
             lbl = tk.Label(top, text="-", bg=color, fg="white", width=6,
-                           font=("Malgun Gothic", 10, "bold"))
+                           font=T.FONT_NUM_LG)
             lbl.pack(side="left", padx=1, ipady=1)
             mon[f"{tag}_{side}"] = lbl
 
