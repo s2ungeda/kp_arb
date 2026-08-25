@@ -192,38 +192,38 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         heads = ("목표수량", "1회주문", en_col, "실행", ex_col, "실행",
                  "설정", "RT선진입", "체결차", "초")
         for c, h in enumerate(heads):
-            tk.Label(grid, text=h, fg="gray25", font=T.FONT_SMALL).grid(
-                row=0, column=c, padx=0, sticky="ew")
+            tk.Label(grid, text=h, fg="gray25").grid(
+                row=0, column=c, padx=1, sticky="ew")
         for i in range(3):
             w = sets[(dtag, i)]
-            lbl_tg = tk.Label(grid, text="-", width=6, anchor="e", bg="#fffbcc",
+            lbl_tg = tk.Label(grid, text="-", width=7, anchor="e", bg="#fffbcc",
                               relief="solid", bd=1)  # 목표수량(세트설정에서만)
-            lbl_tg.grid(row=i + 1, column=0, padx=0, pady=0, sticky="ew")
-            lbl_per = tk.Label(grid, text="-", width=5, anchor="e", bg="#f0f0f0",
+            lbl_tg.grid(row=i + 1, column=0, padx=1, pady=1, sticky="ew")
+            lbl_per = tk.Label(grid, text="-", width=6, anchor="e", bg="#f0f0f0",
                                relief="solid", bd=1)  # 1회주문수량(세트설정)
-            lbl_per.grid(row=i + 1, column=1, padx=0, pady=0, sticky="ew")
-            e_en = tk.Entry(grid, width=5, justify="right", validate="key",
+            lbl_per.grid(row=i + 1, column=1, padx=1, pady=1, sticky="ew")
+            e_en = tk.Entry(grid, width=6, justify="right", validate="key",
                             validatecommand=vcmd_dec)  # 진입 기준값(인라인 수정)
-            e_en.grid(row=i + 1, column=2, padx=0, pady=0, sticky="ew")
-            btn_en = tk.Button(grid, text="진입", width=3, padx=0)
-            btn_en.grid(row=i + 1, column=3, padx=0)
-            e_ex = tk.Entry(grid, width=5, justify="right", validate="key",
+            e_en.grid(row=i + 1, column=2, padx=1, pady=1, sticky="ew")
+            btn_en = tk.Button(grid, text="진입", width=4)
+            btn_en.grid(row=i + 1, column=3, padx=1)
+            e_ex = tk.Entry(grid, width=6, justify="right", validate="key",
                             validatecommand=vcmd_dec)  # 청산 기준값(인라인 수정)
-            e_ex.grid(row=i + 1, column=4, padx=0, pady=0, sticky="ew")
-            btn_ex = tk.Button(grid, text="청산", width=3, padx=0)
-            btn_ex.grid(row=i + 1, column=5, padx=0)
-            btn_set = tk.Button(grid, text="설정", width=3, padx=0,
+            e_ex.grid(row=i + 1, column=4, padx=1, pady=1, sticky="ew")
+            btn_ex = tk.Button(grid, text="청산", width=4)
+            btn_ex.grid(row=i + 1, column=5, padx=1)
+            btn_set = tk.Button(grid, text="설정", width=4,
                                 command=partial(open_set_dialog, dtag, i))
-            btn_set.grid(row=i + 1, column=6, padx=0)
-            lbl_rt = tk.Label(grid, text="-", width=6, anchor="e", bg="white",
+            btn_set.grid(row=i + 1, column=6, padx=1)
+            lbl_rt = tk.Label(grid, text="-", width=7, anchor="e", bg="white",
                               relief="solid", bd=1)  # RT선진입(세트별)
-            lbl_rt.grid(row=i + 1, column=7, padx=0, pady=0, sticky="ew")
-            lbl_diff = tk.Label(grid, text="-", width=5, anchor="e", bg="white",
+            lbl_rt.grid(row=i + 1, column=7, padx=1, pady=1, sticky="ew")
+            lbl_diff = tk.Label(grid, text="-", width=6, anchor="e", bg="white",
                                 relief="solid", bd=1)  # 체결차(세트별)
-            lbl_diff.grid(row=i + 1, column=8, padx=0, pady=0, sticky="ew")
-            lbl_sec = tk.Label(grid, text="-", width=3, anchor="e", bg="#f0f0f0",
+            lbl_diff.grid(row=i + 1, column=8, padx=1, pady=1, sticky="ew")
+            lbl_sec = tk.Label(grid, text="-", width=4, anchor="e", bg="#f0f0f0",
                                relief="solid", bd=1)  # 전환딜레이 초(세트설정)
-            lbl_sec.grid(row=i + 1, column=9, padx=0, pady=0, sticky="ew")
+            lbl_sec.grid(row=i + 1, column=9, padx=1, pady=1, sticky="ew")
             w.update({"tg": lbl_tg, "per_lbl": lbl_per, "e_en": e_en, "e_ex": e_ex,
                       "btn_en": btn_en, "btn_ex": btn_ex, "rt": lbl_rt,
                       "diff": lbl_diff, "sec": lbl_sec,
