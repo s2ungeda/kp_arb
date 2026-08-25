@@ -185,10 +185,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # ===================== 방향 섹션 2개 =====================
     def build_section(dtag: str, name: str, en_col: str, ex_col: str,
                       acc_rows: tuple[Any, ...]) -> None:
-        sec = tk.LabelFrame(root, text=name, fg="black")
-        sec.pack(fill="x", padx=2, pady=(1, 2))
+        row = tk.Frame(root)  # 한 방향 = 방향박스 + 진입/청산 매매결과박스를 나란히(형제)
+        row.pack(fill="x", padx=2, pady=(1, 2), anchor="w")
+        sec = tk.LabelFrame(row, text=name, fg="black")
+        sec.pack(side="left", anchor="n")  # 상단 정렬 — 매매결과박스와 탑라인 맞춤
         grid = tk.Frame(sec)
-        grid.grid(row=0, column=0, sticky="nw")  # 좌상단 고정 — 리사이즈해도 컨트롤 안 늘어남
+        grid.pack(padx=1, pady=1)
         heads = ("목표수량", "1회주문", en_col, "실행", ex_col, "실행",
                  "설정", "RT선진입", "체결차", "초")
         for c, h in enumerate(heads):
@@ -234,12 +236,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             btn_en.config(command=partial(toggle_run, dtag, i, "en"))
             btn_ex.config(command=partial(toggle_run, dtag, i, "ex"))
 
-        # 누적결과(진입/청산별) — 오른쪽. clear 버튼 + -HP/+S/-환(또는 부호반대) + Sprd
-        acc = tk.Frame(sec)
-        acc.grid(row=0, column=1, sticky="nw", padx=(6, 0))
-        for gi, (glabel, comps) in enumerate(acc_rows):
-            box = tk.LabelFrame(acc, text=glabel)
-            box.grid(row=0, column=gi, padx=2)
+        # 매매결과(진입/청산별) — 방향박스 밖(형제)로 빼서 나란히. clear + -HP/+S/-환 + Sprd
+        for glabel, comps in acc_rows:
+            box = tk.LabelFrame(row, text=glabel)
+            box.pack(side="left", anchor="n", padx=(4, 0))
             tk.Button(box, text="clear", width=4, padx=0, font=T.FONT_SMALL,
                       command=partial(clear_acc, dtag, glabel)).grid(
                 row=0, column=0, columnspan=2)
