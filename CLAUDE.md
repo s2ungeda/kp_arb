@@ -7,6 +7,9 @@
 - 구현은 DESIGN.md를 따른다. **임의로 아키텍처를 바꾸지 않는다.**
 - 설계를 바꿔야 한다고 판단되면, **코드보다 DESIGN.md를 먼저 고치고** 사람의 확인을 받는다.
 - DESIGN.md의 `[OPEN]` 항목은 아직 미정이다. 그 부분을 추측으로 채우지 말고, 필요하면 질문한다.
+- **매 세션 함께 확인할 파일:**
+  - `DESIGN.md`(+ 링크된 `DESIGN-*.md`) — 계약/spec
+  - `korean-terms.md`(자동 메모리: `~/.claude/projects/c--project-VibeCode-kp-arb/memory/korean-terms.md`) — **직역 금지 용어 관리대장.** 설명·문서·주석을 쓰기 전에 이 대조표를 확인하고 따른다. 직역 회피는 기계적 치환이 아니라 문맥에 맞는 말로(§7 참고).
 
 ## 2. 검증 루프 (가장 중요)
 - 코드를 고치면 **반드시** `./.claude/hooks/check.sh` 를 돌린다 (ruff + mypy + pytest).
