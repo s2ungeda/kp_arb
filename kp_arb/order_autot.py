@@ -136,11 +136,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # ===================== 상단 바 =====================
     top = tk.Frame(root)
-    top.pack(fill="x", padx=2, pady=(2, 1))
+    top.pack(fill="x", padx=4, pady=(2, 1))  # padx=4 — 그리드(board)와 좌우 라인 맞춤
     tk.Label(top, text="종목").pack(side="left")
     cb_under = ttk.Combobox(top, values=UNDERLYINGS, width=7, state="readonly")
     cb_under.set("하이닉스")
     cb_under.pack(side="left", padx=(2, 4))
+    # TODO(운영 배선): 호가단위를 order_hl처럼 코어 merge_ticks(실제 틱 숫자)로 채운다.
+    # 지금은 가격 미수신(코어 미연결)이라 라벨(원시/2배…)로 둔다.
     cb_agg = ttk.Combobox(top, values=list(AGG_CHOICES), width=5, state="readonly")
     cb_agg.set("원시")
     cb_agg.pack(side="left", padx=(0, 4))
@@ -152,26 +154,31 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         send({"cmd": "manual_hl_merge", "underlying": u,
               "n_sig_figs": nsf, "mantissa": mant}, "호가단위")
 
-    tk.Button(top, text="적", width=3, command=apply_market).pack(side="left", padx=(0, 8))
-    tk.Label(top, text="기준수량").pack(side="left")
+    ttk.Style().configure("Ap.TButton", padding=(6, 2))  # 콤보 높이(≈26)에 맞춤
+    ttk.Button(top, text="적", width=3, style="Ap.TButton",
+               command=apply_market).pack(side="left", padx=(0, 6))
+    # 기준수량 (라벨 없이 입력칸만 — 상단 폭 절약). 0보다 클 때만 상단 모니터 수치 표시.
     ent_refqty = tk.Entry(top, width=6, justify="right", validate="key",
-                          validatecommand=vcmd_int)
+                          validatecommand=vcmd_int, font=T.FONT_NUM_LG)
     ent_refqty.insert(0, "0")
-    ent_refqty.pack(side="left", padx=(2, 10))
+    ent_refqty.pack(side="left", padx=(0, 10))
 
-    # 상단 모니터 수치 (정/역방향 진입·청산 est) — 기준수량>0일 때만 표시(값은 코어 연결 후)
+    # 상단 모니터 수치 (정/역방향 진입·청산 est) — 오른쪽 정렬(그리드 오른쪽 라인과 맞춤).
+    # 기준수량>0일 때만 표시(값은 코어 연결 후).
     mon: dict[str, tk.Label] = {}
-    for tag, name in (("fwd", "정방향"), ("rev", "역방향")):
-        tk.Label(top, text=name).pack(side="left", padx=(4, 1))
+    mon_frame = tk.Frame(top)
+    mon_frame.pack(side="right")
+    for tag, name in (("fwd", "정"), ("rev", "역")):
+        tk.Label(mon_frame, text=name).pack(side="left", padx=(6, 1))
         for side, color in (("en", T.C_BUY), ("ex", T.C_SELL)):
-            lbl = tk.Label(top, text="-", bg=color, fg="white", width=6,
+            lbl = tk.Label(mon_frame, text="-", bg=color, fg="white", width=6,
                            font=T.FONT_NUM_LG)
-            lbl.pack(side="left", padx=1, ipady=1)
+            lbl.pack(side="left", padx=(1, 0), ipady=1)
             mon[f"{tag}_{side}"] = lbl
 
     # ===================== 2번째 바 (공통설정 표시) =====================
     bar2 = tk.Frame(root)
-    bar2.pack(fill="x", padx=2, pady=(0, 2))
+    bar2.pack(fill="x", padx=4, pady=(0, 2))  # padx=4 — 설정 버튼 우측이 그리드 라인과 맞게
     lbl_windows = tk.Label(bar2, text="", fg="gray25")
     lbl_windows.pack(side="left")
     lbl_sexcl = tk.Label(bar2, text="", fg="gray25")
@@ -183,69 +190,72 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         lbl_sexcl.config(text="S 주문 제외" if common["s_exclude"] else "S 포함")
 
     # ===================== 방향 섹션 2개 =====================
-    def build_section(dtag: str, name: str, en_col: str, ex_col: str,
-                      acc_rows: tuple[Any, ...]) -> None:
-        grid = tk.Frame(root)  # 그룹박스 없음 — 매매결과가 박스에 갇히지 않음, 정렬은 통합 그리드로
-        grid.pack(fill="x", padx=4, pady=(1, 2), anchor="w")
+    def build_section(grid: Any, rbase: int, dtag: str, name: str, en_col: str,
+                      ex_col: str, acc_rows: tuple[Any, ...]) -> None:
+        # 두 방향을 하나의 공유 그리드에 rbase 오프셋으로 그린다 — 컬럼 공유 → 완벽 정렬.
         heads = ("목표수량", "1회주문", en_col, "실행", ex_col, "실행",
                  "설정", "RT선진입", "체결차", "초")
         nset = len(heads)
 
-        # row0: 방향 제목(세트 컬럼 span) + 매매결과 헤더(진입/청산 라벨 + clear)
+        # rbase 행: 방향 제목(세트 span) + 매매결과 헤더(진입/청산 라벨 + clear)
         tk.Label(grid, text=name, font=T.FONT_NUM_LG).grid(
-            row=0, column=0, columnspan=nset, sticky="w", pady=(0, 2))
-        ttk.Separator(grid, orient="vertical").grid(  # 세트|매매결과 구분(박스 대신 세로선)
-            row=0, column=nset, rowspan=5, sticky="ns", padx=5)
+            row=rbase, column=0, columnspan=nset, sticky="w", pady=(0, 2))
+        ttk.Separator(grid, orient="vertical").grid(  # 세트|매매결과 구분(세로선)
+            row=rbase, column=nset, rowspan=5, sticky="ns", padx=3)
         acc_cols: dict[str, tuple[int, int, tuple[str, ...]]] = {}
+        cum_labels: dict[str, tk.Label] = {}
         for gi, (glabel, comps) in enumerate(acc_rows):
             lcol, vcol = nset + 1 + gi * 2, nset + 2 + gi * 2
             acc_cols[glabel] = (lcol, vcol, comps)
-            tk.Label(grid, text=glabel, fg="gray25").grid(
-                row=0, column=lcol, padx=(8, 0), sticky="e")
-            tk.Button(grid, text="clear", width=4, padx=0, pady=0, bd=1,
-                      highlightthickness=0, font=T.FONT_SMALL,
-                      command=partial(clear_acc, dtag, glabel)).grid(
-                row=0, column=vcol, padx=1, pady=1, sticky="nsew")
+            # 진입/청산 라벨 자체를 버튼으로 → 누른 매매결과 초기화(clear 대신).
+            tk.Button(grid, text=glabel, padx=0, pady=0, bd=1, highlightthickness=0,
+                      font=T.FONT_LABEL, command=partial(clear_acc, dtag, glabel)).grid(
+                row=rbase, column=lcol, padx=(2, 0), pady=1, sticky="nsew")
+            # clear 자리 → 누적체결량 표시.
+            lbl_cum = tk.Label(grid, text="-", width=7, anchor="e", bg="white",
+                               relief="solid", bd=1, font=T.FONT_NUM_LG)
+            lbl_cum.grid(row=rbase, column=vcol, padx=1, pady=1, sticky="nsew")
+            cum_labels[glabel] = lbl_cum
 
-        # row1: 컬럼 헤더 (매매결과 Sprd가 이 행과 정렬)
+        # rbase+1: 컬럼 헤더 (매매결과 Sprd가 이 행과 정렬). 헤더는 값보다 2pt 작게(9pt).
         for c, h in enumerate(heads):
-            tk.Label(grid, text=h, fg="gray25").grid(
-                row=1, column=c, padx=1, sticky="nsew")
+            tk.Label(grid, text=h, fg="gray25", font=T.FONT_LABEL).grid(
+                row=rbase + 1, column=c, padx=1, sticky="nsew")
 
-        # rows 2~4: 세트 3줄
+        # rbase+2~4: 세트 3줄
         for i in range(3):
-            r = i + 2
+            r = rbase + i + 2
             w = sets[(dtag, i)]
-            lbl_tg = tk.Label(grid, text="-", width=7, anchor="e", bg="#fffbcc",
-                              relief="solid", bd=1)  # 목표수량(세트설정에서만)
+            lbl_tg = tk.Label(grid, text="-", width=6, anchor="e", bg="#fffbcc",
+                              relief="solid", bd=1, font=T.FONT_NUM_LG)  # 목표수량
             lbl_tg.grid(row=r, column=0, padx=1, pady=1, sticky="nsew")
-            lbl_per = tk.Label(grid, text="-", width=6, anchor="e", bg="#f0f0f0",
-                               relief="solid", bd=1)  # 1회주문수량(세트설정)
+            lbl_per = tk.Label(grid, text="-", width=5, anchor="e", bg="#f0f0f0",
+                               relief="solid", bd=1, font=T.FONT_NUM_LG)  # 1회주문수량
             lbl_per.grid(row=r, column=1, padx=1, pady=1, sticky="nsew")
-            e_en = tk.Entry(grid, width=6, justify="right", validate="key",
-                            validatecommand=vcmd_dec)  # 진입 기준값(인라인 수정)
+            e_en = tk.Entry(grid, width=5, justify="right", validate="key",
+                            validatecommand=vcmd_dec, font=T.FONT_NUM_LG)  # 진입 기준값
             e_en.grid(row=r, column=2, padx=1, pady=1, sticky="nsew")
-            btn_en = tk.Button(grid, text="진입", width=4, padx=0, pady=0,
+            btn_en = tk.Button(grid, text="진입", width=3, padx=0, pady=0,
                                bd=1, highlightthickness=0)
             btn_en.grid(row=r, column=3, padx=1, pady=1, sticky="nsew")
-            e_ex = tk.Entry(grid, width=6, justify="right", validate="key",
-                            validatecommand=vcmd_dec)  # 청산 기준값(인라인 수정)
+            e_ex = tk.Entry(grid, width=5, justify="right", validate="key",
+                            validatecommand=vcmd_dec, font=T.FONT_NUM_LG)  # 청산 기준값
             e_ex.grid(row=r, column=4, padx=1, pady=1, sticky="nsew")
-            btn_ex = tk.Button(grid, text="청산", width=4, padx=0, pady=0,
+            btn_ex = tk.Button(grid, text="청산", width=3, padx=0, pady=0,
                                bd=1, highlightthickness=0)
             btn_ex.grid(row=r, column=5, padx=1, pady=1, sticky="nsew")
-            btn_set = tk.Button(grid, text="설정", width=4, padx=0, pady=0,
+            btn_set = tk.Button(grid, text="설정", width=3, padx=0, pady=0,
                                 bd=1, highlightthickness=0,
                                 command=partial(open_set_dialog, dtag, i))
             btn_set.grid(row=r, column=6, padx=1, pady=1, sticky="nsew")
             lbl_rt = tk.Label(grid, text="-", width=7, anchor="e", bg="white",
-                              relief="solid", bd=1)  # RT선진입(세트별)
+                              relief="solid", bd=1, font=T.FONT_NUM_LG)  # RT선진입
             lbl_rt.grid(row=r, column=7, padx=1, pady=1, sticky="nsew")
             lbl_diff = tk.Label(grid, text="-", width=6, anchor="e", bg="white",
-                                relief="solid", bd=1)  # 체결차(세트별)
+                                relief="solid", bd=1, font=T.FONT_NUM_LG)  # 체결차
             lbl_diff.grid(row=r, column=8, padx=1, pady=1, sticky="nsew")
-            lbl_sec = tk.Label(grid, text="-", width=4, anchor="e", bg="#f0f0f0",
-                               relief="solid", bd=1)  # 전환딜레이 초(세트설정)
+            lbl_sec = tk.Label(grid, text="-", width=3, anchor="e", bg="#f0f0f0",
+                               relief="solid", bd=1, font=T.FONT_NUM_LG)  # 전환딜레이 초
             lbl_sec.grid(row=r, column=9, padx=1, pady=1, sticky="nsew")
             w.update({"tg": lbl_tg, "per_lbl": lbl_per, "e_en": e_en, "e_ex": e_ex,
                       "btn_en": btn_en, "btn_ex": btn_ex, "rt": lbl_rt,
@@ -256,13 +266,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
         # 매매결과 값 — Sprd=row1(컬럼헤더 줄), -HP/+S/-환=row2~4(세트1~3). 탑·끝 라인 정렬.
         for glabel, (lcol, vcol, comps) in acc_cols.items():
-            labels: dict[str, tk.Label] = {}
+            labels: dict[str, tk.Label] = {"누적": cum_labels[glabel]}  # 헤더 누적체결량
             for ri, comp in enumerate(("Sprd", *comps)):
-                tk.Label(grid, text=comp, fg="gray30", font=T.FONT_SMALL).grid(
-                    row=ri + 1, column=lcol, padx=(8, 0), sticky="e")
-                v = tk.Label(grid, text="-", width=6, anchor="e", bg="white",
-                             relief="solid", bd=1)
-                v.grid(row=ri + 1, column=vcol, padx=1, pady=1, sticky="nsew")
+                tk.Label(grid, text=comp, fg="gray30", font=T.FONT_LABEL).grid(
+                    row=rbase + ri + 1, column=lcol, padx=(2, 0), sticky="e")
+                v = tk.Label(grid, text="-", width=7, anchor="e", relief="solid",
+                             bd=1, font=T.FONT_NUM_LG,
+                             bg="#fffbcc" if comp == "Sprd" else "white")  # Sprd=목표수량색
+                v.grid(row=rbase + ri + 1, column=vcol, padx=1, pady=1, sticky="nsew")
                 labels[comp] = v
             sets[(dtag, 0)].setdefault("_acc", {})[glabel] = labels  # 방향당 1묶음(세트0에 보관)
 
@@ -270,11 +281,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def toggle_run(dtag: str, i: int, side: str) -> None:
         w = sets[(dtag, i)]
         key = f"run_{side}"
-        w[key] = not w[key]
+        w[key] = on = not w[key]
         btn = w["btn_en" if side == "en" else "btn_ex"]
-        on = w[key]
-        btn.config(text=("정지" if on else ("진입" if side == "en" else "청산")),
-                   bg="#e6b800" if on else "SystemButtonFace")
+        if on:  # 진입중=빨강, 청산중=파랑, 흰 글씨 볼드로 강조
+            btn.config(bg=T.C_BUY if side == "en" else T.C_SELL, fg="white",
+                       font=T.FONT_NUM_LG)
+        else:  # 중지 — 원래대로
+            btn.config(bg="SystemButtonFace", fg="black", font=T.FONT_BASE_LG)
         # TODO(상태기계): send({"cmd":"autot_run", ...}) — 지금은 화면 토글만
 
     def clear_acc(dtag: str, group: str) -> None:
@@ -423,11 +436,33 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     tk.Button(bar2, text="설정", command=open_common_dialog).pack(side="right")
 
+    board = tk.Frame(root)  # 두 방향 공유 그리드 — 컬럼 공유로 좌우 완벽 정렬
+    board.pack(fill="x", padx=4, pady=(1, 2), anchor="w")
     for di, (dtag, name, en_lbl, ex_lbl, en_col, ex_col) in enumerate(_DIRECTIONS):
+        rbase = di * 6  # 정방향 0~4, (5=구분선), 역방향 6~10
         if di > 0:  # 방향 사이 가로 구분선(박스 대신)
-            ttk.Separator(root, orient="horizontal").pack(fill="x", padx=4, pady=2)
+            ttk.Separator(board, orient="horizontal").grid(
+                row=rbase - 1, column=0, columnspan=15, sticky="ew", pady=3)
         acc_rows = _ACC_ROWS_FWD if dtag == "fwd" else _ACC_ROWS_REV
-        build_section(dtag, f"{name}  ({en_lbl} / {ex_lbl})", en_col, ex_col, acc_rows)
+        build_section(board, rbase, dtag, f"{name}  ({en_lbl} / {ex_lbl})",
+                      en_col, ex_col, acc_rows)
+
+    if preview:  # 최대 폭 샘플로 칸 폭 테스트 (실데이터 들어오면 이 폭이어야 함)
+        acc_sample = {"누적": "99,999", "Sprd": "-0.825", "-HP": "9,999",
+                      "+HP": "9,999", "+S": "99,999", "-S": "99,999",
+                      "-환": "1,418.5", "+환": "1,418.5"}
+        for w in sets.values():
+            w["tg"].config(text="10,000")
+            w["per_lbl"].config(text="100")
+            w["rt"].config(text="9,999")
+            w["diff"].config(text="-999")
+            w["sec"].config(text="30")
+            w["e_en"].insert(0, "-1.50")
+            w["e_ex"].insert(0, "0.20")
+        for d in ("fwd", "rev"):
+            for labels in sets[(d, 0)].get("_acc", {}).values():
+                for comp, lbl in labels.items():
+                    lbl.config(text=acc_sample.get(comp, "-"))
 
     status = tk.Label(root, anchor="w", relief="groove",
                       text="UI 미리보기 — 코어 미연결" if preview else "코어 확인 중 ...")
