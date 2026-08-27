@@ -33,6 +33,9 @@ def main() -> None:
     elif arg == "autoT":
         from kp_arb.order_autot import main as run
         run()
+    elif arg == "autoM":
+        from kp_arb.order_autom import main as run
+        run()
     elif arg == "fx_monitor":
         from kp_arb.fx_monitor import main as run
         run()

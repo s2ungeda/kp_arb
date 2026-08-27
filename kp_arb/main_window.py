@@ -129,6 +129,8 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "meme.exe"), "settings"]
     if module == "kp_arb.order_autot":
         return [str(exe_dir / "meme.exe"), "autoT"]
+    if module == "kp_arb.order_autom":
+        return [str(exe_dir / "meme.exe"), "autoM"]
     return [str(exe_dir / "meme.exe")]
 
 
@@ -331,6 +333,8 @@ def main() -> None:
     m_screen = tk.Menu(menubar, tearoff=0)
     m_screen.add_command(label="바로쏴 (자동T)",
                          command=lambda: open_screen("kp_arb.order_autot"))
+    m_screen.add_command(label="체결쏴 (자동M)",
+                         command=lambda: open_screen("kp_arb.order_autom"))
     m_screen.add_command(label="시세 모니터",
                          command=lambda: open_screen("kp_arb.monitor"))
     m_screen.add_command(label="FX 노출 감시",
