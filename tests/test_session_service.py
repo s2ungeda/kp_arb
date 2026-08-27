@@ -6,7 +6,7 @@
 from kp_arb.domain.enums import Instrument, SessionPhase, Underlying
 from kp_arb.gateways.ls_ws import MarketStatus
 from kp_arb.session import reference_instrument, tradeable_instruments
-from kp_arb.session_service import SessionService, phase_from_jif
+from kp_arb.session_service import SessionService, classify_jstatus, phase_from_jif
 
 SAMSUNG = Underlying.SAMSUNG
 
@@ -29,6 +29,65 @@ def test_phase_from_jif_mapping() -> None:
 def test_phase_from_jif_unknown_is_dead() -> None:
     assert phase_from_jif({"jangubun": "1", "jstatus": "99"}) is SessionPhase.DEAD
     assert phase_from_jif({}) is SessionPhase.DEAD  # 누락도 보수적으로 DEAD
+
+
+# --- jstatus 분류: 시간대 / 정지 / 변동성 (순수 함수, §8) ---
+
+
+def test_classify_time_phase() -> None:
+    assert classify_jstatus("1", "21") == ("phase", SessionPhase.REGULAR)
+    assert classify_jstatus("1", "11") == ("phase", SessionPhase.PRE_OPEN)
+
+
+def test_classify_stock_halt_and_resume() -> None:
+    assert classify_jstatus("1", "64") == ("halt", "사이드카매도")
+    assert classify_jstatus("1", "66") == ("halt", "사이드카매수")
+    assert classify_jstatus("1", "61") == ("halt", "서킷1")
+    assert classify_jstatus("1", "68") == ("halt", "서킷2")
+    assert classify_jstatus("1", "65") == ("resume", None)  # 사이드카 해제
+    assert classify_jstatus("1", "63") == ("resume", None)  # 서킷1 동시호가종료
+    assert classify_jstatus("1", "69") == ("phase", SessionPhase.DEAD)  # 서킷3=당일종료
+
+
+def test_classify_futures_halt_info_close() -> None:
+    assert classify_jstatus("5", "63") == ("halt", "서킷")
+    assert classify_jstatus("5", "62") == ("resume", None)
+    assert classify_jstatus("5", "61") == ("phase", SessionPhase.DEAD)  # 당일 장종료
+    assert classify_jstatus("5", "70")[0] == "info"  # 변동성 확대 → 거래 계속
+
+
+def test_classify_same_code_differs_by_market() -> None:
+    # 71: 주식 = 서킷2 동시호가종료(재개) / 선물 = 변동성 확대(거래 계속)
+    assert classify_jstatus("1", "71") == ("resume", None)
+    assert classify_jstatus("5", "71")[0] == "info"
+
+
+def test_classify_unknown() -> None:
+    assert classify_jstatus("1", "99") == ("unknown", None)
+
+
+# --- 정지 오버레이 (SessionService, §8) — phase와 별개, 시장별 격리 ---
+
+
+def test_halt_overlay_set_and_clear() -> None:
+    svc = SessionService()
+    svc.on_market_status(jif("21"))
+    assert svc.halt_for("1") is None
+    svc.on_market_status(jif("64"))  # 사이드카 매도발동
+    assert svc.halt_for("1") == "사이드카매도"
+    svc.on_market_status(jif("65"))  # 사이드카 매도해제
+    assert svc.halt_for("1") is None
+
+
+def test_futures_halt_isolated_from_stock() -> None:
+    # 결정3 근거: 선물(5) 정지는 주식(1)과 격리 → 자동M(선물)은 주식 사이드카 무영향.
+    svc = SessionService()
+    svc.on_market_status(jif("63", jangubun="5"))  # 선물 서킷
+    assert svc.halt_for("5") == "서킷"
+    assert svc.halt_for("1") is None
+    svc.on_market_status(jif("64", jangubun="1"))  # 주식 사이드카
+    assert svc.halt_for("1") == "사이드카매도"
+    assert svc.halt_for("5") == "서킷"  # 선물엔 그대로, 사이드카 안 옮음
 
 
 # --- SessionService: JIF → 세션 맵 ---

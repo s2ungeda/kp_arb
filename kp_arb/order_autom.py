@@ -125,7 +125,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     common: dict[str, Any] = {
         "windows": ["08:30:10", "08:46:20", "15:35:30", "15:46:55"],
         "pre_tick": {"sk_hynix": 3000, "samsung": 500, "hyundai": 1000},
-        "pre_delay": 1000, "pre_range": 0.4, "rel_buy": 1, "rel_sell": 1,
+        "pre_delay": 1000, "resume_delay": 10, "pre_range": 0.4,
+        "rel_buy": 1, "rel_sell": 1,
         "risk": {"fwd_en": 0.0, "fwd_ex": 0.5, "fwd_gap": 0.1,
                  "rev_en": 0.5, "rev_ex": 0.0, "rev_gap": 0.1},
     }
@@ -459,13 +460,18 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                            validatecommand=vcmd_int)
         e_delay.insert(0, str(common["pre_delay"]))
         e_delay.grid(row=0, column=1, padx=4, pady=2)
-        tk.Label(pr, text="선주문 범위(%)").grid(row=1, column=0, sticky="e", pady=2)
+        tk.Label(pr, text="재개 딜레이(초)").grid(row=1, column=0, sticky="e", pady=2)
+        e_resume = tk.Entry(pr, width=7, justify="right", validate="key",
+                            validatecommand=vcmd_int)
+        e_resume.insert(0, str(common["resume_delay"]))
+        e_resume.grid(row=1, column=1, padx=4, pady=2)
+        tk.Label(pr, text="선주문 범위(%)").grid(row=2, column=0, sticky="e", pady=2)
         e_range = tk.Entry(pr, width=7, justify="right", validate="key",
                            validatecommand=vcmd_dec)
         e_range.insert(0, f"{common['pre_range']:g}")
-        e_range.grid(row=1, column=1, padx=4, pady=2)
+        e_range.grid(row=2, column=1, padx=4, pady=2)
         rel_cbs: dict[str, ttk.Combobox] = {}
-        for r, (rk, rlabel) in enumerate((("rel_buy", "매수"), ("rel_sell", "매도")), start=2):
+        for r, (rk, rlabel) in enumerate((("rel_buy", "매수"), ("rel_sell", "매도")), start=3):
             choices = _REL_CHOICES_BUY if rk == "rel_buy" else _REL_CHOICES_SELL
             tk.Label(pr, text=rlabel).grid(row=r, column=0, sticky="e", pady=2)
             cb = ttk.Combobox(pr, values=choices, width=15, state="readonly")
@@ -499,6 +505,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             for pcode, e in pt_ents.items():
                 common["pre_tick"][pcode] = parse_qty(e.get())
             common["pre_delay"] = parse_qty(e_delay.get())
+            common["resume_delay"] = parse_qty(e_resume.get())
             common["pre_range"] = parse_threshold(e_range.get()) or 0.0
             for rk, cb in rel_cbs.items():
                 choices = _REL_CHOICES_BUY if rk == "rel_buy" else _REL_CHOICES_SELL
@@ -572,7 +579,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             "under": cb_under.get(), "agg": cb_agg.get(), "refqty": ent_refqty.get(),
             "common": {"windows": list(common["windows"]),
                        "pre_tick": dict(common["pre_tick"]),
-                       "pre_delay": common["pre_delay"], "pre_range": common["pre_range"],
+                       "pre_delay": common["pre_delay"], "resume_delay": common["resume_delay"],
+                       "pre_range": common["pre_range"],
                        "rel_buy": common["rel_buy"], "rel_sell": common["rel_sell"],
                        "risk": dict(common["risk"])},
             "sets": sets_data}
@@ -596,7 +604,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 for k in common["pre_tick"]:
                     if isinstance(sc["pre_tick"].get(k), int):
                         common["pre_tick"][k] = sc["pre_tick"][k]
-            for k in ("pre_delay", "rel_buy", "rel_sell"):
+            for k in ("pre_delay", "resume_delay", "rel_buy", "rel_sell"):
                 if isinstance(sc.get(k), int):
                     common[k] = sc[k]
             if isinstance(sc.get("pre_range"), int | float):

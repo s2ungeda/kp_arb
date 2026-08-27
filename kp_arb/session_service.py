@@ -19,8 +19,9 @@ from .domain.models import InstrumentStatus
 from .gateways.ls_ws import MarketStatus
 from .session import build_session
 
-# 시장구분(jangubun). 실측: "1"=주식(KOSPI). 파생 시장 코드는 실측 후 추가.
+# 시장구분(jangubun). 실측: "1"=주식(KOSPI). "5"=선물/옵션(자동M 대상, JIF 코드표).
 STOCK_MARKET = "1"
+FUTURES_MARKET = "5"
 
 # jstatus → SessionPhase. 실측(개장 카운트다운) + xingAPI 코드표 부합분만. 미지는 DEAD.
 _JSTATUS_PHASE: dict[str, SessionPhase] = {
@@ -33,11 +34,54 @@ _JSTATUS_PHASE: dict[str, SessionPhase] = {
     "41": SessionPhase.DEAD,      # 장마감
 }
 
+# 정지 발동/해제 코드 — jangubun별로 같은 번호도 뜻이 다르다(JIF 코드표, DESIGN-auto-m-exec §8).
+# 주식(1,2): 값=정지 사유. 62/70(해제,호가접수개시)은 회복 동시호가라 접속매매 불가 → 정지 유지,
+#            63/71(동시호가종료)에서 접속 재개.
+_STOCK_HALT: dict[str, str] = {
+    "61": "서킷1", "62": "서킷1", "68": "서킷2", "70": "서킷2",
+    "64": "사이드카매도", "66": "사이드카매수",
+}
+_STOCK_RESUME = {"63", "65", "67", "71"}  # 동시호가종료·사이드카 해제 → 재개
+# 선물/옵션(5): 63 서킷(장중동시마감)=정지, 62 해제=재개, 70~77 변동성 확대=거래 계속(정보).
+_FUT_HALT: dict[str, str] = {"63": "서킷"}
+_FUT_RESUME = {"62"}
+_FUT_INFO = {"70", "71", "72", "73", "74", "75", "76", "77"}
+
 
 def phase_from_jif(body: dict[str, Any]) -> SessionPhase:
     """JIF body(jstatus)를 SessionPhase로 매핑. 미지/누락은 보수적으로 DEAD."""
     code = str(body.get("jstatus", ""))
     return _JSTATUS_PHASE.get(code, SessionPhase.DEAD)
+
+
+def classify_jstatus(jangubun: str, jstatus: str) -> tuple[str, SessionPhase | str | None]:
+    """JIF 코드 분류 (DESIGN-auto-m-exec §8). **jangubun별로 61~77 의미가 다르다.**
+
+    반환:
+    - ``("phase", SessionPhase)`` — 시간대(장전/장시작/장마감/당일종료 등)
+    - ``("halt", 사유)`` — 정지 발동(서킷·사이드카). 사유는 표시용 문자열
+    - ``("resume", None)`` — 정지 해제(접속 재개)
+    - ``("info", 사유)`` — 선물 변동성 확대(70~77): 거래 계속, 정지 아님
+    - ``("unknown", None)`` — 미분류(보수적으로 상위에서 DEAD 처리)
+    """
+    g, j = str(jangubun), str(jstatus)
+    if j in _JSTATUS_PHASE:  # 시간대 코드(공통)
+        return ("phase", _JSTATUS_PHASE[j])
+    if (g in ("1", "2") and j == "69") or (g == FUTURES_MARKET and j == "61"):
+        return ("phase", SessionPhase.DEAD)  # 당일 장종료(서킷3단계 / 선물 당일종료)
+    if g in ("1", "2"):
+        if j in _STOCK_HALT:
+            return ("halt", _STOCK_HALT[j])
+        if j in _STOCK_RESUME:
+            return ("resume", None)
+    elif g == FUTURES_MARKET:
+        if j in _FUT_HALT:
+            return ("halt", _FUT_HALT[j])
+        if j in _FUT_RESUME:
+            return ("resume", None)
+        if j in _FUT_INFO:
+            return ("info", "변동성확대")
+    return ("unknown", None)
 
 
 class SessionService:
@@ -47,6 +91,7 @@ class SessionService:
 
     def __init__(self) -> None:
         self._market_phase: dict[str, SessionPhase] = {}
+        self._market_halt: dict[str, str] = {}  # 시장별 정지 사유(§8 오버레이)
         self._is_holiday = False
 
     def set_holiday(self, is_holiday: bool) -> None:
@@ -63,11 +108,24 @@ class SessionService:
         self._market_phase.setdefault(market, phase)
 
     def on_market_status(self, status: MarketStatus) -> None:
-        """LS JIF 이벤트 수신 → 해당 시장(jangubun)의 phase 갱신."""
+        """LS JIF 이벤트 수신 → 시장(jangubun) phase 갱신 + 정지 사유 오버레이(§8).
+
+        phase는 기존대로 ``phase_from_jif``. **정지 오버레이는 추가 데이터일 뿐,
+        발주 게이트 연동은 2단계에서** 한다(지금은 동작 불변).
+        """
         market = str(status.body.get("jangubun", ""))
         if not market:
             return
         self._market_phase[market] = phase_from_jif(status.body)
+        kind, reason = classify_jstatus(market, str(status.body.get("jstatus", "")))
+        if kind == "halt" and isinstance(reason, str):
+            self._market_halt[market] = reason
+        elif kind == "resume":
+            self._market_halt.pop(market, None)
+
+    def halt_for(self, market: str = STOCK_MARKET) -> str | None:
+        """해당 시장의 현재 정지 사유(없으면 None). §8 정지 오버레이."""
+        return self._market_halt.get(market)
 
     def phase_for(self, underlying: Underlying) -> SessionPhase:
         # 3종 모두 KOSPI 주식 — 주식 시장 phase 적용. (파생 시장 분리는 실측 후.)
