@@ -277,8 +277,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 fx_text = f"환율[{src}] {used:,.2f}{tail}"
             age = time.time() - state_box["ts"] if state_box["ts"] else -1
             fresh = f"{age:.0f}s 전" if age >= 0 else "-"
+            halt = snap.get("halt") or {}  # §8 정지 사유(주식/선물, 없으면 null)
+            hp = [f"{m}:{halt[k]}" for k, m in (("stock", "주식"), ("futures", "선물"))
+                  if halt.get(k)]
+            halt_text = f" ⚠정지[{' '.join(hp)}]" if hp else ""
             status.config(
-                text=f"장운영: {snap.get('phase', '-')} | {fx_text} | "
+                text=f"장운영: {snap.get('phase', '-')}{halt_text} | {fx_text} | "
                      f"주식 {bal.get('stock', 0):,.0f} | 선물 {bal.get('deriv', 0):,.0f} | "
                      f"수신 {fresh}")
         except tk.TclError:

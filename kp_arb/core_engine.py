@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from .domain.enums import Instrument, SessionPhase, Venue
+from .domain.enums import Instrument, Venue
+from .session_service import market_of_instrument
 from .strategy_core import (
     Block,
     CoreState,
@@ -83,12 +84,15 @@ class RehearsalEngine:
                                     signal, now, mono)
 
     def _session_blocked(self, screen: ScreenState) -> bool:
-        """세션 가드 — 데드존이면 판정 안 함 (사이드카/CB 코드 매핑은 실측 후)."""
+        """세션 가드 — 데드존/시장정지면 판정 안 함 (§8).
+
+        자동T=주식(1)·자동M=선물(5) 시장별로 본다. 정지(사이드카·서킷)도 차단.
+        """
         try:
-            phase = self._system.session.phase_for(screen.underlying)
+            market = market_of_instrument(screen.kind.counterpart)
+            return not self._system.session.is_tradeable(market)
         except Exception:  # noqa: BLE001 - 세션 미구성(테스트 등)은 통과
             return False
-        return phase is SessionPhase.DEAD
 
     def _judge_set(  # noqa: PLR0913 - 판정 문맥 전달
         self,

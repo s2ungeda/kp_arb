@@ -47,6 +47,19 @@ _FUT_HALT: dict[str, str] = {"63": "서킷"}
 _FUT_RESUME = {"62"}
 _FUT_INFO = {"70", "71", "72", "73", "74", "75", "76", "77"}
 
+# instrument → JIF 시장구분(jangubun). 자동T=주식(1) / 자동M=주식선물(5).
+_INSTRUMENT_MARKET: dict[Instrument, str] = {
+    Instrument.KR_STOCK: STOCK_MARKET,
+    Instrument.KR_ETF: STOCK_MARKET,
+    Instrument.KR_STOCK_FUTURE: FUTURES_MARKET,
+    Instrument.KR_FX_FUTURE: FUTURES_MARKET,
+}
+
+
+def market_of_instrument(instrument: Instrument) -> str:
+    """instrument → JIF 시장구분(jangubun). 미지는 보수적으로 주식(1)."""
+    return _INSTRUMENT_MARKET.get(instrument, STOCK_MARKET)
+
 
 def phase_from_jif(body: dict[str, Any]) -> SessionPhase:
     """JIF body(jstatus)를 SessionPhase로 매핑. 미지/누락은 보수적으로 DEAD."""
@@ -108,24 +121,45 @@ class SessionService:
         self._market_phase.setdefault(market, phase)
 
     def on_market_status(self, status: MarketStatus) -> None:
-        """LS JIF 이벤트 수신 → 시장(jangubun) phase 갱신 + 정지 사유 오버레이(§8).
+        """LS JIF 이벤트 수신 → 시장(jangubun) phase / 정지 오버레이 갱신 (§8).
 
-        phase는 기존대로 ``phase_from_jif``. **정지 오버레이는 추가 데이터일 뿐,
-        발주 게이트 연동은 2단계에서** 한다(지금은 동작 불변).
+        분류(``classify_jstatus``)로 갈라 처리한다:
+        - 시간대(phase) → 해당 시장 phase 갱신
+        - 정지 발동/해제 → **정지 오버레이만** 갱신(phase는 건드리지 않음). 이래야
+          정지(사이드카·서킷)가 풀린 뒤 DEAD에 갇히지 않는다(정지 코드로 phase를
+          DEAD로 만들면 해제돼도 REGULAR로 못 돌아옴 — 그 버그를 여기서 막는다).
+        - 변동성(info) → 거래 계속, 무시 / 미지(unknown) → 보수적으로 DEAD
         """
         market = str(status.body.get("jangubun", ""))
         if not market:
             return
-        self._market_phase[market] = phase_from_jif(status.body)
         kind, reason = classify_jstatus(market, str(status.body.get("jstatus", "")))
-        if kind == "halt" and isinstance(reason, str):
+        if kind == "phase" and isinstance(reason, SessionPhase):
+            self._market_phase[market] = reason
+        elif kind == "halt" and isinstance(reason, str):
             self._market_halt[market] = reason
         elif kind == "resume":
             self._market_halt.pop(market, None)
+        elif kind == "unknown":
+            self._market_phase[market] = SessionPhase.DEAD
 
     def halt_for(self, market: str = STOCK_MARKET) -> str | None:
         """해당 시장의 현재 정지 사유(없으면 None). §8 정지 오버레이."""
         return self._market_halt.get(market)
+
+    def phase_for_market(self, market: str) -> SessionPhase:
+        """시장(jangubun)별 phase. 파생 시장 미수신 시 주식 시장 phase 공용(기존 규칙)."""
+        if market in self._market_phase:
+            return self._market_phase[market]
+        return self._market_phase.get(STOCK_MARKET, self.DEFAULT_PHASE)
+
+    def is_tradeable(self, market: str) -> bool:
+        """해당 시장에 지금 발주 가능한가 — phase가 데드 아님 AND 정지 없음 (§8).
+
+        시장별로 본다: 주식(1) 사이드카는 선물(5) 발주를 막지 않는다(결정3).
+        """
+        return (self.phase_for_market(market) is not SessionPhase.DEAD
+                and self._market_halt.get(market) is None)
 
     def phase_for(self, underlying: Underlying) -> SessionPhase:
         # 3종 모두 KOSPI 주식 — 주식 시장 phase 적용. (파생 시장 분리는 실측 후.)

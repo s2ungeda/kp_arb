@@ -6,7 +6,12 @@
 from kp_arb.domain.enums import Instrument, SessionPhase, Underlying
 from kp_arb.gateways.ls_ws import MarketStatus
 from kp_arb.session import reference_instrument, tradeable_instruments
-from kp_arb.session_service import SessionService, classify_jstatus, phase_from_jif
+from kp_arb.session_service import (
+    SessionService,
+    classify_jstatus,
+    market_of_instrument,
+    phase_from_jif,
+)
 
 SAMSUNG = Underlying.SAMSUNG
 
@@ -88,6 +93,48 @@ def test_futures_halt_isolated_from_stock() -> None:
     svc.on_market_status(jif("64", jangubun="1"))  # 주식 사이드카
     assert svc.halt_for("1") == "사이드카매도"
     assert svc.halt_for("5") == "서킷"  # 선물엔 그대로, 사이드카 안 옮음
+
+
+# --- 2단계: 시장 라우팅 + is_tradeable (정지-인지 게이트, §8) ---
+
+
+def test_market_of_instrument() -> None:
+    assert market_of_instrument(Instrument.KR_STOCK) == "1"
+    assert market_of_instrument(Instrument.KR_STOCK_FUTURE) == "5"
+
+
+def test_is_tradeable_regular_and_halt() -> None:
+    svc = SessionService()
+    svc.on_market_status(jif("21"))       # 장시작(주식)
+    assert svc.is_tradeable("1") is True
+    svc.on_market_status(jif("64"))       # 사이드카 발동
+    assert svc.is_tradeable("1") is False  # 정지 → 발주 불가
+
+
+def test_stock_sidecar_does_not_block_futures() -> None:
+    # 결정3: 주식 사이드카 중에도 선물(5)은 발주 가능(공용 phase=REGULAR, 선물 정지 없음).
+    svc = SessionService()
+    svc.on_market_status(jif("21"))       # 주식 REGULAR
+    svc.on_market_status(jif("64"))       # 주식 사이드카
+    assert svc.is_tradeable("1") is False
+    assert svc.is_tradeable("5") is True
+
+
+def test_halt_does_not_clobber_phase_and_resumes() -> None:
+    # 버그 방지: 정지가 phase를 DEAD로 만들지 않아, 해제되면 바로 다시 거래 가능.
+    svc = SessionService()
+    svc.on_market_status(jif("21"))
+    svc.on_market_status(jif("64"))       # 사이드카 발동
+    assert svc.phase_for(SAMSUNG) is SessionPhase.REGULAR  # phase 유지
+    svc.on_market_status(jif("65"))       # 사이드카 해제
+    assert svc.is_tradeable("1") is True   # DEAD에 안 갇힘
+
+
+def test_futures_phase_falls_back_to_stock() -> None:
+    # 선물 phase 미수신 시 주식 phase 공용(기존 규칙).
+    svc = SessionService()
+    svc.on_market_status(jif("21"))       # 주식만 수신
+    assert svc.phase_for_market("5") is SessionPhase.REGULAR
 
 
 # --- SessionService: JIF → 세션 맵 ---

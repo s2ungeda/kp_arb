@@ -589,6 +589,8 @@ def monitor_snapshot(
         "connected": True,
         "fx": {"used": fx_used, "src": fx_src, "futures": system.usdkrw_futures},
         "phase": system.session.phase_for(Underlying.SAMSUNG).value,
+        "halt": {"stock": system.session.halt_for("1"),
+                 "futures": system.session.halt_for("5")},  # §8 정지 사유(없으면 null)
         "balances": {"stock": system.order_book.balance(Account.KR_STOCK),
                      "deriv": system.order_book.balance(Account.KR_DERIV)},
         "ls": [], "hl": [], "board": [],
