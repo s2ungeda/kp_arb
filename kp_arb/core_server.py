@@ -417,7 +417,6 @@ def _fx_command(fx_service: FxReportService | None, body: dict[str, Any]) -> dic
         return _fail([f"알 수 없는 FX 명령: {cmd!r}"])
     return _ok()
 
-
 async def _manual_command(
     system: LiveSystem | None, body: dict[str, Any]
 ) -> dict[str, Any]:
@@ -668,6 +667,10 @@ def make_app(
         payload["error_seq"] = system.error_seq if system is not None else 0
         payload["hl_daily_filled"] = (
             system.hl_daily_filled_today() if system is not None else 0.0)
+        # 시동 로드 실패(종목/잔고/포지션/주문) — 있으면 메인창이 "…재접속하세요" 팝업 후 종료.
+        payload["load_errors"] = (
+            [system.startup_load_error]
+            if system is not None and system.startup_load_error else [])
         return web.json_response(payload, dumps=_dumps)
 
     async def post_command(request: web.Request) -> web.Response:

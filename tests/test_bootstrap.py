@@ -249,6 +249,55 @@ async def test_start_loads_snapshot_then_streams() -> None:
     assert "O01" not in trs
 
 
+async def test_startup_init_ok_leaves_no_error() -> None:
+    # 시동 초기화 성공(종목·잔고·포지션·주문 전부 OK) → startup_load_error 없음 + 스냅샷 로드.
+    system, _, _ = _system([])
+    await system._startup_init()
+    assert system.startup_load_error is None
+    assert system.order_book.balance(Account.KR_STOCK) == 5_000_000
+
+
+async def test_startup_init_marks_balance_step_on_failure() -> None:
+    # 잔고 조회가 실패하면 "잔고"로 남기고 즉시 중단(예외를 던지지 않아 코어는 계속 산다).
+    system, _, _ = _system([])
+
+    async def boom(_account: Account) -> float:
+        raise RuntimeError("조회 실패")
+
+    system._gw.get_balance = boom  # type: ignore[method-assign]
+    await system._startup_init()
+    assert system.startup_load_error == "잔고"
+
+
+async def test_startup_init_marks_order_step_after_earlier_ok() -> None:
+    # 앞 단계(잔고·포지션)는 성공하고 주문(미체결) 조회만 실패하면 "주문"으로 남는다.
+    system, _, _ = _system([])
+
+    async def boom(_account: Account) -> list[object]:
+        raise RuntimeError("조회 실패")
+
+    system._gw.get_open_orders = boom  # type: ignore[method-assign]
+    await system._startup_init()
+    assert system.startup_load_error == "주문"
+
+
+async def test_startup_init_short_circuits_on_symbol_error() -> None:
+    # 종목 실패(근월물 누락)가 이미 잡혀 있으면 잔고 조회까지 가지 않고 그대로 멈춘다.
+    system, _, _ = _system([])
+    system.startup_load_error = "종목(주식선물 근월물 없음: 하이닉스)"
+    called = {"balance": False}
+    orig = system._gw.get_balance
+
+    async def spy(account: Account) -> float:
+        called["balance"] = True
+        return await orig(account)
+
+    system._gw.get_balance = spy  # type: ignore[method-assign]
+    await system._startup_init()
+    assert system.startup_load_error == "종목(주식선물 근월물 없음: 하이닉스)"
+    assert called["balance"] is False  # 종목 실패로 뒤 단계는 아예 실행 안 함
+
+
 async def test_fill_frame_updates_order_book_realtime() -> None:
     intent = OrderIntent(venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
                          side=Side.BUY, qty=10, order_type=OrderType.MARKET)

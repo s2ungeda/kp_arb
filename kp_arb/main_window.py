@@ -245,6 +245,7 @@ def main() -> None:
             alive = data is not None
             alive_box["alive"] = alive
             alive_box["ws"] = (data or {}).get("ws") or []
+            alive_box["load_errors"] = (data or {}).get("load_errors") or []
             check_sounds(data)  # 알람(체결·에러·WS끊김)
             if not closing["flag"]:  # 종료 중엔 재기동·저장 안 함
                 maybe_restart_core(alive)
@@ -355,8 +356,28 @@ def main() -> None:
     menubar.add_cascade(label="코어", menu=m_core)
     root.config(menu=menubar)
 
+    _load_err = {"shown": False}
+
+    def _on_load_error(errors: list[str]) -> None:
+        """시동 로드 실패 팝업 — 확인 누르면 프로그램 종료(자동 되살림 끔). 사용자가 재접속."""
+        from tkinter import messagebox
+        _load_err["shown"] = True  # 한 번만
+        messagebox.showwarning(
+            "로드 실패", f"{', '.join(errors)} 로드 실패 — 재접속하세요")
+        restart["intentional"] = True  # 자동 재기동 하지 않음
+        closing["flag"] = True         # 폴링 스레드 재기동·저장 중단
+        core_request("/command", {"cmd": "shutdown"})  # 코어 안전종료
+        for _tok, _slot, proc in launched:
+            if proc.poll() is None:
+                proc.terminate()
+        root.destroy()
+
     def refresh() -> None:
         try:  # 네트워크 호출 없음 — 뒷단 스레드 결과만 표시 (버벅임 방지)
+            errs = alive_box.get("load_errors") or []
+            if errs and not closing["flag"] and not _load_err["shown"]:
+                _on_load_error(errs)
+                return  # 종료 진행 — 다음 refresh 예약 안 함
             if alive_box["alive"]:
                 lbl_core.config(text="코어: 연결됨 (127.0.0.1:8787)", fg="dark green")
             else:

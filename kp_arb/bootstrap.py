@@ -175,6 +175,9 @@ class LiveSystem:
         self.hl_detail: dict[Underlying, dict[str, Any]] = {}
         # 종목정보(틱·승수·szDecimals·maxLeverage·만기) — 시동 시 1회 조회·보관 (§5.10).
         self.instruments: dict[tuple[Underlying, Instrument], InstrumentInfo] = {}
+        # 시동 초기화(종목→잔고→포지션→주문) 중 실패한 작업명 — 있으면 /state로 알려
+        # 메인창이 "…재접속하세요" 팝업 후 종료시킨다. None=전부 정상.
+        self.startup_load_error: str | None = None
         # 기초 주식 등락률(%, drate) — ETF 이론가의 핵심 입력 (ETF 이론가.md §2).
         self.stock_change_pct: dict[tuple[Underlying, str], float] = {}
         # 예상체결가(동시호가) — (underlying, instrument)별. 기초 주식의 예상등락률 포함.
@@ -698,9 +701,77 @@ class LiveSystem:
             self.instruments[(u, Instrument.KR_STOCK)] = InstrumentInfo(
                 underlying=u, instrument=Instrument.KR_STOCK, multiplier=1.0)
 
+    async def _startup_init(self) -> None:
+        """시동 초기화 — 종목→잔고→포지션→주문 **순차**. 한 작업이라도 실패하면 그 작업명을
+        ``self.startup_load_error``에 남기고 즉시 중단한다(예외는 던지지 않음 — 코어는 살아
+        /state로 실패를 알리고, 메인창이 "…재접속하세요" 팝업 후 종료).
+
+        온디맨드 재조회는 ``refresh_snapshot``(재연결 경로) — 이쪽은 시동 1회 전용.
+        """
+        import logging
+
+        log = logging.getLogger("kp_arb.bootstrap")
+        # 1) 종목 — 근월물 누락은 bootstrap_live가 미리 판정(startup_load_error 설정).
+        if self.startup_load_error is not None:
+            log.error("시동 로드 실패: %s", self.startup_load_error)
+            return
+        log.info("시동 로드 OK: 종목 (주식선물 근월물 %d종)", len(self.futures_symbols))
+
+        accounts = (Account.KR_STOCK, Account.KR_DERIV)
+        positions: list[Position] = []
+        balances: dict[Account, float] = {}
+        open_orders: list[TrackedOrder] = []
+        reconciled: set[Account | None] = {Account.KR_STOCK, Account.KR_DERIV}
+        # 2) 잔고
+        try:
+            for account in accounts:
+                balances[account] = await self._gw.get_balance(account)
+            log.info("시동 로드 OK: 잔고 (%d계좌)", len(balances))
+        except Exception:  # noqa: BLE001 - 실패는 기록만 하고 중단(팝업 유도)
+            self.startup_load_error = "잔고"
+            log.error("시동 로드 실패: 잔고", exc_info=True)
+            return
+        # 3) 포지션
+        try:
+            for account in accounts:
+                positions.extend(await self._gw.get_positions(account))
+            if self._hl is not None:
+                hl_pos, self.hl_detail = await self._hl.get_positions_and_details()
+                positions.extend(hl_pos)
+                reconciled.add(None)  # HL(계좌 없음) 정리 대상
+                for u, lev in (await self._hl.get_leverage_settings()).items():
+                    d = self.hl_detail.setdefault(u, {})
+                    d.setdefault("leverage", lev["leverage"])
+                    d.setdefault("leverage_cross", lev["leverage_cross"])
+            log.info("시동 로드 OK: 포지션 (%d건)", len(positions))
+        except Exception:  # noqa: BLE001
+            self.startup_load_error = "포지션"
+            log.error("시동 로드 실패: 포지션", exc_info=True)
+            return
+        # 4) 주문(미체결)
+        try:
+            for account in accounts:
+                open_orders.extend(await self._gw.get_open_orders(account))
+            if self._hl is not None:
+                open_orders.extend(await self._hl.get_open_orders())
+            log.info("시동 로드 OK: 주문 (미체결 %d건)", len(open_orders))
+        except Exception:  # noqa: BLE001
+            self.startup_load_error = "주문"
+            log.error("시동 로드 실패: 주문", exc_info=True)
+            return
+
+        self.order_book.load_snapshot(
+            positions=positions, balances=balances, open_orders=open_orders,
+            reconcile_accounts=reconciled,
+        )
+        log.info("시동 로드 완료 — 종목·잔고·포지션·주문 전부 OK")
+
     async def start(self) -> None:
         """최초 스냅샷 → 세션 초기값(옵션) → WS 결선 → 실시간 수신 시작(재연결 포함)."""
-        await self.refresh_snapshot()
+        await self._startup_init()  # 종목→잔고→포지션→주문 순차(실패 시 startup_load_error)
+        if self.startup_load_error is not None:
+            # 로드 실패 — WS 결선·상시 조회 생략(사용자가 곧 재접속). 서버는 /state로 실패 알림.
+            return
         await self.load_instruments()  # 종목정보(틱·승수·maxLeverage·만기) 보관
         self._seed_session_from_env()
         self._wire()
@@ -1269,10 +1340,25 @@ async def bootstrap_live(
         rest_transport=AiohttpRestTransport(session),
         base_url=LIVE_BASE_URL,
     )
-    # 선물 최근월물 자동 조회(만기 롤오버 대응) 후 게이트웨이 재조립
-    near_month = select_near_month(await gateway.fetch_futures_master())
+    import logging as _logging
+
+    _blog = _logging.getLogger("kp_arb.bootstrap")
+    # 선물 최근월물 자동 조회(만기 롤오버 대응) 후 게이트웨이 재조립 — 실패해도 시동 계속.
+    try:
+        _fut_rows = await gateway.fetch_futures_master()
+        _blog.info("t8401 주식선물 마스터 %d행 수신", len(_fut_rows))  # 조회 원본(진단)
+        near_month = select_near_month(_fut_rows)
+    except Exception:  # noqa: BLE001 - 조회 실패해도 시동은 계속(선물 시세·FX 대응주문만 비활성)
+        _blog.warning("주식선물 근월물(t8401) 조회 실패 — 선물 시세·FX 대응주문 비활성",
+                      exc_info=True)
+        near_month = {}
     futures_symbols = {u: sh for u, (sh, _) in near_month.items()}
     futures_expiry = {u: ym for u, (_, ym) in near_month.items()}
+    if futures_symbols:  # 시동 시 무엇을 로드했는지 반드시 남긴다(진단 기본)
+        _blog.info("주식선물 근월물 로드: %s",
+                   ", ".join(f"{u.value}={c}" for u, c in futures_symbols.items()))
+    else:
+        _blog.warning("주식선물 근월물 0개 — 선물 시세 구독·FX 대응주문 안 됨(코드 매핑 불가)")
     # 원달러선물 근·차근 월물 (환율이론가=최근월물 + 헤지 월물선택용 §9.1) — 실패해도 시동 계속
     fx_futures = None
     fx_months: list[tuple[str, int]] = []
@@ -1283,8 +1369,12 @@ async def bootstrap_live(
             await gateway.fetch_commodity_master(), datetime.now(), count=2
         )
         fx_futures = fx_months[0] if fx_months else None
-    except Exception:  # noqa: BLE001
-        pass  # 환율이론가 없이 계속 (HL 괴리만 빈값)
+    except Exception:  # noqa: BLE001 - 환율이론가 없이 계속(HL 괴리만 빈값)이되, 실패는 남긴다
+        _blog.warning("원달러선물 월물(commodity) 조회 실패 — 환율이론가 빈값", exc_info=True)
+    if fx_months:
+        _blog.info("원달러선물 월물 로드: %s", [c for c, _ in fx_months])
+    else:
+        _blog.warning("원달러선물 월물 0개 — 환율이론가·FX 대응주문 대상 없음")
     gateway = LSApiGateway.from_accounts(
         accounts,
         token_transport=token_tx,
@@ -1327,7 +1417,7 @@ async def bootstrap_live(
     except ConfigError:
         pass
 
-    return LiveSystem(
+    system = LiveSystem(
         gateway=gateway,
         order_book=OrderBook(),
         session=SessionService(),
@@ -1345,6 +1435,16 @@ async def bootstrap_live(
         fx_spot_window=(config.fx_spot_window.start, config.fx_spot_window.end),
         board_ref_qty=config.disparity.ref_qty,
     )
+    # 종목 로드 판정 — 취급 종목(config.symbols)마다 주식선물 근월물이 있어야 한다.
+    # 하나라도 빠지면 "종목" 로드 실패 → 시동 초기화가 여기서 멈추고 메인창이 팝업(어제
+    # 하이닉스 근월물 누락이 정확히 여기 걸린다).
+    missing = [u for u in config.symbols if u not in futures_symbols]
+    if missing:
+        system.startup_load_error = (
+            "종목(주식선물 근월물 없음: " + ", ".join(u.value for u in missing) + ")"
+        )
+        _blog.error("시동 로드 실패: %s", system.startup_load_error)
+    return system
 
 
 def main() -> None:
