@@ -61,9 +61,10 @@ def watch_parent_exit() -> None:
     threading.Thread(target=_watch, daemon=True).start()
 
 
-def core_request(path: str, payload: dict[str, Any] | None = None,
-                 timeout: float = 1.0) -> dict[str, Any] | None:
-    """GET(payload 없음)/POST(payload=JSON) 요청. 실패는 None."""
+def core_request_err(
+    path: str, payload: dict[str, Any] | None = None, timeout: float = 1.0,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """``core_request``와 같되 실패 사유 문자열도 돌려준다 — 화면 실패 로그용."""
     url = f"{CORE_URL}{path}"
     try:
         if payload is None:
@@ -74,6 +75,80 @@ def core_request(path: str, payload: dict[str, Any] | None = None,
                 headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            return data if isinstance(data, dict) else None
-    except Exception:  # noqa: BLE001 - 클라이언트 헬퍼: 어떤 실패든 None(폴링 스레드 보호)
+            if isinstance(data, dict):
+                return data, None
+            return None, "응답이 JSON 객체가 아님"
+    except Exception as exc:  # noqa: BLE001 - 클라이언트 헬퍼: 어떤 실패든 (None, 사유)
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def core_request(path: str, payload: dict[str, Any] | None = None,
+                 timeout: float = 1.0) -> dict[str, Any] | None:
+    """GET(payload 없음)/POST(payload=JSON) 요청. 실패는 None."""
+    data, _err = core_request_err(path, payload, timeout)
+    return data
+
+
+def merge_poll(box: dict[str, Any], data: dict[str, Any] | None,
+               err: str | None, now: float) -> str | None:
+    """폴링 결과를 상태 박스에 반영 — **실패해도 마지막 데이터를 지우지 않는다.**
+
+    (2026-08-31 주문리스트 실증: 조회 1회 실패로 미체결 목록이 통째로 비어 보임.)
+    성공: data 교체 + ok_ts 갱신 + fails=0. 실패: data 유지, fails만 증가.
+    로그로 남길 메시지를 돌려준다 — 첫 실패·매 60회째·복구 시 1회(스팸 방지). 순수 로직.
+    """
+    if data is not None:
+        prev_fails = int(box.get("fails", 0) or 0)
+        box["data"] = data
+        box["ok_ts"] = now
+        box["fails"] = 0
+        if prev_fails:
+            return f"조회 복구 — 연속 실패 {prev_fails}회 뒤 정상"
         return None
+    box["fails"] = int(box.get("fails", 0) or 0) + 1
+    if box["fails"] == 1 or box["fails"] % 60 == 0:
+        return (f"조회 실패 {box['fails']}회째 — {err or '원인 미상'}"
+                " (마지막 데이터 유지)")
+    return None
+
+
+def stale_seconds(box: dict[str, Any], now: float) -> float | None:
+    """마지막 성공 조회로부터 지난 초. 성공한 적 없으면 None. 순수 로직."""
+    ts = box.get("ok_ts")
+    if ts is None:
+        return None
+    return max(0.0, now - float(ts))
+
+
+_screen_logger: Any = None
+
+
+def screen_log() -> Any:
+    """화면 프로세스 공용 파일 로그(logs/screen_날짜.log) — 첫 호출 때 1회 부착.
+
+    화면들은 별도 프로세스라 코어 로그에 못 쓴다. 여러 창이 같은 파일에 덧붙이지만
+    드문 경고만 남겨 겹침 무해. 파일을 못 만들면 조용히 무시(화면은 계속).
+    """
+    global _screen_logger
+    if _screen_logger is not None:
+        return _screen_logger
+    import logging
+    from datetime import datetime
+    from pathlib import Path
+
+    logger = logging.getLogger("kp_arb.screen")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        try:
+            log_dir = Path("logs")
+            log_dir.mkdir(exist_ok=True)
+            handler: logging.Handler = logging.FileHandler(
+                log_dir / f"screen_{datetime.now():%Y%m%d}.log", encoding="utf-8")
+            handler.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)s %(message)s"))
+        except OSError:
+            handler = logging.NullHandler()
+        logger.addHandler(handler)
+    _screen_logger = logger
+    return logger

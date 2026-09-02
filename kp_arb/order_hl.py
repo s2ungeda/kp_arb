@@ -11,7 +11,14 @@ import queue
 from typing import Any
 
 from . import win_state
-from .core_client import core_request, watch_parent_exit
+from .core_client import (
+    core_request,
+    core_request_err,
+    merge_poll,
+    screen_log,
+    stale_seconds,
+    watch_parent_exit,
+)
 from .order_autot import UNDER_MAP, is_decimal_text
 
 INSTRUMENT = "hl_perp"  # 이 창은 HL perp 전용
@@ -126,7 +133,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     def poller() -> None:
         while True:
-            state_box["data"] = core_request("/manual_state", timeout=2.0)
+            # 실패해도 마지막 데이터 유지(merge_poll) — 잔고·호가가 통째로 비지 않게.
+            data, err = core_request_err("/manual_state", timeout=2.0)
+            msg = merge_poll(state_box, data, err, time.time())
+            if msg is not None:
+                screen_log().warning("일반주문 %s", msg)
             time.sleep(0.5)
 
     threading.Thread(target=poller, daemon=True).start()
@@ -646,8 +657,32 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         bids = sym.get("bids") or []
         return (asks[0][0] if asks else None) or (bids[0][0] if bids else None)
 
+    _TITLE = "HL 일반주문"
+    stale_box: dict[str, Any] = {"on": False, "title": None}
+
+    def _update_staleness() -> None:
+        # 조회가 밀리면 창 제목에 표시 + 상태줄에 시작/복구 1회 알림(마지막 데이터는 유지).
+        age = stale_seconds(state_box, time.time())
+        fails = int(state_box.get("fails", 0) or 0)
+        stale = (age is not None and age > 3.0) or (age is None and fails > 0)
+        if stale and not stale_box["on"]:
+            stale_box["on"] = True
+            set_status("코어 조회 실패 — 마지막 데이터로 표시 중", err=True)
+        elif not stale and stale_box["on"]:
+            stale_box["on"] = False
+            set_status("코어 조회 복구", ok=True)
+        if stale:
+            tail = f" — 갱신 지연 {age:.0f}초" if age is not None else " — 코어 미접속"
+        else:
+            tail = ""
+        title = _TITLE + tail
+        if title != stale_box["title"]:
+            stale_box["title"] = title
+            root.title(title)
+
     def refresh() -> None:
         try:
+            _update_staleness()
             _refresh_merge_combo()  # 호가단위 콤보 채움('적' 전에도, 선택 종목 기준)
             _sync_merge_from_core()  # 다른 창이 바꾼 코어 머지를 콤보에 반영
             sym = active_symbol()

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -28,9 +27,6 @@ from ..ws_status import WsStatus
 from .hl import Mark
 from .hl_live import HL_SYMBOLS
 from .ls_ws import Fill, TradeTick, WSConnection, WSConnector
-
-# HL 핑/퐁 왕복 전용 로거 — hl_ping_날짜.log 파일 부착은 core_server._setup_logging이 한다.
-PINGPONG_LOGGER = "kp_arb.pingpong.hl"
 
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 
@@ -188,8 +184,8 @@ class HLWebSocketClient:
         """연결 → 구독 → 디스패치. 끊기면 재연결(데이터 흐르면 카운터 초기화).
 
         HL은 유지용 ping(60초 무통신 시 서버가 끊음)을 보내지 않으면 유휴 연결이
-        끊길 수 있어 20초마다 ping을 보낸다. 핑 전송·퐁 수신은 hl_ping 파일에 따로 남긴다
-        (3시간 주기 끊김 원인 추적용 — 끊기기 직전 핑/퐁 왕복이 정상이었는지 확인).
+        끊길 수 있어 20초마다 ping을 보낸다(응답 pong은 무시). ~3시간 주기 정상종료는
+        HL 서버측 연결 순환(문서: 주기적·무예고 끊김)이라 핑으로는 못 막는다 — 재연결로 대응.
         """
         attempts = 0
         while True:
@@ -237,12 +233,10 @@ class HLWebSocketClient:
 
     @staticmethod
     async def _ping_loop(conn: WSConnection, interval_s: float = 20.0) -> None:
-        log = logging.getLogger(PINGPONG_LOGGER)
         try:
             while True:
                 await asyncio.sleep(interval_s)
                 await conn.send('{"method":"ping"}')
-                log.info("ping 전송")
         except Exception:  # noqa: BLE001 - 연결 종료 시 조용히 끝 (본선이 재연결)
             return
 
@@ -264,9 +258,6 @@ class HLWebSocketClient:
         msg = json.loads(raw)
         channel = msg.get("channel")
         data = msg.get("data")
-        if channel == "pong":  # 핑 응답 — 왕복 확인용으로만 따로 기록
-            logging.getLogger(PINGPONG_LOGGER).info("pong 수신")
-            return
         if channel == "trades":
             # trades의 data는 체결 목록(list).
             if isinstance(data, list):

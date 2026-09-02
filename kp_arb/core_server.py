@@ -789,13 +789,14 @@ def _setup_logging() -> logging.Logger:
         olg.propagate = False
         if not any(isinstance(h, _DailyFileHandler) for h in olg.handlers):
             try:
-                olg.addHandler(_DailyFileHandler(log_dir, prefix=prefix))
+                oh = _DailyFileHandler(log_dir, prefix=prefix)
+                # 시각 필수 — 발주요청→응답→체결 순서·간격 추적(없으면 순서 재구성 불가).
+                oh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+                olg.addHandler(oh)
             except OSError:
                 pass
     # WS 주문 원본 로그 — 거래소별(ws_hl/ws_ls), 수신 시각 필요 → 타임스탬프 포매터.
-    # HL 핑/퐁 왕복(hl_ping)도 같은 형식 — 끊김 직전 연결유지 신호가 정상이었는지 추적.
-    for name, prefix in (("kp_arb.wsraw.hl", "ws_hl"), ("kp_arb.wsraw.ls", "ws_ls"),
-                         ("kp_arb.pingpong.hl", "hl_ping")):
+    for name, prefix in (("kp_arb.wsraw.hl", "ws_hl"), ("kp_arb.wsraw.ls", "ws_ls")):
         wlg = logging.getLogger(name)
         wlg.setLevel(logging.INFO)
         wlg.propagate = False
