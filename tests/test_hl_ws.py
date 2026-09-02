@@ -356,3 +356,31 @@ def test_bbo_keeps_merged_ladder_intact() -> None:
     assert quote.bid == 184.12                 # 1호가 표시는 bbo 원시
     assert quote.bids == [(184.1, 5.0)]        # 호가창은 머지 그대로 (스플라이스 없음)
     assert quote.asks == [(184.15, 7.0)]
+
+
+def test_pong_frame_logged_to_pingpong_logger() -> None:
+    # 핑 응답(pong) 수신은 전용 로거(kp_arb.pingpong.hl)에 남고 다른 분기로 안 흐른다.
+    import logging
+
+    from kp_arb.gateways.hl_ws import PINGPONG_LOGGER
+
+    client = HLWebSocketClient(FakeConnector([]))
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger = logging.getLogger(PINGPONG_LOGGER)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        client._dispatch('{"channel":"pong"}')
+    finally:
+        logger.removeHandler(handler)
+    assert any("pong 수신" in r.getMessage() for r in records)
+
+
+def test_ping_interval_default_20s() -> None:
+    # HL 유지용 핑 주기 — 20초(60초 무통신 규정 대비 여유, 사용자 지정 2026-09-02).
+    import inspect
+
+    sig = inspect.signature(HLWebSocketClient._ping_loop)
+    assert sig.parameters["interval_s"].default == 20.0

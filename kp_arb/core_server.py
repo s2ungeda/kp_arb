@@ -793,7 +793,9 @@ def _setup_logging() -> logging.Logger:
             except OSError:
                 pass
     # WS 주문 원본 로그 — 거래소별(ws_hl/ws_ls), 수신 시각 필요 → 타임스탬프 포매터.
-    for name, prefix in (("kp_arb.wsraw.hl", "ws_hl"), ("kp_arb.wsraw.ls", "ws_ls")):
+    # HL 핑/퐁 왕복(hl_ping)도 같은 형식 — 끊김 직전 연결유지 신호가 정상이었는지 추적.
+    for name, prefix in (("kp_arb.wsraw.hl", "ws_hl"), ("kp_arb.wsraw.ls", "ws_ls"),
+                         ("kp_arb.pingpong.hl", "hl_ping")):
         wlg = logging.getLogger(name)
         wlg.setLevel(logging.INFO)
         wlg.propagate = False
