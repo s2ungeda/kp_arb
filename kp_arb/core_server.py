@@ -459,6 +459,7 @@ async def _manual_command(
         try:
             await system.cancel(str(order_id))
         except Exception as exc:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
+            _olog.warning("수동주문 취소 실패: #%s — %s", order_id, exc)  # #3 실패 로그
             return _fail([f"취소 실패: {exc}"])
         return _ok()
     if cmd == "manual_leverage":  # 레버리지·마진모드 변경(주문과 별개, §1-3)
@@ -471,6 +472,8 @@ async def _manual_command(
         try:
             await system.update_leverage(underlying, leverage, is_cross=is_cross)
         except Exception as exc:  # noqa: BLE001 - 거부 사유(상한·증거금)를 화면에 전달
+            _olog.warning("레버리지 변경 실패: %s %dx cross=%s — %s",  # #3 실패 로그
+                          underlying.value, leverage, is_cross, exc)
             return _fail([f"레버리지 변경 실패: {exc}"])
         return _ok()
     if cmd == "manual_amend":
@@ -490,6 +493,7 @@ async def _manual_command(
                 str(order_id), float(raw),
                 reduce_only=reduce_only, post_only=post_only)
         except Exception as exc:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
+            _olog.warning("수동주문 정정 실패: #%s @ %s — %s", order_id, raw, exc)  # #3
             return _fail([f"정정 실패: {exc}"])
         return _ok(order_id=new_id)
     if cmd == "manual_order":
@@ -524,7 +528,7 @@ async def _manual_command(
             intent = OrderIntent(
                 venue=instrument.venue, underlying=underlying, instrument=instrument,
                 side=side, qty=qty, order_type=order_type, price=price,
-                reduce_only=reduce_only, post_only=post_only)
+                reduce_only=reduce_only, post_only=post_only, source="일반주문창")
         except ValidationError as exc:
             _olog.warning("수동주문 거부(검증): %s %s %s %g @ %s — %s",
                           underlying.value, instrument.value, side.value, qty, price,

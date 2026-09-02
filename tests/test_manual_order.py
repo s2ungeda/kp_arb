@@ -1,6 +1,9 @@
 """수동 주문 순수 검증 로직 + 명령 핸들러 테스트 (DESIGN-manual-order.md §6.3)."""
 import asyncio
+import logging
 from typing import Any
+
+import pytest
 
 from kp_arb.core_server import _ladder, _manual_command, manual_snapshot
 from kp_arb.domain.enums import Account, Instrument, Side, Underlying, Venue
@@ -92,6 +95,8 @@ class _FakeSystem:
         self.errors = getattr(self, "errors", 0) + 1  # 발주 실패 알람 카운터(테스트용)
 
     async def cancel(self, order_id: str) -> None:
+        if self._fail is not None:
+            raise self._fail
         self.cancelled.append(order_id)
 
     async def amend_price(self, order_id: str, price: float, *,
@@ -238,6 +243,26 @@ async def test_manual_leverage_bad_args() -> None:
     sys = _fake_system(OrderBook())
     r = await _manual_command(sys, {"cmd": "manual_leverage", "underlying": "samsung"})
     assert not r["ok"] and "레버리지 인자" in r["errors"][0]
+
+
+async def test_manual_cancel_failure_logs(caplog: pytest.LogCaptureFixture) -> None:
+    # #3 실패 무조건 로그 — 취소 실패는 화면(_fail)뿐 아니라 파일 로그에도 남는다.
+    sys = _fake_system(OrderBook(), fail=RuntimeError("거래소 거부"))
+    with caplog.at_level(logging.WARNING, logger="kp_arb.order"):
+        r = await _manual_command(sys, {"cmd": "manual_cancel", "order_id": "X1"})
+    assert not r["ok"]
+    assert any("취소 실패" in rec.message and rec.name == "kp_arb.order"
+               for rec in caplog.records)
+
+
+async def test_manual_leverage_failure_logs(caplog: pytest.LogCaptureFixture) -> None:
+    # #3 실패 무조건 로그 — 레버리지 변경 실패도 파일 로그에 작업·사유가 남는다.
+    sys = _fake_system(OrderBook(), fail=RuntimeError("증거금 부족"))
+    with caplog.at_level(logging.WARNING, logger="kp_arb.order"):
+        r = await _manual_command(sys, {"cmd": "manual_leverage",
+            "underlying": "samsung", "leverage": 10, "is_cross": True})
+    assert not r["ok"]
+    assert any("레버리지 변경 실패" in rec.message for rec in caplog.records)
 
 
 async def test_manual_amend_needs_price() -> None:

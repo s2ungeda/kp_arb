@@ -65,3 +65,45 @@ def test_fill_partial_then_full(caplog: pytest.LogCaptureFixture) -> None:
     msgs = [r.message for r in caplog.records if r.name == "kp_arb.order.hl"]
     assert "부분" in msgs[0] and "0.054/0.14" in msgs[0]
     assert "전량" in msgs[1] and "0.14/0.14" in msgs[1]
+
+
+def _ls_manual() -> OrderIntent:
+    return OrderIntent(venue=Venue.LS, underlying=Underlying.SAMSUNG,
+                       instrument=Instrument.KR_STOCK, side=Side.BUY, qty=10,
+                       order_type=OrderType.LIMIT, price=70_000, source="일반주문창")
+
+
+def test_order_requested_logs_before_response(caplog: pytest.LogCaptureFixture) -> None:
+    # 발주요청 — 보내기 직전 단계. 출처(일반주문창)가 로그에 함께 남는다.
+    with caplog.at_level(logging.INFO, logger="kp_arb.order.ls"):
+        order_log.order_requested(_ls_manual())
+    rec = [r for r in caplog.records if r.name == "kp_arb.order.ls"]
+    assert rec and "발주요청" in rec[-1].message and "[일반주문창]" in rec[-1].message
+
+
+def test_order_requested_market_shows_resolved_price(caplog: pytest.LogCaptureFixture) -> None:
+    # 시장가(HL)는 intent.price가 없어, 실제 실어보낸 가격을 함께 남긴다.
+    market = OrderIntent(venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+                         instrument=Instrument.HL_PERP, side=Side.BUY, qty=0.1,
+                         order_type=OrderType.MARKET, source="일반주문창")
+    with caplog.at_level(logging.INFO, logger="kp_arb.order.hl"):
+        order_log.order_requested(market, price=163.5)
+    rec = [r for r in caplog.records if r.name == "kp_arb.order.hl"]
+    assert rec and "@ 163.5" in rec[-1].message
+
+
+def test_source_tag_in_placed_and_fill(caplog: pytest.LogCaptureFixture) -> None:
+    # 발주응답·체결 로그에도 출처가 함께 남아 한 주문의 단계를 출처와 묶어 추적.
+    with caplog.at_level(logging.INFO, logger="kp_arb.order.ls"):
+        order_log.order_placed(_ls_manual(), "555")
+        order_log.order_filled(_ls_manual(), 10, 70_000, "F1", 10)
+    msgs = [r.message for r in caplog.records if r.name == "kp_arb.order.ls"]
+    assert all("[일반주문창]" in m for m in msgs)
+
+
+def test_no_source_omits_tag(caplog: pytest.LogCaptureFixture) -> None:
+    # 출처 미상(빈값)이면 표식을 붙이지 않는다(기존 로그 형태 유지).
+    with caplog.at_level(logging.INFO, logger="kp_arb.order.ls"):
+        order_log.order_requested(_ls())  # source="" 기본
+    rec = [r for r in caplog.records if r.name == "kp_arb.order.ls"]
+    assert rec and "[" not in rec[-1].message

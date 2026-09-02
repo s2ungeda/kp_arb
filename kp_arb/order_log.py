@@ -37,6 +37,11 @@ def ws_order_raw(venue: Venue, raw: str) -> None:
         WS_HL_LOGGER if venue is Venue.HYPERLIQUID else WS_LS_LOGGER).info("%s", raw)
 
 
+def _src(intent: OrderIntent) -> str:
+    """발주 출처 표식 — 로그 앞머리 ``[일반주문창] `` 등. 미상이면 빈 문자열."""
+    return f"[{intent.source}] " if intent.source else ""
+
+
 def _fmt(intent: OrderIntent, *, with_price: bool = True) -> str:
     s = (f"{intent.underlying.value} {intent.instrument.value} "
          f"{intent.side.value} {intent.qty:g}")
@@ -45,16 +50,26 @@ def _fmt(intent: OrderIntent, *, with_price: bool = True) -> str:
     return s + f"{' reduce' if intent.reduce_only else ''}{' post' if intent.post_only else ''}"
 
 
+def order_requested(intent: OrderIntent, *, price: float | None = None) -> None:
+    """발주요청 — 거래소로 **보내기 직전**(응답 전). 네트워크가 막혀 응답이 안 와도 '무엇을
+    보냈는지'가 남아, 뒤따르는 발주응답·체결과 짝을 이뤄 한 주문의 단계를 추적할 수 있다.
+
+    시장가(HL)는 intent.price가 없어 실제 실어보낸 가격을 price로 받아 함께 남긴다.
+    """
+    extra = f" @ {price}" if price is not None and intent.price is None else ""
+    logger_for(intent.venue).info("발주요청 %s%s%s", _src(intent), _fmt(intent), extra)
+
+
 def order_placed(intent: OrderIntent, order_id: str, response: Any = None) -> None:
     """발주 성공(응답 수신) — 요청 요약 + 거래소 원응답(체결/대기·체결수량 판별용)."""
     logger_for(intent.venue).info(
-        "발주 %s → #%s%s", _fmt(intent), order_id,
+        "발주 %s%s → #%s%s", _src(intent), _fmt(intent), order_id,
         f" | resp={response!r}" if response is not None else "")
 
 
 def order_rejected(intent: OrderIntent, error: object) -> None:
     """발주 거부/오류 — 게이트웨이 예외(사유 포함)."""
-    logger_for(intent.venue).warning("발주거부 %s — %s", _fmt(intent), error)
+    logger_for(intent.venue).warning("발주거부 %s%s — %s", _src(intent), _fmt(intent), error)
 
 
 def order_canceled(venue: Venue, order_id: str) -> None:
@@ -85,6 +100,6 @@ def order_filled(intent: OrderIntent, fill_qty: float, fill_price: float,
     """체결통보(WS) — 부분/전량 + 누적/목표 수량(주문이 어디로 갔는지 추적)."""
     kind = "전량" if cum_qty >= intent.qty - 1e-6 else "부분"  # 부동소수점 톨러런스
     logger_for(intent.venue).info(
-        "체결(%s) %s %g @ %s [체결#%s] 누적 %g/%g",
-        kind, _fmt(intent, with_price=False), fill_qty, fill_price,
+        "체결(%s) %s%s %g @ %s [체결#%s] 누적 %g/%g",
+        kind, _src(intent), _fmt(intent, with_price=False), fill_qty, fill_price,
         fill_id, cum_qty, intent.qty)

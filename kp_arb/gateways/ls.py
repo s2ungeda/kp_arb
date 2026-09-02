@@ -166,6 +166,7 @@ class LSApiGateway(LSGateway):
             body = self._future_order_body(intent, account)
         else:
             raise NotImplementedError(f"{intent.instrument} 주문 TR 미정 [OPEN §13 #3]")
+        order_log.order_requested(intent)  # 보내기 직전(응답 전) — 단계 추적
         try:
             resp = await self._rest_for(account).request(tr_cd, body, path=path)
             order_id = self._parse_order_id(resp, tr_cd)
@@ -186,11 +187,14 @@ class LSApiGateway(LSGateway):
         if account not in self._rest_by_account:
             raise RestError("KR_FX(원달러선물 헤지) 계좌 미등록 — 자격 확인 필요")
         body = self._fx_order_body(code, side, qty, price, account)
+        _fxlog = order_log.logger_for(Venue.LS)
+        _fxlog.info(  # 발주요청 — 보내기 직전(응답 전). OrderIntent 밖이라 직접 남긴다.
+            "발주요청 [동시호가] 원달러선물 %s %s %d @ %s", code, side.value, qty, price)
         resp = await self._rest_for(account).request(
             self.FUTURE_ORDER_TR, body, path=self.FUTURE_PATH)
         order_id = self._parse_order_id(resp, self.FUTURE_ORDER_TR)
-        order_log.logger_for(Venue.LS).info(
-            "원달러선물 발주 %s %s %d @ %s → #%s | acct=%s resp=%r",  # [진단] 응답 원문
+        _fxlog.info(
+            "발주 [동시호가] 원달러선물 %s %s %d @ %s → #%s | acct=%s resp=%r",  # 응답 원문
             code, side.value, qty, price, order_id,
             self._order_account_fields(account).get("AcntNo", "?"),
             getattr(resp, "body", None))

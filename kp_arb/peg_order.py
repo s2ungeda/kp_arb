@@ -67,7 +67,7 @@ class PegController:
         return OrderIntent(
             venue=self.venue, underlying=self.underlying,
             instrument=self.instrument, side=self.side, qty=self.qty,
-            order_type=OrderType.LIMIT, price=price,
+            order_type=OrderType.LIMIT, price=price, source="따라가기",
         )
 
     async def step(self) -> str:

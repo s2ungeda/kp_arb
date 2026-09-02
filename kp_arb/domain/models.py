@@ -74,6 +74,7 @@ class OrderIntent(BaseModel):
     account: Account | None = None  # LS 전용. None이면 instrument로 자동 라우팅.
     reduce_only: bool = False       # HL 전용 — 청산전용(포지션 증가 금지). LS는 무시.
     post_only: bool = False         # HL 전용 — 메이커 전용(tif=Alo). LS는 무시.
+    source: str = ""                # 발주 출처(로그용): 일반주문창·따라가기·자동M 등. 빈값=미상.
 
     @field_validator("qty")
     @classmethod

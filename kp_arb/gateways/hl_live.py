@@ -139,6 +139,7 @@ class HLSdkGateway(HLGateway):
             # HL은 순수 시장가가 없음 — IOC 지정가(마크 대비 슬리피지 허용)로 대응.
             price = await self._market_px(coin, is_buy)
             order_type = {"limit": {"tif": "Ioc"}}
+        order_log.order_requested(intent, price=price)  # 보내기 직전(응답 전) — 단계 추적
         try:
             resp = await asyncio.to_thread(
                 self._ex.order, coin, is_buy, float(intent.qty), price, order_type,
