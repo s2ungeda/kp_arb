@@ -14,5 +14,7 @@ win_state.json
 win_fields.json
 .win_state/
 ~$*.xlsx
+~$*.xlsm
 build/
 dist/
+real_log/

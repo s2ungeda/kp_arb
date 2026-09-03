@@ -375,3 +375,47 @@ routing.py  계좌 라우팅 규칙
     ↓
 models.py   둘을 불러다 주문 생성 시점에 강제
 ```
+
+---
+
+## 14. dataclass + 키워드 전용 인자 (pegging.py)
+
+### @dataclass = 델파이 record / C++ struct (생성자·==·출력 자동)
+```python
+@dataclass(frozen=True)
+class PegDecision:
+    action: PegAction
+    price: float | None = None
+
+PegDecision(PegAction.PLACE, 70000.0)    # 위치 인자도 됨
+```
+- pydantic BaseModel과 같은 자리지만 **검증 없음, 가벼움**.
+- `frozen=True` = 만든 뒤 수정 불가 (C++ const 구조체). 판단 결과처럼 "고치면 안 되는 값"에.
+- 선택 기준: 외부 입력 → BaseModel / 내부 계산 결과 → dataclass.
+
+### 키워드 전용 인자 `*`
+```python
+def decide(*, current_price, target): ...
+decide(current_price=1, target=2)   # OK
+decide(1, 2)                        # 에러
+```
+- `*` 뒤 인자는 **반드시 이름을 붙여** 호출. 같은 타입 인자가 여럿일 때 순서 실수 방지.
+- C++/델파이엔 없는 기능.
+
+### 빈 컨테이너는 거짓
+```python
+if depth:            # depth가 None이거나 빈 리스트면 거짓
+```
+- `if len(depth) > 0` 의 관용 표현. None 검사까지 한 번에.
+
+### 이중 인덱스
+```python
+depth[level - 1][0]   # [(가격, 잔량), ...] 에서 N번째 호가의 가격
+```
+- C++ `depth[level-1].first`. 사람 기준 "2호가" = 인덱스 1.
+
+### 읽은 소스: pegging.py (62줄)
+- **판단(순수 함수)과 실행(네트워크) 분리**의 교과서적 예. `decide()`는 숫자 2개 → 작은 구조체.
+- `PegAction`(NONE/PLACE/AMEND/WAIT) — AMEND는 추상 판단, 실행은 거래소별 분기(LS 정정 / HL 취소+신규)는 peg_order.py 몫.
+- `None`에 의미 부여("주문 없음")할 땐 docstring에 못 박는다.
+- 28행 주석의 `CANCEL_PLACE`는 사라진 멤버의 잔재 — 주석도 낡는다.
