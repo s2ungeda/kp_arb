@@ -17,9 +17,7 @@ from . import ui_theme as T
 from . import win_state
 from .core_client import (
     core_request,
-    core_request_err,
-    merge_poll,
-    screen_log,
+    run_state_feed,
     stale_seconds,
     watch_parent_exit,
 )
@@ -86,13 +84,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     state_box: dict[str, Any] = {"data": None}
 
     def poller() -> None:
-        while True:
-            # 실패해도 마지막 데이터 유지(merge_poll) — 목록이 통째로 비지 않게.
-            data, err = core_request_err("/manual_state", timeout=2.0)
-            msg = merge_poll(state_box, data, err, time.time())
-            if msg is not None:
-                screen_log().warning("주문리스트 %s", msg)
-            time.sleep(0.5)
+        # 실시간(DESIGN §12.1): 메인이 기록하는 공유메모리를 0.1초마다 읽고, 없거나 낡으면
+        # 기존 0.5초 HTTP 조회로 폴백. 실패해도 마지막 데이터 유지(merge_poll).
+        run_state_feed(state_box, log_tag="주문리스트")
 
     threading.Thread(target=poller, daemon=True).start()
 
@@ -294,7 +288,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             _render()
         except Exception:  # noqa: BLE001 - 갱신 오류로 창이 죽지 않게
             pass
-        _reschedule(refresh, 400)
+        _reschedule(refresh, 150)  # 데이터가 0.1초 단위로 오니 그리기도 촘촘히(변화 없으면 스킵)
 
     def _rows() -> list[tuple[str, str, tuple[Any, ...]]]:
         # (iid, side, 값11) — 필터로 골라 한 표에. 주문(미체결)→체결→취소 순.

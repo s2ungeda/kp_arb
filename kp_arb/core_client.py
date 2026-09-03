@@ -113,6 +113,82 @@ def merge_poll(box: dict[str, Any], data: dict[str, Any] | None,
     return None
 
 
+def share_is_fresh(share_ts_ms: int, now_ms: float, stale_s: float = 3.0) -> bool:
+    """공유메모리 수신시각이 아직 쓸 만한가 — 메인이 죽으면 시각이 멈춰 낡는다. 순수 로직."""
+    return (now_ms - share_ts_ms) <= stale_s * 1000.0
+
+
+def run_state_feed(
+    box: dict[str, Any], *, log_tag: str, fallback_path: str = "/manual_state",
+    interval_s: float = 0.1, poll_s: float = 0.5, stale_s: float = 3.0,
+    max_ticks: int | None = None,
+) -> None:
+    """화면 뒷단 스레드 몸통(DESIGN §12.1) — **공유메모리 우선, 낡거나 없으면 HTTP 폴링 폴백.**
+
+    0.1초마다 공유 파일의 버전만 확인해 바뀌었을 때만 JSON을 풀어 ``box``에 넣는다
+    (``merge_poll`` 형태 그대로 — 표시 코드·지연 표시 무변경). 메인이 안 떠서 파일이 없거나
+    수신시각이 ``stale_s``보다 낡으면 기존 0.5초 HTTP 조회로 자동 전환, 회복되면 복귀.
+    전환은 화면 로그에 1회씩. ``max_ticks``는 테스트용(None=무한).
+    """
+    import json
+
+    from .state_share import ShareReader, share_path_from_env
+
+    reader: ShareReader | None = None
+    last_version = -1
+    last_poll = 0.0
+    source = ""  # "share" | "http" — 전환 로그용
+    ticks = 0
+    while max_ticks is None or ticks < max_ticks:
+        ticks += 1
+        now = time.time()
+        used_share = False
+        if reader is None:
+            path = share_path_from_env()
+            if path:
+                try:
+                    reader = ShareReader(path)
+                except OSError:
+                    reader = None  # 메인이 아직 파일을 안 만들었거나 없음 → 폴백
+        if reader is not None:
+            try:
+                got = reader.read()
+            except (OSError, ValueError):
+                got = None
+            if got is not None:
+                version, ts_ms, body = got
+                if share_is_fresh(ts_ms, now * 1000.0, stale_s):
+                    used_share = True
+                    if version != last_version:
+                        last_version = version
+                        try:
+                            data = json.loads(body.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                            screen_log().warning("%s 공유메모리 JSON 오류 — %s", log_tag, exc)
+                            data = None
+                        if isinstance(data, dict):
+                            merge_poll(box, data, None, ts_ms / 1000.0)
+                    else:
+                        box["ok_ts"] = ts_ms / 1000.0  # 하트비트 — 데이터 그대로, 신선함만 갱신
+        if used_share:
+            if source != "share":
+                if source:
+                    screen_log().info("%s 공유메모리 복귀(실시간)", log_tag)
+                source = "share"
+        else:
+            if source != "http":
+                screen_log().warning("%s 공유메모리 없음/낡음 — HTTP 폴링으로 폴백", log_tag)
+                source = "http"
+            if now - last_poll >= poll_s:
+                last_poll = now
+                data, err = core_request_err(fallback_path, timeout=2.0)
+                msg = merge_poll(box, data, err, now)
+                if msg is not None:
+                    screen_log().warning("%s %s", log_tag, msg)
+        if max_ticks is None or ticks < max_ticks:
+            time.sleep(interval_s)
+
+
 def stale_seconds(box: dict[str, Any], now: float) -> float | None:
     """마지막 성공 조회로부터 지난 초. 성공한 적 없으면 None. 순수 로직."""
     ts = box.get("ok_ts")

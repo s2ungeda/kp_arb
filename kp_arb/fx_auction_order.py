@@ -13,13 +13,12 @@ from typing import Any, cast
 
 from . import ui_theme as T
 from . import win_state
-from .core_client import core_request, watch_parent_exit
+from .core_client import core_request, run_state_feed, watch_parent_exit
 
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
     """원달러선물 동시호가 주문 창 실행."""
     import threading
-    import time
     import tkinter as tk
     from tkinter import ttk
 
@@ -41,9 +40,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             results.put((label, core_request("/command", payload, timeout=10.0)))
 
     def poller() -> None:
-        while True:
-            state_box["data"] = core_request("/manual_state", timeout=2.0)
-            time.sleep(0.5)
+        # 실시간(DESIGN §12.1): 공유메모리 0.1초 읽기, 없거나 낡으면 HTTP 폴백.
+        # 실패해도 마지막 데이터 유지(merge_poll) — 화면이 통째로 비지 않게.
+        run_state_feed(state_box, log_tag="동시호가")
 
     threading.Thread(target=sender, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
@@ -248,7 +247,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                                     h.get("qty", ""), h.get("price", ""),
                                     h.get("status", "")))
         _apply_running(bool(fx.get("running")))
-        _reschedule(refresh, 500)
+        _reschedule(refresh, 250)  # 데이터가 0.1초 단위로 오니 그리기도 당김(§12.1)
 
     # 저장된 입력 복원 (종목코드는 목록 로드 후 refresh에서 복원)
     _saved = win_state.saved_fields("fx_auction_order")

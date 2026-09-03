@@ -175,7 +175,11 @@ def main() -> None:
 
     # 코어 생존 확인은 HTTP 왕복(최대 1초)이라 화면 스레드에서 하면 창 끌기·
     # 메뉴가 그 순간 얼어붙는다 → 뒷단 스레드가 확인하고 화면은 결과만 읽는다.
-    alive_box: dict[str, Any] = {"alive": False, "ws": []}
+    alive_box: dict[str, Any] = {
+        "alive": False, "ws": [],
+        # 코어↔메인 실시간 채널(/ws) 현황 — 수신 스레드가 갱신, 현황판에 한 줄로 표시
+        "main_ws": {"connected": False, "rx": 0, "disconnects": 0},
+    }
     closing = {"flag": False}
     launched: list[tuple[str, int, subprocess.Popen[bytes]]] = []  # (token, slot, proc)
 
@@ -271,15 +275,18 @@ def main() -> None:
 
         writer = ShareWriter(share_path)
         fails = 0
+        mw = alive_box["main_ws"]  # 현황판 표시용(연결·수신·끊김) — 화면은 읽기만
         while not closing["flag"]:
             try:
                 with connect(CORE_WS_URL, open_timeout=3.0, close_timeout=1.0) as ws:
                     ws.send('{"subscribe":["manual"]}')
+                    mw["connected"] = True
                     if fails:
                         screen_log().warning("메인 WS 복구 — 연속 실패 %d회 뒤 정상", fails)
                         fails = 0
                     while not closing["flag"]:
                         raw = ws.recv(timeout=5.0)  # 하트비트 1초 — 5초 무소식이면 끊김으로
+                        mw["rx"] += 1
                         msg = json.loads(raw)
                         ts = int(msg.get("ts") or time.time() * 1000)
                         if msg.get("heartbeat"):
@@ -288,6 +295,9 @@ def main() -> None:
                             writer.write(json.dumps(msg["data"], ensure_ascii=False)
                                          .encode("utf-8"), ts)
             except Exception as exc:  # noqa: BLE001 - 끊김·미접속: 로그 후 2초 뒤 재접속
+                if mw["connected"]:
+                    mw["disconnects"] += 1
+                mw["connected"] = False
                 fails += 1
                 if fails == 1 or fails % 30 == 0:
                     screen_log().warning(
@@ -328,7 +338,7 @@ def main() -> None:
     ws_frame = tk.LabelFrame(root, text="WS 세션")
     ws_frame.pack(fill="x", padx=8, pady=(0, 8))
     ws_tree = ttk.Treeview(ws_frame, columns=("no", "venue", "name", "state", "rx"),
-                           show="headings", height=3, selectmode="none")
+                           show="headings", height=4, selectmode="none")
     for col, title, wid, anc in (("no", "No", 32, "center"), ("venue", "거래소", 48, "center"),
                                  ("name", "이름", 96, "w"), ("state", "상태", 54, "center"),
                                  ("rx", "수신", 84, "e")):
@@ -340,7 +350,10 @@ def main() -> None:
     ws_box: dict[str, Any] = {"sig": None}
 
     def render_ws() -> None:
-        rows = alive_box.get("ws") or []
+        mw = alive_box["main_ws"]
+        rows = list(alive_box.get("ws") or []) + [{  # 마지막 줄: 코어↔메인 실시간 채널
+            "venue": "코어", "name": "메인 채널(/ws)", "connected": mw["connected"],
+            "rx_count": mw["rx"], "disconnects": mw["disconnects"]}]
         sig = tuple((r.get("name"), r.get("connected"), r.get("rx_count"),
                      r.get("disconnects")) for r in rows)
         if sig == ws_box["sig"]:  # 변화 없으면 다시 그리지 않음(깜빡임 방지)

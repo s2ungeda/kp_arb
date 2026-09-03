@@ -13,9 +13,7 @@ from typing import Any
 from . import win_state
 from .core_client import (
     core_request,
-    core_request_err,
-    merge_poll,
-    screen_log,
+    run_state_feed,
     stale_seconds,
     watch_parent_exit,
 )
@@ -132,13 +130,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     state_box: dict[str, Any] = {"data": None}
 
     def poller() -> None:
-        while True:
-            # 실패해도 마지막 데이터 유지(merge_poll) — 잔고·호가가 통째로 비지 않게.
-            data, err = core_request_err("/manual_state", timeout=2.0)
-            msg = merge_poll(state_box, data, err, time.time())
-            if msg is not None:
-                screen_log().warning("일반주문 %s", msg)
-            time.sleep(0.5)
+        # 실시간(DESIGN §12.1): 메인이 기록하는 공유메모리를 0.1초마다 읽고, 없거나 낡으면
+        # 기존 0.5초 HTTP 조회로 폴백. 실패해도 마지막 데이터 유지(merge_poll).
+        run_state_feed(state_box, log_tag="일반주문")
 
     threading.Thread(target=poller, daemon=True).start()
 
@@ -727,7 +721,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 _apply_hoga_offset()  # 추적 중인 호가 레벨의 현재가로 단가 재계산(따라감)
         except Exception:  # noqa: BLE001 - 갱신 오류로 창이 죽지 않게 (버벅임 방지)
             pass
-        _reschedule(refresh, 500)  # 호가창 갱신 주기 500ms (§1-4)
+        _reschedule(refresh, 150)  # 호가창 갱신 — 데이터가 0.1초 단위(§12.1), 변화 없으면 스킵
 
     def _fill_hoga(sym: dict[str, Any], dec: int, my_ords: dict[str, int]) -> None:
         asks = list(sym.get("asks") or [])[:5]  # 5호가 (§1-4)
