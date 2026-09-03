@@ -31,7 +31,8 @@ def _venue(instrument: str) -> str:
 
 def _sym(underlying: object, instrument: str) -> str:
     """종목 표시 — 거래소는 별도 컬럼이라 여기선 종목명(+선물 태그)만."""
-    return f"{underlying} 선물" if instrument == "kr_stock_future" else f"{underlying}"
+    tag = {"kr_stock_future": " 선물", "kr_stock_future_next": " 선물(차)"}.get(instrument, "")
+    return f"{underlying}{tag}"
 
 
 # 주문상태 한글 표시 — '구분'의 '주문'과 헷갈리지 않게 상태는 한글로(accepted=접수 등).

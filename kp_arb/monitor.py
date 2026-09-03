@@ -24,7 +24,8 @@ from .core_client import core_request, watch_parent_exit
 from .domain.enums import Underlying
 
 _NAMES = {"samsung": "삼성전자", "sk_hynix": "SK하이닉스", "hyundai": "현대차"}
-_KIND = {"kr_stock": "주식", "kr_stock_future": "선물", "kr_etf": "ETF"}
+_KIND = {"kr_stock": "주식", "kr_stock_future": "선물", "kr_stock_future_next": "선물(차)",
+         "kr_etf": "ETF"}
 
 FUNDING_INTERVAL_S = 3600  # HL 펀딩은 매시 정각
 

@@ -36,6 +36,9 @@ _DIRECTIONS = (
 _ACC_ROWS_FWD = (("진입", ("-HP", "+S", "-환")), ("청산", ("+HP", "-S", "+환")))
 _ACC_ROWS_REV = (("진입", ("+HP", "-S", "+환")), ("청산", ("-HP", "+S", "-환")))
 
+# 선물 월물 콤보(상단) — 표시 → 코어 settings.future_month 값 (DESIGN §5.11)
+MONTH_MAP = {"최근": "near", "차근": "next"}  # 표시는 '최근/차근'(사용자 2026-09-03)
+
 # 선주문 호가단위 설정 종목 순서 (목업 라벨 → underlying 코드)
 _PRE_TICK_ROWS = (("하이닉스", "sk_hynix"), ("삼성전자", "samsung"), ("현대차", "hyundai"))
 # 상대호가 콤보 — 선주문 진입범위 §6.3: 매수는 상대호가−1틱, 매도는 +1틱
@@ -149,6 +152,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     cb_agg = ttk.Combobox(top, values=list(AGG_CHOICES), width=5, state="readonly")
     cb_agg.set("원시")
     cb_agg.pack(side="left", padx=(0, 4))
+    # 선물 월물(근/차근) — 화면(종목) 단위, 모든 세트 공통 (DESIGN §5.11, 사용자 확정 2026-09-03).
+    # 목업 layout_1.png에는 없는 항목 — 호가단위 콤보 오른쪽. '적'으로 코어에 보낸다.
+    cb_month = ttk.Combobox(top, values=list(MONTH_MAP), width=4, state="readonly")
+    cb_month.set("최근")
+    cb_month.pack(side="left", padx=(0, 4))
 
     def apply_market() -> None:
         u = UNDER_MAP[cb_under.get()]
@@ -156,6 +164,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         nsf, mant = AGG_CHOICES[cb_agg.get()]
         send({"cmd": "manual_hl_merge", "underlying": u,
               "n_sig_figs": nsf, "mantissa": mant}, "호가단위")
+        send({"cmd": "settings", "future_month": MONTH_MAP[cb_month.get()]}, "선물 월물")
 
     ttk.Style().configure("Ap.TButton", padding=(6, 2))  # 콤보 높이(≈26)에 맞춤
     ttk.Button(top, text="적", width=3, style="Ap.TButton",

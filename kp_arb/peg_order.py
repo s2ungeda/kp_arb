@@ -39,6 +39,7 @@ _LS_MARKETS = {
     "주식": Instrument.KR_STOCK,
     "ETF": Instrument.KR_ETF,
     "선물": Instrument.KR_STOCK_FUTURE,
+    "선물(차근)": Instrument.KR_STOCK_FUTURE_NEXT,  # 차근월물(§5.11)
 }
 
 
@@ -334,9 +335,9 @@ def main() -> None:
                 status_var.set(f"{name_var.get()}: ETF 종목이 없습니다")
                 run_var.set(False)
                 return
-            if (instrument is Instrument.KR_STOCK_FUTURE
-                    and underlying not in system.futures_symbols):
-                status_var.set(f"{name_var.get()}: 선물 종목이 없습니다")
+            if (instrument.is_stock_future
+                    and (underlying, instrument) not in system.futures_codes):
+                status_var.set(f"{name_var.get()}: {market_var.get()} 종목이 없습니다")
                 run_var.set(False)
                 return
             ctl = PegController(
