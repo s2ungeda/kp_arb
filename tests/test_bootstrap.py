@@ -7,7 +7,12 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from kp_arb.bootstrap import HLAmendForbidden, LiveSystem, select_near_month_futures
+from kp_arb.bootstrap import (
+    HLAmendForbidden,
+    LiveSystem,
+    select_near_month_futures,
+    startup_symbol_error,
+)
 from kp_arb.domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent, Position
 from kp_arb.gateways.ls_ws import LSWebSocketClient, WSClosed
@@ -114,6 +119,32 @@ async def test_guarded_ws_gives_up_on_error(monkeypatch) -> None:  # type: ignor
 
     await LiveSystem._guarded_ws("선물", make_run)  # 예외 삼키고 반환
     assert calls["n"] == 1  # 1회만 — 재시작 안 함
+
+
+async def test_guarded_ws_reports_dead_channel() -> None:
+    # 채널이 예외로 영구 중단되면 on_dead 콜백 → LiveSystem이 팝업용 실패로 기록.
+    async def make_run() -> None:
+        raise RuntimeError("auth 실패")
+
+    system, _, _ = _system([])
+    await LiveSystem._guarded_ws("주식", make_run, system._mark_ws_dead)
+    assert system.startup_load_error == "WS 채널(주식) 중단"
+    system._mark_ws_dead("HL")  # 먼저 기록된 실패는 덮지 않는다
+    assert system.startup_load_error == "WS 채널(주식) 중단"
+
+
+def test_startup_symbol_error_rules() -> None:
+    # 시동 '종목' 판정 — 근월물 누락·원달러 월물 없음을 작업명에 담는다.
+    expected = [Underlying.SAMSUNG, Underlying.SK_HYNIX]
+    fx = [("175W09", 202609)]
+    assert startup_symbol_error(expected, {Underlying.SAMSUNG: "A1", Underlying.SK_HYNIX: "A2"},
+                                fx) is None
+    err = startup_symbol_error(expected, {Underlying.SAMSUNG: "A1"}, fx)
+    assert err is not None and "근월물 없음" in err and "sk_hynix" in err
+    err = startup_symbol_error(expected, {Underlying.SAMSUNG: "A1", Underlying.SK_HYNIX: "A2"}, [])
+    assert err == "종목(원달러선물 월물 없음)"
+    err = startup_symbol_error(expected, {}, [])
+    assert err is not None and "근월물 없음" in err and "원달러선물 월물 없음" in err
 
 
 def test_select_near_month_futures() -> None:
@@ -296,6 +327,27 @@ async def test_startup_init_short_circuits_on_symbol_error() -> None:
     await system._startup_init()
     assert system.startup_load_error == "종목(주식선물 근월물 없음: 하이닉스)"
     assert called["balance"] is False  # 종목 실패로 뒤 단계는 아예 실행 안 함
+
+
+async def test_startup_init_marks_instrument_info_step() -> None:
+    # HL 종목정보(소수자릿수·레버리지) 조회 실패도 시동 필수 로드(사용자 확정 2026-09-03) —
+    # "종목정보"로 남기고 중단해 메인창 팝업으로 이어진다.
+    from kp_arb.gateways.mock_hl import MockHLGateway
+
+    hl = MockHLGateway()
+
+    async def boom() -> dict[Underlying, dict[str, object]]:
+        raise RuntimeError("meta 조회 실패")
+
+    hl.get_instrument_meta = boom  # type: ignore[method-assign]
+    system = LiveSystem(
+        gateway=MockLSGateway(),  # type: ignore[arg-type]
+        order_book=OrderBook(), session=SessionService(),
+        stock_ws=LSWebSocketClient(FakeConnector([])),
+        hl_gateway=hl,  # hl_ws 불필요 — 시동 초기화(REST)만 검사
+    )
+    await system._startup_init()
+    assert system.startup_load_error == "종목정보(HL 소수자릿수·레버리지)"
 
 
 async def test_fill_frame_updates_order_book_realtime() -> None:

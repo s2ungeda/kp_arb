@@ -653,8 +653,14 @@ def make_app(
     system: LiveSystem | None = None,
     engine: RehearsalEngine | None = None,
     fx_service: FxReportService | None = None,
+    boot_errors: list[str] | None = None,
 ) -> web.Application:
-    """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅."""
+    """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅.
+
+    boot_errors: 코어 조립 단계(bootstrap_live/start) 자체가 예외로 실패한 경우의 사유 —
+    system이 없어도 /state의 load_errors로 실어 메인창이 "재접속하세요" 팝업을 띄운다.
+    """
+    boot_errors = list(boot_errors or [])
     if system is not None:  # 저장된 공통설정을 시동 시 LiveSystem에 주입
         system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)
         system.set_carry_rates(state.settings.fx_carry_rate, state.settings.eq_carry_rate)
@@ -671,8 +677,9 @@ def make_app(
         payload["error_seq"] = system.error_seq if system is not None else 0
         payload["hl_daily_filled"] = (
             system.hl_daily_filled_today() if system is not None else 0.0)
-        # 시동 로드 실패(종목/잔고/포지션/주문) — 있으면 메인창이 "…재접속하세요" 팝업 후 종료.
-        payload["load_errors"] = (
+        # 시동 실패 — 코어 조립 실패(boot_errors) + 순차 로드 실패(종목/종목정보/잔고/포지션/
+        # 주문) + WS 채널 죽음. 있으면 메인창이 "…재접속하세요" 팝업 후 종료.
+        payload["load_errors"] = boot_errors + (
             [system.startup_load_error]
             if system is not None and system.startup_load_error else [])
         return web.json_response(payload, dumps=_dumps)
@@ -830,6 +837,7 @@ async def _serve() -> None:
         engine = None
         fx_service = None
         tasks: list[asyncio.Task[None]] = []
+        boot_errors: list[str] = []  # 코어 조립 실패 사유 → /state load_errors → 메인창 팝업
         try:
             from .bootstrap import bootstrap_live
             from .core_engine import RehearsalEngine
@@ -842,14 +850,17 @@ async def _serve() -> None:
             tasks.append(asyncio.create_task(engine.run()))
             tasks.append(asyncio.create_task(fx_service.run()))
             log.info("LiveSystem 결합 완료 — 리허설 판정 + FX 보고 시작 (발주 없음)")
-        except Exception:  # noqa: BLE001 - 키 없음/네트워크 등
+        except Exception as exc:  # noqa: BLE001 - 키 없음/네트워크 등
             log.exception("LiveSystem 시동 실패 — API만 운영 (시세 없음)")
+            # 코어는 떠 있지만 거래 기능이 없다 — 메인창 팝업으로 알린다(사용자 확정 2026-09-03).
+            boot_errors.append(f"시동(코어 조립 실패: {type(exc).__name__}: {exc})"[:200])
 
         # access_log=None: 화면 폴링(GET /state 1초)이 로그를 도배하지 않게
         runner = web.AppRunner(make_app(
             state, on_shutdown=stop.set,
             save=lambda: save_state(STATE_PATH, state),
-            system=system, engine=engine, fx_service=fx_service), access_log=None)
+            system=system, engine=engine, fx_service=fx_service,
+            boot_errors=boot_errors), access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, HOST, DEFAULT_PORT)
         await site.start()

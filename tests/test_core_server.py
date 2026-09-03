@@ -137,6 +137,22 @@ def test_load_state_missing_or_corrupt(tmp_path: Path) -> None:
     assert load_state(bad).fx_month == "near"
 
 
+async def test_boot_errors_exposed_in_state() -> None:
+    # 코어 조립 자체가 실패(system=None)해도 /state load_errors에 실려 메인창이 팝업.
+    import asyncio
+
+    state = CoreState()
+    stop = asyncio.Event()
+    client = TestClient(TestServer(make_app(
+        state, on_shutdown=stop.set, boot_errors=["시동(코어 조립 실패: KeyError: 'X')"])))
+    await client.start_server()
+    try:
+        data = await (await client.get("/state")).json()
+        assert data["load_errors"] == ["시동(코어 조립 실패: KeyError: 'X')"]
+    finally:
+        await client.close()
+
+
 async def test_http_roundtrip_and_shutdown_hook() -> None:
     import asyncio
 

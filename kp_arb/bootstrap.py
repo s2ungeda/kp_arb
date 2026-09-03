@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -96,6 +96,24 @@ def select_near_month(
 def select_near_month_futures(rows: list[dict[str, object]]) -> dict[Underlying, str]:
     """underlying별 최근월물 주식선물 **코드만** (기존 호환)."""
     return {u: shcode for u, (shcode, _) in select_near_month(rows).items()}
+
+
+def startup_symbol_error(
+    expected: Iterable[Underlying],
+    futures_symbols: Mapping[Underlying, str],
+    fx_months: Sequence[tuple[str, int]],
+) -> str | None:
+    """시동 '종목' 로드 판정 — 취급 종목마다 주식선물 근월물이 있고, 원달러선물 월물도
+    있어야 한다(없으면 선물 시세·FX 대응주문이 조용히 안 나감). 실패 작업명 또는 None. 순수 로직."""
+    problems: list[str] = []
+    missing = [u for u in expected if u not in futures_symbols]
+    if missing:
+        problems.append("주식선물 근월물 없음: " + ", ".join(u.value for u in missing))
+    if not fx_months:
+        problems.append("원달러선물 월물 없음")
+    if not problems:
+        return None
+    return "종목(" + "; ".join(problems) + ")"
 
 
 class HLAmendForbidden(RuntimeError):
@@ -559,7 +577,20 @@ class LiveSystem:
         try:
             self.session.seed_phase(SessionPhase(raw))
         except ValueError:
-            pass  # 미지 값 → 시딩하지 않음(DEAD 유지)
+            import logging
+
+            # 오타면 발주가 막힌 채 이유를 모른다 — 반드시 남긴다(DEAD 유지는 그대로).
+            logging.getLogger("kp_arb.bootstrap").warning(
+                "KP_SESSION_INIT=%r 알 수 없는 값 — 무시(세션 DEAD 유지, 발주 차단)", raw)
+
+    def _mark_ws_dead(self, name: str) -> None:
+        """WS 채널이 예외로 영구 중단됨 → 시동 실패와 같은 등급으로 /state에 실어 팝업.
+
+        시세·체결통보가 끊긴 채 코어가 계속 돌면 판단·장부가 조용히 틀어진다(사용자 확정
+        2026-09-03). 먼저 기록된 실패가 있으면 덮지 않는다.
+        """
+        if self.startup_load_error is None:
+            self.startup_load_error = f"WS 채널({name}) 중단"
 
     def _wire(self) -> None:
         def fan_quote(quote: Quote) -> None:
@@ -673,20 +704,15 @@ class LiveSystem:
             self._hl_ws.on_reconnect.append(lambda: self._on_ws_reconnect("HL"))
 
     async def load_instruments(self) -> None:
-        """종목정보 조회·보관 — 시동 1회 (§5.10). 실패해도 시동 계속(표시·상한 보정용).
+        """종목정보 조회·보관 — 시동 1회 (§5.10). HL 조회 실패는 **예외로 올린다**
+        (시동 필수 로드 — 사용자 확정 2026-09-03: 소수자릿수 없이는 HL 주문 수량이 어긋남).
 
         HL: metaAndAssetCtxs → szDecimals·maxLeverage·code (포지션 없어도 앎).
         주식선물: 코드·만기(t8401 기조회) + 승수 10 / 주식: 승수 1.
         """
-        import logging
-
         hl_meta: dict[Underlying, dict[str, Any]] = {}
         if self._hl is not None:
-            try:
-                hl_meta = dict(await self._hl.get_instrument_meta())
-            except Exception:  # noqa: BLE001 - 조회 실패가 시동을 막지 않게(보정용)
-                logging.getLogger("kp_arb.bootstrap").warning(
-                    "HL 종목정보 조회 실패 — 없이 계속", exc_info=True)
+            hl_meta = dict(await self._hl.get_instrument_meta())
         for u in Underlying:
             m = hl_meta.get(u, {})
             self.instruments[(u, Instrument.HL_PERP)] = InstrumentInfo(
@@ -702,7 +728,7 @@ class LiveSystem:
                 underlying=u, instrument=Instrument.KR_STOCK, multiplier=1.0)
 
     async def _startup_init(self) -> None:
-        """시동 초기화 — 종목→잔고→포지션→주문 **순차**. 한 작업이라도 실패하면 그 작업명을
+        """시동 초기화 — 종목→종목정보→잔고→포지션→주문 **순차**. 한 작업이라도 실패하면 그 작업명을
         ``self.startup_load_error``에 남기고 즉시 중단한다(예외는 던지지 않음 — 코어는 살아
         /state로 실패를 알리고, 메인창이 "…재접속하세요" 팝업 후 종료).
 
@@ -716,6 +742,15 @@ class LiveSystem:
             log.error("시동 로드 실패: %s", self.startup_load_error)
             return
         log.info("시동 로드 OK: 종목 (주식선물 근월물 %d종)", len(self.futures_symbols))
+        # 1-2) 종목정보 — HL 소수자릿수·최대레버리지(없으면 HL 주문 수량 반올림이 어긋남).
+        try:
+            await self.load_instruments()
+            log.info("시동 로드 OK: 종목정보 (HL %s)",
+                     "조회됨" if self._hl is not None else "미사용")
+        except Exception:  # noqa: BLE001 - 실패는 기록만 하고 중단(팝업 유도)
+            self.startup_load_error = "종목정보(HL 소수자릿수·레버리지)"
+            log.error("시동 로드 실패: 종목정보", exc_info=True)
+            return
 
         accounts = (Account.KR_STOCK, Account.KR_DERIV)
         positions: list[Position] = []
@@ -768,11 +803,10 @@ class LiveSystem:
 
     async def start(self) -> None:
         """최초 스냅샷 → 세션 초기값(옵션) → WS 결선 → 실시간 수신 시작(재연결 포함)."""
-        await self._startup_init()  # 종목→잔고→포지션→주문 순차(실패 시 startup_load_error)
+        await self._startup_init()  # 종목→종목정보→잔고→포지션→주문 순차(실패 시 load_error)
         if self.startup_load_error is not None:
             # 로드 실패 — WS 결선·상시 조회 생략(사용자가 곧 재접속). 서버는 /state로 실패 알림.
             return
-        await self.load_instruments()  # 종목정보(틱·승수·maxLeverage·만기) 보관
         self._seed_session_from_env()
         self._wire()
         # 시동 REST 조회들은 **순차 실행** — 동시에 나가면 서버 계정당 초당 한도에
@@ -782,13 +816,16 @@ class LiveSystem:
         self._aux_tasks = [asyncio.create_task(self._spread_csv_loop()),
                            asyncio.create_task(self._prev_funding_loop())]
         # run 자체가 아니라 **팩토리(.run)**를 넘긴다 — 재시작 때 새 코루틴을 만들어야 하므로.
-        self._tasks.append(asyncio.create_task(self._guarded_ws("주식", self._stock_ws.run)))
+        self._tasks.append(asyncio.create_task(
+            self._guarded_ws("주식", self._stock_ws.run, self._mark_ws_dead)))
         if self._deriv_ws is not None:
             self._tasks.append(
-                asyncio.create_task(self._guarded_ws("선물", self._deriv_ws.run))
+                asyncio.create_task(
+                    self._guarded_ws("선물", self._deriv_ws.run, self._mark_ws_dead))
             )
         if self._hl_ws is not None:
-            self._tasks.append(asyncio.create_task(self._guarded_ws("HL", self._hl_ws.run)))
+            self._tasks.append(asyncio.create_task(
+                self._guarded_ws("HL", self._hl_ws.run, self._mark_ws_dead)))
 
     def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]:
         """HL 환산에 실제 쓰는 환율과 출처: 주간 창(fx_spot_window) 안이고 외환현물이
@@ -1232,7 +1269,8 @@ class LiveSystem:
 
     @staticmethod
     async def _guarded_ws(
-        name: str, make_run: Callable[[], Coroutine[Any, Any, None]]
+        name: str, make_run: Callable[[], Coroutine[Any, Any, None]],
+        on_dead: Callable[[str], None] | None = None,
     ) -> None:
         """WS 하나가 죽어도 전체를 멈추지 않고, **run()이 정상 반환하면 재시작(재연결)**한다.
 
@@ -1255,6 +1293,8 @@ class LiveSystem:
                 return  # 커넥터 명시 종료(테스트/셧다운) — 재시작 안 함
             except Exception:  # noqa: BLE001 - 채널 단위 격리(설정·인증 오류 등)
                 log.exception("%s WS 중단 — 해당 채널 없이 계속", name)
+                if on_dead is not None:
+                    on_dead(name)  # 시세·체결통보가 끊긴 채 돌면 안 됨 → 팝업(재접속하세요)
                 return
             # run() 정상 반환 = 서버 graceful close(끊김) → 재연결 위해 재시작
             log.warning("%s WS 끊김(정상종료) — 재연결", name)
@@ -1435,15 +1475,13 @@ async def bootstrap_live(
         fx_spot_window=(config.fx_spot_window.start, config.fx_spot_window.end),
         board_ref_qty=config.disparity.ref_qty,
     )
-    # 종목 로드 판정 — 취급 종목(config.symbols)마다 주식선물 근월물이 있어야 한다.
-    # 하나라도 빠지면 "종목" 로드 실패 → 시동 초기화가 여기서 멈추고 메인창이 팝업(어제
-    # 하이닉스 근월물 누락이 정확히 여기 걸린다).
-    missing = [u for u in config.symbols if u not in futures_symbols]
-    if missing:
-        system.startup_load_error = (
-            "종목(주식선물 근월물 없음: " + ", ".join(u.value for u in missing) + ")"
-        )
-        _blog.error("시동 로드 실패: %s", system.startup_load_error)
+    # 종목 로드 판정 — 취급 종목(config.symbols)마다 주식선물 근월물 + 원달러선물 월물이
+    # 있어야 한다. 하나라도 빠지면 "종목" 로드 실패 → 시동 초기화가 멈추고 메인창이 팝업
+    # (하이닉스 근월물 누락·원달러 월물 0개가 여기 걸린다 — 2026-09-03 사용자 확정).
+    symbol_error = startup_symbol_error(config.symbols, futures_symbols, fx_months)
+    if symbol_error is not None:
+        system.startup_load_error = symbol_error
+        _blog.error("시동 로드 실패: %s", symbol_error)
     return system
 
 
