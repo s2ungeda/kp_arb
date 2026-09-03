@@ -137,6 +137,56 @@ def test_load_state_missing_or_corrupt(tmp_path: Path) -> None:
     assert load_state(bad).fx_month == "near"
 
 
+async def test_ws_hub_snapshot_push_and_heartbeat() -> None:
+    # 실시간 채널(DESIGN §12.1): 접속 즉시 스냅샷 → mark()면 묶어서 푸시 → 조용하면 하트비트.
+    import asyncio
+    import json
+
+    from kp_arb.core_server import WsHub
+
+    hub = WsHub(None, coalesce_s=0.01, heartbeat_s=0.05)
+    runner = asyncio.create_task(hub.run())
+    client = TestClient(TestServer(make_app(CoreState(), hub=hub)))
+    await client.start_server()
+    try:
+        ws = await client.ws_connect("/ws")
+        first = json.loads((await ws.receive()).data)
+        assert first["channel"] == "manual" and first["data"]["connected"] is False
+        assert hub.subscribers == 1
+
+        hub.mark()  # 이벤트 발생 → 묶음 뒤 스냅샷 1회
+        pushed = json.loads((await asyncio.wait_for(ws.receive(), 1.0)).data)
+        assert "data" in pushed and pushed["channel"] == "manual"
+        assert hub.pushes == 1
+
+        beat = json.loads((await asyncio.wait_for(ws.receive(), 1.0)).data)  # 조용함 → 하트비트
+        assert beat.get("heartbeat") is True and "ts" in beat
+
+        await ws.close()
+        await asyncio.sleep(0.05)
+        assert hub.subscribers == 0  # 접속 종료 시 목록에서 제거
+    finally:
+        runner.cancel()
+        await client.close()
+
+
+def test_order_book_on_change_fires_on_mutations() -> None:
+    # 장부 변화 훅 — 주문 등록·취소마다 불려 실시간 채널이 밀어줄 타이밍을 안다.
+    from kp_arb.domain.enums import Instrument, OrderType, Side, Underlying, Venue
+    from kp_arb.domain.models import OrderIntent
+    from kp_arb.order_book import OrderBook
+
+    ob = OrderBook()
+    hits: list[int] = []
+    ob.on_change.append(lambda: hits.append(1))
+    ob.track("X1", OrderIntent(venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+                               instrument=Instrument.HL_PERP, side=Side.BUY, qty=1,
+                               order_type=OrderType.LIMIT, price=100.0))
+    ob.on_cancel("X1")
+    ob.on_cancel("X1")  # 이미 닫힌 주문 — 변화 없음 → 호출 안 함
+    assert len(hits) == 2
+
+
 async def test_boot_errors_exposed_in_state() -> None:
     # 코어 조립 자체가 실패(system=None)해도 /state load_errors에 실려 메인창이 팝업.
     import asyncio

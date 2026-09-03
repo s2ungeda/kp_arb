@@ -16,6 +16,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -646,6 +647,91 @@ def monitor_snapshot(
     return out
 
 
+class WsHub:
+    """코어→화면 실시간 채널(DESIGN §12.1) — 접속자(메인창)에게 manual 스냅샷을 이벤트 즉시 푸시.
+
+    시세·마크·현재가·체결·주문 변화 훅은 dirty 깃발만 세우고, 전송 루프가 100ms 안에 몰린 것을
+    1번으로 묶어 스냅샷 1번 만들어 접속자 전원에게 보낸다(초당 최대 ~10회). 조용하면 1초마다
+    하트비트 — 화면이 "데이터 없음"과 "연결 끊김"을 구분한다. 페이로드는 /manual_state와 동일.
+    """
+
+    def __init__(self, system: LiveSystem | None, *, coalesce_s: float = 0.1,
+                 heartbeat_s: float = 1.0) -> None:
+        self._system = system
+        self._coalesce_s = coalesce_s
+        self._heartbeat_s = heartbeat_s
+        self._subs: set[web.WebSocketResponse] = set()
+        self._dirty = asyncio.Event()
+        self.pushes = 0       # 스냅샷 푸시 횟수(진단·테스트)
+        self.heartbeats = 0   # 하트비트 횟수(진단·테스트)
+        if system is not None:  # 모든 훅은 코어 이벤트 루프 안에서 불린다 → Event.set 안전
+            system.on_quote.append(lambda _q: self.mark())
+            system.on_mark.append(lambda _m: self.mark())
+            system.on_trade.append(lambda _t: self.mark())
+            system.order_book.on_change.append(self.mark)
+
+    def mark(self) -> None:
+        """밀어줄 게 생겼다 — 전송 루프가 묶어서 보낸다."""
+        self._dirty.set()
+
+    @property
+    def subscribers(self) -> int:
+        return len(self._subs)
+
+    def _snapshot_text(self) -> str:
+        return _dumps({"channel": "manual", "ts": int(time.time() * 1000),
+                       "data": manual_snapshot(self._system)})
+
+    async def run(self) -> None:
+        """전송 루프 — dirty면 100ms 묶어 스냅샷, 조용하면 1초 하트비트."""
+        while True:
+            try:
+                await asyncio.wait_for(self._dirty.wait(), timeout=self._heartbeat_s)
+            except TimeoutError:
+                if self._subs:
+                    await self._broadcast(_dumps({"channel": "manual", "heartbeat": True,
+                                                  "ts": int(time.time() * 1000)}))
+                    self.heartbeats += 1
+                continue
+            await asyncio.sleep(self._coalesce_s)  # 몰린 이벤트 묶기
+            self._dirty.clear()
+            if self._subs:
+                await self._broadcast(self._snapshot_text())
+                self.pushes += 1
+
+    async def _broadcast(self, text: str) -> None:
+        for ws in list(self._subs):
+            try:
+                await ws.send_str(text)
+            except Exception:  # noqa: BLE001 - 죽은 접속은 목록에서 제거(다음 접속에 영향 없음)
+                self._subs.discard(ws)
+
+    async def handle(self, request: web.Request) -> web.WebSocketResponse:
+        """GET /ws — 접속 즉시 스냅샷 1회, 이후 푸시. 채널은 manual 하나(구독 메시지는 확인만)."""
+        ws = web.WebSocketResponse(heartbeat=None)
+        await ws.prepare(request)
+        self._subs.add(ws)
+        logging.getLogger("kp_arb.core").info("WS 화면 접속 — 접속자 %d", len(self._subs))
+        try:
+            await ws.send_str(self._snapshot_text())
+            async for msg in ws:
+                if msg.type != web.WSMsgType.TEXT:
+                    if msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+                        break
+                    continue
+                try:
+                    req = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(req, dict) and req.get("unsubscribe"):
+                    break
+        finally:
+            self._subs.discard(ws)
+            logging.getLogger("kp_arb.core").info(
+                "WS 화면 접속 종료 — 접속자 %d", len(self._subs))
+        return ws
+
+
 def make_app(
     state: CoreState,
     on_shutdown: Callable[[], None] | None = None,
@@ -654,6 +740,7 @@ def make_app(
     engine: RehearsalEngine | None = None,
     fx_service: FxReportService | None = None,
     boot_errors: list[str] | None = None,
+    hub: WsHub | None = None,
 ) -> web.Application:
     """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅.
 
@@ -729,6 +816,8 @@ def make_app(
     app = web.Application()
     app.router.add_get("/state", get_state)
     app.router.add_get("/manual_state", get_manual_state)
+    if hub is not None:  # 실시간 채널(DESIGN §12.1) — 메인창이 붙는 WebSocket
+        app.router.add_get("/ws", hub.handle)
     app.router.add_get("/monitor", get_monitor)
     app.router.add_post("/command", post_command)
     return app
@@ -856,11 +945,13 @@ async def _serve() -> None:
             boot_errors.append(f"시동(코어 조립 실패: {type(exc).__name__}: {exc})"[:200])
 
         # access_log=None: 화면 폴링(GET /state 1초)이 로그를 도배하지 않게
+        hub = WsHub(system)  # 실시간 채널 — system이 없어도 접속은 받는다(연결 표시용)
+        tasks.append(asyncio.create_task(hub.run()))
         runner = web.AppRunner(make_app(
             state, on_shutdown=stop.set,
             save=lambda: save_state(STATE_PATH, state),
             system=system, engine=engine, fx_service=fx_service,
-            boot_errors=boot_errors), access_log=None)
+            boot_errors=boot_errors, hub=hub), access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, HOST, DEFAULT_PORT)
         await site.start()

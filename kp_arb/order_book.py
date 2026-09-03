@@ -84,6 +84,9 @@ class OrderBook:
         # 체결이 **실제 적용될 때**(즉시체결·대기체결 공용, 흡수된 재통보는 제외) 불리는
         # 콜백 — 체결내역·누적을 타이밍 경합 없이 정확히 1회 기록하려는 용도(LiveSystem이 붙임).
         self.on_fill_applied: list[Callable[[TrackedOrder, float, float, str], None]] = []
+        # 장부가 바뀔 때(주문 등록·접수·체결·취소·거부·스냅샷 반영)마다 불리는 콜백 —
+        # 코어→화면 실시간 채널(DESIGN §12.1)이 "밀어줄 게 생겼다"를 알아채는 용도.
+        self.on_change: list[Callable[[], None]] = []
         # 미아 이벤트 버퍼(주문 역전 대비) — track 전에 온 WS 이벤트(체결·접수·취소·거부)를
         # 주문번호별로 보관했다가 track 직후 replay. LS·HL 공용. 외부 주문은 상한으로 버려짐.
         self._pending: dict[str, list[tuple[str, Fill | None]]] = {}
@@ -122,6 +125,7 @@ class OrderBook:
             if now - order.placed_ts >= _SNAPSHOT_GRACE_S:
                 del self._orders[oid]
         self._orders.update(snapshot)
+        self._changed()
 
     def replace_positions(
         self, positions: Iterable[Position], *, instrument: Instrument
@@ -143,7 +147,12 @@ class OrderBook:
         order = TrackedOrder(order_id=order_id, intent=intent, placed_ts=time.monotonic(),
                              placed_at=time.strftime("%H:%M:%S"))
         self._orders[order_id] = order
+        self._changed()
         return order
+
+    def _changed(self) -> None:
+        for cb in self.on_change:
+            cb()
 
     # --- 이벤트 (WS 체결통보 → 상태 전이 + 증분 갱신) ---
 
@@ -154,6 +163,7 @@ class OrderBook:
             return None
         if order.status is OrderStatus.NEW:
             order.status = OrderStatus.ACCEPTED
+            self._changed()
         return order
 
     def on_fill(self, fill: Fill) -> TrackedOrder | None:
@@ -212,6 +222,7 @@ class OrderBook:
             order.intent, qty, price, fill_id, order.filled_qty)
         for cb in self.on_fill_applied:  # 실제 적용 1회 — 체결내역·누적(타이밍 무관)
             cb(order, qty, price, fill_id)
+        self._changed()
 
     def on_cancel(self, order_id: str) -> TrackedOrder | None:
         order = self._orders.get(order_id)
@@ -220,6 +231,7 @@ class OrderBook:
             return None
         if order.is_open:
             order.status = OrderStatus.CANCELLED
+            self._changed()
         return order
 
     def on_reject(self, order_id: str) -> TrackedOrder | None:
@@ -229,6 +241,7 @@ class OrderBook:
             return None
         if order.is_open:
             order.status = OrderStatus.REJECTED
+            self._changed()
         return order
 
     def on_order_event(self, event: OrderEvent) -> TrackedOrder | None:
