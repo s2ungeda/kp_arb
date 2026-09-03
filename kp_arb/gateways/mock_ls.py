@@ -24,6 +24,7 @@ class MockLSGateway(LSGateway):
         self.placed: list[OrderIntent] = []
         self.fx_placed: list[tuple[str, Side, int, float]] = []  # 원달러선물 발주 기록
         self._ids = itertools.count(1)
+        self._last_prices: dict[tuple[object, object], float] = {}  # (종목, 상품) → 현재가
         self._positions: dict[Account, list[Position]] = {
             Account.KR_STOCK: [],
             Account.KR_DERIV: [],
@@ -64,6 +65,13 @@ class MockLSGateway(LSGateway):
         if position.account is None:
             raise ValueError("position needs an account")
         self._positions[position.account].append(position)
+
+    def seed_last_price(self, underlying: object, instrument: object, price: float) -> None:
+        """시동 초기값(구독 전 현재가 조회) 테스트용 — get_price_snapshots가 돌려줄 값."""
+        self._last_prices[(underlying, instrument)] = price
+
+    async def get_price_snapshots(self) -> dict[tuple[object, object], float]:
+        return dict(self._last_prices)
 
     def seed_balance(self, account: Account, amount: float) -> None:
         self._balances[account] = amount

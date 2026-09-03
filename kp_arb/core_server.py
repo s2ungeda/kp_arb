@@ -591,7 +591,10 @@ def monitor_snapshot(
     fx_used, fx_src = system.usdkrw_effective()
     out: dict[str, Any] = {
         "connected": True,
-        "fx": {"used": fx_used, "src": fx_src, "futures": system.usdkrw_futures},
+        "fx": {"used": fx_used, "src": fx_src, "futures": system.usdkrw_futures,
+               # 상태줄에 셋을 나란히(엑셀 시세!N11·N12 배치) — 현물 출처(LS/하나고시)도 함께
+               "spot": system.usdkrw_spot, "theory": system.usdkrw_theory,
+               "spot_src": system.usdkrw_spot_src},
         "phase": system.session.phase_for(Underlying.SAMSUNG).value,
         "halt": {"stock": system.session.halt_for("1"),
                  "futures": system.session.halt_for("5")},  # §8 정지 사유(없으면 null)

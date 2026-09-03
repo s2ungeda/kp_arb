@@ -270,11 +270,21 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             fill_board(board_rows(snap))
             fx = snap.get("fx") or {}
             bal = snap.get("balances") or {}
-            used, src, fut = fx.get("used"), fx.get("src"), fx.get("futures")
-            fx_text = "환율 -"
-            if used is not None:
-                tail = f" (선물 {fut:,.1f})" if fut is not None else ""
-                fx_text = f"환율[{src}] {used:,.2f}{tail}"
+            # 환율 3개를 나란히 — 쓰는 쪽에 [ ]. 엑셀 시세!N11(현물CUR)·N12(선물역산)과 같은 배치.
+            src = fx.get("src")
+            spot, theory, fut = fx.get("spot"), fx.get("theory"), fx.get("futures")
+            spot_src = fx.get("spot_src") or "-"
+
+            def _n(v: Any, d: int = 2) -> str:
+                return f"{v:,.{d}f}" if isinstance(v, (int, float)) else "-"
+
+            spot_txt = f"현물CUR({spot_src}) {_n(spot)}"
+            theory_txt = f"선물역산 {_n(theory)}"
+            if src == "현물":
+                spot_txt = f"[{spot_txt}]"
+            elif src == "선물이론":
+                theory_txt = f"[{theory_txt}]"
+            fx_text = f"환율: {spot_txt} · {theory_txt} · 선물원값 {_n(fut, 1)}"
             age = time.time() - state_box["ts"] if state_box["ts"] else -1
             fresh = f"{age:.0f}s 전" if age >= 0 else "-"
             halt = snap.get("halt") or {}  # §8 정지 사유(주식/선물, 없으면 null)

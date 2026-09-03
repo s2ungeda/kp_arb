@@ -4,6 +4,7 @@
 1) 계좌·비밀 로드(keyring/env) → 계좌별 게이트웨이 생성
 2) t8401 마스터로 **선물 최근월물 코드 자동 조회**(만기 롤오버 대응)
 3) **최초 REST 스냅샷 1회**: 잔고(주식/선물)·포지션·미체결 → OrderBook 초기화
+3-2) **구독 전 현재가 초기값**(주식·주식선물·원달러선물·현물환율) — 실시간이 안 와도 빈칸 방지
 4) WS 결선: 시세(H1_/JIF)+체결통보(SC*/O01·C01·H01) → OrderBook·SessionService
    — 이후는 실시간 이벤트가 기본(체결 대기 폴링 없음)
 같은 스냅샷(`refresh_snapshot`)은 온디맨드(추후 UI 조회 버튼)로 재호출 가능.
@@ -165,12 +166,13 @@ class LiveSystem:
         self._carry = carry_rates if carry_rates is not None else CarryRates()
         self._fees = fees if fees is not None else FeeRates()
         self._board_ref_qty = board_ref_qty  # CSV 분포 기록 기준 수량(화면 없을 때 est용)
-        # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — WS(FC0) 실시간 + 예비 조회 갱신.
+        # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — WS(FC9/DC0) 실시간 + 예비 조회 갱신.
         self.usdkrw_theory: float | None = None
         self.usdkrw_futures: float | None = None  # 원달러선물 현재가 원값(표시용)
         # 외환현물(주간 07:00~18:10 HL 환산용 — 엑셀 시세!N6/O6, 2026-08-21) + 사용 시간대
         self.usdkrw_spot: float | None = None
         self._fx_spot_ts = 0.0  # 마지막 LS 현물환율(CUR) 수신 시각 — Naver 백업 억제용
+        self.usdkrw_spot_src: str | None = None  # 현물환율 출처 "LS"|"하나고시" — 상태줄 표시
         self._fx_spot_window = (parse_hhmm(fx_spot_window[0]), parse_hhmm(fx_spot_window[1]))
         self._hl = hl_gateway
         self._hl_ws = hl_ws
@@ -327,6 +329,14 @@ class LiveSystem:
         이후 환율이론가(usdkrw_theory)·주식선물 이론가가 이 값으로 계산된다.
         """
         self._carry = CarryRates(stock_futures=eq, fx=fx)
+        # 환율이론가는 선물가 수신 때 계산해 둔 값이라, 금리만 바뀌면 다음 선물 틱까지 옛 금리로
+        # 남는다(2026-09-03 실측: 설정 0.4%로 바꿔도 16시 이후 1.0% 값 유지, 엑셀과 0.40원 차이).
+        # 저장된 최근월물 가격으로 즉시 다시 계산한다. (주식선물 이론가는 호출 때 계산하므로 무관)
+        if self._fx_futures is not None:
+            code = self._fx_futures[0]
+            price = self.fx_futures_price.get(code)
+            if price is not None:
+                self._apply_fx_price(code, price)
 
     def _hl_order_notional(self, intent: OrderIntent) -> float:
         """HL 주문 금액(USDC) = |수량| × 가격. 시장가(가격 없음)는 마크가로 추정."""
@@ -652,11 +662,13 @@ class LiveSystem:
         self._stock_ws.subscribe_market_status()
         self._stock_ws.subscribe_stock_fills()
         if self._fx_months:
-            # 원달러선물 체결(FC0) 실시간 — 근·차근 월물 모두 구독(§9.1). 최근월물만
-            # 환율이론가로 쓰고(차근은 저장만), 예비는 _fx_loop 30초 조회.
+            # 원달러선물 체결 실시간 — 주간 FC9 + 야간 DC0, 근·차근 월물 모두(§9.1). 최근월물만
+            # 환율이론가로 쓰고(차근은 저장만), 예비는 _fx_loop 30초 조회. 구 FC0는 2026-06-23
+            # 폐지돼 8/7~9/3 거부(10002)됐었음 — 선물계좌 토큰 WS(파생 그룹)로 등록한다.
+            fx_ws = self._deriv_ws if self._deriv_ws is not None else self._stock_ws
             for code, _ in self._fx_months:
-                self._stock_ws.subscribe_fx(code)
-            self._stock_ws.on_fx_price.append(self._apply_fx_price)
+                fx_ws.subscribe_fx(code)
+            fx_ws.on_fx_price.append(self._apply_fx_price)
         # 원달러 현물환율(CUR) 실시간 — 주간 HL 환산 본선(엑셀 LS현물CUR). Naver는 백업.
         self._stock_ws.subscribe_fx_spot()
         self._stock_ws.on_fx_spot.append(self._apply_fx_spot)
@@ -808,6 +820,7 @@ class LiveSystem:
             # 로드 실패 — WS 결선·상시 조회 생략(사용자가 곧 재접속). 서버는 /state로 실패 알림.
             return
         self._seed_session_from_env()
+        await self._seed_initial_prices()  # 구독 **전** 현재가 초기값 — 실시간이 안 와도 빈칸 방지
         self._wire()
         # 시동 REST 조회들은 **순차 실행** — 동시에 나가면 서버 계정당 초당 한도에
         # 걸려 일부(t1901 등)가 실패한다(운영 실측). 환율 폴링은 그 뒤에 시작.
@@ -839,7 +852,7 @@ class LiveSystem:
 
     def _apply_fx_price(self, code: str, price: float) -> None:
         """원달러선물 현재가 수신 → 월물별 저장 + **최근월물만** 환율이론가(현물환산) 갱신.
-        차근월물은 저장만 한다(§9.1 — 헤지 월물 선택용). WS(FC0)·예비 조회 공용."""
+        차근월물은 저장만 한다(§9.1 — 헤지 월물 선택용). WS(FC9/DC0)·예비 조회 공용."""
         from datetime import date
 
         if price <= 0:
@@ -858,13 +871,20 @@ class LiveSystem:
 
         if rate <= 0:
             return
+        if self.usdkrw_spot_src != "LS":  # 출처 전환(첫 수신·백업→LS 복귀)만 기록 — 틱마다 X
+            import logging
+
+            logging.getLogger("kp_arb.bootstrap").info(
+                "LS 현물환율(CUR) 수신 시작 %.2f (이전 출처: %s)", rate,
+                self.usdkrw_spot_src or "없음")
         self.usdkrw_spot = rate
+        self.usdkrw_spot_src = "LS"
         self._fx_spot_ts = _t.monotonic()
 
     async def _fx_loop(self) -> None:
         """환율 예비 갱신 — 시동 직후 초기값 + 30초 간격 확인 조회(t2111).
 
-        본선은 WS(FC0, K200선물 계열 TR — 사용자 확인) 실시간이고, 이 루프는
+        본선은 WS(주간 FC9 / 야간 DC0 — FC0는 2026-06 폐지) 실시간이고, 이 루프는
         WS가 조용할 때(체결 없음·미실측 필드 불일치)의 안전망이다. 주간(08~16시)만.
         """
         import logging
@@ -893,7 +913,14 @@ class LiveSystem:
 
                     spot = await fetch_usdkrw_spot()
                     if spot is not None:
+                        if self.usdkrw_spot_src != "하나고시":  # 전환 시점만 기록
+                            silent = _t.monotonic() - self._fx_spot_ts
+                            log.warning(
+                                "LS 현물환율(CUR) %s — 하나은행 고시환율로 대체 %.2f",
+                                "미수신(시동 후)" if self._fx_spot_ts == 0.0
+                                else f"{silent:.0f}초 무수신", spot)
                         self.usdkrw_spot = spot
+                        self.usdkrw_spot_src = "하나고시"  # 네이버 경유 하나은행 고시 매매기준율
                 failures = 0
             except Exception:  # noqa: BLE001
                 failures += 1
@@ -1108,6 +1135,44 @@ class LiveSystem:
                 )
         return board
 
+    async def _seed_initial_prices(self) -> None:
+        """구독 **전** 현재가 초기값 채우기 (사용자 원칙 2026-09-03).
+
+        실시간은 장 종료 후 재시동·구독 거부·피드 장애로 안 올 수 있다. 그렇다고 현재가를
+        0/None으로 두면 괴리·est·주문가가 전부 빈칸이 된다. 그래서 WS 결선 전에 REST로 마지막
+        가격을 먼저 채운다: 주식·주식선물(t1102/t8402) → 원달러선물 근·차근(t2111, 시간대 무관 —
+        밤 재시동도 마지막 체결가로 시작) → 현물환율(하나은행 고시, 실시간 CUR 오기 전 임시).
+        실패는 로그만 남기고 계속(실시간이 오면 채워진다). 순차 호출 — 초당 한도 보호.
+        """
+        import logging
+
+        log = logging.getLogger("kp_arb.bootstrap")
+        await self._seed_prices()  # 주식·주식선물·ETF 현재가 → self.trades (실패 시 자체 경고)
+        fx_filled = 0
+        for code, _ym in self._fx_months:
+            try:
+                price = await self._gw.get_fx_futures_price(code)
+            except Exception:  # noqa: BLE001 - 초기값 실패는 기록만(실시간·예비 조회가 채움)
+                log.warning("시동 초기값: 원달러선물 %s 현재가(t2111) 조회 실패", code,
+                            exc_info=True)
+                continue
+            if price is not None and price > 0:
+                self._apply_fx_price(code, price)
+                fx_filled += 1
+        if self._fx_futures is not None and self.usdkrw_spot is None:  # 라이브 구성일 때만
+            try:
+                from .gateways.fx_spot import fetch_usdkrw_spot
+
+                spot = await fetch_usdkrw_spot()
+            except Exception:  # noqa: BLE001
+                spot = None
+            if spot is not None:
+                self.usdkrw_spot = spot
+                self.usdkrw_spot_src = "하나고시"
+        log.info("시동 초기값 채움 — 현재가 %d종, 원달러선물 %d/%d월물, 현물환율 %s",
+                 len(self.trades), fx_filled, len(self._fx_months),
+                 self.usdkrw_spot_src or "없음")
+
     async def _seed_prices(self) -> None:
         """장중 체결이 오기 전(개장 전·애프터·한산 종목) 현재가 초기값 — 스냅샷 1회.
 
@@ -1261,7 +1326,7 @@ class LiveSystem:
         미확보 ETF 재시도는 병행 루프로.
         """
         complete = await self._load_etf_refs()
-        await self._seed_prices()
+        # 현재가 초기값은 start()가 구독 전에 이미 채웠다(_seed_initial_prices).
         if complete:
             await self._fx_loop()
         else:
@@ -1437,7 +1502,11 @@ async def bootstrap_live(
         return LSWebSocketClient(
             LSWebSocketConnector(url), token_provider=fresh_token,
             etf_symbols=etf_symbols,
-            status=WsStatus(venue="LS", name=name, kind="시세/주문", expects_stream=True),
+            # 선물 WS는 계좌 통보(O01/C01/H01)만 받아 평소 데이터가 없다 — "시세 지연(무데이터)"
+            # 헛경고(하루 10회+, 2026-09-03 실측)를 막기 위해 스트림 기대를 끈다.
+            status=WsStatus(venue="LS", name=name,
+                            kind="시세/주문" if account == Account.KR_STOCK else "주문통보",
+                            expects_stream=account == Account.KR_STOCK),
             # 장시간 운영: 사실상 무제한 재연결 + 2초 대기 (한도는 연속 실패에만)
             max_reconnects=1_000_000, reconnect_backoff_s=2.0,
         )

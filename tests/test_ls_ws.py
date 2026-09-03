@@ -126,7 +126,11 @@ async def test_subscribe_fx_spot_registers_cur() -> None:
     await client.run()
     cur = next(json.loads(m) for m in session.sent
                if json.loads(m)["body"]["tr_cd"] == "CUR")
-    assert cur["body"]["tr_key"] == "USD "   # 통화코드 + 공백 패딩(사용자 확정)
+    # LS 문서 샘플: tr_key "USD"+공백 패딩(Length 8). 4자리 "USD "는 등록만 되고 데이터 없음.
+    assert cur["body"]["tr_key"] == "USD     "
+    keys = [json.loads(m)["body"]["tr_key"] for m in session.sent
+            if json.loads(m)["body"]["tr_cd"] == "CUR"]
+    assert keys == ["USD     ", "USD   "]  # 8자리 + 6자리(base_id 길이) 둘 다
     assert cur["header"]["tr_type"] == "3"    # 시세 등록
 
 
@@ -385,9 +389,9 @@ async def test_quote_carries_full_depth() -> None:
 
 async def test_fx_trade_updates_price() -> None:
     # FC0(통화선물 체결) → on_fx_price(월물코드, 가격). 구독한 종목코드만.
-    frame = json.dumps({"header": {"tr_cd": "FC0", "tr_key": "175W07"},
+    frame = json.dumps({"header": {"tr_cd": "FC9", "tr_key": "175W07"},
                         "body": {"focode": "175W07", "price": "1530.1"}})
-    other = json.dumps({"header": {"tr_cd": "FC0", "tr_key": "175W08"},
+    other = json.dumps({"header": {"tr_cd": "FC9", "tr_key": "175W08"},
                         "body": {"focode": "175W08", "price": "1999.0"}})
     session = FakeConnection([other, frame])
     client = LSWebSocketClient(FakeConnector([session]))
@@ -398,14 +402,15 @@ async def test_fx_trade_updates_price() -> None:
     await client.run()
 
     assert events == [("175W07", 1530.1)]  # 미구독 월물(175W08)은 무시
-    assert any('"FC0"' in msg and '"175W07"' in msg for msg in session.sent)  # 구독 전송
+    assert any('"FC9"' in msg and '"175W07"' in msg for msg in session.sent)  # 주간 구독 전송
+    assert any('"DC0"' in msg and '"175W07"' in msg for msg in session.sent)  # 야간 구독 전송
 
 
 async def test_fx_trade_both_months_when_subscribed() -> None:
     # 근·차근 둘 다 구독하면 둘 다 (코드, 가격)으로 전달(§9.1 헤지 월물 선택용).
-    near = json.dumps({"header": {"tr_cd": "FC0", "tr_key": "175W07"},
+    near = json.dumps({"header": {"tr_cd": "FC9", "tr_key": "175W07"},
                        "body": {"focode": "175W07", "price": "1530.1"}})
-    nxt = json.dumps({"header": {"tr_cd": "FC0", "tr_key": "175W08"},
+    nxt = json.dumps({"header": {"tr_cd": "FC9", "tr_key": "175W08"},
                       "body": {"focode": "175W08", "price": "1533.4"}})
     client = LSWebSocketClient(FakeConnector([FakeConnection([near, nxt])]))
     client.subscribe_fx("175W07")

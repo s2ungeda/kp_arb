@@ -46,6 +46,18 @@ def test_share_is_fresh_rule() -> None:
     assert not share_is_fresh(10_000, 13_500, stale_s=3.0)   # 3.5초 전 — 낡음
 
 
+def _quiet_screen_log(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # 테스트가 실제 logs/screen_날짜.log에 쓰지 않게 — 화면 로그를 메모리 로거로 바꿔치기.
+    import logging
+
+    from kp_arb import core_client
+
+    lg = logging.getLogger("kp_arb.screen.test")
+    lg.propagate = False
+    lg.addHandler(logging.NullHandler())
+    monkeypatch.setattr(core_client, "screen_log", lambda: lg)
+
+
 def test_state_feed_reads_share_and_skips_unchanged(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     # 공유메모리가 있고 신선하면 그것을 읽고(버전 바뀔 때만 파싱), HTTP는 부르지 않는다.
     import json
@@ -55,6 +67,7 @@ def test_state_feed_reads_share_and_skips_unchanged(tmp_path, monkeypatch) -> No
     from kp_arb.core_client import run_state_feed
     from kp_arb.state_share import SHARE_PATH_ENV, ShareWriter
 
+    _quiet_screen_log(monkeypatch)
     path = str(tmp_path / "share.bin")
     monkeypatch.setenv(SHARE_PATH_ENV, path)
     calls = {"http": 0}
@@ -85,6 +98,7 @@ def test_state_feed_falls_back_to_http_when_share_missing(tmp_path, monkeypatch)
     from kp_arb.core_client import run_state_feed
     from kp_arb.state_share import SHARE_PATH_ENV
 
+    _quiet_screen_log(monkeypatch)
     monkeypatch.setenv(SHARE_PATH_ENV, str(tmp_path / "none.bin"))
     monkeypatch.setattr(core_client, "core_request_err",
                         lambda *_a, **_k: ({"open_orders": []}, None))
@@ -99,6 +113,7 @@ def test_state_feed_falls_back_when_share_stale(tmp_path, monkeypatch) -> None: 
     from kp_arb.core_client import run_state_feed
     from kp_arb.state_share import SHARE_PATH_ENV, ShareWriter
 
+    _quiet_screen_log(monkeypatch)
     path = str(tmp_path / "share.bin")
     monkeypatch.setenv(SHARE_PATH_ENV, path)
     monkeypatch.setattr(core_client, "core_request_err",

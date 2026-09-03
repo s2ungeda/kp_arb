@@ -36,8 +36,18 @@ QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1", "UH1"})  # KRX/NXT/통합 �
 FUTURES_QUOTE_TR = "JH0"   # 주식선물 호가 (body 필드는 H1_와 동일 가정 — 장중 실확인 예정)
 STOCK_TRADE_TRS: tuple[str, ...] = ("S3_", "NS3", "US3")  # 체결: KRX/NXT/통합
 FUTURES_TRADE_TR = "JC0"   # 주식선물 체결 (동일 가정)
-FX_TRADE_TR = "FC0"        # 통화선물 체결 — K200선물 계열 TR로 수신 가능(사용자 확인, 실측 예정)
-FX_SPOT_TR = "CUR"         # 원달러 현물환율 실시간(투자정보) — tr_key="USD "(통화코드+공백 패딩)
+# 통화(원달러)선물 체결 — 명목상 "KOSPI200선물" TR이지만 tr_key에 USD선물 단축코드를 넣어 공용.
+# 구 FC0/FH0는 **2026-06-23 폐지**(LS 공식 답변) → 등록하면 rsp_cd 10002 거부.
+# 주간(08:45~15:45) FC9(체결)/FH9(호가)/YF9(예상), 야간 KRX파생(18:00~06:00) DC0/DH0/DYC.
+# (사용자 제공 정리표, 2026-09-03)
+FX_TRADE_TR = "FC9"          # 주간 통화선물 체결
+FX_NIGHT_TRADE_TR = "DC0"    # 야간 KRX파생 체결(같은 단축코드)
+FX_SPOT_TR = "CUR"         # 원달러 현물환율 실시간(투자정보)
+# CUR tr_key — LS 문서(현물정보USD실시간): tr_key Length 8, 샘플 "USD     "(USD+공백 패딩).
+# 4자리 "USD "로 보내면 등록은 '정상처리'되지만 어떤 종목에도 안 맞아 데이터가 안 온다
+# (2026-09-03 실측: 낮 내내 미수신 → 하나고시 백업만 사용). 8자리(규격)+6자리(base_id 길이)
+# 둘 다 등록해 어느 쪽이든 받고, 실측으로 확정되면 하나로 줄인다(중복 수신은 같은 값이라 무해).
+FX_SPOT_KEYS = ("USD".ljust(8), "USD".ljust(6))
 EXPECTED_TRS: tuple[str, ...] = ("YS3", "NYS", "UYS", "YJC")  # 예상체결: KRX/NXT/통합/선물
 # NXT 시세는 전용 TR(NH1/NS3)이 아니라 **통합 TR(UH1/US3/UYS)**로 온다(RTD 실측 이관).
 # 통합 TR의 tr_key는 "U"+6자리코드+공백3(총 10자). 모의(29443)는 U/N계열 미중계 —
@@ -231,14 +241,16 @@ class LSWebSocketClient:
     def subscribe_fx(self, code: str) -> None:
         """통화선물(원달러) 체결 구독 → on_fx_price. 환율이론가 계산용 (DESIGN §6.1)."""
         self._fx_codes.add(code)
-        self._add(FX_TRADE_TR, code)
+        self._add(FX_TRADE_TR, code)        # 주간 FC9
+        self._add(FX_NIGHT_TRADE_TR, code)  # 야간 DC0 — 같은 코드로 등록, 시간대별로 오는 쪽이 옴
 
     def subscribe_fx_spot(self) -> None:
-        """원달러 현물환율(CUR) 실시간 구독 → on_fx_spot. tr_key='USD '(통화코드+공백 패딩).
+        """원달러 현물환율(CUR) 실시간 구독 → on_fx_spot. tr_key='USD'+공백 패딩(문서 샘플).
 
-        주간 HL 환산에 쓰는 현물환율을 LS 실시간으로 받는다(엑셀 시세!G1 LS현물CUR).
+        주간 HL 환산에 쓰는 현물환율을 LS 실시간으로 받는다(엑셀 시세!N11 LS현물CUR).
         """
-        self._add(FX_SPOT_TR, "USD ")
+        for key in FX_SPOT_KEYS:
+            self._add(FX_SPOT_TR, key)
 
     def subscribe_trades(self, underlying: Underlying) -> None:
         """주식·ETF 체결(현재가)·예상체결 구독 — KRX(S3_/YS3) + 통합(US3/UYS, NXT 포함)."""
@@ -326,6 +338,13 @@ class LSWebSocketClient:
     async def _resubscribe(self, conn: WSConnection) -> None:
         for tr_cd, tr_key, tr_type in self._subs:
             await conn.send(self._register_msg(tr_cd, tr_key, tr_type))
+        import logging
+
+        # 접속마다 구독 목록 1줄 — "구독이 안 나갔나 / 나갔는데 안 오나"를 로그로 가르기 위함
+        # (2026-09-03 현물환율 CUR 미수신 조사). 키 공백 패딩이 보이게 repr.
+        logging.getLogger("kp_arb.ls_ws").info(
+            "%s 구독 %d건: %s", self.status.name, len(self._subs),
+            ", ".join(f"{tr}/{key!r}" if key else tr for tr, key, _t in self._subs))
 
     def _register_msg(self, tr_cd: str, tr_key: str, tr_type: str) -> str:
         # tr_type: 1=계좌 등록(SC*), 3=시세 등록(H1_/JIF 등)
@@ -342,9 +361,21 @@ class LSWebSocketClient:
         msg = json.loads(raw)
         for raw_handler in self.on_raw:
             raw_handler(raw)
-        tr_cd = msg.get("header", {}).get("tr_cd")
+        header = msg.get("header", {})
+        tr_cd = header.get("tr_cd")
         if not isinstance(msg.get("body"), dict):
-            return  # 등록 ACK/시스템 프레임(body 없음) — 데이터 아님, 무시
+            # 등록 ACK/시스템 프레임(body 없음) — 데이터는 아니지만 **등록 거부 여부가 여기 온다**.
+            # 조용히 버리면 "구독했는데 안 온다"의 원인을 영영 모른다(2026-09-03 CUR 미수신 조사).
+            import logging
+
+            rsp_cd = str(header.get("rsp_cd", "") or "")
+            log = logging.getLogger("kp_arb.ls_ws")
+            if rsp_cd and rsp_cd != "00000":
+                log.warning("%s 구독 응답 거부 %s: %s", self.status.name, tr_cd, header)
+            else:
+                log.info("%s 구독 응답 %s %s", self.status.name, tr_cd,
+                         header.get("rsp_msg", ""))
+            return
         if tr_cd in QUOTE_TRS:
             quote = self._parse_quote(msg)
             if quote is not None:
@@ -379,7 +410,7 @@ class LSWebSocketClient:
             status = self._parse_status(msg)
             for status_handler in self.on_market_status:
                 status_handler(status)
-        elif tr_cd == FX_TRADE_TR:
+        elif tr_cd in (FX_TRADE_TR, FX_NIGHT_TRADE_TR):
             fx = self._parse_fx(msg)
             if fx is not None:
                 for fx_handler in self.on_fx_price:
@@ -403,8 +434,14 @@ class LSWebSocketClient:
         return rate if rate > 0 else None
 
     def _parse_fx(self, msg: dict[str, Any]) -> tuple[str, float] | None:
-        # FC0 체결가 필드는 'price' 가정(실측 예정 — 다르면 on_raw로 확인). (월물코드, 가격).
+        # FC9/DC0 체결가 필드는 'price' 가정 — 첫 프레임 원문을 1회 남겨 실측 확인(아래 로그).
         body = msg["body"]
+        if not getattr(self, "_fx_first_logged", False):
+            self._fx_first_logged = True
+            import logging
+
+            logging.getLogger("kp_arb.ls_ws").info(
+                "[실측] %s 첫 수신 body=%r", msg.get("header", {}).get("tr_cd"), body)
         code = str(body.get("focode") or body.get("shcode")
                    or msg.get("header", {}).get("tr_key", ""))
         if self._fx_codes and code not in self._fx_codes:

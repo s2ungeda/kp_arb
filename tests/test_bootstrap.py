@@ -228,6 +228,27 @@ def test_ws_statuses_collects_present_clients() -> None:
     assert [s.to_dict()["connected"] for s in statuses] == [False, False]  # 시동 전
 
 
+def test_fx_spot_source_marked_ls() -> None:
+    # 현물환율 출처 — LS 실시간 수신이면 "LS"(하나고시 백업과 구분해 상태줄에 표시).
+    system, _, _ = _system([])
+    assert system.usdkrw_spot_src is None
+    system._apply_fx_spot(1386.1)
+    assert system.usdkrw_spot == 1386.1 and system.usdkrw_spot_src == "LS"
+
+
+def test_set_carry_rates_recomputes_fx_theory_immediately() -> None:
+    # 금리 설정을 바꾸면 다음 선물 틱을 기다리지 않고 환율이론가를 즉시 다시 계산한다.
+    system, _, _ = _system([])
+    system._fx_futures = ("175W09", 202609)
+    system._fx_months = [("175W09", 202609)]
+    system._apply_fx_price("175W09", 1357.9)
+    before = system.usdkrw_theory
+    assert before is not None
+    system.set_carry_rates(fx=0.004, eq=0.03)  # 1.0% → 0.4%
+    after = system.usdkrw_theory
+    assert after is not None and after < before  # 금리가 낮아졌으니 환산값도 내려간다
+
+
 def test_fx_price_only_near_month_feeds_theory() -> None:
     # §9.1 — 근·차근 둘 다 저장하되, 환율이론가는 최근월물로만 갱신(차근에 섞이지 않게).
     system, _, _ = _system([])
@@ -278,6 +299,24 @@ async def test_start_loads_snapshot_then_streams() -> None:
     trs = {json.loads(m)["body"]["tr_cd"] for m in connector.conn.sent}
     assert {"H1_", "UH1", "JIF", "SC0", "SC1"} <= trs  # NXT는 통합(UH1)로 수신
     assert "O01" not in trs
+
+
+async def test_prices_seeded_before_subscribe() -> None:
+    # 사용자 원칙(2026-09-03): 실시간이 안 와도 현재가가 0/None이면 안 된다 →
+    # WS 결선(구독) **전에** REST 조회로 채워져 있어야 한다.
+    system, _, _ = _system([])
+    system._gw.seed_last_price(SAMSUNG, Instrument.KR_STOCK, 71_000.0)  # type: ignore[attr-defined]
+    seen: dict[str, dict[object, float]] = {}
+    orig_wire = system._wire
+
+    def wire() -> None:
+        seen["at_wire"] = dict(system.trades)  # 결선 시점에 이미 채워져 있나
+        orig_wire()
+
+    system._wire = wire  # type: ignore[method-assign]
+    await system.start()
+    await system.wait()
+    assert seen["at_wire"].get((SAMSUNG, Instrument.KR_STOCK, "krx")) == 71_000.0
 
 
 async def test_startup_init_ok_leaves_no_error() -> None:
