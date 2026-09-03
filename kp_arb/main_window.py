@@ -380,6 +380,8 @@ def main() -> None:
                 return  # 종료 진행 — 다음 refresh 예약 안 함
             if alive_box["alive"]:
                 lbl_core.config(text="코어: 연결됨 (127.0.0.1:8787)", fg="dark green")
+                if status.cget("text") == "코어 시작 중 ...":  # 시작 요청 → 실제 연결 확인
+                    status.config(text="코어 시작 완료")
             else:
                 lbl_core.config(text="코어: 미접속 — 메뉴 ▸ 코어 ▸ 코어 시작",
                                 fg="#8b0000")

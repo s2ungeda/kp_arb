@@ -8,21 +8,24 @@ LS와 동일 패턴: asyncio 네이티브, 주입형 ``WSConnector``/``WSConnect
   → ``{"channel":"activeAssetCtx","data":{"coin":..,"ctx":{"markPx":..}}}``
 - ``{"method":"subscribe","subscription":{"type":"userFills","user":"0x.."}}``
   → ``{"channel":"userFills","data":{"isSnapshot"?,"fills":[{oid,tid,px,sz,time,fee,..}]}}``
-  isSnapshot(과거 체결 일괄)은 스킵 — 이벤트만 OrderBook으로.
+  isSnapshot(과거 체결 일괄): 시동 시엔 스킵, 재접속 시엔 끊긴 사이의 신규 체결(끊김 이후·
+  미처리 tid)만 이벤트로 흘림 — HL 문서 "놓친 데이터는 재접속 스냅샷에 담겨 온다" 대응.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from ..domain.enums import Instrument, Underlying, Venue
 from ..domain.models import Quote
-from ..order_log import ws_order_raw
+from ..order_log import logger_for, ws_order_raw
 from ..ws_status import WsStatus
 from .hl import Mark
 from .hl_live import HL_SYMBOLS
@@ -102,6 +105,15 @@ class HLWebSocketClient:
         self.on_raw: list[Callable[[str], None]] = []
         # 재연결(최초 연결 제외) 후 재구독까지 끝나면 발화 — OrderBook 재스냅샷용(Phase 8-4).
         self.on_reconnect: list[Callable[[], None]] = []
+        # 재접속 스냅샷 복구용 — 끊긴 순간의 벽시계(epoch ms)와 이미 처리한 체결번호(tid).
+        # HL 문서: "끊긴 동안 놓친 데이터는 재접속 시 스냅샷에 담겨 온다" → 끊김 이후·미처리
+        # tid만 정상 체결로 흘리고, 나머지(끊김 이전·중복)는 건너뛴다. 처리 내역은 로그로.
+        self._disconnected_at_ms: float | None = None
+        self._seen_tids: set[str] = set()
+        self._seen_order: deque[str] = deque(maxlen=5000)  # set 크기 상한(오래된 것부터 잊음)
+        self._snapshot_done = asyncio.Event()  # 재접속 후 userFills 스냅샷 처리 완료 신호
+        self._bg_tasks: set[asyncio.Task[None]] = set()  # 훅 지연 실행 태스크(GC 방지)
+        self._hooks_pending = False  # 재접속 훅 아직 안 울림(스냅샷 대기 중)
 
     # --- 구독 등록 ---
 
@@ -191,15 +203,21 @@ class HLWebSocketClient:
         while True:
             ping_task: asyncio.Task[None] | None = None
             control_task: asyncio.Task[None] | None = None
+            hook_task: asyncio.Task[None] | None = None
             try:
                 conn = await self._connector.connect()
                 self.status.on_connect()
                 self._control.clear()  # 재연결이면 희망 상태로 전부 재구독 — 옛 제어 폐기
                 for sub in self._subs:
                     await conn.send(json.dumps({"method": "subscribe", "subscription": sub}))
-                if self.status.connects > 1:  # 재연결(최초 아님) → 재동기 훅
-                    for on_reconnect in self.on_reconnect:
-                        on_reconnect()
+                if self.status.connects > 1:  # 재연결(최초 아님) → 스냅샷 처리 뒤 재동기 훅
+                    # 훅(REST 재동기)이 스냅샷보다 먼저 장부를 맞추면 뒤늦게 적용되는 스냅샷
+                    # 체결이 이중 반영된다 — 스냅샷 처리 완료(최대 3초)를 기다렸다가 훅 실행.
+                    self._snapshot_done.clear()
+                    self._hooks_pending = True
+                    hook_task = asyncio.create_task(self._fire_reconnect_after_snapshot())
+                    self._bg_tasks.add(hook_task)
+                    hook_task.add_done_callback(self._bg_tasks.discard)
                 ping_task = asyncio.create_task(self._ping_loop(conn))
                 control_task = asyncio.create_task(self._control_loop(conn))
                 async for raw in conn:
@@ -216,6 +234,7 @@ class HLWebSocketClient:
             except (ConnectionError, OSError):
                 if self.status.connected:
                     self.status.on_disconnect()
+                    self._disconnected_at_ms = time.time() * 1000.0
                 attempts += 1
                 if attempts > self._max_reconnects:
                     raise
@@ -224,12 +243,16 @@ class HLWebSocketClient:
                 continue
             else:
                 self.status.on_disconnect()  # 스트림 정상 종료 = 서버가 닫음 = 끊김
+                self._disconnected_at_ms = time.time() * 1000.0
                 return
             finally:
                 if ping_task is not None:
                     ping_task.cancel()
                 if control_task is not None:
                     control_task.cancel()
+                if hook_task is not None:
+                    hook_task.cancel()
+                self._run_reconnect_hooks()  # 스냅샷 전에 연결이 끝났으면 훅을 지금 울림
 
     @staticmethod
     async def _ping_loop(conn: WSConnection, interval_s: float = 20.0) -> None:
@@ -294,10 +317,85 @@ class HLWebSocketClient:
         elif channel == "userFills":
             ws_order_raw(Venue.HYPERLIQUID, raw)  # 체결통보 원본(스냅샷 포함) 상시 기록
             if data.get("isSnapshot"):
-                return  # 과거 체결 일괄 — 이벤트 아님
+                self._handle_fill_snapshot(data)  # 시동=건너뜀 / 재접속=끊김 이후 신규만 처리
+                return
             for fill in self._parse_fills(data):
+                self._remember_tid(fill.fill_id)
                 for fill_handler in self.on_fill:
                     fill_handler(fill)
+
+    # --- 재접속 스냅샷 복구 ---
+
+    def _remember_tid(self, tid: str) -> None:
+        """처리한 체결번호 기억(상한 5,000 — 넘치면 오래된 것부터 잊음)."""
+        if not tid or tid in self._seen_tids:
+            return
+        if len(self._seen_order) == self._seen_order.maxlen:
+            self._seen_tids.discard(self._seen_order[0])
+        self._seen_order.append(tid)
+        self._seen_tids.add(tid)
+
+    @staticmethod
+    def _fmt_ms(ms: float) -> str:
+        return datetime.fromtimestamp(ms / 1000.0).strftime("%H:%M:%S.%f")[:-3]
+
+    def _handle_fill_snapshot(self, data: dict[str, Any]) -> None:
+        """userFills 스냅샷(isSnapshot) 처리 — 무엇을 어떻게 했는지 반드시 로그.
+
+        - 시동 시(첫 연결): 시동 전 체결이라 전부 건너뜀(장부는 REST 조회가 기준).
+        - 재접속 시: 끊김 이전 체결은 건너뛰고, 이미 처리한 tid는 중복으로 건너뛰고,
+          나머지(끊긴 사이에 난 체결)만 정상 체결로 흘린다 → 장부·기록·로그·전략 통지.
+        """
+        log = logger_for(Venue.HYPERLIQUID)
+        raw_n = len(data.get("fills", []) or [])
+        fills = self._parse_fills(data)  # 대상 코인만
+        try:
+            if self.status.connects <= 1 or self._disconnected_at_ms is None:
+                log.info("HL 체결 스냅샷 %d건(대상 %d) — 시동 시 수신, 시동 전 체결이라 건너뜀"
+                         "(장부는 REST 조회 기준)", raw_n, len(fills))
+                return
+            cutoff = self._disconnected_at_ms - 2000.0  # 끊김 직전 2초는 여유로 포함
+            old = dup = 0
+            fresh: list[Fill] = []
+            for f in fills:
+                if f.ts < cutoff:
+                    old += 1
+                elif f.fill_id in self._seen_tids:
+                    dup += 1
+                else:
+                    fresh.append(f)
+            gap_s = (time.time() * 1000.0 - self._disconnected_at_ms) / 1000.0
+            log.log(
+                logging.WARNING if fresh else logging.INFO,
+                "HL 재접속 스냅샷 체결 %d건(대상 %d): 끊김 이전 %d 건너뜀 · 중복 %d 건너뜀 · "
+                "신규 %d 처리 (끊김 %s, 재연결까지 %.1f초)",
+                raw_n, len(fills), old, dup, len(fresh),
+                self._fmt_ms(self._disconnected_at_ms), gap_s)
+            for f in fresh:
+                log.warning("스냅샷 복구 체결 → #%s tid=%s %g @ %s (체결 %s)",
+                            f.order_id, f.fill_id, f.qty, f.price, self._fmt_ms(f.ts))
+                self._remember_tid(f.fill_id)
+                for fill_handler in self.on_fill:
+                    fill_handler(f)
+        finally:
+            self._snapshot_done.set()
+
+    async def _fire_reconnect_after_snapshot(self) -> None:
+        """재접속 훅(REST 재동기)을 스냅샷 처리 뒤에 — 3초 내 안 오면 그냥 실행."""
+        try:
+            await asyncio.wait_for(self._snapshot_done.wait(), timeout=3.0)
+        except TimeoutError:
+            logger_for(Venue.HYPERLIQUID).warning(
+                "HL 재접속 스냅샷 3초 내 미수신 — 재동기 훅을 먼저 실행")
+        self._run_reconnect_hooks()
+
+    def _run_reconnect_hooks(self) -> None:
+        """미발화 재접속 훅을 1회 실행(이미 울렸으면 무시)."""
+        if not self._hooks_pending:
+            return
+        self._hooks_pending = False
+        for on_reconnect in self.on_reconnect:
+            on_reconnect()
 
     def _parse_mark(self, data: dict[str, Any]) -> Mark | None:
         underlying = self._by_symbol.get(str(data.get("coin", "")))

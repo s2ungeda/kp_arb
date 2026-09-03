@@ -358,6 +358,63 @@ def test_bbo_keeps_merged_ladder_intact() -> None:
     assert quote.asks == [(184.15, 7.0)]
 
 
+def _snapshot_frame(fills: list[dict]) -> str:  # type: ignore[type-arg]
+    return json.dumps({"channel": "userFills",
+                       "data": {"isSnapshot": True, "user": ADDR, "fills": fills}})
+
+
+def _fill(tid: int, time_ms: int, oid: int = 485489797671) -> dict:  # type: ignore[type-arg]
+    return {"coin": "xyz:SMSN", "px": "183.87", "sz": "0.1", "side": "B",
+            "oid": oid, "tid": tid, "time": time_ms, "fee": "0.008"}
+
+
+async def test_startup_snapshot_skipped() -> None:
+    # 시동 시 첫 스냅샷 — 시동 전 체결이라 이벤트로 흘리지 않는다(장부는 REST 기준).
+    import time as _t
+
+    client = HLWebSocketClient(FakeConnector([
+        _snapshot_frame([_fill(1, int(_t.time() * 1000))])]))
+    got: list[Fill] = []
+    client.on_fill.append(got.append)
+    await client.run()
+    assert got == []
+
+
+async def test_reconnect_snapshot_recovers_only_gap_fills() -> None:
+    # 재접속 스냅샷: 끊김 이전 체결·이미 처리한 tid는 건너뛰고, 끊긴 사이 신규 체결만 흘린다.
+    import time as _t
+
+    now_ms = int(_t.time() * 1000)
+    live = json.dumps({"channel": "userFills", "data": {"user": ADDR,
+                                                         "fills": [_fill(100, now_ms)]}})
+    s1 = _FailingConn([live, mark_frame()], fail_after=1)  # tid=100 처리 후 끊김(오류 경로)
+    s2 = _FailingConn([_snapshot_frame([
+        _fill(50, now_ms - 60_000),   # 끊김 1분 전 — 건너뜀
+        _fill(100, now_ms),           # 이미 처리 — 중복 건너뜀
+        _fill(200, now_ms + 500),     # 끊긴 사이 신규 — 처리
+    ])])
+    client = HLWebSocketClient(_MultiConnector([s1, s2]))
+    got: list[Fill] = []
+    client.on_fill.append(got.append)
+    await client.run()
+    assert [f.fill_id for f in got] == ["100", "200"]
+
+
+async def test_reconnect_hook_fires_after_snapshot() -> None:
+    # 재동기 훅(REST)은 스냅샷 처리 **뒤**에 — 순서가 바뀌면 스냅샷 체결이 이중 반영된다.
+    import time as _t
+
+    now_ms = int(_t.time() * 1000)
+    s1 = _FailingConn([mark_frame(), mark_frame()], fail_after=1)
+    s2 = _FailingConn([_snapshot_frame([_fill(300, now_ms + 100)])])
+    client = HLWebSocketClient(_MultiConnector([s1, s2]))
+    order: list[str] = []
+    client.on_fill.append(lambda f: order.append("fill"))
+    client.on_reconnect.append(lambda: order.append("hook"))
+    await client.run()
+    assert order == ["fill", "hook"]
+
+
 def test_ping_interval_default_20s() -> None:
     # HL 유지용 핑 주기 — 20초(60초 무통신 규정 대비 여유, 사용자 지정 2026-09-02).
     import inspect
