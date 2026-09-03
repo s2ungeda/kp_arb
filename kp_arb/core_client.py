@@ -14,6 +14,7 @@ import urllib.request
 from typing import Any
 
 CORE_URL = "http://127.0.0.1:8787"
+CORE_WS_URL = "ws://127.0.0.1:8787/ws"  # 실시간 채널(DESIGN §12.1) — 메인창만 붙는다
 PARENT_PID_ENV = "KP_PARENT_PID"  # 메인이 자식 창에 자기 PID를 넘겨 고아 방지
 
 

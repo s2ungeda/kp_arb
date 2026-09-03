@@ -254,6 +254,49 @@ def main() -> None:
 
     threading.Thread(target=poll_core, daemon=True).start()
 
+    # --- 실시간 채널(DESIGN §12.1): 코어 /ws 수신 전용 스레드 → 공유메모리 기록 ---
+    # 소켓은 이 하나뿐. 자식 창들은 환경변수(KP_SHARE_PATH)로 받은 파일을 읽기만 한다 —
+    # os.environ에 넣어두면 launch_module이 띄우는 자식이 그대로 물려받는다.
+    from .state_share import SHARE_PATH_ENV, ShareWriter, default_share_path
+
+    share_path = default_share_path(os.getpid())
+    os.environ[SHARE_PATH_ENV] = share_path
+
+    def ws_receiver() -> None:
+        import json
+
+        from websockets.sync.client import connect
+
+        from .core_client import CORE_WS_URL, screen_log
+
+        writer = ShareWriter(share_path)
+        fails = 0
+        while not closing["flag"]:
+            try:
+                with connect(CORE_WS_URL, open_timeout=3.0, close_timeout=1.0) as ws:
+                    ws.send('{"subscribe":["manual"]}')
+                    if fails:
+                        screen_log().warning("메인 WS 복구 — 연속 실패 %d회 뒤 정상", fails)
+                        fails = 0
+                    while not closing["flag"]:
+                        raw = ws.recv(timeout=5.0)  # 하트비트 1초 — 5초 무소식이면 끊김으로
+                        msg = json.loads(raw)
+                        ts = int(msg.get("ts") or time.time() * 1000)
+                        if msg.get("heartbeat"):
+                            writer.touch(ts)
+                        elif "data" in msg:
+                            writer.write(json.dumps(msg["data"], ensure_ascii=False)
+                                         .encode("utf-8"), ts)
+            except Exception as exc:  # noqa: BLE001 - 끊김·미접속: 로그 후 2초 뒤 재접속
+                fails += 1
+                if fails == 1 or fails % 30 == 0:
+                    screen_log().warning(
+                        "메인 WS 끊김/실패 %d회 — 2초 뒤 재접속: %s: %s",
+                        fails, type(exc).__name__, exc)
+                time.sleep(2.0)
+
+    threading.Thread(target=ws_receiver, daemon=True).start()
+
     def _next_slot(module: str) -> int:
         # 같은 module의 살아있는 인스턴스가 안 쓰는 가장 작은 슬롯 — 창별 위치 분리.
         used = {slot for tok, slot, p in launched
