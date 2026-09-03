@@ -95,10 +95,17 @@ class LSApiGateway(LSGateway):
         accounts: LSAccounts | None = None,
         futures_symbols: Mapping[Underlying, str] | None = None,
         etf_symbols: Mapping[Underlying, str] | None = None,
+        next_futures_symbols: Mapping[Underlying, str] | None = None,
     ) -> None:
         self._rest_by_account = dict(rest_by_account)
         self._accounts = accounts
-        self._futures_symbols: dict[Underlying, str] = dict(futures_symbols or {})
+        # 주식선물 코드: (종목, 근|차근) → 코드 (§5.11). futures_symbols=근월물, next_=차근월물.
+        self._futures_codes: dict[tuple[Underlying, Instrument], str] = {}
+        for u, code in (futures_symbols or {}).items():
+            self._futures_codes[(u, Instrument.KR_STOCK_FUTURE)] = code
+        for u, code in (next_futures_symbols or {}).items():
+            self._futures_codes[(u, Instrument.KR_STOCK_FUTURE_NEXT)] = code
+        self._futures_key = {v: k for k, v in self._futures_codes.items()}  # 코드 → (종목, 상품)
         # 단일종목 레버리지 ETF 코드(config.yaml에서 주입). 없으면 ETF 미취급.
         self._etf_symbols: dict[Underlying, str] = dict(etf_symbols or {})
         self._etf_underlying = {v: k for k, v in self._etf_symbols.items()}
@@ -115,6 +122,7 @@ class LSApiGateway(LSGateway):
         base_url: str = LIVE_BASE_URL,
         futures_symbols: Mapping[Underlying, str] | None = None,
         etf_symbols: Mapping[Underlying, str] | None = None,
+        next_futures_symbols: Mapping[Underlying, str] | None = None,
         now: Callable[[], float] = time.monotonic,
     ) -> LSApiGateway:
         """계좌별 키로 계좌별 토큰·REST 클라이언트를 조립. (레이트리밋은 계좌별 독립.)"""
@@ -131,7 +139,8 @@ class LSApiGateway(LSGateway):
             rest_by_account[account] = LSRestClient(
                 base_url, tokens, rest_transport, limiter, backoff_base_s=0.3)
         return cls(rest_by_account, accounts=accounts,
-                   futures_symbols=futures_symbols, etf_symbols=etf_symbols)
+                   futures_symbols=futures_symbols, etf_symbols=etf_symbols,
+                   next_futures_symbols=next_futures_symbols)
 
     def _rest_for(self, account: Account) -> LSRestClient:
         return self._rest_by_account[account]
@@ -161,7 +170,7 @@ class LSApiGateway(LSGateway):
         if intent.instrument in self._SPOT:
             tr_cd, path = self.SPOT_ORDER_TR, self.SPOT_PATH
             body = self._spot_order_body(intent, account)
-        elif intent.instrument is Instrument.KR_STOCK_FUTURE:
+        elif intent.instrument.is_stock_future:  # 근·차근 — 코드만 다르고 TR 동일
             tr_cd, path = self.FUTURE_ORDER_TR, self.FUTURE_PATH
             body = self._future_order_body(intent, account)
         else:
@@ -379,8 +388,8 @@ class LSApiGateway(LSGateway):
             targets.append((u, Instrument.KR_STOCK, u.krx_code, False))
         for u, code in self._etf_symbols.items():
             targets.append((u, Instrument.KR_ETF, code, False))
-        for u, code in self._futures_symbols.items():
-            targets.append((u, Instrument.KR_STOCK_FUTURE, code, True))
+        for (u, instrument), code in self._futures_codes.items():  # 근·차근 모두
+            targets.append((u, instrument, code, True))
         for u, instrument, code, futures in targets:
             price = await self.get_last_price(code, futures=futures)
             if price is not None and price > 0:
@@ -514,18 +523,17 @@ class LSApiGateway(LSGateway):
         # t0441 실측 행: expcode(선물코드 "A5067000"), medocd(1매도/2매수),
         # jqty(잔고수량), pamt(평균단가 문자열). 취급 외 종목(실계좌 보유)은 건너뜀.
         code = str(row.get("expcode", ""))
-        underlying = next(
-            (u for u, sh in self._futures_symbols.items() if sh == code), None
-        )
-        if underlying is None:
-            return None  # 취급 외 종목(예: 원달러선물 보유분) — 추적 대상 아님
+        key = self._futures_key.get(code)  # 코드 → (종목, 근|차근)
+        if key is None:
+            return None  # 취급 외 종목(예: 원달러선물·지난 월물 보유분) — 추적 대상 아님
+        underlying, instrument = key
         qty = float(row.get("jqty") or 0)
         if qty <= 0:
             return None
         side = Side.BUY if str(row.get("medocd")) == "2" else Side.SELL  # 1매도 2매수
         return Position(
             venue=Venue.LS,
-            instrument=Instrument.KR_STOCK_FUTURE,
+            instrument=instrument,
             underlying=underlying,
             side=side,
             qty=qty,
@@ -579,7 +587,7 @@ class LSApiGateway(LSGateway):
         return {
             f"{self.FUTURE_ORDER_TR}InBlock1": {
                 **self._order_account_fields(account),
-                "FnoIsuNo": self._futures_symbol(intent.underlying),  # 선물 종목코드(config)
+                "FnoIsuNo": self._futures_symbol(intent),  # 선물 종목코드(t8401, 근|차근)
                 "OrdQty": int(intent.qty),
                 "FnoOrdPrc": intent.price if intent.price is not None else 0.0,
                 "BnsTpCode": "2" if intent.side is Side.BUY else "1",  # 1매도 2매수
@@ -607,7 +615,7 @@ class LSApiGateway(LSGateway):
         return {
             f"{self.FUTURE_AMEND_TR}InBlock1": {
                 **self._order_account_fields(ctx.account),
-                "FnoIsuNo": self._futures_symbol(ctx.intent.underlying),
+                "FnoIsuNo": self._futures_symbol(ctx.intent),
                 "OrgOrdNo": int(ctx.order_id),  # 원주문 보존
                 "MdfyQty": int(qty if qty is not None else ctx.intent.qty),
                 "FnoOrdPrc": price if price is not None else (ctx.intent.price or 0.0),
@@ -619,17 +627,20 @@ class LSApiGateway(LSGateway):
         return {
             f"{self.FUTURE_CANCEL_TR}InBlock1": {
                 **self._order_account_fields(ctx.account),
-                "FnoIsuNo": self._futures_symbol(ctx.intent.underlying),
+                "FnoIsuNo": self._futures_symbol(ctx.intent),
                 "OrgOrdNo": int(ctx.order_id),  # 원주문 보존
                 "CancQty": int(ctx.intent.qty),
             }
         }
 
-    def _futures_symbol(self, underlying: Underlying) -> str:
+    def _futures_symbol(self, intent: OrderIntent) -> str:
+        """주문 의도의 (종목, 근|차근) → 선물 종목코드. 미보유 월물이면 RestError."""
         try:
-            return self._futures_symbols[underlying]
+            return self._futures_codes[(intent.underlying, intent.instrument)]
         except KeyError as exc:
-            raise RestError(f"no futures symbol configured for {underlying}") from exc
+            raise RestError(
+                f"no futures symbol configured for {intent.underlying}/{intent.instrument}"
+            ) from exc
 
     def _amend_body(
         self, ctx: OrderContext, qty: float | None, price: float | None

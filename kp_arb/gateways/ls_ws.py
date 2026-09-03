@@ -199,8 +199,8 @@ class LSWebSocketClient:
         # ETF 종목코드(config.yaml 주입) — 호가 구독·해석에 사용.
         self._etf_symbols = dict(etf_symbols or {})
         self._etf_underlying = {v: k for k, v in self._etf_symbols.items()}
-        # 선물 종목코드(t8401 자동 조회값 주입) — 선물 호가 구독·해석에 사용.
-        self._futures_underlying: dict[str, Underlying] = {}
+        # 선물 종목코드(t8401 조회값) → (종목, 근|차근) — 선물 호가 구독·해석에 사용(§5.11).
+        self._futures_underlying: dict[str, tuple[Underlying, Instrument]] = {}
         self._max_reconnects = max_reconnects
         self._reconnect_backoff_s = reconnect_backoff_s
         self._subs: list[tuple[str, str, str]] = []  # (tr_cd, tr_key, tr_type) 희망 구독 상태
@@ -230,10 +230,16 @@ class LSWebSocketClient:
             self._add("H1_", code)                  # KRX 전용 (모의에서도 동작)
             self._add("UH1", _unified_key(code))    # 통합(KRX+NXT) — 운영 전용
 
-    def subscribe_futures_quotes(self, symbols: dict[Underlying, str]) -> None:
-        """주식선물 호가(JH0)+체결(JC0)+예상체결(YJC) 구독. symbols = t8401 자동 조회."""
+    def subscribe_futures_quotes(
+        self, symbols: dict[Underlying, str],
+        instrument: Instrument = Instrument.KR_STOCK_FUTURE,
+    ) -> None:
+        """주식선물 호가(JH0)+체결(JC0)+예상체결(YJC) 구독. symbols = t8401 자동 조회.
+
+        instrument로 근(KR_STOCK_FUTURE)/차근(KR_STOCK_FUTURE_NEXT)을 구분해 프레임을 해석한다.
+        """
         for underlying, code in symbols.items():
-            self._futures_underlying[code] = underlying
+            self._futures_underlying[code] = (underlying, instrument)
             self._add(FUTURES_QUOTE_TR, code)
             self._add(FUTURES_TRADE_TR, code)
             self._add("YJC", code)
@@ -485,13 +491,14 @@ class LSWebSocketClient:
         # JH0 body 필드는 H1_와 동일(bidho1/offerho1/hotime/shcode) 가정 — 장중 실확인 예정.
         body = msg["body"]
         code = str(body.get("shcode") or msg.get("header", {}).get("tr_key", ""))
-        underlying = self._futures_underlying.get(code)
-        if underlying is None:
+        key = self._futures_underlying.get(code)
+        if key is None:
             return None
+        underlying, instrument = key
         try:
             return Quote(
                 underlying=underlying,
-                instrument=Instrument.KR_STOCK_FUTURE,
+                instrument=instrument,
                 bid=float(body["bidho1"]),
                 ask=float(body["offerho1"]),
                 ts=float(body.get("hotime", 0) or 0),
@@ -508,13 +515,18 @@ class LSWebSocketClient:
         body = msg["body"]
         code = _norm_code(str(body.get("shcode") or msg.get("header", {}).get("tr_key", "")))
         if tr_cd == FUTURES_TRADE_TR:
-            underlying = self._futures_underlying.get(code)
-            instrument = Instrument.KR_STOCK_FUTURE
+            fut_key = self._futures_underlying.get(code)
+            if fut_key is None:
+                return None
+            underlying, instrument = fut_key
         else:
             etf_u = self._etf_underlying.get(code)
-            underlying = etf_u if etf_u is not None else Underlying.from_krx_code(code)
+            spot_u = etf_u if etf_u is not None else Underlying.from_krx_code(code)
+            if spot_u is None:
+                return None
+            underlying = spot_u
             instrument = Instrument.KR_ETF if etf_u is not None else Instrument.KR_STOCK
-        if underlying is None or "price" not in body:
+        if "price" not in body:
             return None
         try:
             drate = body.get("drate")
@@ -532,10 +544,10 @@ class LSWebSocketClient:
         body = msg["body"]
         code = _norm_code(str(body.get("shcode") or body.get("focode")
                               or msg.get("header", {}).get("tr_key", "")))
-        fut_underlying = self._futures_underlying.get(code)
+        fut_key = self._futures_underlying.get(code)
         etf_underlying = self._etf_underlying.get(code)
-        if fut_underlying is not None:
-            underlying, instrument = fut_underlying, Instrument.KR_STOCK_FUTURE
+        if fut_key is not None:
+            underlying, instrument = fut_key
         elif etf_underlying is not None:
             underlying, instrument = etf_underlying, Instrument.KR_ETF
         else:

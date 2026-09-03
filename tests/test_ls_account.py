@@ -84,6 +84,7 @@ def _gateway(
     *,
     etf_symbols: dict[Underlying, str] | None = None,
     futures_symbols: dict[Underlying, str] | None = None,
+    next_futures_symbols: dict[Underlying, str] | None = None,
 ) -> LSApiGateway:
     clock = _Clock()
     tm = TokenManager("k", "s", _TokenStub(), now=clock)
@@ -92,7 +93,8 @@ def _gateway(
     return LSApiGateway({Account.KR_STOCK: rest, Account.KR_DERIV: rest},
                         etf_symbols=etf_symbols,
                         futures_symbols=futures_symbols
-                        or {Underlying.SAMSUNG: "A1167000"})
+                        or {Underlying.SAMSUNG: "A1167000"},
+                        next_futures_symbols=next_futures_symbols)
 
 
 # --- 잔고(예수금/증거금) ---
@@ -147,6 +149,16 @@ async def test_deriv_positions_parsed_to_deriv_account() -> None:
     assert pos.side is Side.SELL  # medocd "1" = 매도 (t0441 실측)
     assert pos.underlying is Underlying.SAMSUNG  # expcode A1167000 → 삼성 선물
     assert pos.qty == 2 and pos.avg_price == 71_000
+
+
+async def test_deriv_position_code_maps_to_next_month() -> None:
+    # t0441 expcode가 차근 코드와 일치하면 KR_STOCK_FUTURE_NEXT 포지션(§5.11). 근월물과 코드 분리.
+    gw = _gateway(AccountTransport(), futures_symbols={Underlying.SAMSUNG: "A1166000"},
+                  next_futures_symbols={Underlying.SAMSUNG: "A1167000"})
+    positions = await gw.get_positions(Account.KR_DERIV)
+    assert len(positions) == 1
+    assert positions[0].instrument is Instrument.KR_STOCK_FUTURE_NEXT
+    assert positions[0].underlying is Underlying.SAMSUNG
 
 
 async def test_positions_route_to_different_trs() -> None:

@@ -79,6 +79,7 @@ def _gateway(
     futures_symbols: dict[Underlying, str] | None = None,
     etf_symbols: dict[Underlying, str] | None = None,
     accounts: LSAccounts | None = None,
+    next_futures_symbols: dict[Underlying, str] | None = None,
 ) -> LSApiGateway:
     clock = _Clock()
     tm = TokenManager("k", "s", _TokenStub(), now=clock)
@@ -90,6 +91,7 @@ def _gateway(
         accounts=accounts,
         futures_symbols=futures_symbols,
         etf_symbols=etf_symbols,
+        next_futures_symbols=next_futures_symbols,
     )
 
 
@@ -146,6 +148,28 @@ async def test_future_order_uses_cfoat_and_routes_to_deriv() -> None:
     assert blk["account"] == Account.KR_DERIV.value
     assert blk["FnoIsuNo"] == "1AB3000"
     assert oid == "2901"
+
+
+async def test_next_month_future_order_uses_next_code() -> None:
+    # 차근월물(§5.11): 같은 CFOAT00100·선물계좌, 종목코드만 차근 코드. 정정·취소도 차근 코드 유지.
+    transport = OrderTransport()
+    gw = _gateway(transport, futures_symbols={Underlying.SAMSUNG: "1AB3000"},
+                  next_futures_symbols={Underlying.SAMSUNG: "1AB6000"})
+    oid = await gw.place_order(_intent(Instrument.KR_STOCK_FUTURE_NEXT, side=Side.SELL))
+    req = transport.requests[-1]
+    assert req["headers"]["tr_cd"] == LSApiGateway.FUTURE_ORDER_TR
+    blk = inblk(req, LSApiGateway.FUTURE_ORDER_TR)
+    assert blk["account"] == Account.KR_DERIV.value
+    assert blk["FnoIsuNo"] == "1AB6000"
+    await gw.amend_order(oid, qty=5, price=71_000.0)
+    assert inblk(transport.requests[-1], LSApiGateway.FUTURE_AMEND_TR)["FnoIsuNo"] == "1AB6000"
+
+
+async def test_next_month_order_without_next_code_raises() -> None:
+    # 근월물 코드만 있고 차근이 없으면(차근 미상장) 차근 주문은 거부 — 근월물로 대체 발주 금지.
+    gw = _gateway(OrderTransport(), futures_symbols={Underlying.SAMSUNG: "1AB3000"})
+    with pytest.raises(RestError):
+        await gw.place_order(_intent(Instrument.KR_STOCK_FUTURE_NEXT))
 
 
 async def test_future_order_without_symbol_raises() -> None:

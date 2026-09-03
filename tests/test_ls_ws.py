@@ -288,6 +288,30 @@ async def test_futures_quote_subscribed_and_parsed() -> None:
     assert quotes[0].mid == 293_250
 
 
+async def test_next_month_futures_quote_parsed_with_next_instrument() -> None:
+    # 차근월물 코드는 instrument=KR_STOCK_FUTURE_NEXT로 구독·해석 — 근월물 프레임과 섞이지 않는다.
+    from kp_arb.domain.enums import Instrument
+
+    frames = [json.dumps({
+        "header": {"tr_cd": "JH0", "tr_key": code},
+        "body": {"shcode": code, "bidho1": bid, "offerho1": ask, "hotime": "100000"},
+    }) for code, bid, ask in (("A1167000", "293000", "293500"),
+                              ("A116A000", "294000", "294500"))]
+    session = FakeConnection(frames)
+    client = LSWebSocketClient(FakeConnector([session]))
+    quotes: list[Quote] = []
+    client.on_quote.append(quotes.append)
+    client.subscribe_futures_quotes({Underlying.SAMSUNG: "A1167000"})
+    client.subscribe_futures_quotes({Underlying.SAMSUNG: "A116A000"},
+                                    instrument=Instrument.KR_STOCK_FUTURE_NEXT)
+
+    await client.run()
+
+    by_inst = {q.instrument: q.mid for q in quotes}
+    assert by_inst == {Instrument.KR_STOCK_FUTURE: 293_250,
+                       Instrument.KR_STOCK_FUTURE_NEXT: 294_250}
+
+
 async def test_order_events_dispatched_by_kind() -> None:
     # SC0=접수(ack) / SC3=취소(cancel, orgordno=원주문) → OrderEvent로 분화.
     ack = json.dumps({"header": {"tr_cd": "SC0"}, "body": {"ordno": "9852", "orgordno": "0"}})
