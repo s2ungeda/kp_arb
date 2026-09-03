@@ -14,6 +14,7 @@ from .domain.models import Position
 _DEFAULT_MULTIPLIERS: dict[Instrument, float] = {
     Instrument.KR_STOCK: 1.0,
     Instrument.KR_STOCK_FUTURE: 10.0,  # 단일종목선물 승수
+    Instrument.KR_STOCK_FUTURE_NEXT: 10.0,  # 차근월물 — 노출 합산(§5.11)
     Instrument.KR_ETF: 2.0,            # 2x 레버리지 ETF
 }
 

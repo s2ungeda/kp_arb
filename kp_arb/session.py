@@ -12,6 +12,7 @@ _KR_INSTRUMENTS: tuple[Instrument, ...] = (
     Instrument.KR_STOCK,
     Instrument.KR_ETF,
     Instrument.KR_STOCK_FUTURE,
+    Instrument.KR_STOCK_FUTURE_NEXT,  # 차근월물 — 근월물과 같은 세션 (§5.11)
 )
 
 
@@ -25,7 +26,8 @@ def build_session(
         return status
 
     if phase is SessionPhase.REGULAR:
-        for i in (Instrument.KR_ETF, Instrument.KR_STOCK_FUTURE):
+        for i in (Instrument.KR_ETF, Instrument.KR_STOCK_FUTURE,
+                  Instrument.KR_STOCK_FUTURE_NEXT):
             status[i] = InstrumentStatus(instrument=i, tradeable=True)
         # 정규장 기본 레퍼런스 = 주식 (주식 vs 주식선물은 [OPEN] DESIGN.md §13)
         status[Instrument.KR_STOCK] = InstrumentStatus(
@@ -33,9 +35,8 @@ def build_session(
         )
     elif phase is SessionPhase.AFTER_MARKET:
         # 애프터마켓 ~20:00 (2026-09-14~): 주식·주식선물 연장 거래. 레퍼런스 = 주식.
-        status[Instrument.KR_STOCK_FUTURE] = InstrumentStatus(
-            instrument=Instrument.KR_STOCK_FUTURE, tradeable=True
-        )
+        for i in (Instrument.KR_STOCK_FUTURE, Instrument.KR_STOCK_FUTURE_NEXT):
+            status[i] = InstrumentStatus(instrument=i, tradeable=True)
         status[Instrument.KR_STOCK] = InstrumentStatus(
             instrument=Instrument.KR_STOCK, tradeable=True, is_reference=True
         )

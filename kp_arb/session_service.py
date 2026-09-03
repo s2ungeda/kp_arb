@@ -52,6 +52,7 @@ _INSTRUMENT_MARKET: dict[Instrument, str] = {
     Instrument.KR_STOCK: STOCK_MARKET,
     Instrument.KR_ETF: STOCK_MARKET,
     Instrument.KR_STOCK_FUTURE: FUTURES_MARKET,
+    Instrument.KR_STOCK_FUTURE_NEXT: FUTURES_MARKET,  # 차근월물 (§5.11)
     Instrument.KR_FX_FUTURE: FUTURES_MARKET,
 }
 

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from .domain.enums import Instrument, Venue
+from .domain.enums import Venue
 from .session_service import market_of_instrument
 from .strategy_core import (
     Block,
@@ -89,7 +89,7 @@ class RehearsalEngine:
         자동T=주식(1)·자동M=선물(5) 시장별로 본다. 정지(사이드카·서킷)도 차단.
         """
         try:
-            market = market_of_instrument(screen.kind.counterpart)
+            market = market_of_instrument(screen.counterpart)
             return not self._system.session.is_tradeable(market)
         except Exception:  # noqa: BLE001 - 세션 미구성(테스트 등)은 통과
             return False
@@ -118,7 +118,7 @@ class RehearsalEngine:
             return  # 목표 완료/한도 소진 등 — 로그 없이 조용히 (매 틱 반복 방지)
         kr_qty = self._kr_qty(screen, plan.legs)
         est_bid, est_ask, px_entry, px_exit = self._system.est_pair_prices(
-            screen.underlying, screen.kind.counterpart, screen.per_qty(block),
+            screen.underlying, screen.counterpart, screen.per_qty(block),
             spread_set.threshold if block is Block.ENTRY else 0.0,
             spread_set.threshold if block is Block.EXIT else 0.0)
         ls_price = px_entry if block is Block.ENTRY else px_exit
@@ -146,5 +146,5 @@ class RehearsalEngine:
         for leg in legs:
             if leg.venue is Venue.LS:
                 return leg.qty
-        ratio = 10 if screen.kind.counterpart is Instrument.KR_STOCK_FUTURE else 1
+        ratio = 10 if screen.counterpart.is_stock_future else 1
         return legs[0].qty // ratio

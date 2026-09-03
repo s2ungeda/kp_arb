@@ -14,7 +14,8 @@ def test_regular_session() -> None:
 def test_after_market_session() -> None:
     # 애프터마켓(~20:00): 주식·주식선물만 거래, ETF 없음. 레퍼런스 = 주식.
     s = build_session(SessionPhase.AFTER_MARKET)
-    assert tradeable_instruments(s) == {Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE}
+    assert tradeable_instruments(s) == {Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE,
+                                        Instrument.KR_STOCK_FUTURE_NEXT}  # 차근도 같은 세션
     assert reference_instrument(s) == Instrument.KR_STOCK
 
 

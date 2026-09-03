@@ -42,13 +42,19 @@ class Account(StrEnum):
 class Instrument(StrEnum):
     KR_STOCK = "kr_stock"
     KR_ETF = "kr_etf"
-    KR_STOCK_FUTURE = "kr_stock_future"  # 정규장 + 애프터마켓(~20:00, 2026-09-14~) 공용
+    KR_STOCK_FUTURE = "kr_stock_future"  # 주식선물 근월물 — 정규장 + 애프터마켓(~20:00) 공용
+    KR_STOCK_FUTURE_NEXT = "kr_stock_future_next"  # 주식선물 차근월물 (DESIGN §5.11, 2026-09-03)
     KR_FX_FUTURE = "kr_fx_future"  # 원달러선물(환헤지, KR_FX 계좌) — 동시호가 대응주문 §9.1
     HL_PERP = "hl_perp"
 
     @property
     def venue(self) -> Venue:
         return Venue.HYPERLIQUID if self is Instrument.HL_PERP else Venue.LS
+
+    @property
+    def is_stock_future(self) -> bool:
+        """주식선물(근·차근) 여부 — 틱·승수·수량 규칙이 같은 묶음. 개별 `is` 비교 대신 쓴다."""
+        return self in (Instrument.KR_STOCK_FUTURE, Instrument.KR_STOCK_FUTURE_NEXT)
 
 
 class Side(StrEnum):

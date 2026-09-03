@@ -61,6 +61,7 @@ from .theory import (
     carry_theory,
     days_to_expiry,
     in_time_window,
+    is_rolled,
     parse_hhmm,
     select_usd_futures_months,
 )
@@ -97,6 +98,34 @@ def select_near_month(
 def select_near_month_futures(rows: list[dict[str, object]]) -> dict[Underlying, str]:
     """underlying별 최근월물 주식선물 **코드만** (기존 호환)."""
     return {u: shcode for u, (shcode, _) in select_near_month(rows).items()}
+
+
+def select_months(
+    rows: list[dict[str, object]], count: int = 2, now: datetime | None = None,
+) -> dict[Underlying, list[tuple[str, int]]]:
+    """t8401 마스터 행에서 underlying별 **근·차근 월물**(만기 오름차순 count개) — [(코드, YYYYMM)].
+
+    §5.11(2026-09-03): 롤 지난 월물(최종거래일 15:45 이후)은 제외한다 — 기존 select_near_month는
+    이 필터가 없어 만기일 저녁 재시동 시 만기월물을 "근"으로 잡았다. 원달러선물
+    select_usd_futures_months와 같은 모양. 순수 로직(now 주입).
+    """
+    moment = now if now is not None else datetime.now()
+    base_to_underlying = {f"A{u.krx_code}": u for u in Underlying}
+    found: dict[Underlying, dict[int, str]] = {}
+    for row in rows:
+        underlying = base_to_underlying.get(str(row.get("basecode", "")))
+        parts = str(row.get("hname", "")).split()
+        if underlying is None or len(parts) < 3 or parts[-2] != "F":
+            continue  # 대상 아님 또는 스프레드(SP)
+        yyyymm = parts[-1]
+        if not (len(yyyymm) == 6 and yyyymm.isdigit()):
+            continue
+        ym = int(yyyymm)
+        if is_rolled(ym, "EQ", moment):
+            continue  # 만기 지난 월물
+        found.setdefault(underlying, {}).setdefault(ym, str(row.get("shcode", "")))
+    return {u: [(code, ym) for ym, code in sorted(months.items())][:count]
+            for u, months in found.items()}
 
 
 def startup_symbol_error(

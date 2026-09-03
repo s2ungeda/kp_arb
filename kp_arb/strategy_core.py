@@ -125,6 +125,16 @@ class ScreenState:
     exit_sets: list[SpreadSet] = field(
         default_factory=lambda: [SpreadSet() for _ in range(SET_COUNT)])
     settings: ScreenSettings = field(default_factory=ScreenSettings)
+    # 자동M 선물 월물 선택(§5.11, 사용자 확정 2026-09-03): "near"(근, 기본) | "next"(차근).
+    # 자동T는 주식 상대라 무시된다.
+    future_month: str = "near"
+
+    @property
+    def counterpart(self) -> Instrument:
+        """이 화면의 국내 상대 상품 — 자동M은 월물 선택을 반영(근/차근), 자동T는 주식."""
+        if self.kind is ScreenKind.AUTO_M and self.future_month == "next":
+            return Instrument.KR_STOCK_FUTURE_NEXT
+        return self.kind.counterpart
 
     def sets_of(self, block: Block) -> list[SpreadSet]:
         return self.entry_sets if block is Block.ENTRY else self.exit_sets
@@ -188,7 +198,7 @@ def validate_run(screen: ScreenState, block: Block, index: int) -> list[str]:
 
 def hl_qty_for(counterpart: Instrument, kr_qty: int) -> int:
     """국내 수량 → HL 계약수: 주식 1주=1계약, 선물 1계약=10계약."""
-    if counterpart is Instrument.KR_STOCK_FUTURE:
+    if counterpart.is_stock_future:  # 근·차근 공용
         return kr_qty * FUTURES_SHARES_PER_CONTRACT
     return kr_qty
 
@@ -207,7 +217,7 @@ def allowed_order_qty(
     """
     if block is Block.ENTRY:
         room = max_position - position_qty
-    elif counterpart is Instrument.KR_STOCK_FUTURE:
+    elif counterpart.is_stock_future:  # 근·차근 공용 — 빠지면 주식의 롱전용 규칙으로 잘못 흐름
         room = max_position + position_qty  # 매도: 포지션 - q ≥ -최대
     else:
         room = position_qty                 # 주식 매도는 보유분까지만
@@ -249,7 +259,7 @@ def plan_order(
         errors.append("운영시간 밖")
     target = screen.sets_of(block)[index]
     remaining = max(0, target.target_qty - target.fired_qty)
-    counterpart = screen.kind.counterpart
+    counterpart = screen.counterpart
     ls_enabled = target.ls_order  # 세트별 LS주문 체크 (해제 = HL 주문만)
     qty = min(
         allowed_order_qty(block, counterpart, position_qty,
@@ -333,6 +343,8 @@ def state_from_dict(data: dict[str, object]) -> CoreState:
             continue
         try:
             screen.underlying = Underlying(str(raw.get("underlying", screen.underlying)))
+            month = str(raw.get("future_month", screen.future_month))  # §5.11 근/차근
+            screen.future_month = month if month in ("near", "next") else "near"
         except ValueError:
             pass
         # 1회주문수량: 신규(진입/청산 별도) 우선, 없으면 옛 per_order_qty를 양쪽에 이어받음

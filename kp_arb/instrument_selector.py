@@ -24,6 +24,7 @@ _DEFAULT_PRIORITY: tuple[Instrument, ...] = (
     Instrument.KR_STOCK_FUTURE,
     Instrument.KR_STOCK,
     Instrument.KR_ETF,
+    # KR_STOCK_FUTURE_NEXT(차근)는 자동 선택 대상이 아님 — 자동M 세트 설정의 월물 선택으로만(§5.11)
 )
 
 
@@ -60,6 +61,8 @@ class InstrumentSelector:
             for instrument, status in session.items()
             if status.tradeable
             and instrument is not Instrument.HL_PERP
+            # 차근월물은 자동 선택 제외 — 자동M 세트 설정의 월물 선택으로만 쓴다(§5.11)
+            and instrument is not Instrument.KR_STOCK_FUTURE_NEXT
             and self._direction_ok(instrument, side)
             and self._product_exists(instrument, underlying)
         ]

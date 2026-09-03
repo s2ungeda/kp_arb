@@ -35,7 +35,7 @@ def stock_futures_tick(price: float) -> int:
 
 def tick_for(instrument: Instrument, price: float) -> int:
     """국내 상품의 호가단위. HL은 대상 아님(자체 규칙)."""
-    if instrument is Instrument.KR_STOCK_FUTURE:
+    if instrument.is_stock_future:  # 근·차근 공용
         return stock_futures_tick(price)
     return stock_tick(price)
 

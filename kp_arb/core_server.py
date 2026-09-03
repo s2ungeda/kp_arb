@@ -165,7 +165,13 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
             screen.sets_of(block)[index].running = value
             return _ok()
         if cmd == "settings":
-            s = _screen_of(state, body).settings
+            screen = _screen_of(state, body)
+            if "future_month" in body:  # 자동M 선물 월물(근/차근) — §5.11
+                month = str(body["future_month"]).strip()
+                if month not in ("near", "next"):
+                    return _fail([f"선물 월물 값 오류: {month!r} (near|next)"])
+                screen.future_month = month
+            s = screen.settings
             s.kr_margin_ticks = int(body.get("kr_margin_ticks", s.kr_margin_ticks))
             s.hl_margin_pct = float(body.get("hl_margin_pct", s.hl_margin_pct))
             s.delay_ms = int(body.get("delay_ms", s.delay_ms))
