@@ -1,7 +1,7 @@
 """주식선물 차근월물(KR_STOCK_FUTURE_NEXT) — 도메인·순수 로직 매핑 (DESIGN §5.11, ①단계)."""
 from datetime import datetime
 
-from kp_arb.bootstrap import select_months
+from kp_arb.bootstrap import LiveSystem, select_months
 from kp_arb.domain.enums import Account, Instrument, SessionPhase, Underlying
 from kp_arb.fx import _DEFAULT_MULTIPLIERS
 from kp_arb.routing import account_for
@@ -56,6 +56,61 @@ def test_screen_counterpart_follows_future_month() -> None:
     assert m.counterpart is NEXT
     t = ScreenState(kind=ScreenKind.AUTO_T, future_month="next")
     assert t.counterpart is Instrument.KR_STOCK
+
+
+def _live_system() -> LiveSystem:
+    # 코어 상태(③) 검증용 최소 조립 — mock 게이트웨이 + 프레임 없는 가짜 WS(라이브 호출 없음).
+    from kp_arb.gateways.ls_ws import LSWebSocketClient
+    from kp_arb.gateways.mock_ls import MockLSGateway
+    from kp_arb.order_book import OrderBook
+    from kp_arb.session_service import SessionService
+
+    class _Conn:
+        async def send(self, message: str) -> None:
+            return None
+
+        def __aiter__(self) -> "_Conn":
+            return self
+
+        async def __anext__(self) -> str:
+            raise StopAsyncIteration
+
+    class _Connector:
+        async def connect(self) -> _Conn:
+            return _Conn()
+
+    return LiveSystem(
+        gateway=MockLSGateway(),  # type: ignore[arg-type]
+        order_book=OrderBook(), session=SessionService(),
+        stock_ws=LSWebSocketClient(_Connector()),  # type: ignore[arg-type]
+        futures_symbols={Underlying.SAMSUNG: "A1169000"},
+        next_futures_symbols={Underlying.SAMSUNG: "A116C000"},
+        futures_expiry={(Underlying.SAMSUNG, NEAR): 202712, (Underlying.SAMSUNG, NEXT): 202803},
+    )
+
+
+def test_core_theory_and_board_per_month() -> None:
+    # 이론가는 월물별 만기(잔존일)로 — 차근이 근보다 길어 이론가가 더 높다. 괴리보드에 차근 행.
+    system = _live_system()
+    system.trades[(Underlying.SAMSUNG, Instrument.KR_STOCK, "krx")] = 100_000.0
+    near_t = system.stock_futures_theory(Underlying.SAMSUNG)
+    next_t = system.stock_futures_theory(Underlying.SAMSUNG, NEXT)
+    assert near_t is not None and next_t is not None and next_t > near_t > 100_000
+    assert system.futures_codes == {(Underlying.SAMSUNG, NEAR): "A1169000",
+                                    (Underlying.SAMSUNG, NEXT): "A116C000"}
+    board = system.disparity_board(1)
+    assert (Underlying.SAMSUNG, NEXT) in board and (Underlying.SAMSUNG, NEAR) in board
+    # 동시호가 원달러 대응주문: 차근 코드도 감시 대상 종목으로 풀린다.
+    assert system._resolve_fut_code("A116C000") is Underlying.SAMSUNG
+    assert system._resolve_fut_code("A9999999") is None
+
+
+async def test_core_load_instruments_registers_next_month() -> None:
+    system = _live_system()
+    await system.load_instruments()
+    info = system.instruments[(Underlying.SAMSUNG, NEXT)]
+    assert info.code == "A116C000" and info.expiry == 202803 and info.multiplier == 10.0
+    assert system.instruments[(Underlying.SAMSUNG, NEAR)].expiry == 202712
 
 
 _ROWS = [

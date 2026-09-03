@@ -132,13 +132,18 @@ def startup_symbol_error(
     expected: Iterable[Underlying],
     futures_symbols: Mapping[Underlying, str],
     fx_months: Sequence[tuple[str, int]],
+    next_futures_symbols: Mapping[Underlying, str],
 ) -> str | None:
-    """시동 '종목' 로드 판정 — 취급 종목마다 주식선물 근월물이 있고, 원달러선물 월물도
-    있어야 한다(없으면 선물 시세·FX 대응주문이 조용히 안 나감). 실패 작업명 또는 None. 순수 로직."""
+    """시동 '종목' 로드 판정 — 취급 종목마다 주식선물 **근·차근 월물이 모두** 있고, 원달러선물
+    월물도 있어야 한다(없으면 선물 시세·FX 대응주문이 조용히 안 나감). 차근 누락도 실패
+    (사용자 정정 2026-09-03, §5.11). 실패 작업명 또는 None. 순수 로직."""
     problems: list[str] = []
     missing = [u for u in expected if u not in futures_symbols]
     if missing:
         problems.append("주식선물 근월물 없음: " + ", ".join(u.value for u in missing))
+    missing_next = [u for u in expected if u not in next_futures_symbols]
+    if missing_next:
+        problems.append("주식선물 차근월물 없음: " + ", ".join(u.value for u in missing_next))
     if not fx_months:
         problems.append("원달러선물 월물 없음")
     if not problems:
@@ -170,7 +175,8 @@ class LiveSystem:
         hl_ws: HLWebSocketClient | None = None,
         futures_symbols: dict[Underlying, str] | None = None,
         etf_symbols: dict[Underlying, str] | None = None,
-        futures_expiry: dict[Underlying, int] | None = None,
+        futures_expiry: dict[tuple[Underlying, Instrument], int] | None = None,
+        next_futures_symbols: dict[Underlying, str] | None = None,
         fx_futures: tuple[str, int] | None = None,
         fx_months: list[tuple[str, int]] | None = None,
         carry_rates: CarryRates | None = None,
@@ -180,9 +186,11 @@ class LiveSystem:
     ) -> None:
         self._gw = gateway
         # 취급 종목코드 (공개 — UI/도구가 상품 가용성 판단에 사용. 예: 현대차 ETF 없음)
-        self.futures_symbols = dict(futures_symbols or {})
+        self.futures_symbols = dict(futures_symbols or {})            # 주식선물 근월물 코드
+        self.next_futures_symbols = dict(next_futures_symbols or {})  # 차근월물 코드(§5.11)
         self.etf_symbols = dict(etf_symbols or {})
-        self.futures_expiry = dict(futures_expiry or {})  # 만기 YYYYMM (캐리 잔존일용)
+        # 만기 YYYYMM (캐리 잔존일용) — (종목, 근|차근)별
+        self.futures_expiry: dict[tuple[Underlying, Instrument], int] = dict(futures_expiry or {})
         # 원달러선물 (shcode, 만기YYYYMM) — 최근월물(환율이론가 기준, bootstrap_live 조회).
         self._fx_futures = fx_futures
         # 구독할 원달러선물 월물 전체(근·차근, §9.1) — 없으면 최근월물 하나로 폴백.
@@ -388,9 +396,18 @@ class LiveSystem:
         """발주 거부·실패 알림 — 메인창이 증가를 감지해 에러 사운드 재생(DESIGN-settings §2)."""
         self.error_seq += 1
 
+    @property
+    def futures_codes(self) -> dict[tuple[Underlying, Instrument], str]:
+        """(종목, 근|차근) → 주식선물 코드 — 근·차근 두 표를 한 눈에(§5.11)."""
+        out = {(u, Instrument.KR_STOCK_FUTURE): c for u, c in self.futures_symbols.items()}
+        out.update({(u, Instrument.KR_STOCK_FUTURE_NEXT): c
+                    for u, c in self.next_futures_symbols.items()})
+        return out
+
     def _resolve_fut_code(self, code: str) -> Underlying | None:
-        """주식선물 종목코드 → Underlying(감시 대상 판정). 근월물 코드 매칭."""
-        for u, sh in self.futures_symbols.items():
+        """주식선물 종목코드 → Underlying(감시 대상 판정). 근·차근 코드 모두 매칭 —
+        동시호가 원달러 대응주문은 차근 신규주문도 헤지 대상(§5.11)."""
+        for (u, _inst), sh in self.futures_codes.items():
             if sh == code:
                 return u
         return None
@@ -688,6 +705,9 @@ class LiveSystem:
             self._stock_ws.subscribe_trades(underlying)  # 현재가(S3_) + 예상체결(YS3)
         if self.futures_symbols:
             self._stock_ws.subscribe_futures_quotes(self.futures_symbols)
+        if self.next_futures_symbols:  # 차근월물 호가·체결·예상체결(§5.11)
+            self._stock_ws.subscribe_futures_quotes(
+                self.next_futures_symbols, instrument=Instrument.KR_STOCK_FUTURE_NEXT)
         self._stock_ws.subscribe_market_status()
         self._stock_ws.subscribe_stock_fills()
         if self._fx_months:
@@ -760,11 +780,11 @@ class LiveSystem:
                 underlying=u, instrument=Instrument.HL_PERP,
                 code=str(m.get("code", "")), multiplier=1.0,
                 sz_decimals=m.get("sz_decimals"), max_leverage=m.get("max_leverage"))
-            if u in self.futures_symbols:
-                self.instruments[(u, Instrument.KR_STOCK_FUTURE)] = InstrumentInfo(
-                    underlying=u, instrument=Instrument.KR_STOCK_FUTURE,
-                    code=self.futures_symbols[u], multiplier=10.0,
-                    expiry=self.futures_expiry.get(u))
+            for (fu, inst), code in self.futures_codes.items():  # 근·차근(§5.11)
+                if fu is u:
+                    self.instruments[(u, inst)] = InstrumentInfo(
+                        underlying=u, instrument=inst, code=code, multiplier=10.0,
+                        expiry=self.futures_expiry.get((u, inst)))
             self.instruments[(u, Instrument.KR_STOCK)] = InstrumentInfo(
                 underlying=u, instrument=Instrument.KR_STOCK, multiplier=1.0)
 
@@ -782,7 +802,8 @@ class LiveSystem:
         if self.startup_load_error is not None:
             log.error("시동 로드 실패: %s", self.startup_load_error)
             return
-        log.info("시동 로드 OK: 종목 (주식선물 근월물 %d종)", len(self.futures_symbols))
+        log.info("시동 로드 OK: 종목 (주식선물 근월물 %d종, 차근월물 %d종)",
+                 len(self.futures_symbols), len(self.next_futures_symbols))
         # 1-2) 종목정보 — HL 소수자릿수·최대레버리지(없으면 HL 주문 수량 반올림이 어긋남).
         try:
             await self.load_instruments()
@@ -960,8 +981,11 @@ class LiveSystem:
 
     # --- 괴리 보드 (DESIGN §6.1 — 모니터·전략 공용) ---
 
-    def stock_futures_theory(self, underlying: Underlying) -> float | None:
-        """주식선물 이론가 = 기초 주식 현재가 × (1 + 3.5% × 잔존일/365).
+    def stock_futures_theory(
+        self, underlying: Underlying,
+        instrument: Instrument = Instrument.KR_STOCK_FUTURE,
+    ) -> float | None:
+        """주식선물 이론가 = 기초 주식 현재가 × (1 + 3.5% × 잔존일/365). 월물(근|차근)별 만기.
 
         기초가는 **통합(uni, NXT 포함) 우선, 없으면 KRX** — 엑셀(RTD)과 동일 기준.
         (ETF 이론가의 기초는 KRX 전용 유지 — 거래소 iNAV 기준과 일치시키기 위함.)
@@ -969,7 +993,7 @@ class LiveSystem:
         from datetime import date
 
         base = self.stock_last(underlying)
-        ym = self.futures_expiry.get(underlying)
+        ym = self.futures_expiry.get((underlying, instrument))
         if base is None or ym is None:
             return None
         return carry_theory(
@@ -1050,15 +1074,15 @@ class LiveSystem:
         quote = self.quotes.get((u, Instrument.HL_PERP, "hl"))
         if quote is None:
             return None, None
-        ratio = 10.0 if instrument is Instrument.KR_STOCK_FUTURE else 1.0
+        ratio = 10.0 if instrument.is_stock_future else 1.0
         est_bid = (est_price(quote.bids or [], entry_qty * ratio)
                    if entry_qty > 0 else None)
         est_ask = (est_price(quote.asks or [], exit_qty * ratio)
                    if exit_qty > 0 else None)
         fx, _ = self.usdkrw_effective()
         stock = self.stock_last(u)
-        base = (self.stock_futures_theory(u)
-                if instrument is Instrument.KR_STOCK_FUTURE else stock)
+        base = (self.stock_futures_theory(u, instrument)
+                if instrument.is_stock_future else stock)
         if fx is None or stock is None or base is None:
             return None, None
         kr_ask, kr_bid = self._best_quote(u, instrument)
@@ -1092,13 +1116,13 @@ class LiveSystem:
         if quote is None or kr_qty <= 0:
             return None, None, None, None
         hl_qty = float(kr_qty) * (
-            10.0 if instrument is Instrument.KR_STOCK_FUTURE else 1.0)
+            10.0 if instrument.is_stock_future else 1.0)
         est_bid = est_price(quote.bids or [], hl_qty)   # 진입: HL 매도 → 매수호가
         est_ask = est_price(quote.asks or [], hl_qty)   # 청산: HL 매수 → 매도호가
         fx, _ = self.usdkrw_effective()
         stock = self.stock_last(u)
-        base = (self.stock_futures_theory(u)
-                if instrument is Instrument.KR_STOCK_FUTURE else stock)
+        base = (self.stock_futures_theory(u, instrument)
+                if instrument.is_stock_future else stock)
         px_entry = px_exit = None
         if fx is not None and stock is not None and base is not None:
             hl_bid_d = disp(est_bid * fx if est_bid is not None else None, stock)
@@ -1130,6 +1154,7 @@ class LiveSystem:
         fees = {
             Instrument.KR_STOCK: self._fees.stock,
             Instrument.KR_STOCK_FUTURE: self._fees.stock_future,
+            Instrument.KR_STOCK_FUTURE_NEXT: self._fees.stock_future,  # 차근 동일 수수료
             Instrument.KR_ETF: self._fees.etf,
         }
         for u in Underlying:
@@ -1146,10 +1171,13 @@ class LiveSystem:
             ]
             if u in self.futures_symbols:
                 targets.append((Instrument.KR_STOCK_FUTURE, self.stock_futures_theory(u)))
+            if u in self.next_futures_symbols:  # 차근 행 — 진입·청산·est 모두 차근 기준(§5.11)
+                targets.append((Instrument.KR_STOCK_FUTURE_NEXT, self.stock_futures_theory(
+                    u, Instrument.KR_STOCK_FUTURE_NEXT)))
             if u in self.etf_symbols:
                 targets.append((Instrument.KR_ETF, self.etf_theory_price(u)))
             for instrument, base in targets:
-                mult = 10.0 if instrument is Instrument.KR_STOCK_FUTURE else 1.0
+                mult = 10.0 if instrument.is_stock_future else 1.0
                 hl = est_side_disp(hl_bids, hl_asks, kr_qty * mult, stock, fx)
                 kr_bids, kr_asks = self._levels(self._ls_depth_quote(u, instrument))
                 kr = est_side_disp(kr_bids, kr_asks, float(kr_qty), base)
@@ -1282,7 +1310,7 @@ class LiveSystem:
     def _spread_csv_rows(self, hhmmss: str) -> list[tuple[str, ...]]:
         """CSV 한 줄씩(진입/청산 중 하나라도 있는 쌍만) — 파일 I/O 없는 순수 조립."""
         kind = {Instrument.KR_STOCK: "S", Instrument.KR_STOCK_FUTURE: "SF",
-                Instrument.KR_ETF: "ETF"}
+                Instrument.KR_STOCK_FUTURE_NEXT: "SFN", Instrument.KR_ETF: "ETF"}
 
         def _pct(v: float | None) -> str:
             return f"{v * 100:.3f}" if v is not None else "-"
@@ -1477,22 +1505,29 @@ async def bootstrap_live(
     import logging as _logging
 
     _blog = _logging.getLogger("kp_arb.bootstrap")
-    # 선물 최근월물 자동 조회(만기 롤오버 대응) 후 게이트웨이 재조립 — 실패해도 시동 계속.
+    # 주식선물 근·차근 월물 자동 조회(만기 롤오버 대응, §5.11) 후 게이트웨이 재조립.
+    # 조회 실패·월물 누락은 아래 startup_symbol_error가 "종목" 로드 실패로 판정한다.
     try:
         _fut_rows = await gateway.fetch_futures_master()
         _blog.info("t8401 주식선물 마스터 %d행 수신", len(_fut_rows))  # 조회 원본(진단)
-        near_month = select_near_month(_fut_rows)
-    except Exception:  # noqa: BLE001 - 조회 실패해도 시동은 계속(선물 시세·FX 대응주문만 비활성)
-        _blog.warning("주식선물 근월물(t8401) 조회 실패 — 선물 시세·FX 대응주문 비활성",
-                      exc_info=True)
-        near_month = {}
-    futures_symbols = {u: sh for u, (sh, _) in near_month.items()}
-    futures_expiry = {u: ym for u, (_, ym) in near_month.items()}
-    if futures_symbols:  # 시동 시 무엇을 로드했는지 반드시 남긴다(진단 기본)
-        _blog.info("주식선물 근월물 로드: %s",
-                   ", ".join(f"{u.value}={c}" for u, c in futures_symbols.items()))
-    else:
-        _blog.warning("주식선물 근월물 0개 — 선물 시세 구독·FX 대응주문 안 됨(코드 매핑 불가)")
+        months = select_months(_fut_rows, count=2)
+    except Exception:  # noqa: BLE001 - 조회 실패는 종목 로드 실패(팝업)로 이어진다
+        _blog.warning("주식선물 월물(t8401) 조회 실패", exc_info=True)
+        months = {}
+    futures_symbols: dict[Underlying, str] = {}
+    next_futures_symbols: dict[Underlying, str] = {}
+    futures_expiry: dict[tuple[Underlying, Instrument], int] = {}
+    for u, picked in months.items():
+        # 시동 시 종목별 월물 목록을 반드시 남긴다 — 차근 누락 원인(부분 응답·롤 직후) 확인용
+        _blog.info("주식선물 월물 %s: %s", u.value,
+                   ", ".join(f"{ym}={code}" for code, ym in picked))
+        if picked:
+            futures_symbols[u], futures_expiry[(u, Instrument.KR_STOCK_FUTURE)] = picked[0]
+        if len(picked) > 1:
+            next_futures_symbols[u] = picked[1][0]
+            futures_expiry[(u, Instrument.KR_STOCK_FUTURE_NEXT)] = picked[1][1]
+    if not futures_symbols:
+        _blog.warning("주식선물 월물 0개 — 종목 로드 실패로 처리")
     # 원달러선물 근·차근 월물 (환율이론가=최근월물 + 헤지 월물선택용 §9.1) — 실패해도 시동 계속
     fx_futures = None
     fx_months: list[tuple[str, int]] = []
@@ -1516,6 +1551,7 @@ async def bootstrap_live(
         base_url=LIVE_BASE_URL,
         futures_symbols=futures_symbols,
         etf_symbols=etf_symbols,
+        next_futures_symbols=next_futures_symbols,
     )
 
     url = ls_ws_url(current_mode())
@@ -1566,6 +1602,7 @@ async def bootstrap_live(
         futures_symbols=futures_symbols,
         etf_symbols=etf_symbols,
         futures_expiry=futures_expiry,
+        next_futures_symbols=next_futures_symbols,
         fx_futures=fx_futures,
         fx_months=fx_months,
         carry_rates=config.carry_rates,
@@ -1573,10 +1610,11 @@ async def bootstrap_live(
         fx_spot_window=(config.fx_spot_window.start, config.fx_spot_window.end),
         board_ref_qty=config.disparity.ref_qty,
     )
-    # 종목 로드 판정 — 취급 종목(config.symbols)마다 주식선물 근월물 + 원달러선물 월물이
+    # 종목 로드 판정 — 취급 종목(config.symbols)마다 주식선물 근·차근 월물 + 원달러선물 월물이
     # 있어야 한다. 하나라도 빠지면 "종목" 로드 실패 → 시동 초기화가 멈추고 메인창이 팝업
-    # (하이닉스 근월물 누락·원달러 월물 0개가 여기 걸린다 — 2026-09-03 사용자 확정).
-    symbol_error = startup_symbol_error(config.symbols, futures_symbols, fx_months)
+    # (하이닉스 근월물 누락·원달러 월물 0개가 여기 걸린다 — 2026-09-03 사용자 확정, 차근 포함).
+    symbol_error = startup_symbol_error(config.symbols, futures_symbols, fx_months,
+                                        next_futures_symbols)
     if symbol_error is not None:
         system.startup_load_error = symbol_error
         _blog.error("시동 로드 실패: %s", symbol_error)

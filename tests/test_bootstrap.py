@@ -134,16 +134,19 @@ async def test_guarded_ws_reports_dead_channel() -> None:
 
 
 def test_startup_symbol_error_rules() -> None:
-    # 시동 '종목' 판정 — 근월물 누락·원달러 월물 없음을 작업명에 담는다.
+    # 시동 '종목' 판정 — 근·차근월물 누락·원달러 월물 없음을 작업명에 담는다(차근도 실패, §5.11).
     expected = [Underlying.SAMSUNG, Underlying.SK_HYNIX]
     fx = [("175W09", 202609)]
-    assert startup_symbol_error(expected, {Underlying.SAMSUNG: "A1", Underlying.SK_HYNIX: "A2"},
-                                fx) is None
-    err = startup_symbol_error(expected, {Underlying.SAMSUNG: "A1"}, fx)
+    near = {Underlying.SAMSUNG: "A1", Underlying.SK_HYNIX: "A2"}
+    nxt = {Underlying.SAMSUNG: "B1", Underlying.SK_HYNIX: "B2"}
+    assert startup_symbol_error(expected, near, fx, nxt) is None
+    err = startup_symbol_error(expected, {Underlying.SAMSUNG: "A1"}, fx, nxt)
     assert err is not None and "근월물 없음" in err and "sk_hynix" in err
-    err = startup_symbol_error(expected, {Underlying.SAMSUNG: "A1", Underlying.SK_HYNIX: "A2"}, [])
+    err = startup_symbol_error(expected, near, fx, {Underlying.SAMSUNG: "B1"})
+    assert err == "종목(주식선물 차근월물 없음: sk_hynix)"  # 근월물은 정상 → 차근만 문제
+    err = startup_symbol_error(expected, near, [], nxt)
     assert err == "종목(원달러선물 월물 없음)"
-    err = startup_symbol_error(expected, {}, [])
+    err = startup_symbol_error(expected, {}, [], {})
     assert err is not None and "근월물 없음" in err and "원달러선물 월물 없음" in err
 
 
@@ -624,7 +627,7 @@ def test_disparity_board_computes_pairs() -> None:
 
     system, _, _ = _system([])
     system.futures_symbols[SAMSUNG] = "A1167000"
-    system.futures_expiry[SAMSUNG] = 202612  # 먼 만기 — 테스트 안정성
+    system.futures_expiry[(SAMSUNG, Instrument.KR_STOCK_FUTURE)] = 202612  # 먼 만기 — 테스트 안정성
     system.etf_symbols[SAMSUNG] = "0193W0"
     system.usdkrw_theory = 1_500.0
     system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] = 300_000.0  # 기초 현재가
@@ -680,7 +683,7 @@ def test_disparity_board_est_is_quantity_dependent() -> None:
 
     system, _, _ = _system([])
     system.futures_symbols[SAMSUNG] = "A1167000"
-    system.futures_expiry[SAMSUNG] = 202612
+    system.futures_expiry[(SAMSUNG, Instrument.KR_STOCK_FUTURE)] = 202612
     system.usdkrw_theory = 1_500.0
     system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] = 300_000.0
     system.stock_change_pct[(SAMSUNG, "krx")] = 0.0
@@ -822,7 +825,7 @@ def test_spread_csv_rows() -> None:
     assert system._spread_csv_rows("09:00:00") == []  # 데이터 없으면 빈 목록
 
     system.futures_symbols[SAMSUNG] = "A1167000"
-    system.futures_expiry[SAMSUNG] = 202612
+    system.futures_expiry[(SAMSUNG, Instrument.KR_STOCK_FUTURE)] = 202612
     system.usdkrw_theory = 1_500.0
     system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] = 300_000.0
     system.stock_change_pct[(SAMSUNG, "krx")] = 0.0

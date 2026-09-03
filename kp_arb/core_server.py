@@ -267,10 +267,12 @@ def live_snapshot(
 
 # 수동 주문창이 다루는 instrument와, 호가/현재가를 고를 시장 우선순위.
 _MANUAL_INSTRUMENTS: tuple[Instrument, ...] = (
-    Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE, Instrument.HL_PERP)
+    Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE, Instrument.KR_STOCK_FUTURE_NEXT,
+    Instrument.HL_PERP)
 _MARKET_PREF: dict[Instrument, tuple[str, ...]] = {
     Instrument.KR_STOCK: ("uni", "krx", "nxt"),
     Instrument.KR_STOCK_FUTURE: ("krx", "uni", "nxt"),
+    Instrument.KR_STOCK_FUTURE_NEXT: ("krx", "uni", "nxt"),  # 차근월물(§5.11)
     Instrument.HL_PERP: ("hl",),
 }
 
@@ -572,7 +574,8 @@ async def _manual_command(
     return _fail([f"알 수 없는 수동 명령: {cmd!r}"])
 
 
-_LS_MON_INSTS = (Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE)
+_LS_MON_INSTS = (Instrument.KR_STOCK, Instrument.KR_STOCK_FUTURE,
+                 Instrument.KR_STOCK_FUTURE_NEXT)  # 차근월물 행(§5.11)
 
 
 def _disp_pct(price: float | None, base: float | None) -> float | None:
@@ -623,8 +626,8 @@ def monitor_snapshot(
             ask, ask_qty, bid, bid_qty = _merged(u, inst)
             last = (system.trades.get((u, inst, "uni"))
                     or system.trades.get((u, inst, "krx")))
-            theory = (system.stock_futures_theory(u)
-                      if inst is Instrument.KR_STOCK_FUTURE else None)
+            theory = (system.stock_futures_theory(u, inst)
+                      if inst.is_stock_future else None)
             out["ls"].append({
                 "underlying": u.value, "instrument": inst.value,
                 "ask": ask, "ask_qty": ask_qty, "bid": bid, "bid_qty": bid_qty,
