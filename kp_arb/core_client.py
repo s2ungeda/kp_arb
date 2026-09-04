@@ -118,8 +118,21 @@ def share_is_fresh(share_ts_ms: int, now_ms: float, stale_s: float = 3.0) -> boo
     return (now_ms - share_ts_ms) <= stale_s * 1000.0
 
 
+def box_is_live(box: dict[str, Any], now: float, stale_s: float = 3.0) -> bool:
+    """화면이 "코어 접속 중"으로 볼 수 있는가 — 데이터가 있고 마지막 성공이 stale_s 안. 순수 로직.
+
+    merge_poll이 실패해도 데이터를 지우지 않으므로 `data is not None`만으로는 접속 판정이
+    안 된다(옛 화면들의 실수) — 신선함까지 본다.
+    """
+    if not isinstance(box.get("data"), dict):
+        return False
+    age = stale_seconds(box, now)
+    return age is not None and age <= stale_s
+
+
 def run_state_feed(
     box: dict[str, Any], *, log_tag: str, fallback_path: str = "/manual_state",
+    channel: str = "manual",
     interval_s: float = 0.1, poll_s: float = 0.5, stale_s: float = 3.0,
     max_ticks: int | None = None,
 ) -> None:
@@ -144,7 +157,7 @@ def run_state_feed(
         now = time.time()
         used_share = False
         if reader is None:
-            path = share_path_from_env()
+            path = share_path_from_env(channel)  # 채널별 파일(manual/state)
             if path:
                 try:
                     reader = ShareReader(path)

@@ -87,7 +87,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     from . import ui_theme as T
     from . import win_state
-    from .core_client import core_request, watch_parent_exit
+    from .core_client import box_is_live, core_request, run_state_feed, watch_parent_exit
 
     preview = "--preview" in sys.argv  # UI만 확인 — 코어 접속·부모감시 없이 레이아웃만
     if not preview:
@@ -113,9 +113,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             results.put((label, core_request("/command", payload, timeout=10.0)))
 
     def poller() -> None:
-        while True:
-            state_box["data"] = core_request("/state", timeout=2.0)
-            time.sleep(1.0)
+        # 실시간(DESIGN §12.1 state 채널): 공유메모리 0.1초 읽기, 없거나 낡으면 HTTP 폴백.
+        run_state_feed(state_box, log_tag="자동M", channel="state",
+                       fallback_path="/state", poll_s=1.0)
 
     if not preview:
         threading.Thread(target=sender, daemon=True).start()
@@ -677,7 +677,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 for key, lbl in mon.items():
                     lbl.config(text=preview_mon.get(key, "-"))
                 return
-            connected = isinstance(state_box["data"], dict)
+            connected = box_is_live(state_box, time.time())  # 데이터 있고 3초 안에 성공
             show = parse_qty(ent_refqty.get()) > 0  # 기준수량>0일 때만 모니터 수치
             for lbl in mon.values():
                 lbl.config(text="0.00" if (connected and show) else "-")

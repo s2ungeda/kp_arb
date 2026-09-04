@@ -69,3 +69,32 @@ def test_reader_missing_file_raises(tmp_path: Path) -> None:
 
 def test_header_size() -> None:
     assert HEADER == 24
+
+
+def test_share_path_for_channels() -> None:
+    # manual은 기본 경로 그대로(구버전 호환), state는 `_state` 접미 — 채널별 파일(§12.1).
+    from kp_arb.state_share import share_path_for
+
+    base = str(Path("/tmp") / "kp_arb_share_123.bin")
+    assert share_path_for(base, "manual") == base
+    assert Path(share_path_for(base, "state")).name == "kp_arb_share_123_state.bin"
+
+
+def test_stale_share_files_by_owner_pid() -> None:
+    # 주인 메인(pid)이 죽은 공유 파일만 청소 대상 — 다른 이름·살아있는 pid는 남긴다.
+    from kp_arb.state_share import stale_share_files
+
+    names = ["kp_arb_share_111.bin", "kp_arb_share_111_state.bin", "kp_arb_share_222.bin",
+             "other.bin", "kp_arb_share_x.bin"]
+    got = stale_share_files(names, pid_alive=lambda pid: pid == 222)
+    assert got == ["kp_arb_share_111.bin", "kp_arb_share_111_state.bin"]
+
+
+def test_cleanup_stale_shares_removes_only_dead(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import kp_arb.state_share as ss
+
+    for name in ("kp_arb_share_111.bin", "kp_arb_share_222_state.bin", "keep.txt"):
+        (tmp_path / name).write_bytes(b"x")
+    monkeypatch.setattr(ss, "pid_alive", lambda pid: pid == 222)
+    assert ss.cleanup_stale_shares(str(tmp_path)) == 1
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["keep.txt", "kp_arb_share_222_state.bin"]

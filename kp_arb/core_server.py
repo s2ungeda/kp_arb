@@ -667,14 +667,22 @@ class WsHub:
     하트비트 — 화면이 "데이터 없음"과 "연결 끊김"을 구분한다. 페이로드는 /manual_state와 동일.
     """
 
+    CHANNELS = ("manual", "state")
+
     def __init__(self, system: LiveSystem | None, *, coalesce_s: float = 0.1,
-                 heartbeat_s: float = 1.0) -> None:
+                 heartbeat_s: float = 1.0,
+                 state_provider: Callable[[], dict[str, Any]] | None = None) -> None:
         self._system = system
         self._coalesce_s = coalesce_s
         self._heartbeat_s = heartbeat_s
-        self._subs: set[web.WebSocketResponse] = set()
+        # 접속 → 구독 채널 집합. 접속 직후 기본 manual(구버전 메인 호환), 구독 메시지로 추가.
+        self._subs: dict[web.WebSocketResponse, set[str]] = {}
         self._dirty = asyncio.Event()
-        self.pushes = 0       # 스냅샷 푸시 횟수(진단·테스트)
+        # state 채널(/state와 동일 페이로드) — 자동T·자동M·설정창·동시호가창용. make_app이 넣는다.
+        # 시세 틱마다 보내면 낭비라 **내용이 바뀌었을 때만** 보낸다(마지막 본문과 비교).
+        self.state_provider = state_provider
+        self._last_state_body = ""
+        self.pushes = 0       # 스냅샷 푸시 횟수(진단·테스트, 채널 합산)
         self.heartbeats = 0   # 하트비트 횟수(진단·테스트)
         if system is not None:  # 모든 훅은 코어 이벤트 루프 안에서 불린다 → Event.set 안전
             system.on_quote.append(lambda _q: self.mark())
@@ -690,42 +698,81 @@ class WsHub:
     def subscribers(self) -> int:
         return len(self._subs)
 
-    def _snapshot_text(self) -> str:
+    def _subs_of(self, channel: str) -> list[web.WebSocketResponse]:
+        return [ws for ws, chans in self._subs.items() if channel in chans]
+
+    def _manual_text(self) -> str:
         return _dumps({"channel": "manual", "ts": int(time.time() * 1000),
                        "data": manual_snapshot(self._system)})
 
+    def _state_body(self) -> str:
+        data = self.state_provider() if self.state_provider is not None else {}
+        return _dumps(data)
+
+    def _state_text(self, body: str) -> str:
+        return f'{{"channel":"state","ts":{int(time.time() * 1000)},"data":{body}}}'
+
+    async def _push_state(self, *, force: bool = False) -> None:
+        """state 채널 — 본문이 바뀐 경우(또는 force)에만 구독자에게 전송."""
+        subs = self._subs_of("state")
+        if not subs:
+            return
+        body = self._state_body()
+        if not force and body == self._last_state_body:
+            return
+        self._last_state_body = body
+        await self._broadcast(self._state_text(body), subs)
+        self.pushes += 1
+
     async def run(self) -> None:
-        """전송 루프 — dirty면 100ms 묶어 스냅샷, 조용하면 1초 하트비트."""
+        """전송 루프 — dirty면 100ms 묶어 스냅샷, 조용하면 1초 하트비트(채널별)."""
         while True:
             try:
                 await asyncio.wait_for(self._dirty.wait(), timeout=self._heartbeat_s)
             except TimeoutError:
                 if self._subs:
-                    await self._broadcast(_dumps({"channel": "manual", "heartbeat": True,
-                                                  "ts": int(time.time() * 1000)}))
+                    # 조용해도 설정·잔고·WS 상태는 바뀔 수 있다 → state는 1초마다 변화 확인
+                    await self._push_state()
+                    ts = int(time.time() * 1000)
+                    for ch in self.CHANNELS:
+                        subs = self._subs_of(ch)
+                        if subs:
+                            await self._broadcast(
+                                _dumps({"channel": ch, "heartbeat": True, "ts": ts}), subs)
                     self.heartbeats += 1
                 continue
             await asyncio.sleep(self._coalesce_s)  # 몰린 이벤트 묶기
             self._dirty.clear()
-            if self._subs:
-                await self._broadcast(self._snapshot_text())
+            manual_subs = self._subs_of("manual")
+            if manual_subs:
+                await self._broadcast(self._manual_text(), manual_subs)
                 self.pushes += 1
+            await self._push_state()
 
-    async def _broadcast(self, text: str) -> None:
-        for ws in list(self._subs):
+    async def _broadcast(self, text: str, subs: list[web.WebSocketResponse]) -> None:
+        for ws in subs:
             try:
                 await ws.send_str(text)
             except Exception:  # noqa: BLE001 - 죽은 접속은 목록에서 제거(다음 접속에 영향 없음)
-                self._subs.discard(ws)
+                self._subs.pop(ws, None)
+
+    async def _send_snapshot(self, ws: web.WebSocketResponse, channel: str) -> None:
+        if channel == "manual":
+            await ws.send_str(self._manual_text())
+        elif channel == "state":
+            body = self._state_body()
+            self._last_state_body = body
+            await ws.send_str(self._state_text(body))
 
     async def handle(self, request: web.Request) -> web.WebSocketResponse:
-        """GET /ws — 접속 즉시 스냅샷 1회, 이후 푸시. 채널은 manual 하나(구독 메시지는 확인만)."""
+        """GET /ws — 접속 즉시 manual 스냅샷 1회, 이후 푸시. `{"subscribe":["state"]}`로 채널 추가
+        (추가된 채널은 즉시 스냅샷 1회)."""
         ws = web.WebSocketResponse(heartbeat=None)
         await ws.prepare(request)
-        self._subs.add(ws)
+        self._subs[ws] = {"manual"}
         logging.getLogger("kp_arb.core").info("WS 화면 접속 — 접속자 %d", len(self._subs))
         try:
-            await ws.send_str(self._snapshot_text())
+            await self._send_snapshot(ws, "manual")
             async for msg in ws:
                 if msg.type != web.WSMsgType.TEXT:
                     if msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
@@ -735,10 +782,16 @@ class WsHub:
                     req = json.loads(msg.data)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(req, dict) and req.get("unsubscribe"):
+                if not isinstance(req, dict):
+                    continue
+                if req.get("unsubscribe"):
                     break
+                for ch in req.get("subscribe") or []:
+                    if ch in self.CHANNELS and ch not in self._subs.get(ws, set()):
+                        self._subs.setdefault(ws, set()).add(ch)
+                        await self._send_snapshot(ws, ch)
         finally:
-            self._subs.discard(ws)
+            self._subs.pop(ws, None)
             logging.getLogger("kp_arb.core").info(
                 "WS 화면 접속 종료 — 접속자 %d", len(self._subs))
         return ws
@@ -764,7 +817,8 @@ def make_app(
         system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)
         system.set_carry_rates(state.settings.fx_carry_rate, state.settings.eq_carry_rate)
 
-    async def get_state(_request: web.Request) -> web.Response:
+    def state_payload() -> dict[str, Any]:
+        """/state 본문 — HTTP와 WS `state` 채널(§12.1)이 같은 함수를 쓴다."""
         payload = snapshot(state)
         payload["live"] = live_snapshot(state, system, engine)
         payload["fx"] = (fx_service.snapshot() if fx_service is not None
@@ -781,7 +835,13 @@ def make_app(
         payload["load_errors"] = boot_errors + (
             [system.startup_load_error]
             if system is not None and system.startup_load_error else [])
-        return web.json_response(payload, dumps=_dumps)
+        return payload
+
+    if hub is not None and hub.state_provider is None:
+        hub.state_provider = state_payload
+
+    async def get_state(_request: web.Request) -> web.Response:
+        return web.json_response(state_payload(), dumps=_dumps)
 
     async def post_command(request: web.Request) -> web.Response:
         try:

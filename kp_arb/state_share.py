@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import mmap
 import os
+import re
 import struct
 import tempfile
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 SHARE_PATH_ENV = "KP_SHARE_PATH"
@@ -31,10 +33,71 @@ def default_share_path(pid: int) -> str:
     return str(Path(tempfile.gettempdir()) / f"kp_arb_share_{pid}.bin")
 
 
-def share_path_from_env() -> str | None:
+def share_path_for(base: str, channel: str) -> str:
+    """채널별 공유 파일 — 'manual'은 기본 경로 그대로(호환), 그 외는 `_채널` 접미 (§12.1)."""
+    if channel == "manual":
+        return base
+    p = Path(base)
+    return str(p.with_name(f"{p.stem}_{channel}{p.suffix}"))
+
+
+def share_path_from_env(channel: str = "manual") -> str | None:
     """자식 창이 읽을 경로 — 메인이 안 넘겼으면 None(→ HTTP 폴링 폴백)."""
     raw = os.environ.get(SHARE_PATH_ENV, "").strip()
-    return raw or None
+    return share_path_for(raw, channel) if raw else None
+
+
+_SHARE_NAME = re.compile(r"^kp_arb_share_(\d+)(?:_[a-z]+)?\.bin$")
+
+
+def stale_share_files(names: Iterable[str], pid_alive: Callable[[int], bool]) -> list[str]:
+    """공유 파일 이름들 중 주인 메인(pid)이 죽은 것 — 순수 로직(청소 대상 판정)."""
+    out: list[str] = []
+    for name in names:
+        m = _SHARE_NAME.match(name)
+        if m and not pid_alive(int(m.group(1))):
+            out.append(name)
+    return out
+
+
+def pid_alive(pid: int) -> bool:
+    """그 pid의 프로세스가 살아 있는가 — Windows는 OpenProcess, 그 외는 kill(0)."""
+    if os.name == "nt":
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def cleanup_stale_shares(dir_path: str | None = None) -> int:
+    """죽은 메인이 남긴 공유 파일 삭제(메인 시동 때 1회). 지운 개수. 실패는 조용히 건너뜀."""
+    folder = Path(dir_path) if dir_path else Path(tempfile.gettempdir())
+    try:
+        names = [p.name for p in folder.iterdir()]
+    except OSError:
+        return 0
+    removed = 0
+    for name in stale_share_files(names, pid_alive):
+        try:
+            (folder / name).unlink()
+            removed += 1
+        except OSError:
+            pass  # 다른 프로세스가 아직 열어 둔 파일 등 — 다음 시동 때 다시
+    return removed
 
 
 class ShareWriter:

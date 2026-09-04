@@ -170,6 +170,39 @@ async def test_ws_hub_snapshot_push_and_heartbeat() -> None:
         await client.close()
 
 
+async def test_ws_hub_state_channel_snapshot_and_change_only_push() -> None:
+    # state 채널(§12.1): 구독하면 /state와 같은 본문 1회 → 내용이 안 바뀌면 mark()해도 안 보냄
+    # → 하트비트는 채널별로 온다.
+    import asyncio
+    import json
+
+    from kp_arb.core_server import WsHub
+
+    hub = WsHub(None, coalesce_s=0.01, heartbeat_s=0.05)
+    runner = asyncio.create_task(hub.run())
+    client = TestClient(TestServer(make_app(CoreState(), hub=hub)))
+    await client.start_server()
+    try:
+        ws = await client.ws_connect("/ws")
+        first = json.loads((await ws.receive()).data)
+        assert first["channel"] == "manual"
+        await ws.send_str('{"subscribe":["state"]}')
+        st = json.loads((await asyncio.wait_for(ws.receive(), 1.0)).data)
+        assert st["channel"] == "state" and "settings" in st["data"] and "ws" in st["data"]
+
+        hub.mark()  # 시세 이벤트 — manual은 푸시, state는 내용 그대로라 안 보냄
+        got = []
+        for _ in range(4):
+            got.append(json.loads((await asyncio.wait_for(ws.receive(), 1.0)).data))
+        kinds = [(m["channel"], bool(m.get("heartbeat"))) for m in got]
+        assert ("manual", False) in kinds and ("state", False) not in kinds
+        assert ("manual", True) in kinds and ("state", True) in kinds  # 채널별 하트비트
+        await ws.close()
+    finally:
+        runner.cancel()
+        await client.close()
+
+
 def test_order_book_on_change_fires_on_mutations() -> None:
     # 장부 변화 훅 — 주문 등록·취소마다 불려 실시간 채널이 밀어줄 타이밍을 안다.
     from kp_arb.domain.enums import Instrument, OrderType, Side, Underlying, Venue

@@ -261,10 +261,21 @@ def main() -> None:
     # --- 실시간 채널(DESIGN §12.1): 코어 /ws 수신 전용 스레드 → 공유메모리 기록 ---
     # 소켓은 이 하나뿐. 자식 창들은 환경변수(KP_SHARE_PATH)로 받은 파일을 읽기만 한다 —
     # os.environ에 넣어두면 launch_module이 띄우는 자식이 그대로 물려받는다.
-    from .state_share import SHARE_PATH_ENV, ShareWriter, default_share_path
+    from .state_share import (
+        SHARE_PATH_ENV,
+        ShareWriter,
+        cleanup_stale_shares,
+        default_share_path,
+        share_path_for,
+    )
 
     share_path = default_share_path(os.getpid())
     os.environ[SHARE_PATH_ENV] = share_path
+    _swept = cleanup_stale_shares()  # 죽은 메인이 남긴 공유 파일 청소(임시 폴더)
+    if _swept:
+        from .core_client import screen_log as _slog
+
+        _slog().info("오래된 공유 파일 %d개 삭제", _swept)
 
     def ws_receiver() -> None:
         import json
@@ -273,13 +284,15 @@ def main() -> None:
 
         from .core_client import CORE_WS_URL, screen_log
 
-        writer = ShareWriter(share_path)
+        # 채널별 공유 파일 — manual(일반주문·주문리스트) / state(자동T·자동M·설정·동시호가)
+        writers = {ch: ShareWriter(share_path_for(share_path, ch))
+                   for ch in ("manual", "state")}
         fails = 0
         mw = alive_box["main_ws"]  # 현황판 표시용(연결·수신·끊김) — 화면은 읽기만
         while not closing["flag"]:
             try:
                 with connect(CORE_WS_URL, open_timeout=3.0, close_timeout=1.0) as ws:
-                    ws.send('{"subscribe":["manual"]}')
+                    ws.send('{"subscribe":["manual","state"]}')
                     mw["connected"] = True
                     if fails:
                         screen_log().warning("메인 WS 복구 — 연속 실패 %d회 뒤 정상", fails)
@@ -289,6 +302,9 @@ def main() -> None:
                         mw["rx"] += 1
                         msg = json.loads(raw)
                         ts = int(msg.get("ts") or time.time() * 1000)
+                        writer = writers.get(str(msg.get("channel") or "manual"))
+                        if writer is None:
+                            continue  # 모르는 채널(구버전/신버전 혼용) — 무시
                         if msg.get("heartbeat"):
                             writer.touch(ts)
                         elif "data" in msg:

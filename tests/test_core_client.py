@@ -128,6 +128,42 @@ def test_state_feed_falls_back_when_share_stale(tmp_path, monkeypatch) -> None: 
         w.close()
 
 
+def test_box_is_live_requires_fresh_success() -> None:
+    # 접속 판정 — 데이터가 있어도 마지막 성공이 3초 넘게 지났으면 끊긴 것
+    # (merge_poll이 실패해도 데이터를 남기므로 유무만으론 판정 불가).
+    from kp_arb.core_client import box_is_live
+
+    assert box_is_live({"data": None}, 100.0) is False
+    assert box_is_live({"data": {"a": 1}}, 100.0) is False  # 성공한 적 없음
+    assert box_is_live({"data": {"a": 1}, "ok_ts": 98.0}, 100.0) is True
+    assert box_is_live({"data": {"a": 1}, "ok_ts": 96.0}, 100.0) is False
+
+
+def test_state_feed_reads_channel_file(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # state 채널은 `_state` 접미 파일을 읽는다 — manual 파일과 섞이지 않는다.
+    import json
+    import time
+
+    from kp_arb.core_client import run_state_feed
+    from kp_arb.state_share import SHARE_PATH_ENV, ShareWriter, share_path_for
+
+    base = str(tmp_path / "kp_arb_share_1.bin")
+    monkeypatch.setenv(SHARE_PATH_ENV, base)
+    _quiet_screen_log(monkeypatch)
+    wm, ws = ShareWriter(base), ShareWriter(share_path_for(base, "state"))
+    try:
+        now_ms = int(time.time() * 1000)
+        wm.write(json.dumps({"kind": "manual"}).encode(), now_ms)
+        ws.write(json.dumps({"kind": "state"}).encode(), now_ms)
+        box: dict[str, object] = {"data": None}
+        run_state_feed(box, log_tag="t", channel="state", fallback_path="/state",
+                       interval_s=0.0, max_ticks=1)
+        assert box["data"] == {"kind": "state"}
+    finally:
+        wm.close()
+        ws.close()
+
+
 def test_stale_seconds() -> None:
     box: dict = {}
     assert stale_seconds(box, 10.0) is None  # 성공한 적 없음
