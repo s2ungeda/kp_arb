@@ -20,7 +20,13 @@ import time
 from typing import Any
 
 from . import win_state
-from .core_client import core_request, watch_parent_exit
+from .core_client import (
+    core_request,
+    core_request_err,
+    merge_poll,
+    screen_log,
+    watch_parent_exit,
+)
 from .domain.enums import Underlying
 
 _NAMES = {"samsung": "삼성전자", "sk_hynix": "SK하이닉스", "hyundai": "현대차"}
@@ -28,6 +34,8 @@ _KIND = {"kr_stock": "주식", "kr_stock_future": "선물", "kr_stock_future_nex
          "kr_etf": "ETF"}
 
 FUNDING_INTERVAL_S = 3600  # HL 펀딩은 매시 정각
+# 시세 화면에서 숨기는 종목(사용자 2026-09-04: 현대차 제외) — 코어 구독·계산은 그대로, 표시만 뺀다.
+HIDDEN_UNDERLYINGS: frozenset[str] = frozenset({"hyundai"})
 
 
 def _fmt(value: float | None, *, decimals: int = 0) -> str:
@@ -53,6 +61,8 @@ def ls_rows(snap: dict[str, Any]) -> list[tuple[str, ...]]:
     last_u: str | None = None
     for r in snap.get("ls", []):
         u, inst = r["underlying"], r["instrument"]
+        if u in HIDDEN_UNDERLYINGS:
+            continue
         name = _NAMES.get(u, u) if u != last_u else ""
         last_u = u
         disp = r.get("disp")
@@ -72,6 +82,8 @@ def hl_rows(snap: dict[str, Any], now_epoch: float | None = None) -> list[tuple[
     countdown = funding_countdown(now)
     rows: list[tuple[str, ...]] = []
     for r in snap.get("hl", []):
+        if r["underlying"] in HIDDEN_UNDERLYINGS:
+            continue
         lvo, mvo = r.get("last_vs_oracle"), r.get("mark_vs_oracle")
         prev, nxt = r.get("funding_prev"), r.get("funding_next")
         rows.append((
@@ -93,6 +105,8 @@ def board_rows(snap: dict[str, Any]) -> list[tuple[str, ...]]:
     rows: list[tuple[str, ...]] = []
     for r in sorted(snap.get("board", []),
                     key=lambda x: (x["underlying"], x["instrument"])):
+        if r["underlying"] in HIDDEN_UNDERLYINGS:
+            continue
         name = _NAMES.get(r["underlying"], r["underlying"])
         kind = _KIND.get(r["instrument"], r["instrument"])
         rows.append((
@@ -119,13 +133,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     jobs: queue.Queue[dict[str, Any]] = queue.Queue()
 
     def poller() -> None:
+        # 시세모니터는 HTTP 조회 유지(사용자 확정 2026-09-04) — est 입력(수량·기준%)이 창마다
+        # 달라 공유 채널에 못 싣는다. 대신 실패해도 마지막 데이터를 지우지 않는다(merge_poll).
         while True:
             q = params  # 평범한 dict 읽기(UI 스레드가 갱신) — 한 틱 지연은 무해
-            snap = core_request(
+            snap, err = core_request_err(
                 f"/monitor?qty={q['qty']}&en={q['en']}&ex={q['ex']}", timeout=2.0)
-            if snap is not None:
-                state_box["data"] = snap
-                state_box["ts"] = time.time()
+            msg = merge_poll(state_box, snap, err, time.time())
+            state_box["ts"] = state_box.get("ok_ts") or 0.0  # 표시용 '몇 초 전'
+            if msg is not None:
+                screen_log().warning("시세모니터 %s", msg)
             time.sleep(0.3)
 
     def sender() -> None:  # 호가단위 머지 명령 전송(네트워크는 뒷단)
@@ -138,7 +155,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     root = tk.Tk()
     root.title("시세")
     root.geometry("760x600")
-    win_state.attach(root, "monitor")  # 마지막 창 위치 복원·저장
+    win_state.attach(root, "monitor", keep_size=True)  # 마지막 창 위치·크기 복원·저장
     font = ("Malgun Gothic", 9)
 
     topmost_var = tk.BooleanVar(value=False)
@@ -210,6 +227,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         return _apply
 
     for agg_u in Underlying:
+        if agg_u.value in HIDDEN_UNDERLYINGS:
+            continue
         tk.Label(agg_row, text=_NAMES[agg_u.value], font=font).pack(side="left", padx=(8, 2))
         agg_combo = ttk.Combobox(agg_row, values=list(agg_choices), width=5,
                                  state="readonly", font=font)
@@ -237,7 +256,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     fill_board = make_grid(
         "괴리 보드 (%) — 진입=HL매수d−국내매수d(국내 maker)", [
-            ("쌍", 13, "black"),
+            ("쌍", 18, "black"),  # "SK하이닉스-선물(차)"까지 잘리지 않게(2026-09-04)
             ("진입", 8, "red"), ("청산", 8, "blue"),
             ("진입 est", 10, "red"), ("청산 est", 10, "blue"),   # HL est-pr 평균 체결가(USD)
             ("진입 주문가", 10, "darkred"), ("청산 주문가", 10, "darkblue"),  # 역산 LS maker(원)
@@ -270,7 +289,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             fill_hl(hl_rows(snap))
             fill_board(board_rows(snap))
             fx = snap.get("fx") or {}
-            bal = snap.get("balances") or {}
             # 환율 3개를 나란히 — 쓰는 쪽에 [ ]. 엑셀 시세!N11(현물CUR)·N12(선물역산)과 같은 배치.
             src = fx.get("src")
             spot, theory, fut = fx.get("spot"), fx.get("theory"), fx.get("futures")
@@ -294,8 +312,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             halt_text = f" ⚠정지[{' '.join(hp)}]" if hp else ""
             status.config(
                 text=f"장운영: {snap.get('phase', '-')}{halt_text} | {fx_text} | "
-                     f"주식 {bal.get('stock', 0):,.0f} | 선물 {bal.get('deriv', 0):,.0f} | "
-                     f"수신 {fresh}")
+                     f"수신 {fresh}")  # 계좌 잔고는 표시 안 함(사용자 2026-09-04)
         except tk.TclError:
             return  # 창이 닫히는 중 — 다음 예약 없이 조용히 종료
         except Exception:  # noqa: BLE001 - 1회 실패는 기록만 하고 계속

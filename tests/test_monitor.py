@@ -46,7 +46,7 @@ def test_hl_rows_format_funding_and_countdown() -> None:
 
 def test_hl_rows_missing_values_dash() -> None:
     snap = {"hl": [
-        {"underlying": "hyundai", "ask": None, "bid": None, "last": None,
+        {"underlying": "sk_hynix", "ask": None, "bid": None, "last": None,  # 현대차는 숨김 대상
          "oracle": None, "mark": 184.62, "last_vs_oracle": None,
          "mark_vs_oracle": None, "funding_prev": None, "funding_next": None},
     ]}
@@ -66,6 +66,20 @@ def test_board_rows_pct_and_est() -> None:
     assert r[1] == "0.500" and r[2] == "1.000"    # 소수→% (×100, 소수 3자리)
     assert r[3] == "184.1234" and r[4] == "184.5678"  # est (USD, 소수 4자리)
     assert r[5] == "301,500" and r[6] == "303,000"    # 주문가 (원)
+
+
+def test_hidden_underlying_dropped_from_all_tables() -> None:
+    # 현대차는 시세 화면에서 뺀다(사용자 2026-09-04) — LS·HL·괴리보드 모두. 코어 데이터는 그대로.
+    snap = {
+        "ls": [{"underlying": "hyundai", "instrument": "kr_stock"},
+               {"underlying": "samsung", "instrument": "kr_stock_future_next"}],
+        "hl": [{"underlying": "hyundai"}, {"underlying": "sk_hynix"}],
+        "board": [{"underlying": "hyundai", "instrument": "kr_stock"},
+                  {"underlying": "sk_hynix", "instrument": "kr_stock_future_next"}],
+    }
+    assert [r[0] for r in ls_rows(snap)] == ["삼성전자 선물(차)"]
+    assert [r[0] for r in hl_rows(snap, now_epoch=0)] == ["SK하이닉스"]
+    assert [r[0] for r in board_rows(snap)] == ["SK하이닉스-선물(차)"]
 
 
 def test_funding_countdown_wraps_hourly() -> None:

@@ -66,6 +66,16 @@ def test_slot_separates_instances(
     assert win_state.saved_fields("order_hl") == {"under": "삼성"}
 
 
+def test_keep_size_saves_and_restores_full_geometry(_statedir: Path) -> None:
+    # 시세 화면처럼 크기까지 기억하는 창 — keep_size일 때만 'WxH+X+Y'를 저장한다.
+    win_state.save("mon", "900x700+10+20")
+    assert win_state.saved_geometry("mon") is None  # 기본은 위치만
+    win_state.save("mon", "900x700+10+20", keep_size=True)
+    assert win_state.saved_geometry("mon") == "900x700+10+20"
+    assert win_state.saved_position("mon") == "+10+20"
+    assert win_state.is_full_geometry("900x700-5+20") and not win_state.is_full_geometry("+1+2")
+
+
 def test_missing_or_corrupt_returns_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(win_state, "_STATE_DIR", tmp_path / ".win_state")

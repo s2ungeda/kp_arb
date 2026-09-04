@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -77,15 +78,31 @@ def saved_position(name: str) -> str | None:
     return pos if isinstance(pos, str) else None
 
 
-def save(name: str, geometry: str) -> None:
-    """현재 창 위치를 저장(같은 키의 필드값은 보존). 이 키 파일만 건드려 경합 없음."""
+def save(name: str, geometry: str, *, keep_size: bool = False) -> None:
+    """현재 창 위치를 저장(같은 키의 필드값은 보존). 이 키 파일만 건드려 경합 없음.
+
+    keep_size=True면 크기까지(``'WxH+X+Y'`` 통째로) 저장 — 시세 화면처럼 사용자가 늘려 쓰는 창용.
+    """
     pos = position_only(geometry)
     if pos is None:
         return
     key = _slotted(name)
     data = _read(key)
     data["pos"] = pos
+    if keep_size and is_full_geometry(geometry):
+        data["geom"] = geometry
     _write(key, data)
+
+
+def is_full_geometry(geometry: str) -> bool:
+    """``'WxH+X+Y'`` 모양인가(크기+위치 둘 다). 크기 저장 대상 판정. (순수 함수)"""
+    return re.fullmatch(r"\d+x\d+[+-]\d+[+-]\d+", geometry) is not None
+
+
+def saved_geometry(name: str) -> str | None:
+    """저장된 크기+위치(``'WxH+X+Y'``) 또는 없으면 None — keep_size 창용."""
+    geom = _read(_slotted(name)).get("geom")
+    return geom if isinstance(geom, str) and is_full_geometry(geom) else None
 
 
 def saved_fields(name: str) -> dict[str, Any]:
@@ -102,24 +119,26 @@ def save_fields(name: str, fields: dict[str, Any]) -> None:
     _write(key, data)
 
 
-def attach(root: tk.Tk, name: str, *, interval_ms: int = 2000) -> None:
+def attach(root: tk.Tk, name: str, *, interval_ms: int = 2000,
+           keep_size: bool = False) -> None:
     """창의 마지막 위치를 복원하고, 주기적으로 저장한다. tkinter 창에 붙인다.
 
     같은 종류 창을 여러 개 띄우면 프로세스별 슬롯(``KP_WIN_SLOT``)이 키에 붙어
     각 창이 자기 위치를 따로, 서로 안 덮어쓰고 기억한다.
+    keep_size=True면 크기도 함께 복원·저장한다(기본은 위치만 — 고정 크기 창의 내용 잘림 방지).
     """
     import tkinter as tk
 
-    pos = saved_position(name)
-    if pos:
+    target = (saved_geometry(name) if keep_size else None) or saved_position(name)
+    if target:
         try:
-            root.geometry(pos)  # 위치만 이동(크기는 그대로)
+            root.geometry(target)  # 위치(+크기) 복원
         except tk.TclError:
             pass
 
     def _tick() -> None:
         try:
-            save(name, root.winfo_geometry())
+            save(name, root.winfo_geometry(), keep_size=keep_size)
             root.after(interval_ms, _tick)
         except tk.TclError:
             pass  # 창 닫힘
