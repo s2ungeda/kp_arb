@@ -333,6 +333,13 @@ def main() -> None:
         return slot
 
     def open_screen(module: str, *args: str) -> None:
+        if not alive_box["alive"]:  # 코어 연결 전엔 화면을 열지 않는다(사용자 2026-09-04)
+            from .ui_dialog import show_message
+
+            show_message(root, "코어 연결 전",
+                         "코어가 아직 연결되지 않았습니다.\n"
+                         "'코어: 연결됨'이 표시된 뒤 화면을 여세요.")
+            return
         token = " ".join([module, *args])  # ui_state 저장/복원용 식별자
         slot = _next_slot(module)  # 인스턴스별 슬롯 → win_state 키 분리(각 창 위치 따로)
         launched.append((token, slot, launch_module(module, *args, slot=slot)))
@@ -432,10 +439,10 @@ def main() -> None:
 
     def _on_load_error(errors: list[str]) -> None:
         """시동 로드 실패 팝업 — 확인 누르면 프로그램 종료(자동 되살림 끔). 사용자가 재접속."""
-        from tkinter import messagebox
+        from .ui_dialog import show_message
+
         _load_err["shown"] = True  # 한 번만
-        messagebox.showwarning(
-            "로드 실패", f"{', '.join(errors)} 로드 실패 — 재접속하세요")
+        show_message(root, "로드 실패", f"{', '.join(errors)} 로드 실패 — 재접속하세요")
         restart["intentional"] = True  # 자동 재기동 하지 않음
         closing["flag"] = True         # 폴링 스레드 재기동·저장 중단
         core_request("/command", {"cmd": "shutdown"})  # 코어 안전종료
@@ -491,10 +498,10 @@ def main() -> None:
 
         단, 자동 매매(실행 중 세트)가 있으면 확인창 — 실수로 매매를 끊지 않게.
         """
-        from tkinter import messagebox
+        from .ui_dialog import ask_yes_no
 
-        if _auto_running() and not messagebox.askokcancel(
-                "종료 확인", "자동 매매가 실행 중입니다.\n코어까지 종료하시겠습니까?"):
+        if _auto_running() and not ask_yes_no(
+                root, "종료 확인", "자동 매매가 실행 중입니다.\n코어까지 종료하시겠습니까?"):
             return
         save_ui_state()  # 닫기 직전 화면 목록 저장 — 다음 실행 때 다시 열림
         closing["flag"] = True

@@ -85,6 +85,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     from . import ui_theme as T
     from . import win_state
     from .core_client import box_is_live, core_request, run_state_feed, watch_parent_exit
+    from .ui_dialog import center_on_parent
 
     # UI만 확인하는 미리보기 — 코어 접속·부모감시 없이 레이아웃만 띄운다.
     preview = "--preview" in sys.argv
@@ -428,10 +429,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         _center(win)
 
     def _center(win: tk.Toplevel) -> None:
-        win.update_idletasks()
-        x = root.winfo_x() + (root.winfo_width() - win.winfo_width()) // 2
-        y = root.winfo_y() + (root.winfo_height() - win.winfo_height()) // 2
-        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        center_on_parent(win, root)  # 팝업은 항상 그 화면 중앙(사용자 2026-09-04, DESIGN-ui §7)
         win.grab_set()
         win.focus_set()
 

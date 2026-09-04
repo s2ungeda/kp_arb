@@ -33,9 +33,9 @@ class _FakeRoot:
 
 
 def test_attach_auto_close_waits_for_core_to_stop(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import tkinter.messagebox as mb
+    from kp_arb import ui_close
 
-    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: True)  # 확인창 '예'
+    monkeypatch.setattr(ui_close, "ask_yes_no", lambda *a, **k: True)  # 확인창 '예'
     root = _FakeRoot()
     state = {"running": True}
     stops: list[int] = []
@@ -53,10 +53,10 @@ def test_attach_auto_close_waits_for_core_to_stop(monkeypatch) -> None:  # type:
 
 
 def test_attach_auto_close_timeout_and_stay(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import tkinter.messagebox as mb
+    from kp_arb import ui_close
 
     # '아니오' → 유지
-    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: False)
+    monkeypatch.setattr(ui_close, "ask_yes_no", lambda *a, **k: False)
     root = _FakeRoot()
     on_close = attach_auto_close(root, title="t", is_running=lambda: True,
                                  send_stop=lambda: None)
@@ -64,7 +64,7 @@ def test_attach_auto_close_timeout_and_stay(monkeypatch) -> None:  # type: ignor
     assert not root.destroyed
 
     # '예'지만 코어가 안 풀림 → 3초 지나면 그냥 닫는다
-    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: True)
+    monkeypatch.setattr(ui_close, "ask_yes_no", lambda *a, **k: True)
     root = _FakeRoot()
     clock = {"t": 100.0}
     on_close = attach_auto_close(root, title="t", is_running=lambda: True,

@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from .ui_dialog import ask_yes_no
+
 
 def close_plan(running: bool, confirmed: bool | None) -> str:
     """닫기 판정 — 순수 로직. "close" | "stop_and_close" | "stay".
@@ -52,14 +54,11 @@ def attach_auto_close(
             pass
 
     def on_close() -> None:
-        from tkinter import messagebox
-
         running = bool(is_running())
         confirmed: bool | None = None
         if running:
-            confirmed = bool(messagebox.askyesno(
-                title, "자동주문이 실행 중입니다. 자동주문을 정지하고 화면을 닫을까요?",
-                parent=root))
+            confirmed = ask_yes_no(  # 모니터 중앙 팝업(ui_dialog)
+                root, title, "자동주문이 실행 중입니다. 자동주문을 정지하고 화면을 닫을까요?")
         plan = close_plan(running, confirmed)
         if plan == "stay":
             return
