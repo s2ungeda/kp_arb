@@ -18,8 +18,7 @@ from datetime import time as dtime
 from enum import StrEnum
 
 from .disparity import maker_price_for_spread
-from .domain.enums import Side, Underlying
-from .strategy_core import Block
+from .domain.enums import Block, Side, Underlying
 from .theory import in_time_window
 from .ticks import ceil_to_tick, floor_to_tick
 
@@ -179,7 +178,9 @@ class AutoMSet:
     en_s: float | None = None               # 진입 S 기준값
     ex_sf: float | None = None              # 청산 SF 기준값
     rt: int = 0                             # RT선진입(계약) — 후주문 전부 체결 때 증감
-    fill_diff: int = 0                      # 체결차 = SF잔고×10 + HL잔고 (코어가 갱신)
+    fill_diff: int = 0                      # 체결차 = SF잔고×10 + HL잔고 (이 세트 체결 기준)
+    sf_net: int = 0                         # 이 세트가 잡은 SF 순잔고(계약, 매수 +)
+    hl_net: float = 0.0                     # 이 세트가 잡은 HL 순잔고(계약, 매도 −)
     entry: Leg = field(default_factory=lambda: Leg(Block.ENTRY))
     exit: Leg = field(default_factory=lambda: Leg(Block.EXIT))
     last_entry_fill_mono: float | None = None
@@ -360,6 +361,7 @@ def on_pre_fill(
     leg.acc.sf_qty += qty
     leg.acc.sf_px_sum += price * qty
     leg.post_pending += qty * HL_PER_SF
+    s.sf_net += qty if block is Block.ENTRY else -qty
     if leg.pre_filled >= leg.pre_qty and leg.pre_qty > 0:
         leg.status = LegStatus.POST_PENDING
     else:
@@ -399,12 +401,18 @@ def on_post_fill(
     sf_contracts = int(round(hl_qty / HL_PER_SF))
     if block is Block.ENTRY:
         s.rt += sf_contracts
+        s.hl_net -= hl_qty
         s.last_entry_fill_mono = mono
     else:
         s.rt = max(0, s.rt - sf_contracts)
+        s.hl_net += hl_qty
         s.last_exit_fill_mono = mono
     if leg.post_pending > 0:
         return []
+    # 헤지 완성 시점의 체결차 확인(exec ㄹ1) — 이 세트 체결 기준. ≠0이면 중지.
+    halted = halt_if_unhedged(s, block, fill_diff(s.sf_net, s.hl_net))
+    if halted:
+        return halted
     # 이번 판의 헤지 완성 — 남은 선주문 없으면 딜레이, 부분체결 잔량이 남아 있으면 계속 대기
     if leg.await_post_then_delay or leg.pre_order_id is None or leg.pre_filled >= leg.pre_qty:
         leg.await_post_then_delay = False
@@ -447,6 +455,13 @@ def set_running(s: AutoMSet, block: Block, value: bool) -> list[Action]:
     return acts
 
 
+def on_post_partial_reject(s: AutoMSet, block: Block, unfilled: int) -> list[Action]:
+    """후주문 일부만 체결되고 나머지 거부/취소(IOC 잔량) — 미체결분만큼 체결차 → 중지."""
+    leg = s.leg(block)
+    leg.post_pending = max(0, leg.post_pending - unfilled)
+    return on_post_reject(s, block, f"HL {unfilled}계약 미체결")
+
+
 def release_halt(s: AutoMSet, block: Block) -> None:
     """중지 해제 — 사람이 정리한 뒤 직접 푼다(exec §2). 실행은 꺼진 대기로 돌아간다."""
     leg = s.leg(block)
@@ -456,3 +471,93 @@ def release_halt(s: AutoMSet, block: Block) -> None:
     leg._clear_pre()
     leg.post_pending = 0
     leg.replace_pending = leg.await_post_then_delay = False
+
+
+# ---------------------------------------------------------- 화면 단위 묶음 ---
+
+SET_COUNT = 3
+
+
+@dataclass
+class AutoMScreen:
+    """자동M 화면 전체(정방향 3세트 + 체결쏴 공통설정 + 리스크방지). core_state.json에 저장.
+
+    복원(autom_from_dict)은 **입력값·RT·누적**만 되살리고 실행 상태(running·status·주문번호)는
+    항상 꺼진 채로 시작한다(자동T와 같은 원칙)."""
+
+    sets: list[AutoMSet] = field(default_factory=lambda: [AutoMSet() for _ in range(SET_COUNT)])
+    settings: AutoMSettings = field(default_factory=AutoMSettings)
+    # 리스크방지(DESIGN-auto-m §10, 화면 입력 검증용) — 정방향 진입 > en, 청산 < ex, 진입−청산 > gap
+    risk_fwd_en: float = 0.0
+    risk_fwd_ex: float = 0.005
+    risk_fwd_gap: float = 0.001
+
+    def any_running(self) -> bool:
+        return any(s.entry.running or s.exit.running for s in self.sets)
+
+
+def _opt_float(raw: object) -> float | None:
+    if raw is None or raw == "":
+        return None
+    return float(raw)  # type: ignore[arg-type]
+
+
+def autom_from_dict(screen: AutoMScreen, raw: object) -> None:
+    """저장 스냅샷 → AutoMScreen(입력값·RT·누적만). 값 오류는 그 필드만 기본값."""
+    if not isinstance(raw, dict):
+        return
+    sets = raw.get("sets")
+    if isinstance(sets, list):
+        for target, rs in zip(screen.sets, sets, strict=False):
+            if not isinstance(rs, dict):
+                continue
+            try:
+                target.target_qty = int(rs.get("target_qty", target.target_qty))
+                target.per_qty = int(rs.get("per_qty", target.per_qty))
+                target.switch_delay_s = int(rs.get("switch_delay_s", target.switch_delay_s))
+                target.en_sf = _opt_float(rs.get("en_sf"))
+                target.en_s = _opt_float(rs.get("en_s"))
+                target.ex_sf = _opt_float(rs.get("ex_sf"))
+                target.rt = int(rs.get("rt", target.rt))
+                target.sf_net = int(rs.get("sf_net", target.sf_net))
+                target.hl_net = float(rs.get("hl_net", target.hl_net))
+            except (TypeError, ValueError):
+                pass
+            for name, leg in (("entry", target.entry), ("exit", target.exit)):
+                acc = (rs.get(name) or {}).get("acc") if isinstance(rs.get(name), dict) else None
+                if isinstance(acc, dict):
+                    try:
+                        leg.acc.hl_qty = float(acc.get("hl_qty", 0) or 0)
+                        leg.acc.hl_px_sum = float(acc.get("hl_px_sum", 0) or 0)
+                        leg.acc.fx_sum = float(acc.get("fx_sum", 0) or 0)
+                        leg.acc.sf_qty = int(acc.get("sf_qty", 0) or 0)
+                        leg.acc.sf_px_sum = float(acc.get("sf_px_sum", 0) or 0)
+                    except (TypeError, ValueError):
+                        pass
+    st = raw.get("settings")
+    if isinstance(st, dict):
+        s = screen.settings
+        try:
+            win = st.get("windows")
+            if isinstance(win, list) and win:
+                parsed = tuple((str(a), str(b)) for a, b in win)
+                for a, b in parsed:
+                    parse_hms(a)
+                    parse_hms(b)
+                s.windows = parsed
+            ticks = st.get("pre_tick")
+            if isinstance(ticks, dict):
+                s.pre_tick = {Underlying(str(k)): int(v) for k, v in ticks.items()}
+            s.pre_delay_ms = int(st.get("pre_delay_ms", s.pre_delay_ms))
+            s.resume_delay_s = int(st.get("resume_delay_s", s.resume_delay_s))
+            s.pre_range = float(st.get("pre_range", s.pre_range))
+            s.rel_buy = int(st.get("rel_buy", s.rel_buy))
+            s.rel_sell = int(st.get("rel_sell", s.rel_sell))
+        except (TypeError, ValueError):
+            pass
+    try:
+        screen.risk_fwd_en = float(raw.get("risk_fwd_en", screen.risk_fwd_en))
+        screen.risk_fwd_ex = float(raw.get("risk_fwd_ex", screen.risk_fwd_ex))
+        screen.risk_fwd_gap = float(raw.get("risk_fwd_gap", screen.risk_fwd_gap))
+    except (TypeError, ValueError):
+        pass

@@ -67,6 +67,15 @@ class OrderType(StrEnum):
     MARKET = "market"
 
 
+class Block(StrEnum):
+    """자동 주문 화면의 블록 — 진입(국내 매수 + HL 매도) / 청산(국내 매도 + HL 매수).
+
+    strategy_core·auto_m·core_engine이 함께 쓴다(순환 import 방지로 여기 둠, 2026-09-04)."""
+
+    ENTRY = "entry"
+    EXIT = "exit"
+
+
 class SessionPhase(StrEnum):
     """장운영 단계. 실제 값은 LS 장운영데이터에서 산출되며, 여기선 입력으로 받는다."""
 

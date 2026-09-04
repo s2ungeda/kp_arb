@@ -213,6 +213,8 @@ class LSWebSocketClient:
         self.on_market_status: list[Callable[[MarketStatus], None]] = []
         # 통화선물 체결가 (FC0) — (월물코드, 가격). 근/차근 구분 위해 코드 동반(§9.1).
         self.on_fx_price: list[Callable[[str, float], None]] = []
+        # 통화선물 1호가 — (월물코드, 매수1호가, 매도1호가). 자동M 환진입가(§9a)용.
+        self.on_fx_quote: list[Callable[[str, float, float], None]] = []
         self.on_fx_spot: list[Callable[[float], None]] = []  # 원달러 현물환율(원/달러) 실시간
         self._fx_codes: set[str] = set()
         self.on_raw: list[Callable[[str], None]] = []  # 진단: 모든 원시 프레임
@@ -421,6 +423,10 @@ class LSWebSocketClient:
             if fx is not None:
                 for fx_handler in self.on_fx_price:
                     fx_handler(*fx)
+                fxq = self._parse_fx_quote(msg)
+                if fxq is not None:
+                    for fx_quote_handler in self.on_fx_quote:
+                        fx_quote_handler(fx[0], *fxq)
         elif tr_cd == FX_SPOT_TR:
             spot = self._parse_fx_spot(msg)
             if spot is not None:
@@ -457,6 +463,16 @@ class LSWebSocketClient:
         except (KeyError, TypeError, ValueError):
             return None
         return (code, price) if price > 0 else None
+
+    @staticmethod
+    def _parse_fx_quote(msg: dict[str, Any]) -> tuple[float, float] | None:
+        """FC9/DC0 body의 1호가(bidho1/offerho1, 실측 2026-09-04) → (매수1호가, 매도1호가)."""
+        body = msg["body"]
+        try:
+            bid, ask = float(body["bidho1"]), float(body["offerho1"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return (bid, ask) if bid > 0 and ask > 0 else None
 
     def _parse_quote(self, msg: dict[str, Any]) -> Quote | None:
         body = msg["body"]

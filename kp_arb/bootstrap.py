@@ -55,7 +55,7 @@ from .limits import DailyFilled, DailyLimitExceeded, would_exceed_daily_limit
 from .order_book import OrderBook, TrackedOrder
 from .risk import RiskManager, RiskState
 from .session import reference_instrument
-from .session_service import SessionService
+from .session_service import FUTURES_MARKET, SessionService
 from .strategy.base import Strategy
 from .theory import (
     carry_theory,
@@ -210,6 +210,8 @@ class LiveSystem:
         if self._fx_futures is None and self._fx_months:
             self._fx_futures = self._fx_months[0]
         self.fx_futures_price: dict[str, float] = {}  # 월물코드 → 최근 현재가(근·차근)
+        # 월물코드 → (매수1호가, 매도1호가) — 자동M 환진입가(§9a: 진입 −환은 매수1호가)
+        self.fx_futures_quote: dict[str, tuple[float, float]] = {}
         # 캐리 이론가 연이자율·왕복 수수료 — config.yaml 조정 대상
         self._carry = carry_rates if carry_rates is not None else CarryRates()
         self._fees = fees if fees is not None else FeeRates()
@@ -385,6 +387,24 @@ class LiveSystem:
             price = self.fx_futures_price.get(code)
             if price is not None:
                 self._apply_fx_price(code, price)
+
+    def _apply_fx_quote(self, code: str, bid: float, ask: float) -> None:
+        self.fx_futures_quote[code] = (bid, ask)
+
+    def futures_halted(self) -> bool:
+        """선물시장(5) 정지 오버레이(사이드카·서킷) 여부 — 자동M 판정용(exec §8)."""
+        return self.session.halt_for(FUTURES_MARKET) is not None
+
+    def fx_entry_rate(self, side: Side) -> float | None:
+        """자동M 환진입가(§9a) — 최근월물 원달러선물의 매수1호가(HL 매도, −환) / 매도1호가(HL 매수).
+        호가가 없으면 직전 체결가, 그것도 없으면 None."""
+        if self._fx_futures is None:
+            return None
+        code = self._fx_futures[0]
+        quote = self.fx_futures_quote.get(code)
+        if quote is not None:
+            return quote[0] if side is Side.SELL else quote[1]
+        return self.fx_futures_price.get(code)
 
     def set_fx_spot_window(self, start: str, end: str) -> None:
         """현물환율(CUR) 사용 시간대 반영("HH:MM") — 코어가 공통설정에서 주입(사용자 입력,
@@ -735,6 +755,7 @@ class LiveSystem:
             for code, _ in self._fx_months:
                 fx_ws.subscribe_fx(code)
             fx_ws.on_fx_price.append(self._apply_fx_price)
+            fx_ws.on_fx_quote.append(self._apply_fx_quote)  # 1호가 — 자동M 환진입가
         # 원달러 현물환율(CUR) 실시간 — 주간 HL 환산 본선(엑셀 LS현물CUR). Naver는 백업.
         self._stock_ws.subscribe_fx_spot()
         self._stock_ws.on_fx_spot.append(self._apply_fx_spot)

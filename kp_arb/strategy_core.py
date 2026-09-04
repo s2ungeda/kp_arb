@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from datetime import time as dtime
 from enum import StrEnum
 
-from .domain.enums import Instrument, Side, Underlying, Venue
+from .auto_m import AutoMScreen, autom_from_dict
+from .domain.enums import Block, Instrument, Side, Underlying, Venue
 from .theory import in_time_window, parse_hhmm
 
 FUTURES_SHARES_PER_CONTRACT = 10  # 주식선물 1계약 = 10주 = HL 10계약 (§6.2-3)
@@ -29,9 +30,8 @@ class ScreenKind(StrEnum):
                 else Instrument.KR_STOCK_FUTURE)
 
 
-class Block(StrEnum):
-    ENTRY = "entry"   # en: 국내 매수 + HL 매도
-    EXIT = "exit"     # ex: 국내 매도 + HL 매수
+# Block(진입/청산)은 domain.enums로 옮김(auto_m와 공유) — 여기서 그대로 re-export.
+__all__ = ["Block"]
 
 
 # 운영시간 기본값 (§6.2-1, 문서 값). 세션 가드(JIF)와 별개의 화면 규칙.
@@ -178,6 +178,8 @@ class CoreState:
     })
     fx_month: str = "near"  # 환율 표시용 원달러선물 월물 선택: near/next (§6.2-7)
     settings: GlobalSettings = field(default_factory=GlobalSettings)  # 공통설정(한도·알람)
+    # 자동M(정방향 3세트 + 체결쏴 공통설정) — DESIGN-auto-m(-exec). 실행 상태는 복원 안 함.
+    autom: AutoMScreen = field(default_factory=AutoMScreen)
 
 
 # --- 검증 ---
@@ -346,6 +348,7 @@ def state_from_dict(data: dict[str, object]) -> CoreState:
     if fx in ("near", "next"):
         state.fx_month = str(fx)
     _global_settings_from_dict(state.settings, data.get("settings"))
+    autom_from_dict(state.autom, data.get("autom"))
     screens = data.get("screens")
     if not isinstance(screens, dict):
         return state

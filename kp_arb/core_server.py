@@ -42,6 +42,7 @@ from .strategy_core import (
 from .ticks import tick_for
 
 if TYPE_CHECKING:
+    from .auto_m_engine import AutoMEngine
     from .bootstrap import LiveSystem
     from .core_engine import RehearsalEngine
     from .fx_service import FxReportService
@@ -434,6 +435,97 @@ def _fx_command(fx_service: FxReportService | None, body: dict[str, Any]) -> dic
         return _fail([f"알 수 없는 FX 명령: {cmd!r}"])
     return _ok()
 
+def _autom_set_from_body(target: Any, body: dict[str, Any]) -> None:
+    """세트 설정 창 값 → AutoMSet(입력값). 없는 키는 그대로 둔다."""
+    from .auto_m import _opt_float
+
+    if "target_qty" in body:
+        target.target_qty = int(body["target_qty"])
+    if "per_qty" in body:
+        target.per_qty = int(body["per_qty"])
+    if "switch_delay_s" in body:
+        target.switch_delay_s = int(body["switch_delay_s"])
+    for key in ("en_sf", "en_s", "ex_sf"):
+        if key in body:
+            setattr(target, key, _opt_float(body[key]))
+    if body.get("rt_manual") is not None:  # RT 진입수량 수동 입력
+        target.rt = int(body["rt_manual"])
+    if body.get("clear_diff"):
+        target.fill_diff = 0
+        target.sf_net, target.hl_net = 0, 0.0
+
+
+async def _autom_command(
+    engine: AutoMEngine | None, state: CoreState, body: dict[str, Any]
+) -> dict[str, Any]:
+    """자동M 명령(화면 → 코어) — DESIGN-auto-m(-exec). 실행/정지는 엔진이 있어야 한다.
+
+    autom_set(세트 설정) · autom_settings(체결쏴 설정) · autom_run(실행 토글) ·
+    autom_release(중지 해제) · autom_clear_acc(누적 clear) · autom_stop_all(전 세트 정지)
+    """
+    from .auto_m import parse_hms
+
+    cmd = body.get("cmd")
+    am = state.autom
+    try:
+        if cmd == "autom_set":
+            _autom_set_from_body(am.sets[int(body["set"])], body)
+            return _ok()
+        if cmd == "autom_settings":
+            st = am.settings
+            if "windows" in body:
+                wins = tuple((str(a), str(b)) for a, b in body["windows"])
+                for a, b in wins:
+                    parse_hms(a)
+                    parse_hms(b)
+                st.windows = wins
+            if "pre_tick" in body:
+                st.pre_tick = {Underlying(str(k)): int(v) for k, v in body["pre_tick"].items()}
+            for key in ("pre_delay_ms", "resume_delay_s", "rel_buy", "rel_sell"):
+                if key in body:
+                    setattr(st, key, int(body[key]))
+            if "pre_range" in body:
+                st.pre_range = float(body["pre_range"])
+            for key in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap"):
+                if key in body:
+                    setattr(am, key, float(body[key]))
+            return _ok()
+        if cmd == "autom_clear_acc":
+            am.sets[int(body["set"])].leg(Block(str(body["block"]))).acc.clear()
+            return _ok()
+        if engine is None:
+            return _fail(["코어 시세 미접속 — 자동M 실행 불가"])
+        if cmd == "autom_run":
+            index, block = int(body["set"]), Block(str(body["block"]))
+            value = bool(body["value"])
+            target = am.sets[index]
+            if value:
+                errors: list[str] = []
+                if target.per_qty <= 0:
+                    errors.append("1회주문수량을 입력하세요")
+                if target.target_qty <= 0:
+                    errors.append("목표수량을 입력하세요")
+                if block is Block.ENTRY and (target.en_sf is None or target.en_s is None):
+                    errors.append("진입SF·진입S 기준값을 입력하세요")
+                if block is Block.EXIT and target.ex_sf is None:
+                    errors.append("청산 기준값을 입력하세요")
+                if target.leg(block).status.value == "halted":
+                    errors.append("중지 상태 — 먼저 해제하세요")
+                if errors:
+                    return _fail(errors)
+            engine.set_running(index, block, value)
+            return _ok()
+        if cmd == "autom_release":
+            engine.release(int(body["set"]), Block(str(body["block"])))
+            return _ok()
+        if cmd == "autom_stop_all":
+            engine.stop_all()
+            return _ok()
+    except (KeyError, ValueError, TypeError, IndexError) as exc:
+        return _fail([f"잘못된 자동M 인자: {exc!r}"])
+    return _fail([f"알 수 없는 자동M 명령: {cmd!r}"])
+
+
 async def _manual_command(
     system: LiveSystem | None, body: dict[str, Any]
 ) -> dict[str, Any]:
@@ -814,6 +906,7 @@ def make_app(
     fx_service: FxReportService | None = None,
     boot_errors: list[str] | None = None,
     hub: WsHub | None = None,
+    autom: AutoMEngine | None = None,
 ) -> web.Application:
     """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅.
 
@@ -844,6 +937,8 @@ def make_app(
         payload["load_errors"] = boot_errors + (
             [system.startup_load_error]
             if system is not None and system.startup_load_error else [])
+        # 자동M 실시간 상태(세트별 상태·RT·체결차·누적 Sprd) — 엔진 없으면 빈 값
+        payload["autom_live"] = autom.live_snapshot() if autom is not None else {}
         return payload
 
     if hub is not None and hub.state_provider is None:
@@ -867,6 +962,11 @@ def make_app(
             return web.json_response(result, dumps=_dumps)
         if isinstance(cmd, str) and cmd.startswith("fx_"):
             result = _fx_command(fx_service, payload)
+            return web.json_response(result, dumps=_dumps)
+        if isinstance(cmd, str) and cmd.startswith("autom_"):
+            result = await _autom_command(autom, state, payload)
+            if result.get("ok") and save:
+                save()  # 세트 설정·공통설정·RT 저장
             return web.json_response(result, dumps=_dumps)
         result = apply_command(state, payload)
         if result.get("ok") and save:
@@ -1008,6 +1108,7 @@ async def _serve() -> None:
         system = None
         engine = None
         fx_service = None
+        autom_engine = None
         tasks: list[asyncio.Task[None]] = []
         boot_errors: list[str] = []  # 코어 조립 실패 사유 → /state load_errors → 메인창 팝업
         try:
@@ -1019,8 +1120,12 @@ async def _serve() -> None:
             await system.start()
             engine = RehearsalEngine(state, system)
             fx_service = FxReportService(system)
+            from .auto_m_engine import AutoMEngine as _AutoMEngine
+
+            autom_engine = _AutoMEngine(state, system)  # 자동M 실행(정방향) — 실행은 화면 버튼
             tasks.append(asyncio.create_task(engine.run()))
             tasks.append(asyncio.create_task(fx_service.run()))
+            tasks.append(asyncio.create_task(autom_engine.run()))
             log.info("LiveSystem 결합 완료 — 리허설 판정 + FX 보고 시작 (발주 없음)")
         except Exception as exc:  # noqa: BLE001 - 키 없음/네트워크 등
             log.exception("LiveSystem 시동 실패 — API만 운영 (시세 없음)")
@@ -1034,12 +1139,15 @@ async def _serve() -> None:
             state, on_shutdown=stop.set,
             save=lambda: save_state(STATE_PATH, state),
             system=system, engine=engine, fx_service=fx_service,
-            boot_errors=boot_errors, hub=hub), access_log=None)
+            boot_errors=boot_errors, hub=hub, autom=autom_engine), access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, HOST, DEFAULT_PORT)
         await site.start()
         log.info("코어 시동: http://%s:%s (안전종료는 메인 화면에서)", HOST, DEFAULT_PORT)
         await stop.wait()
+        if autom_engine is not None:
+            autom_engine.stop_all()  # 안전종료 1단계 — 자동M 전 세트 정지(미체결 선주문 취소 요청)
+            await asyncio.sleep(0.3)
         if system is not None:
             await system.stop()  # WS(_guarded_ws)·시동 태스크 명시 취소 — 종료 중 재접속 방지
         for task in tasks:
