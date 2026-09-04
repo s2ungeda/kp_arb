@@ -14,6 +14,7 @@ from typing import Any, cast
 from . import ui_theme as T
 from . import win_state
 from .core_client import core_request, run_state_feed, watch_parent_exit
+from .ui_close import attach_auto_close
 
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
@@ -267,6 +268,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             "price": e_price.get(), "tick": e_tick.get(), "ratio": e_ratio.get(),
             "code": cb_code.get()})
         _reschedule(_persist, 2000)
+
+    # 창 닫기(X) — 자동주문 화면 공통 규칙(DESIGN-ui §6): 실행 중이면 확인 뒤 정지하고 닫는다.
+    attach_auto_close(
+        root, title="원달러선물 동시호가 주문",
+        is_running=lambda: bool(_fx_state().get("running")),
+        send_stop=lambda: send({"cmd": "fx_auction_stop"}, "정지"),
+        set_status=set_status)
 
     root.update_idletasks()
     # 최소 높이 = (트리 제외한 폼·안내·상태바) + 트리 한 줄 정도 → 트리를 거의 다 줄일 수 있음.
