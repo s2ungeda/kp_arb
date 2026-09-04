@@ -114,9 +114,18 @@ async def test_engine_round_trip_pre_fill_post_fill() -> None:
     sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1184.0, ts=0))
     await _settle()
     assert s.rt == 4 and s.entry.post_pending == 0 and s.entry.acc.fx_avg() == 1355.9
-    live = eng.live_snapshot()["sets"][0]
+    snap = eng.live_snapshot()
+    live = snap["sets"][0]
     assert live["rt"] == 4 and live["entry"]["status"] == "pre_partial"
     assert live["entry"]["sprd"] is not None
+    # 상단 모니터 3칸 — 정방향 진입 = 진입 스프레드, 역방향 진입 = 청산 스프레드(반대 호가창)
+    assert snap["monitor"]["fwd"] == {"en_sf": 0.01, "en_s": 0.01, "ex_sf": -0.01}
+    assert snap["monitor"]["rev"]["en_sf"] == -0.01 and snap["monitor"]["rev"]["ex_sf"] == 0.01
+    res = await _autom_command(eng, state, {"cmd": "autom_ref_qty", "qty": 5})
+    assert res["ok"] and state.autom.ref_qty == 5
+    # HL 호가단위 옵션 — 1184.5 USD → 기준틱 0.1, 그 배수(일반주문창과 같은 표)
+    ticks = [t["tick"] for t in snap["hl_merge_ticks"]]
+    assert ticks[:3] == ["0.1", "0.2", "0.5"] and snap["hl_merge_active"] is None
 
 
 async def test_engine_cancel_on_signal_loss_and_halt_on_post_reject() -> None:

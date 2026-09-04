@@ -493,6 +493,9 @@ async def _autom_command(
         if cmd == "autom_clear_acc":
             am.sets[int(body["set"])].leg(Block(str(body["block"]))).acc.clear()
             return _ok()
+        if cmd == "autom_ref_qty":  # 상단 기준수량 — 모니터 3칸 est 계산 수량
+            am.ref_qty = max(0, int(body["qty"]))
+            return _ok()
         if engine is None:
             return _fail(["코어 시세 미접속 — 자동M 실행 불가"])
         if cmd == "autom_run":

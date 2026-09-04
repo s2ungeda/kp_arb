@@ -16,7 +16,6 @@ from functools import partial
 from typing import Any
 
 from .order_autot import (
-    AGG_CHOICES,
     UNDER_MAP,
     UNDERLYINGS,
     is_decimal_text,
@@ -38,6 +37,63 @@ _ACC_ROWS_REV = (("진입", ("+HP", "-S", "+환")), ("청산", ("-HP", "+S", "-�
 
 # 선물 월물 콤보(상단) — 표시 → 코어 settings.future_month 값 (DESIGN §5.11)
 MONTH_MAP = {"최근": "near", "차근": "next"}  # 표시는 '최근/차근'(사용자 2026-09-03)
+
+
+def pct_to_frac(value: float | None) -> float | None:
+    """화면 %(0.5) → 코어 소수(0.005). 빈값은 None 그대로."""
+    return None if value is None else value / 100.0
+
+
+def set_payload(index: int, w: dict[str, Any]) -> dict[str, Any]:
+    """세트 화면 상태 → 코어 autom_set 명령(정방향). 기준값은 %→소수."""
+    return {
+        "cmd": "autom_set", "set": index,
+        "target_qty": int(w.get("target") or 0), "per_qty": int(w.get("per") or 0),
+        "switch_delay_s": int(w.get("delay") or 0),
+        "en_sf": pct_to_frac(w.get("en_sf")), "en_s": pct_to_frac(w.get("en_s")),
+        "ex_sf": pct_to_frac(w.get("ex_sf")),
+        "rt_manual": w.get("rt_manual"), "clear_diff": bool(w.get("clear_diff")),
+    }
+
+
+def settings_payload(common: dict[str, Any]) -> dict[str, Any]:
+    """체결쏴 설정 화면 상태 → 코어 autom_settings 명령. 범위·리스크는 %→소수."""
+    win = common["windows"]
+    return {
+        "cmd": "autom_settings",
+        "windows": [[win[0], win[1]], [win[2], win[3]]],
+        "pre_tick": dict(common["pre_tick"]),
+        "pre_delay_ms": int(common["pre_delay"]), "resume_delay_s": int(common["resume_delay"]),
+        "pre_range": float(common["pre_range"]) / 100.0,
+        "rel_buy": int(common["rel_buy"]), "rel_sell": int(common["rel_sell"]),
+        "risk_fwd_en": float(common["risk"]["fwd_en"]) / 100.0,
+        "risk_fwd_ex": float(common["risk"]["fwd_ex"]) / 100.0,
+        "risk_fwd_gap": float(common["risk"]["fwd_gap"]) / 100.0,
+    }
+
+
+def sum_acc(rows: list[dict[str, Any]], leg: str) -> dict[str, float | None]:
+    """세트별 누적(autom_live)을 방향 하나로 합산 — HL·SF 수량은 합, 환·Sprd는 HL 수량 가중."""
+    hl = sf = 0.0
+    fx_w = sprd_w = 0.0
+    sprd_q = 0.0
+    for row in rows:
+        acc = row.get(leg) or {}
+        q = float(acc.get("hl_qty") or 0)
+        hl += q
+        sf += float(acc.get("sf_qty") or 0)
+        if q > 0 and acc.get("fx_avg") is not None:
+            fx_w += float(acc["fx_avg"]) * q
+        if q > 0 and acc.get("sprd") is not None:
+            sprd_w += float(acc["sprd"]) * q
+            sprd_q += q
+    return {"hl_qty": hl, "sf_qty": sf,
+            "fx_avg": fx_w / hl if hl > 0 else None,
+            "sprd": sprd_w / sprd_q if sprd_q > 0 else None}
+
+# 다리 진행 상태(exec §2)의 짧은 표시 — 상태줄 상세용(버튼 캡션은 항상 '진입'/'청산')
+_STATUS_TEXT = {"armed": "감시", "pre_resting": "걸림", "pre_partial": "부분",
+                "post_pending": "HL", "settle_delay": "쉼", "halted": "중지"}
 
 # 선주문 호가단위 설정 종목 순서 (목업 라벨 → underlying 코드)
 _PRE_TICK_ROWS = (("하이닉스", "sk_hynix"), ("삼성전자", "samsung"), ("현대차", "hyundai"))
@@ -88,6 +144,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     from . import ui_theme as T
     from . import win_state
     from .core_client import box_is_live, core_request, run_state_feed, watch_parent_exit
+    from .ui_close import attach_auto_close
     from .ui_dialog import center_on_parent
 
     preview = "--preview" in sys.argv  # UI만 확인 — 코어 접속·부모감시 없이 레이아웃만
@@ -146,13 +203,18 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     top = tk.Frame(root)
     top.pack(fill="x", padx=4, pady=(2, 2))
     tk.Label(top, text="종목").pack(side="left")
-    cb_under = ttk.Combobox(top, values=UNDERLYINGS, width=7, state="readonly")
+    # 종목 콤보 — 현대차 제외(사용자 2026-09-04, 시세 화면과 동일). 코어 취급 종목은 그대로.
+    cb_under = ttk.Combobox(top, values=[u for u in UNDERLYINGS if u != "현대차"],
+                            width=7, state="readonly")
     cb_under.set("하이닉스")
     cb_under.pack(side="left", padx=(2, 4))
-    # TODO(운영 배선): 호가단위를 코어 merge_ticks(실제 틱 숫자)로 채운다(지금은 라벨).
-    cb_agg = ttk.Combobox(top, values=list(AGG_CHOICES), width=5, state="readonly")
-    cb_agg.set("원시")
+    # HL 호가단위(틱) — 일반주문창처럼 코어가 계산한 실제 틱 숫자(autom_live.hl_merge_ticks)로
+    # 채운다. 코어 가격 수신 전엔 "-" 하나.
+    cb_agg = ttk.Combobox(top, values=["-"], width=6, state="readonly")
+    cb_agg.set("-")
     cb_agg.pack(side="left", padx=(0, 4))
+    agg_map: dict[str, tuple[int | None, int | None]] = {}  # 틱 라벨 → (nSigFigs, mantissa)
+    agg_shown = {"under": ""}  # 어느 종목 기준으로 콤보를 채웠나
     # 선물 월물(근/차근) — 화면(종목) 단위, 모든 세트 공통 (DESIGN §5.11, 사용자 확정 2026-09-03).
     # 목업 layout_1.png에는 없는 항목 — 호가단위 콤보 오른쪽. '적'으로 코어에 보낸다.
     cb_month = ttk.Combobox(top, values=list(MONTH_MAP), width=4, state="readonly")
@@ -162,14 +224,17 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def apply_market() -> None:
         u = UNDER_MAP[cb_under.get()]
         send({"cmd": "select", "underlying": u}, "종목 선택")
-        nsf, mant = AGG_CHOICES[cb_agg.get()]
-        send({"cmd": "manual_hl_merge", "underlying": u,
-              "n_sig_figs": nsf, "mantissa": mant}, "호가단위")
+        if cb_agg.get() in agg_map:  # 틱 목록이 아직 없으면(가격 미수신) 머지는 건너뜀
+            nsf, mant = agg_map[cb_agg.get()]
+            send({"cmd": "manual_hl_merge", "underlying": u,
+                  "n_sig_figs": nsf, "mantissa": mant}, "호가단위")
         send({"cmd": "settings", "future_month": MONTH_MAP[cb_month.get()]}, "선물 월물")
+        send({"cmd": "autom_ref_qty", "qty": parse_qty(ent_refqty.get())}, "기준수량")
+        state_box["_applied"] = True  # 모니터 수치는 '적'을 누른 뒤부터 표시(사용자 2026-09-04)
 
     ttk.Style().configure("Ap.TButton", padding=(6, 2))  # 콤보 높이(≈26)에 맞춤
-    ttk.Button(top, text="적", width=3, style="Ap.TButton",
-               command=apply_market).pack(side="left", padx=(0, 4))
+    btn_apply = ttk.Button(top, text="적", width=3, style="Ap.TButton", command=apply_market)
+    btn_apply.pack(side="left", padx=(0, 4))
     ent_refqty = tk.Entry(top, width=6, justify="right", validate="key",
                           validatecommand=vcmd_int, font=T.FONT_NUM_LG)
     ent_refqty.insert(0, "0")
@@ -261,7 +326,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             w.update({"tg": lbl_tg, "per_lbl": lbl_per, "e_en_sf": e_en_sf,
                       "e_en_s": e_en_s, "e_ex_sf": e_ex_sf, "btn_en": btn_en,
                       "btn_ex": btn_ex, "rt": lbl_rt, "diff": lbl_diff,
-                      "sec": lbl_sec, "run_en": False, "run_ex": False})
+                      "sec": lbl_sec, "run_en": False, "run_ex": False,
+                      # 중지 표시(세트 행 검정/흰 글자, §9a) 되돌리기용 원래 배경
+                      "row": [(lbl_tg, "#fffbcc"), (lbl_per, "#f0f0f0"), (lbl_rt, "white"),
+                              (lbl_diff, "white"), (lbl_sec, "#f0f0f0")],
+                      "halted": False})
             btn_en.config(command=partial(toggle_run, dtag, i, "en"))
             btn_ex.config(command=partial(toggle_run, dtag, i, "ex"))
 
@@ -308,6 +377,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 return
             w["en_sf"], w["en_s"], w["ex_sf"] = en_sf, en_s, ex_sf
         w[key] = on = turning_on
+        # 코어 상태가 명령을 반영하기까지(실시간 채널 0.2~0.3초) 화면 표시를 코어값이 덮어쓰지
+        # 않게 한다 — 안 그러면 잠금→풀림→잠금으로 깜빡인다(사용자 실증 2026-09-04).
+        w[f"_pend_{side}"] = time.time() + 2.0
         btn = w["btn_en" if side == "en" else "btn_ex"]
         if on:  # 진입중=빨강, 청산중=파랑, 흰 글씨 볼드
             btn.config(bg=T.C_BUY if side == "en" else T.C_SELL, fg="white",
@@ -318,13 +390,23 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         st = "disabled" if on else "normal"
         for ent in (("e_en_sf", "e_en_s") if side == "en" else ("e_ex_sf",)):
             w[ent].config(state=st)
-        # TODO(상태기계): send({"cmd":"autom_run", ...})
+        if dtag == "fwd":  # 코어 실행(정방향) — 켤 때 세트 입력값을 먼저 보내고 실행 명령
+            block = "entry" if side == "en" else "exit"
+            if on:
+                send(set_payload(i, w), "세트 설정")
+            send({"cmd": "autom_run", "set": i, "block": block, "value": on},
+                 "실행" if on else "정지")
+        else:
+            status.config(text="역방향은 아직 미구현 — 화면 표시만(정방향 실측 후)")
 
     def clear_acc(dtag: str, group: str) -> None:
         accs = sets[(dtag, 0)].get("_acc", {}).get(group, {})
         for lbl in accs.values():
             lbl.config(text="-")
-        # TODO(상태기계): send 누적 초기화 명령
+        if dtag == "fwd":  # 누적은 세트별로 코어가 들고 있다 → 3세트 모두 clear
+            block = "entry" if group == "진입" else "exit"
+            for idx in range(3):
+                send({"cmd": "autom_clear_acc", "set": idx, "block": block}, "누적 clear")
 
     def _risk_of(dtag: str) -> tuple[float, float, float]:
         r = common["risk"]
@@ -360,9 +442,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                          validatecommand=vc)
             if key in inline_map:  # 진입SF·진입S·청산 = 화면 인라인 현재값
                 e.insert(0, w[inline_map[key]].get())
-            else:  # 목표수량·1회주문·전환딜레이 = 세트 상태값
+            else:  # 목표수량·1회주문·전환딜레이 = 세트 상태값 (전환딜레이는 0도 유효한 값)
                 val = w.get(key)
-                e.insert(0, "" if val in (None, 0) else str(val))
+                blank = val is None or (val == 0 and key != "delay")
+                e.insert(0, "" if blank else str(val))
             e.grid(row=r, column=1, padx=6, pady=3)
             ents[key] = e
         rt_var = tk.BooleanVar(value=w.get("rt_manual") is not None)
@@ -403,7 +486,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             w["clear_diff"] = diff_var.get()
             apply_set_display(dtag, i)
             win.destroy()
-            # TODO(상태기계): send 세트 설정 명령
+            if dtag == "fwd":  # 코어에 세트 설정 전송(실행 중에도 가능 — 코어가 다음 판정부터 반영)
+                send(set_payload(i, w), "세트 설정")
+                w["clear_diff"] = False  # 체결차 Clear는 1회성
 
         btns = tk.Frame(win)
         btns.grid(row=len(rows) + 2, column=0, columnspan=2, pady=(4, 6))
@@ -415,7 +500,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         w = sets[(dtag, i)]
         w["tg"].config(text=str(w["target"]) if w["target"] else "-")
         w["per_lbl"].config(text=str(w["per"]) if w["per"] else "-")
-        w["sec"].config(text=str(w["delay"]) if w["delay"] else "-")
+        w["sec"].config(text=str(w["delay"]) if w["delay"] is not None else "-")  # 0도 표시
         # 실행 중이면 잠긴 칸도 잠시 열어 값 반영 후 다시 잠금(세트설정은 실행 중에도 가능).
         for key, entkey, running in (("en_sf", "e_en_sf", w["run_en"]),
                                      ("en_s", "e_en_s", w["run_en"]),
@@ -524,7 +609,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 common["risk"][rk] = parse_threshold(e.get()) or 0.0
             refresh_windows_bar()
             win.destroy()
-            # TODO(상태기계): send 공통설정 명령
+            send(settings_payload(common), "체결쏴 설정")  # 코어 저장·즉시 반영
 
         btns = tk.Frame(win)
         btns.grid(row=3, column=0, columnspan=4, pady=(6, 6))
@@ -573,6 +658,26 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     status.pack(fill="x", padx=4, pady=(2, 4))
     refresh_windows_bar()  # 상단 주문가능시간 표시 초기화
 
+    def _live_sets() -> list[dict[str, Any]]:
+        data = state_box.get("data") or {}
+        live = data.get("autom_live") or {}
+        rows = live.get("sets")
+        return rows if isinstance(rows, list) else []
+
+    def _any_running() -> bool:
+        return any(bool((r.get("entry") or {}).get("running"))
+                   or bool((r.get("exit") or {}).get("running")) for r in _live_sets())
+
+    def _set_status(text: str) -> None:
+        status.config(text=text)
+
+    # 창 닫기(X) — 자동주문 화면 공통 규칙(DESIGN-ui §6): 실행 중이면 확인 뒤 전 세트 정지하고 닫기
+    if not preview:
+        attach_auto_close(
+            root, title="체결쏴 (자동M)", is_running=_any_running,
+            send_stop=lambda: send({"cmd": "autom_stop_all"}, "전 세트 정지"),
+            set_status=_set_status)
+
     # --- 화면 저장/복원 (win_state.autoM — 2초 자동저장, order_hl과 동일 방식) ---
     def _collect_fields() -> dict[str, Any]:
         sets_data: dict[str, Any] = {}
@@ -596,10 +701,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         saved = win_state.saved_fields("autoM")
         if not saved:
             return
-        if saved.get("under") in UNDERLYINGS:
+        if saved.get("under") in cb_under["values"]:  # 현대차 등 제외된 종목은 복원 안 함
             cb_under.set(saved["under"])
-        if saved.get("agg") in AGG_CHOICES:
-            cb_agg.set(saved["agg"])
+        if isinstance(saved.get("agg"), str):
+            state_box["_want_agg"] = saved["agg"]  # 틱 목록이 오면 그때 고른다
         if isinstance(saved.get("refqty"), str):
             ent_refqty.delete(0, "end")
             ent_refqty.insert(0, saved["refqty"])
@@ -669,6 +774,154 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     preview_mon = {"fwd_en_sf": "-0.82", "fwd_en_s": "-0.82", "fwd_ex_sf": "-0.52",
                    "rev_en_sf": "0.12", "rev_en_s": "0.12", "rev_ex_sf": "0.23"}
 
+    def _fmt_num(v: Any, d: int = 0) -> str:
+        return f"{float(v):,.{d}f}" if isinstance(v, int | float) else "-"
+
+    def _paint_leg(w: dict[str, Any], side: str, leg: dict[str, Any]) -> None:
+        """실행 버튼 색·글자(진행 상태)·기준값 칸 잠금을 코어 상태에 맞춘다."""
+        on = bool(leg.get("running"))
+        status_code = str(leg.get("status") or "idle")
+        key = f"run_{side}"
+        if w[key] != on and time.time() < w.get(f"_pend_{side}", 0.0):
+            return  # 방금 누른 버튼 — 코어가 반영할 때까지 화면 표시 유지(깜빡임 방지)
+        btn = w["btn_en" if side == "en" else "btn_ex"]
+        # 캡션은 항상 '진입'/'청산'(사용자 2026-09-04) — 진행 상태는 색(실행중 빨강/파랑,
+        # 중지 검정)과 상태줄 상세로만 보여준다.
+        text = "진입" if side == "en" else "청산"
+        if status_code == "halted":
+            btn.config(text=text, bg="black", fg="white", font=T.FONT_NUM_LG)
+        elif on:
+            btn.config(text=text, bg=T.C_BUY if side == "en" else T.C_SELL, fg="white",
+                       font=T.FONT_NUM_LG)
+        else:
+            btn.config(text=text, bg="SystemButtonFace", fg="black", font=T.FONT_BASE_LG)
+        if w[key] == on:
+            return
+        w[key] = on
+        st = "disabled" if on else "normal"
+        for ent in (("e_en_sf", "e_en_s") if side == "en" else ("e_ex_sf",)):
+            w[ent].config(state=st)
+
+    def _leg_detail(i: int, side: str, leg: dict[str, Any]) -> str | None:
+        """상태줄용 진행 상세 — 감시/대기 외 상태만 한 줄."""
+        st = str(leg.get("status") or "idle")
+        if st in ("idle", "armed"):
+            return None
+        name = "진입" if side == "en" else "청산"
+        parts = [f"{i + 1}세트 {name}: {_STATUS_TEXT.get(st, st)}"]
+        if leg.get("pre_order_id"):
+            price = leg.get("pre_price")
+            px = f"{float(price):,.0f}" if isinstance(price, int | float) else "-"
+            parts.append(f"선주문 #{leg['pre_order_id']} {leg.get('pre_qty', 0)}계약 @{px}"
+                         f" (체결 {leg.get('pre_filled', 0)}/{leg.get('pre_qty', 0)})")
+        if leg.get("post_pending"):
+            parts.append(f"HL {leg['post_pending']} 대기")
+        if st == "halted" and leg.get("halt_reason"):
+            parts.append(str(leg["halt_reason"]))
+        return " · ".join(parts)
+
+    def _paint_halt(w: dict[str, Any], halted: bool) -> None:
+        """중지 표시 — 세트 행을 검은 배경·흰 글자로(사용자 확정 2026-09-04)."""
+        if w["halted"] == halted:
+            return
+        w["halted"] = halted
+        for lbl, orig_bg in w["row"]:
+            lbl.config(bg="black" if halted else orig_bg, fg="white" if halted else "black")
+
+    def _load_inputs_from_core(data: dict[str, Any]) -> None:
+        """코어가 기억하는 세트 입력값(core_state.json)을 화면에 1회 채운다 — 코어가 원본."""
+        am = data.get("autom") or {}
+        rows = am.get("sets")
+        if not isinstance(rows, list):
+            return
+        for i, raw in enumerate(rows[:3]):
+            w = sets[("fwd", i)]
+            w["target"] = int(raw.get("target_qty") or 0)
+            w["per"] = int(raw.get("per_qty") or 0)
+            w["delay"] = int(raw.get("switch_delay_s") or 0)
+            for key in ("en_sf", "en_s", "ex_sf"):
+                v = raw.get(key)
+                w[key] = float(v) * 100.0 if isinstance(v, int | float) else None
+            apply_set_display("fwd", i)
+
+    def _refresh_merge_combo(data: dict[str, Any]) -> None:
+        """코어가 준 hl_merge_ticks로 호가단위 콤보를 채운다 — 종목이 바뀌거나 처음일 때만 set.
+        우선순위: 코어 적용값(hl_merge_active) > 창 저장값 > 최소 틱 (일반주문창과 동일)."""
+        live = data.get("autom_live") or {}
+        ticks = live.get("hl_merge_ticks") or []
+        under = cb_under.get()
+        if not ticks or (agg_shown["under"] == under and agg_map):
+            return
+        agg_map.clear()
+        vals: list[str] = []
+        for t in ticks:
+            label = str(t.get("tick"))
+            vals.append(label)
+            agg_map[label] = (t.get("n_sig_figs"), t.get("mantissa"))
+        cb_agg.config(values=vals)
+        active = live.get("hl_merge_active")
+        core_label = None
+        if isinstance(active, dict):
+            key = (active.get("n_sig_figs"), active.get("mantissa"))
+            core_label = next((s for s, v in agg_map.items() if v == key), None)
+        want = state_box.get("_want_agg")
+        cb_agg.set(core_label or (want if want in vals else vals[0]))
+        agg_shown["under"] = under
+
+    def apply_live() -> None:
+        data = state_box.get("data") or {}
+        if not state_box.get("_autom_loaded") and data.get("autom"):
+            state_box["_autom_loaded"] = True
+            _load_inputs_from_core(data)
+        rows = _live_sets()
+        details: list[str] = []
+        for i, row in enumerate(rows[:3]):
+            w = sets[("fwd", i)]
+            en, ex = row.get("entry") or {}, row.get("exit") or {}
+            _paint_leg(w, "en", en)
+            _paint_leg(w, "ex", ex)
+            _paint_halt(w, en.get("status") == "halted" or ex.get("status") == "halted")
+            for side, leg in (("en", en), ("ex", ex)):
+                detail = _leg_detail(i, side, leg)
+                if detail:
+                    details.append(detail)
+            w["rt"].config(text=_fmt_num(row.get("rt")))
+            w["diff"].config(text=_fmt_num(row.get("fill_diff")))
+        # 상단 모니터 3칸 — 코어가 기준수량으로 계산한 est 괴리(%), 정/역 각각.
+        # '적'을 누른 뒤부터 표시(종목·호가단위·기준수량이 코어에 적용된 값이라야 뜻이 있음).
+        monitor = ((data.get("autom_live") or {}).get("monitor")) or {}
+        applied = bool(state_box.get("_applied")) and parse_qty(ent_refqty.get()) > 0
+        for dtag in ("fwd", "rev"):
+            vals = monitor.get(dtag) or {}
+            for skey in ("en_sf", "en_s", "ex_sf"):
+                v = vals.get(skey)
+                text = (f"{float(v) * 100:.2f}"
+                        if applied and isinstance(v, int | float) else "-")
+                mon[f"{dtag}_{skey}"].config(text=text)
+        # 매매결과 누적(정방향) — 진입 = entry 다리, 청산 = exit 다리(세트 합산)
+        accs = sets[("fwd", 0)].get("_acc", {})
+        for glabel, leg in (("진입", "entry"), ("청산", "exit")):
+            labels = accs.get(glabel, {})
+            if not labels or not rows:
+                continue
+            agg = sum_acc(rows, leg)
+            hp_key, s_key, fx_key = ("-HP", "+S", "-환") if leg == "entry" else ("+HP", "-S", "+환")
+            labels["누적"].config(text=_fmt_num(agg["sf_qty"]))
+            labels[hp_key].config(text=_fmt_num(agg["hl_qty"]))
+            labels[s_key].config(text=_fmt_num(agg["sf_qty"]))
+            labels[fx_key].config(text=_fmt_num(agg["fx_avg"], 1))
+            sprd = agg["sprd"]
+            labels["Sprd"].config(text=f"{sprd * 100:.3f}" if sprd is not None else "-")
+        _refresh_merge_combo(data)
+        # 세트 하나라도 실행 중이면 종목·호가단위·월물 콤보와 '적' 잠금(사용자 2026-09-04) —
+        # 실행 중 상대 상품·호가단위가 바뀌면 판정 기준이 통째로 바뀐다.
+        running = _any_running()
+        for cb in (cb_under, cb_agg, cb_month):
+            cb.config(state="disabled" if running else "readonly")
+        btn_apply.config(state="disabled" if running else "normal")
+        if details:  # 진행 중인 세트의 상세(선주문 번호·가격·체결·HL 대기·중지 사유)
+            status.config(text=" / ".join(details))
+
     def refresh() -> None:
         try:
             if preview:
@@ -676,14 +929,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     lbl.config(text=preview_mon.get(key, "-"))
                 return
             connected = box_is_live(state_box, time.time())  # 데이터 있고 3초 안에 성공
-            show = parse_qty(ent_refqty.get()) > 0  # 기준수량>0일 때만 모니터 수치
-            for lbl in mon.values():
-                lbl.config(text="0.00" if (connected and show) else "-")
             if not connected:
+                for lbl in mon.values():
+                    lbl.config(text="-")
                 status.config(text="코어 미접속 — 메인에서 코어 시작")
+            else:
+                apply_live()
         except tk.TclError:
             return
-        _reschedule(refresh, 1000)
+        _reschedule(refresh, 300)
 
     def _reschedule(fn: Callable[[], None], ms: int) -> None:
         try:

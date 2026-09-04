@@ -487,6 +487,7 @@ class AutoMScreen:
 
     sets: list[AutoMSet] = field(default_factory=lambda: [AutoMSet() for _ in range(SET_COUNT)])
     settings: AutoMSettings = field(default_factory=AutoMSettings)
+    ref_qty: int = 1  # 상단 기준수량(계약) — 모니터 3칸(진입SF·진입S·청산SF) est 계산용
     # 리스크방지(DESIGN-auto-m §10, 화면 입력 검증용) — 정방향 진입 > en, 청산 < ex, 진입−청산 > gap
     risk_fwd_en: float = 0.0
     risk_fwd_ex: float = 0.005
@@ -556,6 +557,7 @@ def autom_from_dict(screen: AutoMScreen, raw: object) -> None:
         except (TypeError, ValueError):
             pass
     try:
+        screen.ref_qty = int(raw.get("ref_qty", screen.ref_qty))
         screen.risk_fwd_en = float(raw.get("risk_fwd_en", screen.risk_fwd_en))
         screen.risk_fwd_ex = float(raw.get("risk_fwd_ex", screen.risk_fwd_ex))
         screen.risk_fwd_gap = float(raw.get("risk_fwd_gap", screen.risk_fwd_gap))

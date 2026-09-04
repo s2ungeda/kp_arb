@@ -41,6 +41,7 @@ from .auto_m import (
 from .disparity import disp, est_price
 from .domain.enums import Block, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
+from .hl_merge import merge_tick_options
 
 if TYPE_CHECKING:
     from .order_book import OrderBook, TrackedOrder
@@ -298,6 +299,13 @@ class AutoMEngine:
         u, inst = self._underlying(), self._counterpart()
         stock = self._system.stock_last(u)
         theory = self._system.stock_futures_theory(u, inst)
+        # 상단 모니터 3칸(§9): 기준수량 est 괴리. 정방향 진입 = HL 매수호가창 est,
+        # 청산 = 매도호가창; 역방향은 반대(진입 = 매도호가창, 청산 = 매수호가창).
+        q = max(1, self.screen.ref_qty)
+        sf_en, sf_ex = self._system.pair_signal(u, inst, q, q)
+        s_en, s_ex = self._system.pair_signal(u, Instrument.KR_STOCK, q * HL_PER_SF, q * HL_PER_SF)
+        monitor = {"fwd": {"en_sf": sf_en, "en_s": s_en, "ex_sf": sf_ex},
+                   "rev": {"en_sf": sf_ex, "en_s": s_ex, "ex_sf": sf_en}}
         out = []
         for s in self.screen.sets:
             row: dict[str, Any] = {"rt": s.rt, "fill_diff": s.fill_diff}
@@ -311,4 +319,14 @@ class AutoMEngine:
                     "fx_avg": leg.acc.fx_avg(), "sprd": leg.acc.sprd(stock, theory),
                 }
             out.append(row)
-        return {"sets": out, "any_running": self.screen.any_running()}
+        # HL 호가단위(틱) 옵션 — 일반주문창과 같은 표(가격 자릿수 기반, 코어 계산 §5.10)
+        hl = self._system.quotes.get((u, Instrument.HL_PERP, "hl"))
+        ref = (hl.ask or hl.bid) if hl is not None else None
+        merge_ticks = ([{"tick": s, "n_sig_figs": nsf, "mantissa": mant}
+                        for s, nsf, mant in merge_tick_options(float(ref))] if ref else [])
+        active_fn = getattr(self._system, "hl_merge_active", None)
+        active = active_fn(u) if callable(active_fn) else None
+        return {"sets": out, "any_running": self.screen.any_running(), "monitor": monitor,
+                "hl_merge_ticks": merge_ticks,
+                "hl_merge_active": ({"n_sig_figs": active[0], "mantissa": active[1]}
+                                    if active is not None else None)}
