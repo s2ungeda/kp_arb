@@ -128,6 +128,17 @@ def select_months(
             for u, months in found.items()}
 
 
+FX_SPOT_SILENT_S = 600.0  # 현물환율(CUR) 무수신 → 하나고시 대체 기준(사용자 확정 2026-09-04: 10분)
+
+
+def fx_spot_backup_due(last_rx: float, now: float, silent_s: float = FX_SPOT_SILENT_S) -> bool:
+    """하나은행 고시환율로 대체할 때인가 — CUR을 한 번도 못 받았거나(last_rx=0) silent_s 넘게
+    조용할 때만. 마지막 CUR 체결가는 실제 거래가라 잠시 뜸해도 고시환율보다 낫다. 순수 로직."""
+    if last_rx == 0.0:
+        return True
+    return now - last_rx > silent_s
+
+
 def startup_symbol_error(
     expected: Iterable[Underlying],
     futures_symbols: Mapping[Underlying, str],
@@ -945,6 +956,9 @@ class LiveSystem:
         code, _ = self._fx_futures
         log = logging.getLogger("kp_arb.bootstrap")
         failures = 0
+        # 시동 초기값 조회(_seed_initial_prices)가 방금 t2111을 월물 수만큼 써서 초당 한도(2회)가
+        # 찬 상태 — 바로 조회하면 RateLimitError 경고만 남긴다(2026-09-04 실측). 한 박자 쉬고 시작.
+        await asyncio.sleep(2.0)
         while True:
             now = datetime.now()
             in_spot = in_time_window(now.time(), *self._fx_spot_window)
@@ -956,9 +970,11 @@ class LiveSystem:
                     price = await self._gw.get_fx_futures_price(code)
                     if price is not None:
                         self._apply_fx_price(code, price)  # code=최근월물
-                # 외환현물 시간대 — 본선은 LS 실시간(CUR). 그게 60초+ 조용할 때만 네이버 백업.
+                # 외환현물 시간대 — 본선은 LS 실시간(CUR). 한 번도 못 받았거나 10분+ 조용할 때만
+                # 네이버 백업. (60초 기준은 개장 전후 1~2분 간격 체결에 계속 걸려 출처가
+                # 널뛰었다 — 2026-09-04 실측.)
                 import time as _t
-                if in_spot and _t.monotonic() - self._fx_spot_ts > 60:
+                if in_spot and fx_spot_backup_due(self._fx_spot_ts, _t.monotonic()):
                     from .gateways.fx_spot import fetch_usdkrw_spot
 
                     spot = await fetch_usdkrw_spot()

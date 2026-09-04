@@ -231,6 +231,17 @@ def test_ws_statuses_collects_present_clients() -> None:
     assert [s.to_dict()["connected"] for s in statuses] == [False, False]  # 시동 전
 
 
+def test_fx_spot_backup_due_only_when_never_or_long_silent() -> None:
+    # 하나고시 대체는 CUR을 한 번도 못 받았거나 10분 넘게 조용할 때만 — 개장 전후 1~2분 간격
+    # 체결에 60초 기준이 계속 걸려 출처가 널뛰던 것을 고침(2026-09-04 실측).
+    from kp_arb.bootstrap import fx_spot_backup_due
+
+    assert fx_spot_backup_due(0.0, 1000.0) is True          # 시동 후 미수신
+    assert fx_spot_backup_due(1000.0, 1000.0 + 89) is False  # 89초 무수신 — 유지
+    assert fx_spot_backup_due(1000.0, 1000.0 + 599) is False
+    assert fx_spot_backup_due(1000.0, 1000.0 + 601) is True  # 10분 초과 — 대체
+
+
 def test_fx_spot_source_marked_ls() -> None:
     # 현물환율 출처 — LS 실시간 수신이면 "LS"(하나고시 백업과 구분해 상태줄에 표시).
     system, _, _ = _system([])
