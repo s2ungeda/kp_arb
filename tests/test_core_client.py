@@ -103,7 +103,9 @@ def test_state_feed_falls_back_to_http_when_share_missing(tmp_path, monkeypatch)
     monkeypatch.setattr(core_client, "core_request_err",
                         lambda *_a, **_k: ({"open_orders": []}, None))
     box: dict = {}
-    run_state_feed(box, log_tag="t", interval_s=0.0, max_ticks=1)
+    run_state_feed(box, log_tag="t", interval_s=0.0, max_ticks=2)
+    assert "data" not in box  # 한두 틱 못 읽은 것은 폴백 아님(창 여는 순간 쓰기와 겹침 등)
+    run_state_feed(box, log_tag="t", interval_s=0.0, max_ticks=3)  # 3틱 연속 → HTTP
     assert box["data"] == {"open_orders": []} and box["fails"] == 0
 
 
@@ -122,7 +124,7 @@ def test_state_feed_falls_back_when_share_stale(tmp_path, monkeypatch) -> None: 
     try:
         w.write(b'{"from":"share"}', 1_000)  # 아주 옛날 시각
         box: dict = {}
-        run_state_feed(box, log_tag="t", interval_s=0.0, max_ticks=1)
+        run_state_feed(box, log_tag="t", interval_s=0.0, max_ticks=3)  # 3틱 연속 낡음 → HTTP
         assert box["data"] == {"from": "http"}
     finally:
         w.close()

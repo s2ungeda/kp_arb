@@ -151,6 +151,7 @@ def run_state_feed(
     last_version = -1
     last_poll = 0.0
     source = ""  # "share" | "http" — 전환 로그용
+    misses = 0   # 연속으로 공유메모리를 못 쓴 틱 수 — 3틱(0.3초) 넘어야 폴백으로 본다
     ticks = 0
     while max_ticks is None or ticks < max_ticks:
         ticks += 1
@@ -184,15 +185,21 @@ def run_state_feed(
                     else:
                         box["ok_ts"] = ts_ms / 1000.0  # 하트비트 — 데이터 그대로, 신선함만 갱신
         if used_share:
+            misses = 0
             if source != "share":
                 if source:
                     screen_log().info("%s 공유메모리 복귀(실시간)", log_tag)
                 source = "share"
         else:
-            if source != "http":
+            misses += 1
+            # 창을 여는 순간 쓰기와 겹치거나 메인이 한두 틱 늦은 것은 폴백이 아니다 —
+            # 3틱 연속 실패해야 HTTP로 넘어간다(운영 실측 2026-09-04: 열자마자 폴백→0.1초 뒤 복귀).
+            if misses < 3:
+                pass
+            elif source != "http":
                 screen_log().warning("%s 공유메모리 없음/낡음 — HTTP 폴링으로 폴백", log_tag)
                 source = "http"
-            if now - last_poll >= poll_s:
+            if misses >= 3 and now - last_poll >= poll_s:
                 last_poll = now
                 data, err = core_request_err(fallback_path, timeout=2.0)
                 msg = merge_poll(box, data, err, now)
