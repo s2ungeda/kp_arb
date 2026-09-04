@@ -159,6 +159,10 @@ class GlobalSettings:
     hl_daily_limit_usdc: float = 0.0  # HL 당일 체결액 한도(USDC). 0=무제한
     fx_carry_rate: float = 0.010      # 환율이론가 연이자율(기본 1.0%) — 원달러선물→현물 환산
     eq_carry_rate: float = 0.030      # 주식선물 이론가 연이자율(기본 3.0%)
+    # 현물환율(LS CUR) 사용 시간대 "HH:MM" — 이 안은 HL 환산에 현물, 밖은 환율이론가.
+    # config.yaml fx_spot_window가 초기값이었으나 사용자 입력으로 전환(2026-09-04).
+    fx_spot_start: str = "07:00"
+    fx_spot_end: str = "18:10"
     sound_fill: SoundSetting = field(default_factory=SoundSetting)   # 주문 체결 시
     sound_error: SoundSetting = field(default_factory=SoundSetting)  # 에러(발주 거부·실패)
     sound_ws: SoundSetting = field(default_factory=SoundSetting)     # WS 끊김
@@ -319,6 +323,14 @@ def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
         s.eq_carry_rate = float(raw.get("eq_carry_rate", s.eq_carry_rate))
     except (TypeError, ValueError):
         pass
+    for name in ("fx_spot_start", "fx_spot_end"):  # 형식 틀리면 그 필드만 기본값 유지
+        val = raw.get(name)
+        if isinstance(val, str):
+            try:
+                parse_hhmm(val)
+            except ValueError:
+                continue
+            setattr(s, name, val)
     for name, snd in (("sound_fill", s.sound_fill), ("sound_error", s.sound_error),
                       ("sound_ws", s.sound_ws)):
         rs = raw.get(name)

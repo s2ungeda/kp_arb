@@ -386,6 +386,12 @@ class LiveSystem:
             if price is not None:
                 self._apply_fx_price(code, price)
 
+    def set_fx_spot_window(self, start: str, end: str) -> None:
+        """현물환율(CUR) 사용 시간대 반영("HH:MM") — 코어가 공통설정에서 주입(사용자 입력,
+        2026-09-04). usdkrw_effective·백업 조회가 다음 호출부터 이 창을 쓴다.
+        형식 오류는 ValueError."""
+        self._fx_spot_window = (parse_hhmm(start), parse_hhmm(end))
+
     def _hl_order_notional(self, intent: OrderIntent) -> float:
         """HL 주문 금액(USDC) = |수량| × 가격. 시장가(가격 없음)는 마크가로 추정."""
         px = intent.price
@@ -1001,7 +1007,8 @@ class LiveSystem:
         self, underlying: Underlying,
         instrument: Instrument = Instrument.KR_STOCK_FUTURE,
     ) -> float | None:
-        """주식선물 이론가 = 기초 주식 현재가 × (1 + 3.5% × 잔존일/365). 월물(근|차근)별 만기.
+        """주식선물 이론가 = 기초 주식 현재가 × (1 + r × 잔존일/365), r = 공통설정 주식선물 이자율
+        (기본 3.0%), 배당 무시. 월물(근|차근)별 만기(둘째 목요일).
 
         기초가는 **통합(uni, NXT 포함) 우선, 없으면 KRX** — 엑셀(RTD)과 동일 기준.
         (ETF 이론가의 기초는 KRX 전용 유지 — 거래소 iNAV 기준과 일치시키기 위함.)

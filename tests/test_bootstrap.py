@@ -242,6 +242,20 @@ def test_fx_spot_backup_due_only_when_never_or_long_silent() -> None:
     assert fx_spot_backup_due(1000.0, 1000.0 + 601) is True  # 10분 초과 — 대체
 
 
+def test_set_fx_spot_window_changes_effective_rate_source() -> None:
+    # 현물환율 사용시간을 설정창에서 바꾸면 HL 환산 환율 출처 판정이 즉시 그 창을 따른다.
+    from datetime import datetime
+
+    system, _, _ = _system([])
+    system._apply_fx_spot(1386.1)
+    at_9 = datetime(2026, 9, 4, 9, 0)
+    assert system.usdkrw_effective(at_9)[1] == "현물"          # 기본 07:00~18:10 안
+    system.set_fx_spot_window("10:00", "15:00")
+    assert system.usdkrw_effective(at_9)[1] != "현물"          # 새 창 밖 → 이론가
+    with pytest.raises(ValueError):
+        system.set_fx_spot_window("25:00", "15:00")
+
+
 def test_fx_spot_source_marked_ls() -> None:
     # 현물환율 출처 — LS 실시간 수신이면 "LS"(하나고시 백업과 구분해 상태줄에 표시).
     system, _, _ = _system([])

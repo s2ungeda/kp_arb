@@ -19,6 +19,14 @@ _ALARMS: tuple[tuple[str, str], ...] = (
 )
 
 
+def is_time_text(text: str) -> bool:
+    """'HH:MM' 형식 검사(00~23시, 00~59분) — 현물환율 사용시간 입력용. 순수 로직."""
+    parts = text.split(":")
+    if len(parts) != 2 or not all(p.isdigit() and len(p) == 2 for p in parts):
+        return False
+    return int(parts[0]) < 24 and int(parts[1]) < 60
+
+
 def _fmt_amount(v: float) -> str:
     """금액을 3자리 콤마로 — 지수표현(5e+09) 방지. 정수면 소수점 없음."""
     return f"{int(v):,}" if float(v).is_integer() else f"{v:,.2f}"
@@ -102,10 +110,22 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     e_eq_rate.grid(row=2, column=1, sticky="w", padx=6, pady=2)
     tk.Label(form, text="주식선물 이론가", fg=T.C_MUTED).grid(row=2, column=2, sticky="w")
 
+    # 현물환율(LS CUR) 사용시간 — 이 안은 HL 환산에 현물, 밖은 환율이론가 (사용자 입력, 2026-09-04)
+    tk.Label(form, text="현물환율 사용시간").grid(row=3, column=0, sticky="w", pady=2)
+    spot_row = tk.Frame(form)
+    spot_row.grid(row=3, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    e_spot_s = tk.Entry(spot_row, width=6, justify="center", font=T.FONT_NUM)
+    e_spot_s.pack(side="left")
+    tk.Label(spot_row, text="~").pack(side="left", padx=4)
+    e_spot_e = tk.Entry(spot_row, width=6, justify="center", font=T.FONT_NUM)
+    e_spot_e.pack(side="left")
+    tk.Label(spot_row, text="HH:MM · 이 시간 밖은 환율이론가", fg=T.C_MUTED).pack(
+        side="left", padx=(8, 0))
+
     # 알람 3줄 — [체크박스] 이벤트명  [wav 경로]  [찾아보기] [듣기]
-    tk.Label(form, text="알람 (wav)").grid(row=3, column=0, sticky="w", pady=(10, 2))
+    tk.Label(form, text="알람 (wav)").grid(row=4, column=0, sticky="w", pady=(10, 2))
     rows: dict[str, dict[str, Any]] = {}
-    for i, (key, name) in enumerate(_ALARMS, start=4):
+    for i, (key, name) in enumerate(_ALARMS, start=5):
         var = tk.BooleanVar(value=False)
         tk.Checkbutton(form, text=name, variable=var, width=10, anchor="w").grid(
             row=i, column=0, sticky="w", pady=1)
@@ -140,9 +160,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         except ValueError:
             set_status("한도·이자율은 숫자로 입력하세요", err=True)
             return
+        spot_s, spot_e = e_spot_s.get().strip(), e_spot_e.get().strip()
+        if not (is_time_text(spot_s) and is_time_text(spot_e)):
+            set_status("현물환율 사용시간은 HH:MM 형식으로 입력하세요", err=True)
+            return
         payload: dict[str, Any] = {
             "cmd": "settings_global", "hl_daily_limit_usdc": limit,
-            "fx_carry_rate": fx_rate, "eq_carry_rate": eq_rate}
+            "fx_carry_rate": fx_rate, "eq_carry_rate": eq_rate,
+            "fx_spot_start": spot_s, "fx_spot_end": spot_e}
         for key, r in rows.items():
             payload[key] = {"enabled": bool(r["var"].get()),
                             "path": r["entry"].get().strip()}
@@ -183,6 +208,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             e_fx_rate.insert(0, f"{float(settings.get('fx_carry_rate', 0.010) or 0) * 100:g}")
             e_eq_rate.delete(0, "end")
             e_eq_rate.insert(0, f"{float(settings.get('eq_carry_rate', 0.030) or 0) * 100:g}")
+            for entry, key, default in ((e_spot_s, "fx_spot_start", "07:00"),
+                                        (e_spot_e, "fx_spot_end", "18:10")):
+                entry.delete(0, "end")
+                entry.insert(0, str(settings.get(key) or default))
             for key, r in rows.items():
                 snd = settings.get(key) or {}
                 r["var"].set(bool(snd.get("enabled", False)))

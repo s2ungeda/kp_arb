@@ -190,6 +190,14 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
                 body.get("hl_daily_limit_usdc", g.hl_daily_limit_usdc))
             g.fx_carry_rate = float(body.get("fx_carry_rate", g.fx_carry_rate))
             g.eq_carry_rate = float(body.get("eq_carry_rate", g.eq_carry_rate))
+            # 현물환율 사용시간(HH:MM~HH:MM) — 형식 틀리면 ValueError → 거부(사용자 입력 2026-09-04)
+            from .theory import parse_hhmm
+
+            spot_s = str(body.get("fx_spot_start", g.fx_spot_start)).strip()
+            spot_e = str(body.get("fx_spot_end", g.fx_spot_end)).strip()
+            parse_hhmm(spot_s)
+            parse_hhmm(spot_e)
+            g.fx_spot_start, g.fx_spot_end = spot_s, spot_e
             for name, snd in (("sound_fill", g.sound_fill),
                               ("sound_error", g.sound_error), ("sound_ws", g.sound_ws)):
                 raw = body.get(name)
@@ -816,6 +824,7 @@ def make_app(
     if system is not None:  # 저장된 공통설정을 시동 시 LiveSystem에 주입
         system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)
         system.set_carry_rates(state.settings.fx_carry_rate, state.settings.eq_carry_rate)
+        system.set_fx_spot_window(state.settings.fx_spot_start, state.settings.fx_spot_end)
 
     def state_payload() -> dict[str, Any]:
         """/state 본문 — HTTP와 WS `state` 채널(§12.1)이 같은 함수를 쓴다."""
@@ -866,6 +875,8 @@ def make_app(
             system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)  # 한도 즉시 반영
             system.set_carry_rates(  # 이자율 즉시 반영(이론가 재계산에 반영)
                 state.settings.fx_carry_rate, state.settings.eq_carry_rate)
+            system.set_fx_spot_window(  # 현물환율 사용시간 즉시 반영
+                state.settings.fx_spot_start, state.settings.fx_spot_end)
         if payload.get("cmd") == "shutdown" and result.get("ok") and on_shutdown:
             # 응답을 먼저 보내고 잠시 뒤 종료 (화면이 결과를 받을 시간)
             asyncio.get_running_loop().call_later(0.2, on_shutdown)

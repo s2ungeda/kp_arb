@@ -10,7 +10,7 @@ from kp_arb.core_server import (
     save_state,
     snapshot,
 )
-from kp_arb.strategy_core import CoreState, ScreenKind
+from kp_arb.strategy_core import CoreState, ScreenKind, _global_settings_from_dict
 
 
 def _ready(state: CoreState, screen: str = "autoM") -> None:
@@ -104,6 +104,22 @@ def test_state_persistence_roundtrip(tmp_path: Path) -> None:
     assert screen.entry_sets[0].target_qty == 100
     assert restored.fx_month == "next"
     assert not screen.entry_sets[0].running  # 실행 상태는 복원 안 함 (안전)
+
+
+def test_settings_global_fx_spot_window_user_input() -> None:
+    # 현물환율 사용시간은 공통설정 사용자 입력(2026-09-04) — HH:MM 저장, 형식 오류는 거부.
+    state = CoreState()
+    assert (state.settings.fx_spot_start, state.settings.fx_spot_end) == ("07:00", "18:10")
+    ok = apply_command(state, {"cmd": "settings_global",
+                               "fx_spot_start": "08:00", "fx_spot_end": "17:30"})
+    assert ok["ok"] and state.settings.fx_spot_start == "08:00"
+    assert state.settings.fx_spot_end == "17:30"
+    bad = apply_command(state, {"cmd": "settings_global", "fx_spot_end": "25:00"})
+    assert not bad["ok"] and state.settings.fx_spot_end == "17:30"  # 거부 시 값 유지
+    restored = CoreState()
+    _global_settings_from_dict(restored.settings,
+                               {"fx_spot_start": "09:00", "fx_spot_end": "bad"})
+    assert (restored.settings.fx_spot_start, restored.settings.fx_spot_end) == ("09:00", "18:10")
 
 
 def test_settings_global_command_and_persistence(tmp_path: Path) -> None:
