@@ -28,6 +28,7 @@ from .domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .fx_auction import FxAuctionSettings
 from .hl_merge import merge_tick_options
+from .logs import DailyFileHandler
 from .manual_order import is_spot_stock, sellable_qty, short_sale_error
 from .routing import account_for
 from .strategy_core import (
@@ -1009,38 +1010,8 @@ def make_app(
     return app
 
 
-class _DailyFileHandler(logging.FileHandler):
-    """자정에 파일을 바꾸는 로그 핸들러 — 항상 ``logs/core_<오늘>.log`` 에 쓴다.
-
-    표준 TimedRotatingFileHandler는 활성 파일이 날짜 없는 이름(core.log)이고 회전분에만
-    날짜가 붙어 '파일 이름=당일 날짜' 요구와 반대다. 그래서 기록할 때 날짜가 바뀌면 스스로
-    오늘 날짜 파일로 갈아탄다 — 24시간 무중단이라 시작 시각 날짜에 고정되면 안 됨(Phase 8).
-    """
-
-    def __init__(self, log_dir: Path, prefix: str = "core") -> None:
-        self._dir = log_dir
-        self._prefix = prefix
-        self._day = self._today()
-        super().__init__(self._path(self._day), encoding="utf-8")
-
-    @staticmethod
-    def _today() -> str:
-        import time
-
-        return time.strftime("%Y%m%d")
-
-    def _path(self, day: str) -> str:
-        return str((self._dir / f"{self._prefix}_{day}.log").resolve())
-
-    def emit(self, record: logging.LogRecord) -> None:
-        day = self._today()
-        if day != self._day:  # 자정 넘김 → 오늘 파일로 갈아탄다
-            self._day = day
-            self.baseFilename = self._path(day)
-            if self.stream is not None:
-                self.stream.close()
-            self.stream = self._open()
-        super().emit(record)
+# 자정 롤오버 파일 핸들러 — kp_arb.logs로 옮김(자동M 종목별 로그와 공용). 이름은 그대로 둔다.
+_DailyFileHandler = DailyFileHandler
 
 
 def _setup_logging() -> logging.Logger:
@@ -1125,7 +1096,8 @@ async def _serve() -> None:
             fx_service = FxReportService(system)
             from .auto_m_engine import AutoMEngine as _AutoMEngine
 
-            autom_engine = _AutoMEngine(state, system)  # 자동M 실행(정방향) — 실행은 화면 버튼
+            autom_engine = _AutoMEngine(  # 자동M 실행(정방향) — 실행은 화면 버튼
+                state, system, log_dir=_base_dir() / "logs")
             tasks.append(asyncio.create_task(engine.run()))
             tasks.append(asyncio.create_task(fx_service.run()))
             tasks.append(asyncio.create_task(autom_engine.run()))

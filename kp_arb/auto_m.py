@@ -152,6 +152,8 @@ class Leg:
     replace_pending: bool = False   # 역산가 바뀜 → 취소 보냄, 취소 확인 대기
     await_post_then_delay: bool = False  # 취소 확인됨, 병행 후주문 체결 확인 뒤 딜레이
     halt_reason: str = ""
+    # 마지막 판정 결과 한 줄(어느 게이트에서 막혔나·통과했나 + 숫자) — 로그는 바뀔 때만 남긴다
+    block_reason: str = ""
     acc: Accum = field(default_factory=Accum)
 
     @property
@@ -267,68 +269,86 @@ def evaluate(
 ) -> list[Action]:
     """시세 1건에 대한 판정(exec §4 G1~G6 + §6 상태 규칙). 반환: 코어가 할 일."""
     leg = s.leg(block)
+
+    def hold(reason: str, acts: list[Action] | None = None) -> list[Action]:
+        leg.block_reason = reason
+        return acts or []
+
+    def pct(v: float | None) -> str:
+        return f"{v * 100:.3f}%" if v is not None else "-"
+
     if leg.status is LegStatus.HALTED:
-        return []
+        return hold("중지")
     # G1 실행 꺼짐 → 미체결 취소, 대기
     if not leg.running:
         acts = _cancel_if_resting(leg)
         if leg.post_pending == 0 and leg.pre_order_id is None:
             leg.status = LegStatus.IDLE
-        return acts
+        return hold("G1 실행 꺼짐", acts)
     if leg.status is LegStatus.IDLE:
         leg.status = LegStatus.ARMED
     # 시장 정지(exec §8) — 신규·정정 중단 + 미체결 취소, HL은 손대지 않음
     if sig.market_halted:
-        return _cancel_if_resting(leg)
+        return hold("시장 정지 — 신규·정정 중단", _cancel_if_resting(leg))
     if sig.resumed_mono is not None and sig.mono - sig.resumed_mono < settings.resume_delay_s:
-        return []  # 재개 딜레이
+        return hold(f"재개 딜레이 {settings.resume_delay_s}초")
     # 사건 대기 중인 상태는 시세로 바꾸지 않는다
     if leg.status is LegStatus.POST_PENDING or leg.replace_pending or leg.await_post_then_delay:
-        return []
+        return hold("후주문/취소 확인 대기")
     if leg.status is LegStatus.SETTLE_DELAY:
         if leg.delay_until is not None and sig.mono < leg.delay_until:
-            return []
+            return hold(f"선주문 딜레이 {settings.pre_delay_ms}ms")
         leg.delay_until = None
         leg.status = LegStatus.ARMED
     # G2 주문가능시간
     if not settings.in_window(sig.now.time()):
-        acts = _cancel_if_resting(leg)
-        return acts
+        return hold(f"G2 주문가능시간 밖 {sig.now:%H:%M:%S}", _cancel_if_resting(leg))
     # G3 전환대기 · G4 여유 계약수 — 새로 내지 않음(걸어둔 것은 유지)
     if _switch_wait(s, leg, sig.mono):
-        return []
+        return hold(f"G3 전환대기 {s.switch_delay_s}초")
     qty = order_qty(block, s.per_qty, s.target_qty, s.rt)
     if qty < 1 and leg.pre_order_id is None:
-        return []
+        return hold(f"G4 여유 없음 (목표 {s.target_qty} RT {s.rt} 1회 {s.per_qty})")
     # G5 판정
     if not _passes_signal(s, leg, sig):
-        return _cancel_if_resting(leg)
+        if block is Block.ENTRY:
+            why = (f"G5 미달 SF {pct(sig.sf_spread_entry)}>{pct(s.en_sf)}? "
+                   f"S {pct(sig.s_spread_entry)}>{pct(s.en_s)}?")
+        else:
+            why = f"G5 미달 SF {pct(sig.sf_spread_exit)}<{pct(s.ex_sf)}?"
+        return hold(why, _cancel_if_resting(leg))
     # G6 역산가 → 허용범위
     thr = s.threshold(block)
     hl_disp = sig.hl_disp_bid if block is Block.ENTRY else sig.hl_disp_ask
     tick = settings.pre_tick.get(underlying)
     if sig.sf_theory is None or hl_disp is None or thr is None or not tick:
-        return []
+        return hold(f"G6 입력 없음 (이론가 {sig.sf_theory} HL괴리 {pct(hl_disp)} 틱 {tick})")
     price = pre_order_price(block, sig.sf_theory, hl_disp, thr, tick)
     side = leg.pre_side
     rel = (rel_quote(sig.sf_asks, settings.rel_buy) if side is Side.BUY
            else rel_quote(sig.sf_bids, settings.rel_sell))
     if rel is None:
-        return []
-    if not within_limit(side, price, limit_price(side, rel, tick, settings.pre_range)):
-        return _cancel_if_resting(leg)
+        return hold("G6 SF 호가 없음")
+    limit = limit_price(side, rel, tick, settings.pre_range)
+    if not within_limit(side, price, limit):
+        return hold(f"G6 한계 밖 역산가 {price:,.0f} 한계 {limit:,.0f} (상대호가 {rel:,.0f})",
+                    _cancel_if_resting(leg))
+    basis = (f"역산가 {price:,.0f} = 이론가 {sig.sf_theory:,.0f}×(1+{pct(hl_disp)}−{pct(thr)}) "
+             f"틱 {tick} 한계 {limit:,.0f}")
     # 통과 — 없으면 발주, 있고 역산가가 바뀌었으면 재발주 규칙(취소→후주문 확인→딜레이→신규)
     if leg.pre_order_id is None and leg.status is LegStatus.ARMED:
         if qty < 1:
-            return []
+            return hold(f"G4 여유 없음 (목표 {s.target_qty} RT {s.rt})")
         leg.pre_price, leg.pre_qty, leg.pre_filled = price, qty, 0
         leg.status = LegStatus.PRE_RESTING
-        return [Action("place_pre", side=side, qty=qty, price=price)]
+        return hold(f"통과 → 선주문 {qty}계약 {basis}",
+                    [Action("place_pre", side=side, qty=qty, price=price)])
     if leg.pre_order_id is not None and leg.pre_price != price:
         leg.replace_pending = True
-        return [Action("cancel_pre", order_id=leg.pre_order_id,
-                       reason=f"역산가 변경 {leg.pre_price:g}→{price:g}")]
-    return []
+        return hold(f"역산가 변경 {leg.pre_price:,.0f}→{price:,.0f} → 취소 후 재발주 ({basis})",
+                    [Action("cancel_pre", order_id=leg.pre_order_id,
+                            reason=f"역산가 변경 {leg.pre_price:g}→{price:g}")])
+    return hold(f"유지 {basis}")
 
 
 # ------------------------------------------------------------ 주문 사건 처리 ---

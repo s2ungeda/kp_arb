@@ -145,6 +145,25 @@ def test_gates_cancel_or_hold_resting_order() -> None:
         == "place_pre"
 
 
+def test_block_reason_records_gate_and_basis() -> None:
+    # 판정 근거 한 줄 — 어느 게이트에서 막혔는지·통과 시 역산가 계산 근거(로그는 바뀔 때만).
+    s = _set()
+    assert evaluate(s, Block.ENTRY, _sig(), SETTINGS, U) == []
+    assert s.entry.block_reason.startswith("G1")
+    set_running(s, Block.ENTRY, True)
+    evaluate(s, Block.ENTRY, _sig(now=datetime(2026, 9, 4, 16, 0)), SETTINGS, U)
+    assert s.entry.block_reason.startswith("G2")
+    evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.001), SETTINGS, U)
+    assert "G5" in s.entry.block_reason and "0.100%" in s.entry.block_reason
+    evaluate(s, Block.ENTRY, _sig(hl_disp_bid=-0.01), SETTINGS, U)
+    assert "G6 한계 밖" in s.entry.block_reason
+    evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
+    assert s.entry.block_reason.startswith("통과") and "201,000" in s.entry.block_reason
+    on_pre_ack(s, Block.ENTRY, "1")
+    evaluate(s, Block.ENTRY, _sig(mono=101), SETTINGS, U)
+    assert s.entry.block_reason.startswith("유지")
+
+
 def test_switch_delay_and_exit_leg() -> None:
     # 청산: SF 매도(올림) — 직전 진입 체결 뒤 전환딜레이 30초 동안 안 냄, 수량 Min(1회, RT)
     s = _set(rt=3, last_entry_fill_mono=100.0)

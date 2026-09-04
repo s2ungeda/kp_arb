@@ -72,11 +72,11 @@ class FakeSystem:
         self.order_book.on_cancel(order_id)
 
 
-def _engine() -> tuple[AutoMEngine, FakeSystem, CoreState]:
+def _engine(log_dir: Any = None) -> tuple[AutoMEngine, FakeSystem, CoreState]:
     state = CoreState()
     state.screens[ScreenKind.AUTO_M].underlying = U
     sys_ = FakeSystem()
-    eng = AutoMEngine(state, sys_)  # type: ignore[arg-type]
+    eng = AutoMEngine(state, sys_, log_dir=log_dir)  # type: ignore[arg-type]
     s = state.autom.sets[0]
     s.target_qty, s.per_qty, s.en_sf, s.en_s, s.ex_sf = 100, 10, 0.005, 0.005, -0.001
     state.autom.settings.windows = (("09:00:00", "15:20:00"),)
@@ -126,6 +126,35 @@ async def test_engine_round_trip_pre_fill_post_fill() -> None:
     # HL 호가단위 옵션 — 1184.5 USD → 기준틱 0.1, 그 배수(일반주문창과 같은 표)
     ticks = [t["tick"] for t in snap["hl_merge_ticks"]]
     assert ticks[:3] == ["0.1", "0.2", "0.5"] and snap["hl_merge_active"] is None
+
+
+async def test_engine_writes_per_underlying_log(tmp_path: Any) -> None:
+    # 종목별 상세 로그(logs/autom_<종목>_날짜.log): 명령·판정 근거(바뀔 때만)·상태 전이·행동·체결
+    import logging
+
+    from kp_arb.auto_m_engine import AutoMEngine as _E
+
+    logging.getLogger("kp_arb.autom.sk_hynix").handlers.clear()  # 다른 테스트의 조용한 핸들러 제거
+    eng, sys_, state = _engine(log_dir=tmp_path)
+    assert isinstance(eng, _E)
+    now = datetime(2026, 9, 4, 10, 0, 0)
+    eng.set_running(0, Block.ENTRY, True)
+    eng.tick(now, 100.0)
+    eng.tick(now, 100.1)  # 같은 판정 → 로그 추가 없음
+    await _settle()
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=1_602_000.0, ts=0))
+    await _settle()
+    for h in logging.getLogger("kp_arb.autom.sk_hynix").handlers:
+        h.flush()
+    files = list(tmp_path.glob("autom_sk_hynix_*.log"))
+    assert len(files) == 1
+    text = files[0].read_text(encoding="utf-8")
+    assert "명령 1세트 entry 실행 켬" in text
+    assert text.count("판정 1세트 진입: 통과") == 1  # 바뀔 때만
+    assert "상태 1세트 진입: - → armed" in text and "armed → pre_resting" in text  # 전이 순서
+    assert "행동 1세트 entry: place_pre buy 10 1602000" in text
+    assert "체결 1세트 entry 선주문 #O1" in text and "누적 4/10, HL 대기 40" in text
+    assert "행동 1세트 entry: place_post sell 40" in text
 
 
 async def test_engine_cancel_on_signal_loss_and_halt_on_post_reject() -> None:

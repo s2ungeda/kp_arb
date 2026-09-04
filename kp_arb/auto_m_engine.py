@@ -17,6 +17,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .auto_m import (
@@ -24,6 +25,7 @@ from .auto_m import (
     Action,
     AutoMScreen,
     AutoMSet,
+    Leg,
     LegStatus,
     Signals,
     evaluate,
@@ -42,6 +44,7 @@ from .disparity import disp, est_price
 from .domain.enums import Block, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .hl_merge import merge_tick_options
+from .logs import attach_daily_file
 
 if TYPE_CHECKING:
     from .order_book import OrderBook, TrackedOrder
@@ -80,12 +83,18 @@ class _OrderRef:
 class AutoMEngine:
     """자동M 실행 엔진 — CoreState.autom(세트·설정)과 LiveSystem을 묶는다."""
 
-    def __init__(self, state: CoreState, system: _SystemLike) -> None:
+    def __init__(self, state: CoreState, system: _SystemLike,
+                 log_dir: Path | None = None) -> None:
         self._state = state
         self._system = system
-        self._log = logging.getLogger("kp_arb.autom")
+        self._log = logging.getLogger("kp_arb.autom")  # 굵직한 줄 → 코어 로그
+        self._log_dir = log_dir
         self._orders: dict[str, _OrderRef] = {}
         self._seen_status: dict[str, str] = {}
+        # 종목별 상세 로그(logs/autom_<종목>_날짜.log) — 판정 근거·상태 전이·체결 반영
+        # (사용자 2026-09-04). 판정·상태는 바뀔 때만 한 줄.
+        self._logged_reason: dict[tuple[int, Block], str] = {}
+        self._logged_status: dict[tuple[int, Block], str] = {}
         self._halt_since: float | None = None
         self._resumed_mono: float | None = None
         self._bg: set[asyncio.Task[None]] = set()
@@ -106,6 +115,24 @@ class AutoMEngine:
         from .strategy_core import ScreenKind
 
         return self._state.screens[ScreenKind.AUTO_M].counterpart
+
+    def ulog(self) -> logging.Logger:
+        """현재 종목의 상세 로거 — logs/autom_<종목>_날짜.log (자정 롤오버, 코어 로그와 분리)."""
+        u = self._underlying()
+        return attach_daily_file(f"kp_arb.autom.{u.value}", f"autom_{u.value}", self._log_dir)
+
+    def _trace(self, index: int, block: Block, leg: Leg) -> None:
+        """판정 결과·상태가 바뀐 때만 한 줄 — 100ms마다 다 남기면 하루 수십만 줄."""
+        key = (index, block)
+        tag = f"{index + 1}세트 {'진입' if block is Block.ENTRY else '청산'}"
+        if leg.block_reason and leg.block_reason != self._logged_reason.get(key):
+            self._logged_reason[key] = leg.block_reason
+            self.ulog().info("판정 %s: %s", tag, leg.block_reason)
+        status = leg.status.value
+        if status != self._logged_status.get(key):
+            prev = self._logged_status.get(key, "-")
+            self._logged_status[key] = status
+            self.ulog().info("상태 %s: %s → %s", tag, prev, status)
 
     # ------------------------------------------------------------ 판정 루프 ---
     async def run(self) -> None:
@@ -133,6 +160,7 @@ class AutoMEngine:
                 sig = self.build_signals(s, block, now, mono, halted)
                 self._apply(index, block, evaluate(
                     s, block, sig, self.screen.settings, self._underlying()))
+                self._trace(index, block, leg)
 
     def build_signals(self, s: AutoMSet, block: Block, now: datetime, mono: float,
                       halted: bool) -> Signals:
@@ -168,6 +196,10 @@ class AutoMEngine:
     # ------------------------------------------------------------ 행동 실행 ---
     def _apply(self, index: int, block: Block, actions: list[Action]) -> None:
         for act in actions:
+            if act.kind != "notify":  # 행동 전부 종목 로그에(발주·취소·후주문·중지)
+                self.ulog().info("행동 %d세트 %s: %s %s %s %s %s", index + 1, block.value,
+                                 act.kind, act.side.value if act.side else "",
+                                 act.qty or "", act.price or "", act.reason or act.order_id or "")
             if act.kind == "place_pre":
                 self._spawn(self._place_pre(index, block, act))
             elif act.kind == "cancel_pre" and act.order_id:
@@ -237,13 +269,25 @@ class AutoMEngine:
             return
         s = self.screen.sets[ref.index]
         mono = time.monotonic()
+        leg = s.leg(ref.block)
         if ref.leg == "pre":
             self._apply(ref.index, ref.block,
                         on_pre_fill(s, ref.block, int(round(qty)), price, mono))
+            self.ulog().info("체결 %d세트 %s 선주문 #%s %g @ %g → 누적 %d/%d, HL 대기 %d",
+                             ref.index + 1, ref.block.value, order.order_id, qty, price,
+                             leg.pre_filled, leg.pre_qty, leg.post_pending)
         else:
             fx = self._system.fx_entry_rate(order.intent.side) or 0.0
             self._apply(ref.index, ref.block, on_post_fill(
                 s, ref.block, qty, price, fx, mono, self.screen.settings))
+            acc = leg.acc
+            self.ulog().info(
+                "체결 %d세트 %s 후주문 #%s HL %g @ %g 환 %g → RT %d 체결차 %d HL대기 %d | "
+                "누적 HL %g SF %d 환평균 %s HL평균 %s SF평균 %s",
+                ref.index + 1, ref.block.value, order.order_id, qty, price, fx,
+                s.rt, s.fill_diff, leg.post_pending, acc.hl_qty, acc.sf_qty,
+                acc.fx_avg(), acc.hl_avg(), acc.sf_avg())
+        self._trace(ref.index, ref.block, leg)
 
     def _on_book_change(self) -> None:
         """취소·거부는 상태 변화로 온다 — 추적 주문의 상태 전이를 한 번씩 처리."""
@@ -257,6 +301,10 @@ class AutoMEngine:
             self._seen_status[oid] = status
             s = self.screen.sets[ref.index]
             mono = time.monotonic()
+            self.ulog().info("통보 %d세트 %s %s주문 #%s 상태 %s (체결 %g/%g)",
+                             ref.index + 1, ref.block.value,
+                             "선" if ref.leg == "pre" else "후", oid, status,
+                             order.filled_qty, order.intent.qty)
             if ref.leg == "pre":
                 if status == "cancelled":
                     on_pre_cancelled(s, ref.block, mono, self.screen.settings)
@@ -275,6 +323,7 @@ class AutoMEngine:
                 self._forget(oid)
             elif status == "filled":
                 self._forget(oid)
+            self._trace(ref.index, ref.block, s.leg(ref.block))
 
     def _forget(self, oid: str) -> None:
         self._orders.pop(oid, None)
@@ -282,10 +331,18 @@ class AutoMEngine:
 
     # ---------------------------------------------------------------- 명령 ---
     def set_running(self, index: int, block: Block, value: bool) -> None:
-        self._apply(index, block, set_running(self.screen.sets[index], block, value))
+        s = self.screen.sets[index]
+        self.ulog().info(
+            "명령 %d세트 %s 실행 %s | 목표 %d 1회 %d 전환 %ds 진입SF %s 진입S %s 청산 %s RT %d",
+            index + 1, block.value, "켬" if value else "끔", s.target_qty,
+            s.per_qty, s.switch_delay_s, s.en_sf, s.en_s, s.ex_sf, s.rt)
+        self._apply(index, block, set_running(s, block, value))
+        self._trace(index, block, s.leg(block))
 
     def release(self, index: int, block: Block) -> None:
+        self.ulog().info("명령 %d세트 %s 중지 해제", index + 1, block.value)
         release_halt(self.screen.sets[index], block)
+        self._trace(index, block, self.screen.sets[index].leg(block))
 
     def stop_all(self) -> None:
         """전 세트 실행 해제(창 닫기·안전종료) — 미체결 선주문 취소."""
