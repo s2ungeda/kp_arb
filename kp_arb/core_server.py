@@ -487,6 +487,9 @@ async def _autom_command(
                     setattr(st, key, int(body[key]))
             if "pre_range" in body:
                 st.pre_range = float(body["pre_range"])
+            for key in ("hl_margin_buy", "hl_margin_sell"):  # 후주문 지정가 여유(소수)
+                if key in body:
+                    setattr(st, key, float(body[key]))
             for key in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap"):
                 if key in body:
                     setattr(am, key, float(body[key]))

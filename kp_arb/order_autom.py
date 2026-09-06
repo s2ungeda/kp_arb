@@ -66,6 +66,8 @@ def settings_payload(common: dict[str, Any]) -> dict[str, Any]:
         "pre_delay_ms": int(common["pre_delay"]), "resume_delay_s": int(common["resume_delay"]),
         "pre_range": float(common["pre_range"]) / 100.0,
         "rel_buy": int(common["rel_buy"]), "rel_sell": int(common["rel_sell"]),
+        "hl_margin_buy": float(common.get("hl_margin_buy", 1.0)) / 100.0,
+        "hl_margin_sell": float(common.get("hl_margin_sell", 1.0)) / 100.0,
         "risk_fwd_en": float(common["risk"]["fwd_en"]) / 100.0,
         "risk_fwd_ex": float(common["risk"]["fwd_ex"]) / 100.0,
         "risk_fwd_gap": float(common["risk"]["fwd_gap"]) / 100.0,
@@ -188,6 +190,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         "pre_tick": {"sk_hynix": 3000, "samsung": 500, "hyundai": 1000},
         "pre_delay": 1000, "resume_delay": 10, "pre_range": 0.4,
         "rel_buy": 1, "rel_sell": 1,
+        "hl_margin_buy": 1.0, "hl_margin_sell": 1.0,  # 후주문 HP 여유(%) — 지정가 taker
+
         "risk": {"fwd_en": 0.0, "fwd_ex": 0.5, "fwd_gap": 0.1,
                  "rev_en": 0.5, "rev_ex": 0.0, "rev_gap": 0.1},
     }
@@ -534,45 +538,64 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             e.pack(side="left", padx=1)
             w_ents.append(e)
 
-        # 선주문 호가단위 (종목별) — 왼쪽 블록
+        # 배치(사용자 확정 2026-09-04): 한 그리드에 두 줄 — 줄1 [선주문 호가단위 | 선주문(딜레이·
+        # 재개·범위)], 줄2 [상대호가 | 후주문 HP]. 행 수가 같은 틀끼리 같은 줄이라 가로선이 맞는다.
         pt = tk.LabelFrame(win, text="선주문 호가단위")
-        pt.grid(row=1, column=0, columnspan=2, sticky="nw", padx=6, pady=4)
+        pt.grid(row=1, column=0, columnspan=2, sticky="new", padx=6, pady=4)
         pt_ents: dict[str, tk.Entry] = {}
         for r, (plabel, pcode) in enumerate(_PRE_TICK_ROWS):
-            tk.Label(pt, text=plabel, anchor="w").grid(
+            tk.Label(pt, text=plabel, anchor="w", width=7).grid(  # 라벨 폭 통일 → 입력칸 세로 정렬
                 row=r, column=0, sticky="w", padx=4, pady=2)
             e = tk.Entry(pt, width=9, justify="right", validate="key",
                          validatecommand=vcmd_int)
             e.insert(0, str(common["pre_tick"][pcode]))
             e.grid(row=r, column=1, padx=4, pady=2)
             pt_ents[pcode] = e
+        # 줄2 왼쪽 — 상대호가 콤보(매수/매도)
+        rel = tk.LabelFrame(win, text="상대호가")
+        rel.grid(row=2, column=0, columnspan=2, sticky="new", padx=6, pady=4)
+        rel_cbs: dict[str, ttk.Combobox] = {}
+        for r, (rk, rlabel) in enumerate((("rel_buy", "매수"), ("rel_sell", "매도"))):
+            choices = _REL_CHOICES_BUY if rk == "rel_buy" else _REL_CHOICES_SELL
+            tk.Label(rel, text=rlabel, anchor="w", width=7).grid(
+                row=r, column=0, sticky="w", padx=4, pady=2)
+            cb = ttk.Combobox(rel, values=choices, width=14, state="readonly")
+            cb.set(choices[common[rk] - 1])
+            cb.grid(row=r, column=1, padx=4, pady=2)
+            rel_cbs[rk] = cb
 
-        # 선주문 딜레이·범위·상대호가 — 오른쪽 블록
-        pr = tk.Frame(win)
-        pr.grid(row=1, column=2, columnspan=2, sticky="nw", padx=6, pady=4)
-        tk.Label(pr, text="선주문 딜레이(ms)").grid(row=0, column=0, sticky="e", pady=2)
+        # 줄2 오른쪽 — 후주문 HP(%) (자동T의 HP 여유와 같은 뜻: 매도 = 매수1호가×(1−여유)).
+        # 2행짜리라 2행인 상대호가 틀과 같은 줄, 3행짜리 선주문 틀은 3행인 호가단위 틀과 같은 줄.
+        hp = tk.LabelFrame(win, text="후주문 HP(%)")
+        hp.grid(row=2, column=2, columnspan=2, sticky="new", padx=6, pady=4)
+        hp_ents: dict[str, tk.Entry] = {}
+        for r, (hk, hlabel) in enumerate((("hl_margin_buy", "매수"), ("hl_margin_sell", "매도"))):
+            tk.Label(hp, text=hlabel, anchor="w", width=7).grid(
+                row=r, column=0, sticky="w", padx=4, pady=2)
+            e_hp = tk.Entry(hp, width=9, justify="right", validate="key",
+                            validatecommand=vcmd_dec)
+            e_hp.insert(0, f"{common.get(hk, 1.0):g}")
+            e_hp.grid(row=r, column=1, padx=4, pady=2)
+            hp_ents[hk] = e_hp
+        # 줄1 오른쪽 — 선주문 딜레이·재개 딜레이·범위 (3행 — 호가단위 틀과 같은 줄, 행 높이 일치)
+        pr = tk.LabelFrame(win, text="선주문")
+        pr.grid(row=1, column=2, columnspan=2, sticky="new", padx=6, pady=4)
+        pr.columnconfigure(0, weight=1)  # 라벨은 오른쪽 붙임 → 입력칸이 오른쪽 끝에 정렬
+        tk.Label(pr, text="딜레이(ms)").grid(row=0, column=0, sticky="e", pady=2)
         e_delay = tk.Entry(pr, width=7, justify="right", validate="key",
                            validatecommand=vcmd_int)
         e_delay.insert(0, str(common["pre_delay"]))
-        e_delay.grid(row=0, column=1, padx=4, pady=2)
+        e_delay.grid(row=0, column=1, padx=4, pady=2, sticky="e")  # 오른쪽 끝을 콤보와 맞춤
         tk.Label(pr, text="재개 딜레이(초)").grid(row=1, column=0, sticky="e", pady=2)
         e_resume = tk.Entry(pr, width=7, justify="right", validate="key",
                             validatecommand=vcmd_int)
         e_resume.insert(0, str(common["resume_delay"]))
-        e_resume.grid(row=1, column=1, padx=4, pady=2)
-        tk.Label(pr, text="선주문 범위(%)").grid(row=2, column=0, sticky="e", pady=2)
+        e_resume.grid(row=1, column=1, padx=4, pady=2, sticky="e")
+        tk.Label(pr, text="범위(%)").grid(row=2, column=0, sticky="e", pady=2)
         e_range = tk.Entry(pr, width=7, justify="right", validate="key",
                            validatecommand=vcmd_dec)
         e_range.insert(0, f"{common['pre_range']:g}")
-        e_range.grid(row=2, column=1, padx=4, pady=2)
-        rel_cbs: dict[str, ttk.Combobox] = {}
-        for r, (rk, rlabel) in enumerate((("rel_buy", "매수"), ("rel_sell", "매도")), start=3):
-            choices = _REL_CHOICES_BUY if rk == "rel_buy" else _REL_CHOICES_SELL
-            tk.Label(pr, text=rlabel).grid(row=r, column=0, sticky="e", pady=2)
-            cb = ttk.Combobox(pr, values=choices, width=15, state="readonly")
-            cb.set(choices[common[rk] - 1])
-            cb.grid(row=r, column=1, padx=4, pady=2)
-            rel_cbs[rk] = cb
+        e_range.grid(row=2, column=1, padx=4, pady=2, sticky="e")
 
         # 리스크방지 — 정/역방향 각 3칸
         risk_ents: dict[str, tk.Entry] = {}
@@ -580,7 +603,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         def _risk_block(col: int, title: str, pfx: str,
                         specs: tuple[tuple[str, str, str], ...]) -> None:
             fr = tk.LabelFrame(win, text=title)
-            fr.grid(row=2, column=col, columnspan=2, sticky="nw", padx=6, pady=4)
+            fr.grid(row=3, column=col, columnspan=2, sticky="new", padx=6, pady=4)
             for r, (rlabel, op, rk) in enumerate(specs):
                 tk.Label(fr, text=f"{rlabel} {op}").grid(
                     row=r, column=0, sticky="e", padx=4, pady=2)
@@ -605,6 +628,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             for rk, cb in rel_cbs.items():
                 choices = _REL_CHOICES_BUY if rk == "rel_buy" else _REL_CHOICES_SELL
                 common[rk] = choices.index(cb.get()) + 1
+            for hk, e_hp in hp_ents.items():
+                common[hk] = parse_threshold(e_hp.get()) or 0.0
             for rk, e in risk_ents.items():
                 common["risk"][rk] = parse_threshold(e.get()) or 0.0
             refresh_windows_bar()
@@ -612,7 +637,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             send(settings_payload(common), "체결쏴 설정")  # 코어 저장·즉시 반영
 
         btns = tk.Frame(win)
-        btns.grid(row=3, column=0, columnspan=4, pady=(6, 6))
+        btns.grid(row=4, column=0, columnspan=4, pady=(6, 6))
         tk.Button(btns, text="확인", width=8, command=save).pack(side="left", padx=4)
         tk.Button(btns, text="취소", width=8, command=win.destroy).pack(side="left", padx=4)
         _center(win)
@@ -694,6 +719,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                        "pre_delay": common["pre_delay"], "resume_delay": common["resume_delay"],
                        "pre_range": common["pre_range"],
                        "rel_buy": common["rel_buy"], "rel_sell": common["rel_sell"],
+                       "hl_margin_buy": common.get("hl_margin_buy", 1.0),
+                       "hl_margin_sell": common.get("hl_margin_sell", 1.0),
                        "risk": dict(common["risk"])},
             "sets": sets_data}
 
@@ -721,6 +748,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     common[k] = sc[k]
             if isinstance(sc.get("pre_range"), int | float):
                 common["pre_range"] = float(sc["pre_range"])
+            for hk in ("hl_margin_buy", "hl_margin_sell"):
+                if isinstance(sc.get(hk), int | float):
+                    common[hk] = float(sc[hk])
             if isinstance(sc.get("risk"), dict):
                 for k in common["risk"]:
                     if isinstance(sc["risk"].get(k), int | float):

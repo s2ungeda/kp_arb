@@ -61,6 +61,17 @@ class AutoMSettings:
     pre_range: float = 0.004     # 선주문 발주 허용범위(0.4%)
     rel_buy: int = 1             # 매수 한계의 상대 매도N호가
     rel_sell: int = 1            # 매도 한계의 상대 매수N호가
+    # 후주문(HL) 지정가 여유 — 항상 지정가(Gtc)만 쓴다(사용자 확정 2026-09-04, IOC·FOK 없음).
+    # HL 매수 = 매도1호가 × (1 + hl_margin_buy) / HL 매도 = 매수1호가 × (1 − hl_margin_sell).
+    # 잔량은 선주문 딜레이만큼 기다린 뒤 취소 → 체결차 → 중지.
+    hl_margin_buy: float = 0.01
+    hl_margin_sell: float = 0.01
+
+    def post_price(self, side: Side, hl_bid: float, hl_ask: float) -> float:
+        """후주문 지정가 — 상대 1호가에 여유를 얹어 taker로 잡히게."""
+        if side is Side.BUY:
+            return hl_ask * (1.0 + self.hl_margin_buy)
+        return hl_bid * (1.0 - self.hl_margin_sell)
 
     def in_window(self, now: dtime) -> bool:
         return any(in_time_window(now, parse_hms(s), parse_hms(e)) for s, e in self.windows)
@@ -574,6 +585,8 @@ def autom_from_dict(screen: AutoMScreen, raw: object) -> None:
             s.pre_range = float(st.get("pre_range", s.pre_range))
             s.rel_buy = int(st.get("rel_buy", s.rel_buy))
             s.rel_sell = int(st.get("rel_sell", s.rel_sell))
+            s.hl_margin_buy = float(st.get("hl_margin_buy", s.hl_margin_buy))
+            s.hl_margin_sell = float(st.get("hl_margin_sell", s.hl_margin_sell))
         except (TypeError, ValueError):
             pass
     try:

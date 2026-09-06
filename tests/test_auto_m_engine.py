@@ -107,8 +107,10 @@ async def test_engine_round_trip_pre_fill_post_fill() -> None:
     sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=1_602_000.0, ts=0))
     await _settle()
     post = sys_.placed[1]
+    # 후주문도 지정가(Gtc)만 — HL 매도 = 매수1호가 1184 × (1 − 1%) = 1172.16 (사용자 확정)
     assert (post.venue, post.instrument, post.side, post.qty, post.order_type) == (
-        Venue.HYPERLIQUID, Instrument.HL_PERP, Side.SELL, 40, OrderType.MARKET)
+        Venue.HYPERLIQUID, Instrument.HL_PERP, Side.SELL, 40, OrderType.LIMIT)
+    assert post.price == 1184.0 * 0.99
     assert s.entry.status is LegStatus.PRE_PARTIAL and s.entry.post_pending == 40
 
     sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1184.0, ts=0))
@@ -177,7 +179,12 @@ async def test_engine_cancel_on_signal_loss_and_halt_on_post_reject() -> None:
     sys_.order_book.on_fill(Fill(fill_id="f3", order_id="O2", qty=10, price=1_602_000.0, ts=0))
     await _settle()
     assert sys_.placed[-1].instrument is Instrument.HL_PERP
-    sys_.order_book.on_cancel("O3")  # HL IOC 전량 미체결
+    # 지정가 후주문이 선주문 딜레이(1초) 안에 안 잡히면 엔진이 잔량을 취소한다 → 체결차 → 중지
+    eng.tick(now, 102.5)
+    assert "O3" not in sys_.cancelled  # 아직 기한 전
+    eng.tick(now, 200.0)
+    await _settle()
+    assert sys_.cancelled[-1] == "O3"  # 기한 초과 → 취소 → (가짜 시스템이 취소 통보)
     await _settle()
     assert s.entry.status is LegStatus.HALTED and "체결차" in s.entry.halt_reason
     assert sys_.error_seq == 1  # 에러 알람

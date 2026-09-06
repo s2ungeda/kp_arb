@@ -91,6 +91,8 @@ class AutoMEngine:
         self._log_dir = log_dir
         self._orders: dict[str, _OrderRef] = {}
         self._seen_status: dict[str, str] = {}
+        self._post_deadline: dict[str, float] = {}  # 후주문 oid → 잔량 취소 기한(단조 초)
+        self._mono = 0.0  # 마지막 tick의 단조 시계 — 기한 계산도 같은 시계를 쓴다(테스트 주입 가능)
         # 종목별 상세 로그(logs/autom_<종목>_날짜.log) — 판정 근거·상태 전이·체결 반영
         # (사용자 2026-09-04). 판정·상태는 바뀔 때만 한 줄.
         self._logged_reason: dict[tuple[int, Block], str] = {}
@@ -145,6 +147,7 @@ class AutoMEngine:
 
     def tick(self, now: datetime, mono: float) -> None:
         """전 세트·다리 1회 판정(now/mono 주입 — 테스트 가능)."""
+        self._mono = mono
         halted = self._system.futures_halted()
         if halted:
             self._halt_since = mono
@@ -152,6 +155,7 @@ class AutoMEngine:
         elif self._halt_since is not None:
             self._halt_since = None
             self._resumed_mono = mono
+        self._sweep_post_orders(mono)
         for index, s in enumerate(self.screen.sets):
             for block in (Block.ENTRY, Block.EXIT):
                 leg = s.leg(block)
@@ -248,9 +252,16 @@ class AutoMEngine:
         s = self.screen.sets[index]
         u = self._underlying()
         assert act.side is not None
+        # 후주문도 지정가(Gtc)만(사용자 확정 2026-09-04) — 상대 1호가 ± HP 여유로 taker처럼 잡는다.
+        hl = self._system.quotes.get((u, Instrument.HL_PERP, "hl"))
+        if hl is None or not hl.bid or not hl.ask:
+            self._log.error("[자동M] 후주문 불가 %d세트 %s — HL 호가 없음", index + 1, block.value)
+            self._apply(index, block, on_post_reject(s, block, "HL 호가 없음"))
+            return
+        price = self.screen.settings.post_price(act.side, hl.bid, hl.ask)
         intent = OrderIntent(venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
-                             side=act.side, qty=act.qty, order_type=OrderType.MARKET,
-                             source=SOURCE)
+                             side=act.side, qty=act.qty, order_type=OrderType.LIMIT,
+                             price=price, source=SOURCE)
         try:
             oid = await self._system.place(intent)
         except Exception as exc:  # noqa: BLE001 - 후주문 거부 → 체결차 → 중지(exec ㄹ2)
@@ -258,8 +269,31 @@ class AutoMEngine:
             self._apply(index, block, on_post_reject(s, block, str(exc)[:80]))
             return
         self._orders[oid] = _OrderRef(index, block, "post")
-        self._log.info("[자동M] 후주문 %d세트 %s HL %s %d → #%s",
-                       index + 1, block.value, act.side.value, act.qty, oid)
+        # 잔량 처리: 선주문 딜레이만큼 기다린 뒤 미체결이면 취소 → 체결차 → 중지
+        self._post_deadline[oid] = self._mono + self.screen.settings.pre_delay_ms / 1000.0
+        self._log.info("[자동M] 후주문 %d세트 %s HL %s %d @ %g → #%s",
+                       index + 1, block.value, act.side.value, act.qty, price, oid)
+
+    def _sweep_post_orders(self, mono: float) -> None:
+        """후주문 잔량 감시 — 기한을 넘긴 미체결 후주문은 취소(취소 통보 → 체결차 → 중지)."""
+        for oid, deadline in list(self._post_deadline.items()):
+            if mono < deadline:
+                continue
+            self._post_deadline.pop(oid, None)
+            order = self._system.order_book.order(oid)
+            if order is None or not order.is_open:
+                continue
+            ref = self._orders.get(oid)
+            if ref is not None:
+                self.ulog().warning("후주문 %d세트 %s #%s 잔량 %g 미체결(기한 초과) → 취소",
+                                    ref.index + 1, ref.block.value, oid, order.remaining_qty)
+            self._spawn(self._cancel_post(oid))
+
+    async def _cancel_post(self, order_id: str) -> None:
+        try:
+            await self._system.cancel(order_id)
+        except Exception as exc:  # noqa: BLE001 - 이미 체결/취소됐으면 통보로 정리된다
+            self._log.warning("[자동M] 후주문 취소 실패 #%s — %s", order_id, exc)
 
     # ------------------------------------------------------------ 주문 통보 ---
     def _on_fill_applied(self, order: TrackedOrder, qty: float, price: float,
@@ -328,6 +362,7 @@ class AutoMEngine:
     def _forget(self, oid: str) -> None:
         self._orders.pop(oid, None)
         self._seen_status.pop(oid, None)
+        self._post_deadline.pop(oid, None)
 
     # ---------------------------------------------------------------- 명령 ---
     def set_running(self, index: int, block: Block, value: bool) -> None:
