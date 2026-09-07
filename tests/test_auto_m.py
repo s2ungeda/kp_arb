@@ -145,6 +145,25 @@ def test_gates_cancel_or_hold_resting_order() -> None:
         == "place_pre"
 
 
+def test_signal_gate_uses_only_s_for_entry_and_nothing_for_exit() -> None:
+    # 정정 2026-09-07(exec §11.3): 진입은 S괴리만 비교(SF괴리 미달이어도 통과), 청산은 비교 없음.
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    acts = evaluate(s, Block.ENTRY, _sig(sf_spread_entry=-0.05), SETTINGS, U)  # SF 크게 미달
+    assert [a.kind for a in acts] == ["place_pre"]  # 그래도 발주 — SF 기준값은 역산가에만
+    s2 = _set()
+    s2.rt = 10  # 청산할 RT가 있어야 G4 통과
+    set_running(s2, Block.EXIT, True)
+    # 옛 규칙이면 SF괴리 0.05 > 청산 −0.001로 미달. hl_disp_ask 0 → 역산가 201,000 ≤ 한계(G6 통과)
+    acts2 = evaluate(s2, Block.EXIT, _sig(sf_spread_exit=0.05, hl_disp_ask=0.0), SETTINGS, U)
+    assert [a.kind for a in acts2] == ["place_pre"]  # 청산은 조건 비교 없음
+    s3 = _set()
+    s3.ex_sf = None
+    s3.rt = 10
+    set_running(s3, Block.EXIT, True)
+    assert evaluate(s3, Block.EXIT, _sig(), SETTINGS, U) == []  # 기준값 없으면 역산 불가 → 안 냄
+
+
 def test_block_reason_records_gate_and_basis() -> None:
     # 판정 근거 한 줄 — 어느 게이트에서 막혔는지·통과 시 역산가 계산 근거(로그는 바뀔 때만).
     s = _set()

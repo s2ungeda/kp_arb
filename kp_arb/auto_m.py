@@ -272,15 +272,17 @@ def _cancel_if_resting(leg: Leg) -> list[Action]:
 
 
 def _passes_signal(s: AutoMSet, leg: Leg, sig: Signals) -> bool:
-    """G5 판정(§3) — 진입: SF괴리 > 진입SF AND S괴리 > 진입S / 청산: SF괴리 < 청산SF."""
+    """G5 판정(exec §11.3, 정정 2026-09-07) — 진입: **S(현물)괴리 > 진입S만** / 청산: **비교 없음**.
+
+    SF 기준값(진입SF·청산SF)은 판정이 아니라 **역산가(G6)** 에 쓴다 — 선주문은 그 기준값이
+    체결로 보장되는 가격(maker)에 걸므로 SF 괴리를 따로 비교할 이유가 없다. S 괴리는
+    진입 허용 조건으로만 본다(실제 매매는 SF+HL).
+    """
     if leg.block is Block.ENTRY:
         if s.en_sf is None or s.en_s is None:
             return False
-        return (sig.sf_spread_entry is not None and sig.s_spread_entry is not None
-                and sig.sf_spread_entry > s.en_sf and sig.s_spread_entry > s.en_s)
-    if s.ex_sf is None:
-        return False
-    return sig.sf_spread_exit is not None and sig.sf_spread_exit < s.ex_sf
+        return sig.s_spread_entry is not None and sig.s_spread_entry > s.en_s
+    return s.ex_sf is not None
 
 
 def _switch_wait(s: AutoMSet, leg: Leg, mono: float) -> bool:
@@ -338,10 +340,10 @@ def evaluate(
     # G5 판정
     if not _passes_signal(s, leg, sig):
         if block is Block.ENTRY:
-            why = (f"G5 미달 SF {pct(sig.sf_spread_entry)}>{pct(s.en_sf)}? "
-                   f"S {pct(sig.s_spread_entry)}>{pct(s.en_s)}?")
+            why = (f"G5 미달 S {pct(sig.s_spread_entry)}>{pct(s.en_s)}? "
+                   f"(SF {pct(sig.sf_spread_entry)})")
         else:
-            why = f"G5 미달 SF {pct(sig.sf_spread_exit)}<{pct(s.ex_sf)}?"
+            why = "G5 청산 기준값 없음"
         return hold(why, _cancel_if_resting(leg))
     # G6 역산가 → 허용범위
     thr = s.threshold(block)
