@@ -1,4 +1,4 @@
-"""자동M(체결쏴) 실행 뼈대 — 순수 상태기계 (DESIGN-auto-m.md §3~§9a, DESIGN-auto-m-exec.md).
+"""자동M(체결쏴) 실행 뼈대 — 순수 상태변화 (DESIGN-auto-m.md §3~§9a, DESIGN-auto-m-exec.md).
 
 I/O 없음. 코어(결선 단계)가 시세마다 ``Signals``를 넣고 ``evaluate``를 부르고, 주문 사건이 오면
 ``on_*`` 를 부른다. 여기서 나온 ``Action`` 목록을 코어가 실제 발주/취소로 옮긴다.
@@ -248,7 +248,7 @@ def fill_diff(sf_net_contracts: int, hl_net_contracts: float) -> float:
     return sf_net_contracts * HL_PER_SF + hl_net_contracts
 
 
-# ---------------------------------------------------------------- 상태기계 ---
+# ---------------------------------------------------------------- 상태변화 ---
 
 def _cancel_if_resting(leg: Leg) -> list[Action]:
     """걸어둔 선주문이 있으면 취소 요청(취소 확인은 on_pre_cancelled)."""

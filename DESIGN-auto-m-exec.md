@@ -365,7 +365,7 @@ JIF `jstatus`는 성격이 셋으로 갈리고, **`jangubun`(시장)에 따라 �
 
 ## 구현 상태 (2026-09-04)
 
-- ① 순수 상태기계 `kp_arb/auto_m.py` — 상태·G1~G6·역산가·재발주 규칙·RT·체결차·누적 Sprd. 테스트 `tests/test_auto_m.py`.
+- ① 순수 상태변화 `kp_arb/auto_m.py` — 상태·G1~G6·역산가·재발주 규칙·RT·체결차·누적 Sprd. 테스트 `tests/test_auto_m.py`.
 - ② 코어 결선 `kp_arb/auto_m_engine.py` — 100ms 판정, 선주문 LS 지정가(출처 "자동M"), 후주문 HL IOC(체결×10), OrderBook 통보, 중지 시 에러 알람. 코어 명령 `autom_set/settings/run/release/clear_acc/stop_all`, `/state.autom_live`. 체결차는 **그 세트가 낸 체결 기준**(계좌 잔고 기준이면 수동 포지션에 걸려 켜자마자 멈춤).
 - ③ 화면 `kp_arb/order_autom.py` — 정방향 실행/설정/누적/중지 행(검정) 표시, 공통 닫기 규칙, 실행 중 월물 잠금. 코어 저장값이 원본(창 열 때 1회 채움).
 - 화면 진행 표시: 실행 버튼은 캡션 고정('진입'/'청산') + 색(실행중·중지), 상태줄 = 다리 상태(감시·걸림·부분·HL·쉼) + 선주문 번호·가격·체결/수량·HL 대기·중지 사유. 상단 모니터 3칸 = 기준수량 est 괴리(정/역).

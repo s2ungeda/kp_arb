@@ -60,7 +60,7 @@
   - **아니오** → 창 유지. 실수 클릭 방지용 확인이며, "닫으면서 실행을 남기는" 선택지는 없다.
 - 구현: `kp_arb/ui_close.py` — `attach_auto_close(root, title, is_running, send_stop, set_status)` 한 줄.
   판정은 순수 함수 `close_plan(running, confirmed)`. 적용: ✅ 동시호가 창 · ✅ 자동M(2026-09-04,
-  실행 중 = 정방향 세트 중 하나라도 running, '예'면 `autom_stop_all`) · ⬜ 자동T(실행 상태기계와 함께).
+  실행 중 = 정방향 세트 중 하나라도 running, '예'면 `autom_stop_all`) · ⬜ 자동T(실행 상태변화와 함께).
 
 ## 7. 팝업(확인·알림)은 항상 그 화면(부모 창) 중앙 (사용자 확정 2026-09-04)
 - tk `messagebox`는 위치를 정할 수 없어 창이 구석에 있으면 엉뚱한 곳에 뜬다 → 쓰지 않는다.

@@ -1,4 +1,4 @@
-"""자동M 순수 상태기계 — DESIGN-auto-m-exec.md 정방향 진입·청산 (①단계)."""
+"""자동M 순수 상태변화 — DESIGN-auto-m-exec.md 정방향 진입·청산 (①단계)."""
 from datetime import datetime
 
 import pytest

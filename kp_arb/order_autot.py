@@ -5,8 +5,8 @@
 원본: docs/STG_1 목업 + DESIGN-auto-t.md. 화면은 입력·표시만, 판단·주문은 코어.
 **화면 스레드는 네트워크 금지**(CLAUDE.md) — 명령은 뒷단 전송 스레드, 표시는 뒷단 폴링 결과만.
 
-v1 = **레이아웃·입력 중심**(발주 상태기계는 다음 단계). 실행 토글·표시 셀은 자리만 잡아 두고
-코어 명령은 종목/호가단위 등 이미 있는 것만 연결한다(나머지는 상태기계 구현 시 배선).
+v1 = **레이아웃·입력 중심**(발주 상태변화는 다음 단계). 실행 토글·표시 셀은 자리만 잡아 두고
+코어 명령은 종목/호가단위 등 이미 있는 것만 연결한다(나머지는 상태변화 구현 시 배선).
 """
 from __future__ import annotations
 
@@ -290,13 +290,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                        font=T.FONT_NUM_LG)
         else:  # 중지 — 원래대로
             btn.config(bg="SystemButtonFace", fg="black", font=T.FONT_BASE_LG)
-        # TODO(상태기계): send({"cmd":"autot_run", ...}) — 지금은 화면 토글만
+        # TODO(상태변화): send({"cmd":"autot_run", ...}) — 지금은 화면 토글만
 
     def clear_acc(dtag: str, group: str) -> None:
         accs = sets[(dtag, 0)].get("_acc", {}).get(group, {})
         for lbl in accs.values():
             lbl.config(text="-")
-        # TODO(상태기계): send 누적 초기화 명령
+        # TODO(상태변화): send 누적 초기화 명령
 
     def open_set_dialog(dtag: str, i: int) -> None:
         w = sets[(dtag, i)]
@@ -336,7 +336,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             w["clear_diff"] = diff_var.get()
             apply_set_display(dtag, i)
             win.destroy()
-            # TODO(상태기계): send 세트 설정 명령
+            # TODO(상태변화): send 세트 설정 명령
 
         btns = tk.Frame(win)
         btns.grid(row=len(rows) + 2, column=0, columnspan=2, pady=(4, 6))
@@ -420,7 +420,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 common["otype"][ok] = name_to_code.get(cb.get(), "00")
             refresh_common_bar()
             win.destroy()
-            # TODO(상태기계): send 공통설정 명령
+            # TODO(상태변화): send 공통설정 명령
 
         btns = tk.Frame(win)
         btns.grid(row=3, column=0, columnspan=4, pady=(6, 6))
