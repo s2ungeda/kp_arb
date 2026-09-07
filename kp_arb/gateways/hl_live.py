@@ -13,6 +13,7 @@ SDK는 동기(requests) — asyncio에서는 ``asyncio.to_thread``로 감싼다.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -140,6 +141,7 @@ class HLSdkGateway(HLGateway):
             price = await self._market_px(coin, is_buy)
             order_type = {"limit": {"tif": "Ioc"}}
         order_log.order_requested(intent, price=price)  # 보내기 직전(응답 전) — 단계 추적
+        self._log_wire(coin, is_buy, float(intent.qty), price, order_type, intent.reduce_only)
         try:
             resp = await asyncio.to_thread(
                 self._ex.order, coin, is_buy, float(intent.qty), price, order_type,
@@ -154,6 +156,28 @@ class HLSdkGateway(HLGateway):
         self._last_place_fill = self._parse_place_fill(resp)  # 즉시체결이면 (수량, 평균가)
         order_log.order_placed(intent, oid, resp)  # 원응답(filled/resting·수량) 포함
         return oid
+
+    def _log_wire(self, coin: str, is_buy: bool, sz: float, price: float,
+                  order_type: dict[str, Any], reduce_only: bool) -> None:
+        """HL로 나가는 주문 패킷(action)을 그대로 hl_order 로그에 남긴다(사용자 요청 2026-09-07).
+
+        SDK가 서명 직전에 만드는 wire 형식({a,b,p,s,r,t}, grouping)을 같은 함수로 재구성 —
+        nonce·서명만 뺀 것이라 서버가 받는 본문과 같다. 로그 실패가 발주를 막으면 안 되므로 삼킨다.
+        """
+        try:
+            from hyperliquid.utils.signing import (
+                order_request_to_order_wire,
+                order_wires_to_order_action,
+            )
+
+            req: dict[str, Any] = {"coin": coin, "is_buy": is_buy, "sz": sz, "limit_px": price,
+                                   "order_type": order_type, "reduce_only": reduce_only}
+            wire = order_request_to_order_wire(req, self._ex.info.name_to_asset(coin))
+            action = order_wires_to_order_action([wire])
+            order_log.logger_for(Venue.HYPERLIQUID).info(
+                "HL 요청패킷 %s", json.dumps(action, ensure_ascii=False))
+        except Exception as exc:  # noqa: BLE001 - 로그용
+            order_log.logger_for(Venue.HYPERLIQUID).warning("HL 요청패킷 기록 실패: %s", exc)
 
     @staticmethod
     def _parse_place_fill(resp: dict[str, Any]) -> tuple[float, float] | None:

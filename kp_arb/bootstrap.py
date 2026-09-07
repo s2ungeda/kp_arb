@@ -522,10 +522,16 @@ class LiveSystem:
                  else self.order_book.on_cancel(upd.oid))
         log = order_log.logger_for(Venue.HYPERLIQUID)
         if order is not None:
-            log.info("주문종료(%s) #%s — OrderBook 제거(실시간)", upd.status, upd.oid)
+            if upd.ended_with_remainder:  # 거래소가 잔량을 버리고 끝냄(증거금 한도 등, 실측 09-07)
+                log.warning("주문종료(filled, 잔량 %g 버림) #%s — 거래소가 끝냄, 미체결분 정리",
+                            upd.sz, upd.oid)
+            else:
+                log.info("주문종료(%s) #%s — OrderBook 제거(실시간)", upd.status, upd.oid)
             self._record_cancel(order)  # 취소내역(주문 리스트 '취소' 행)
         else:
-            log.info("외부 주문종료(%s) #%s (추적 안 함)", upd.status, upd.oid)
+            # 아직 track 전(발주 응답보다 WS가 먼저) — OrderBook이 보관했다가 track 뒤 replay로 반영
+            log.info("주문종료(%s, 잔량 %g) #%s — 추적 전 도착, 발주 처리 뒤 반영(또는 외부 주문)",
+                     upd.status, upd.sz, upd.oid)
 
     def _on_ws_reconnect(self, label: str) -> None:
         """WS 재연결 후(동기 콜백) — 끊긴 동안 놓친 체결/외부거래를 반영하러 OrderBook을

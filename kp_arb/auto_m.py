@@ -1,4 +1,4 @@
-"""자동M(체결쏴) 실행 뼈대 — 순수 상태변화 (DESIGN-auto-m.md §3~§9a, DESIGN-auto-m-exec.md).
+"""자동M(체결쏴) 실행 뼈대 — 순수 상태변화 (DESIGN-auto-m-exec.md — 자동M 단일 스펙, §11 전략·화면).
 
 I/O 없음. 코어(결선 단계)가 시세마다 ``Signals``를 넣고 ``evaluate``를 부르고, 주문 사건이 오면
 ``on_*`` 를 부른다. 여기서 나온 ``Action`` 목록을 코어가 실제 발주/취소로 옮긴다.
@@ -158,7 +158,7 @@ class Leg:
     pre_price: float | None = None
     pre_qty: int = 0            # 이번 선주문 계약수
     pre_filled: int = 0         # 이번 선주문 체결 계약수
-    post_pending: int = 0       # 후주문(HL) 체결 확인 대기 계약수
+    post_pending: float = 0.0   # 후주문(HL) 체결 대기 계약수 — HL은 소수 체결(0.588 등, 실측 09-07)
     delay_until: float | None = None
     replace_pending: bool = False   # 역산가 바뀜 → 취소 보냄, 취소 확인 대기
     await_post_then_delay: bool = False  # 취소 확인됨, 병행 후주문 체결 확인 뒤 딜레이
@@ -191,9 +191,10 @@ class AutoMSet:
     en_s: float | None = None               # 진입 S 기준값
     ex_sf: float | None = None              # 청산 SF 기준값
     rt: int = 0                             # RT선진입(계약) — 후주문 전부 체결 때 증감
-    fill_diff: int = 0                      # 체결차 = SF잔고×10 + HL잔고 (이 세트 체결 기준)
+    fill_diff: float = 0.0                  # 체결차 = SF잔고×10 + HL잔고 (이 세트 체결 기준, 소수)
     sf_net: int = 0                         # 이 세트가 잡은 SF 순잔고(계약, 매수 +)
     hl_net: float = 0.0                     # 이 세트가 잡은 HL 순잔고(계약, 매도 −)
+    hl_rt_carry: float = 0.0                # RT 환산 전 HL 체결 잔여분(10 미만) — 소수 체결 누적용
     entry: Leg = field(default_factory=lambda: Leg(Block.ENTRY))
     exit: Leg = field(default_factory=lambda: Leg(Block.EXIT))
     last_entry_fill_mono: float | None = None
@@ -243,6 +244,14 @@ def within_limit(side: Side, price: float, limit: float) -> bool:
     return price >= limit if side is Side.BUY else price <= limit
 
 
+_EPS = 1e-9  # HL 소수 계약 비교용(0.588 같은 체결이 오므로 "== 0" 대신 사용)
+
+
+def post_done(leg: Leg) -> bool:
+    """후주문 대기분이 없는가(소수 오차 허용)."""
+    return leg.post_pending <= _EPS
+
+
 def fill_diff(sf_net_contracts: int, hl_net_contracts: float) -> float:
     """체결차(§8) = SF 잔고 × 10 + HL 잔고(매도 −). 0이면 완전 헤지."""
     return sf_net_contracts * HL_PER_SF + hl_net_contracts
@@ -251,8 +260,13 @@ def fill_diff(sf_net_contracts: int, hl_net_contracts: float) -> float:
 # ---------------------------------------------------------------- 상태변화 ---
 
 def _cancel_if_resting(leg: Leg) -> list[Action]:
-    """걸어둔 선주문이 있으면 취소 요청(취소 확인은 on_pre_cancelled)."""
-    if leg.pre_order_id is not None and not leg.replace_pending:
+    """걸어둔 선주문이 있으면 취소 요청(취소 확인은 on_pre_cancelled).
+
+    전부 체결된 선주문(pre_filled ≥ pre_qty)은 취소할 잔량이 없다 — 보내면 LS가 거부한다
+    (실측 2026-09-07 "정정/취소할 수량이 없습니다", 중지 뒤 실행 끔에서).
+    """
+    resting = leg.pre_order_id is not None and not leg.replace_pending
+    if resting and (leg.pre_qty <= 0 or leg.pre_filled < leg.pre_qty):
         return [Action("cancel_pre", order_id=leg.pre_order_id)]
     return []
 
@@ -293,7 +307,7 @@ def evaluate(
     # G1 실행 꺼짐 → 미체결 취소, 대기
     if not leg.running:
         acts = _cancel_if_resting(leg)
-        if leg.post_pending == 0 and leg.pre_order_id is None:
+        if post_done(leg) and leg.pre_order_id is None:
             leg.status = LegStatus.IDLE
         return hold("G1 실행 꺼짐", acts)
     if leg.status is LegStatus.IDLE:
@@ -392,7 +406,7 @@ def on_pre_fill(
     leg.pre_filled += qty
     leg.acc.sf_qty += qty
     leg.acc.sf_px_sum += price * qty
-    leg.post_pending += qty * HL_PER_SF
+    leg.post_pending += float(qty * HL_PER_SF)
     s.sf_net += qty if block is Block.ENTRY else -qty
     if leg.pre_filled >= leg.pre_qty and leg.pre_qty > 0:
         leg.status = LegStatus.POST_PENDING
@@ -406,14 +420,14 @@ def on_pre_cancelled(s: AutoMSet, block: Block, mono: float, settings: AutoMSett
     leg = s.leg(block)
     if leg.replace_pending:
         leg.replace_pending = False
-        if leg.post_pending > 0:
+        if not post_done(leg):
             leg.await_post_then_delay = True  # 헤지 체결(RT 갱신) 확인 뒤 딜레이 → 신규
             leg._clear_pre()
             return
         _start_delay(leg, mono, settings)
         return
     leg._clear_pre()
-    if leg.post_pending == 0:
+    if post_done(leg):
         leg.status = LegStatus.ARMED if leg.running else LegStatus.IDLE
 
 
@@ -429,8 +443,11 @@ def on_post_fill(
     leg.acc.hl_qty += hl_qty
     leg.acc.hl_px_sum += hl_price * hl_qty
     leg.acc.fx_sum += fx_quote * hl_qty
-    leg.post_pending = max(0, leg.post_pending - int(round(hl_qty)))
-    sf_contracts = int(round(hl_qty / HL_PER_SF))
+    leg.post_pending = max(0.0, leg.post_pending - hl_qty)
+    # RT(SF 계약)는 HL 체결을 10계약 단위로 환산 — 소수 체결(0.588 등)은 잔여분에 모아 둔다
+    s.hl_rt_carry += hl_qty
+    sf_contracts = int(s.hl_rt_carry // HL_PER_SF + _EPS)
+    s.hl_rt_carry -= sf_contracts * HL_PER_SF
     if block is Block.ENTRY:
         s.rt += sf_contracts
         s.hl_net -= hl_qty
@@ -439,7 +456,7 @@ def on_post_fill(
         s.rt = max(0, s.rt - sf_contracts)
         s.hl_net += hl_qty
         s.last_exit_fill_mono = mono
-    if leg.post_pending > 0:
+    if not post_done(leg):
         return []
     # 헤지 완성 시점의 체결차 확인(exec ㄹ1) — 이 세트 체결 기준. ≠0이면 중지.
     halted = halt_if_unhedged(s, block, fill_diff(s.sf_net, s.hl_net))
@@ -458,6 +475,8 @@ def on_post_reject(s: AutoMSet, block: Block, reason: str = "") -> list[Action]:
     """후주문 거부 → 국내는 체결됐는데 HL 미체결 = 체결차 → 중지 + 알림(exec ㄹ2, 재시도 없음)."""
     leg = s.leg(block)
     leg.status = LegStatus.HALTED
+    leg.running = False  # 중지 = 실행 꺼짐(버튼 원색). 다시 켜려면 사람이 해제(release_halt)
+    s.fill_diff = round(fill_diff(s.sf_net, s.hl_net), 6)  # 화면 체결차 칸 — 미헤지분(소수)
     leg.halt_reason = f"후주문 거부 — 체결차 발생{(': ' + reason) if reason else ''}"
     return [Action("halt", reason=leg.halt_reason), Action("notify", reason=leg.halt_reason)]
 
@@ -465,10 +484,11 @@ def on_post_reject(s: AutoMSet, block: Block, reason: str = "") -> list[Action]:
 def halt_if_unhedged(s: AutoMSet, block: Block, diff: float) -> list[Action]:
     """체결차 감지(exec ㅂ1) — 후주문 대기분이 없는데 ≠0이면 중지. 코어가 잔고로 diff를 넣는다."""
     leg = s.leg(block)
-    s.fill_diff = int(diff)
-    if diff == 0 or leg.post_pending > 0 or leg.status is LegStatus.HALTED:
+    s.fill_diff = round(diff, 6)  # HL 소수 계약 그대로(0.412 등) — 정수로 깎으면 체결차가 사라진다
+    if abs(diff) < _EPS or not post_done(leg) or leg.status is LegStatus.HALTED:
         return []
     leg.status = LegStatus.HALTED
+    leg.running = False  # 중지 = 실행 꺼짐 — 해제는 사람이(release_halt)
     leg.halt_reason = f"체결차 {diff:g} ≠ 0"
     return [Action("halt", reason=leg.halt_reason), Action("notify", reason=leg.halt_reason)]
 
@@ -482,16 +502,16 @@ def set_running(s: AutoMSet, block: Block, value: bool) -> list[Action]:
             leg.status = LegStatus.ARMED
         return []
     acts = _cancel_if_resting(leg)
-    if leg.pre_order_id is None and leg.post_pending == 0 and leg.status is not LegStatus.HALTED:
+    if leg.pre_order_id is None and post_done(leg) and leg.status is not LegStatus.HALTED:
         leg.status = LegStatus.IDLE
     return acts
 
 
-def on_post_partial_reject(s: AutoMSet, block: Block, unfilled: int) -> list[Action]:
-    """후주문 일부만 체결되고 나머지 거부/취소(IOC 잔량) — 미체결분만큼 체결차 → 중지."""
+def on_post_partial_reject(s: AutoMSet, block: Block, unfilled: float) -> list[Action]:
+    """후주문 일부만 체결되고 나머지가 취소/거부됨 — 미체결분(소수 그대로)만큼 체결차 → 중지."""
     leg = s.leg(block)
-    leg.post_pending = max(0, leg.post_pending - unfilled)
-    return on_post_reject(s, block, f"HL {unfilled}계약 미체결")
+    leg.post_pending = max(0.0, leg.post_pending - unfilled)
+    return on_post_reject(s, block, f"HL {unfilled:g}계약 미체결")
 
 
 def release_halt(s: AutoMSet, block: Block) -> None:
@@ -501,7 +521,7 @@ def release_halt(s: AutoMSet, block: Block) -> None:
     leg.running = False
     leg.halt_reason = ""
     leg._clear_pre()
-    leg.post_pending = 0
+    leg.post_pending = 0.0
     leg.replace_pending = leg.await_post_then_delay = False
 
 
@@ -554,6 +574,8 @@ def autom_from_dict(screen: AutoMScreen, raw: object) -> None:
                 target.rt = int(rs.get("rt", target.rt))
                 target.sf_net = int(rs.get("sf_net", target.sf_net))
                 target.hl_net = float(rs.get("hl_net", target.hl_net))
+                target.hl_rt_carry = float(rs.get("hl_rt_carry", target.hl_rt_carry))
+                target.fill_diff = round(fill_diff(target.sf_net, target.hl_net), 6)
             except (TypeError, ValueError):
                 pass
             for name, leg in (("entry", target.entry), ("exit", target.exit)):

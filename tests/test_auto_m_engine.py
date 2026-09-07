@@ -26,6 +26,12 @@ class FakeSystem:
         self.cancelled: list[str] = []
         self.halted = False
         self._ids = 0
+        from kp_arb.domain.models import InstrumentInfo
+
+        # HL szDecimals=1 → 가격 소수 최대 5자리, 유효숫자 5자리(1184.5 → 소수 1자리)
+        self.instruments = {(U, Instrument.HL_PERP): InstrumentInfo(
+            underlying=U, instrument=Instrument.HL_PERP, code="xyz:SKHX",
+            multiplier=1.0, sz_decimals=1)}
         self.quotes = {
             (U, Instrument.HL_PERP, "hl"): Quote(
                 underlying=U, instrument=Instrument.HL_PERP, bid=1184.0, ask=1184.5, ts=0,
@@ -65,6 +71,13 @@ class FakeSystem:
         oid = f"O{self._ids}"
         self.placed.append(intent)
         self.order_book.track(oid, intent)
+        # HL 발주 응답에 즉시 체결분이 실려 오는 경우 흉내 — place()가 끝나기 전에 체결 훅이 돈다
+        imm = getattr(self, "immediate_fill", 0.0)
+        if imm > 0 and intent.instrument is Instrument.HL_PERP:
+            from kp_arb.gateways.ls_ws import Fill
+
+            self.order_book.on_fill(Fill(fill_id=f"imm-{oid}", order_id=oid,
+                                         qty=imm, price=intent.price or 0.0, ts=0))
         return oid
 
     async def cancel(self, order_id: str) -> None:
@@ -86,6 +99,28 @@ def _engine(log_dir: Any = None) -> tuple[AutoMEngine, FakeSystem, CoreState]:
 async def _settle() -> None:
     for _ in range(3):
         await asyncio.sleep(0)
+
+
+async def test_immediate_partial_fill_is_applied_and_remainder_is_fractional() -> None:
+    # 실측 2026-09-07: 후주문 10 중 0.588이 발주 응답에 즉시 체결로 실려 옴(등록 전 훅) →
+    # 세트에 반영돼야 하고(hl_net −0.588, HL 대기 9.412), 잔량 취소 시 체결차 9.412(소수 그대로).
+    eng, sys_, state = _engine()
+    sys_.immediate_fill = 0.588
+    now, mono = datetime(2026, 9, 4, 10, 0, 0), 100.0
+    await _autom_command(eng, state, {"cmd": "autom_run", "set": 0, "block": "entry",
+                                      "value": True})
+    eng.tick(now, mono)
+    await _settle()
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
+    await _settle()
+    s = state.autom.sets[0]
+    assert s.hl_net == -0.588 and abs(s.entry.post_pending - 9.412) < 1e-9
+    assert s.rt == 0 and abs(s.hl_rt_carry - 0.588) < 1e-9  # 10 미만은 RT로 안 올라감
+    sys_.order_book.on_cancel("O2")  # 잔량 취소 확인 → 미체결 9.412 체결차 → 중지
+    await _settle()
+    assert s.entry.status is LegStatus.HALTED and not s.entry.running
+    assert abs(s.fill_diff - 9.412) < 1e-9
+    assert "9.412" in s.entry.halt_reason
 
 
 async def test_engine_round_trip_pre_fill_post_fill() -> None:
@@ -110,7 +145,8 @@ async def test_engine_round_trip_pre_fill_post_fill() -> None:
     # 후주문도 지정가(Gtc)만 — HL 매도 = 매수1호가 1184 × (1 − 1%) = 1172.16 (사용자 확정)
     assert (post.venue, post.instrument, post.side, post.qty, post.order_type) == (
         Venue.HYPERLIQUID, Instrument.HL_PERP, Side.SELL, 40, OrderType.LIMIT)
-    assert post.price == 1184.0 * 0.99
+    # 1172.16은 유효숫자 6자리 → HL 거부(실측 09-07). 매도는 내림 → 1172.1(격자 맞춤)
+    assert post.price == 1172.1
     assert s.entry.status is LegStatus.PRE_PARTIAL and s.entry.post_pending == 40
 
     sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1184.0, ts=0))
@@ -172,19 +208,21 @@ async def test_engine_cancel_on_signal_loss_and_halt_on_post_reject() -> None:
     s = state.autom.sets[0]
     assert s.entry.status is LegStatus.ARMED and s.entry.pre_order_id is None
 
-    # 다시 조건 충족 → 신규 → 전량 체결 → 후주문이 IOC 잔량 취소(미체결 100) → 체결차 → 중지
+    # 다시 조건 충족 → 신규 → 전량 체결 → 후주문(지정가) 발주 → 잔량이 걸려 있어도 엔진은 취소 안 함
     sys_.s_entry = 0.01
     eng.tick(now, 102.0)
     await _settle()
     sys_.order_book.on_fill(Fill(fill_id="f3", order_id="O2", qty=10, price=1_602_000.0, ts=0))
     await _settle()
     assert sys_.placed[-1].instrument is Instrument.HL_PERP
-    # 지정가 후주문이 선주문 딜레이(1초) 안에 안 잡히면 엔진이 잔량을 취소한다 → 체결차 → 중지
+    # 후주문은 취소하지 않는다(사용자 확정 2026-09-07) — 시간이 아무리 지나도 후주문대기 유지
     eng.tick(now, 102.5)
-    assert "O3" not in sys_.cancelled  # 아직 기한 전
     eng.tick(now, 200.0)
     await _settle()
-    assert sys_.cancelled[-1] == "O3"  # 기한 초과 → 취소 → (가짜 시스템이 취소 통보)
+    assert "O3" not in sys_.cancelled
+    assert s.entry.status is LegStatus.POST_PENDING and s.entry.post_pending == 100
+    # 밖에서(사람·거래소) 취소되면 미체결분만큼 체결차 → 중지 + 에러 알람
+    sys_.order_book.on_cancel("O3")
     await _settle()
     assert s.entry.status is LegStatus.HALTED and "체결차" in s.entry.halt_reason
     assert sys_.error_seq == 1  # 에러 알람

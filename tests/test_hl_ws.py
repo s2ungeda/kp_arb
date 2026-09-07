@@ -140,6 +140,14 @@ def test_terminal_cancel_covers_status_families() -> None:
         assert upd(s).is_terminal_cancel is False, s
     assert upd("tickRejected").is_rejected is True
     assert upd("canceled").is_rejected is False
+    # 실측 2026-09-07: 거래소가 잔량을 버리고 'filled'(sz>0)로 끝냄 → 종료(잔량 정리 대상)
+    dropped = OrderUpdate(oid="2", coin="xyz:SKHX", status="filled", side="A",
+                          sz=9.412, orig_sz=10.0, limit_px=1300.3)
+    assert dropped.ended_with_remainder is True and dropped.is_terminal_cancel is True
+    assert dropped.is_rejected is False
+    full = OrderUpdate(oid="3", coin="xyz:SKHX", status="filled", side="A",
+                       sz=0.0, orig_sz=10.0, limit_px=1300.3)
+    assert full.ended_with_remainder is False and full.is_terminal_cancel is False
 
 
 async def test_mark_parsed() -> None:

@@ -2,7 +2,7 @@
 
 - 100ms마다 정방향 3세트의 진입·청산 다리를 판정(``evaluate``)하고, 나온 Action을 실제
   주문(LiveSystem.place/cancel)으로 옮긴다. 선주문 = 국내 SF 지정가(maker, source "자동M"),
-  후주문 = HL 즉시체결(IOC, 체결 계약 × 10).
+  후주문 = HL 지정가(Gtc, 상대 1호가 ± HP 여유, 체결 계약 × 10 — IOC·FOK 안 씀).
 - 체결·취소·거부는 OrderBook 통보(on_fill_applied·on_change)로 받아 ``on_*``에 넣는다.
 - 중지(체결차·후주문 거부)는 에러 알람 카운터(error_seq)를 올려 메인창이 소리를 내고,
   화면은 상태(HALTED)를 보고 세트 행을 검게 칠한다(DESIGN-auto-m §9a).
@@ -42,8 +42,9 @@ from .auto_m import (
 )
 from .disparity import disp, est_price
 from .domain.enums import Block, Instrument, OrderType, Side, Underlying, Venue
-from .domain.models import OrderIntent, Quote
+from .domain.models import InstrumentInfo, OrderIntent, Quote
 from .hl_merge import merge_tick_options
+from .hl_price import hl_round_price
 from .logs import attach_daily_file
 
 if TYPE_CHECKING:
@@ -59,6 +60,7 @@ class _SystemLike(Protocol):
 
     order_book: OrderBook
     quotes: dict[tuple[Underlying, Instrument, str], Quote]
+    instruments: dict[tuple[Underlying, Instrument], InstrumentInfo]  # HL szDecimals(가격 격자)
     error_seq: int
 
     def pair_signal(self, u: Underlying, instrument: Instrument, entry_qty: int,
@@ -90,9 +92,10 @@ class AutoMEngine:
         self._log = logging.getLogger("kp_arb.autom")  # 굵직한 줄 → 코어 로그
         self._log_dir = log_dir
         self._orders: dict[str, _OrderRef] = {}
+        # 등록 전에 온 우리 주문 체결(발주 응답 즉시체결) — oid → [(주문, 수량, 가격)], 등록 때 반영
+        self._orphan_fills: dict[str, list[tuple[TrackedOrder, float, float]]] = {}
         self._seen_status: dict[str, str] = {}
-        self._post_deadline: dict[str, float] = {}  # 후주문 oid → 잔량 취소 기한(단조 초)
-        self._mono = 0.0  # 마지막 tick의 단조 시계 — 기한 계산도 같은 시계를 쓴다(테스트 주입 가능)
+        self._mono = 0.0  # 마지막 tick의 단조 시계(테스트 주입 가능)
         # 종목별 상세 로그(logs/autom_<종목>_날짜.log) — 판정 근거·상태 전이·체결 반영
         # (사용자 2026-09-04). 판정·상태는 바뀔 때만 한 줄.
         self._logged_reason: dict[tuple[int, Block], str] = {}
@@ -155,7 +158,6 @@ class AutoMEngine:
         elif self._halt_since is not None:
             self._halt_since = None
             self._resumed_mono = mono
-        self._sweep_post_orders(mono)
         for index, s in enumerate(self.screen.sets):
             for block in (Block.ENTRY, Block.EXIT):
                 leg = s.leg(block)
@@ -235,7 +237,7 @@ class AutoMEngine:
             self._apply(index, block, on_pre_reject(
                 s, block, time.monotonic(), self.screen.settings))
             return
-        self._orders[oid] = _OrderRef(index, block, "pre")
+        self._register(oid, _OrderRef(index, block, "pre"))
         on_pre_ack(s, block, oid)
         self._log.info("[자동M] 선주문 %d세트 %s %s %d @ %g → #%s",
                        index + 1, block.value, act.side.value, act.qty, act.price, oid)
@@ -258,7 +260,10 @@ class AutoMEngine:
             self._log.error("[자동M] 후주문 불가 %d세트 %s — HL 호가 없음", index + 1, block.value)
             self._apply(index, block, on_post_reject(s, block, "HL 호가 없음"))
             return
-        price = self.screen.settings.post_price(act.side, hl.bid, hl.ask)
+        raw_price = self.screen.settings.post_price(act.side, hl.bid, hl.ask)
+        # HL 가격 격자(유효숫자 5·소수 6−szDecimals)에 맞춘다 — 안 맞으면 통째로 거부(실측 09-07)
+        info = self._system.instruments.get((u, Instrument.HL_PERP))
+        price = hl_round_price(raw_price, act.side, info.sz_decimals if info else None)
         intent = OrderIntent(venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
                              side=act.side, qty=act.qty, order_type=OrderType.LIMIT,
                              price=price, source=SOURCE)
@@ -268,46 +273,38 @@ class AutoMEngine:
             self._log.error("[자동M] 후주문 실패 %d세트 %s — %s", index + 1, block.value, exc)
             self._apply(index, block, on_post_reject(s, block, str(exc)[:80]))
             return
-        self._orders[oid] = _OrderRef(index, block, "post")
-        # 잔량 처리: 선주문 딜레이만큼 기다린 뒤 미체결이면 취소 → 체결차 → 중지
-        self._post_deadline[oid] = self._mono + self.screen.settings.pre_delay_ms / 1000.0
+        self._register(oid, _OrderRef(index, block, "post"))
+        # 후주문은 취소하지 않는다(사용자 확정 2026-09-07) — 잔량이 걸려 있어도 후주문대기로 둔다.
         self._log.info("[자동M] 후주문 %d세트 %s HL %s %d @ %g → #%s",
                        index + 1, block.value, act.side.value, act.qty, price, oid)
 
-    def _sweep_post_orders(self, mono: float) -> None:
-        """후주문 잔량 감시 — 기한을 넘긴 미체결 후주문은 취소(취소 통보 → 체결차 → 중지)."""
-        for oid, deadline in list(self._post_deadline.items()):
-            if mono < deadline:
-                continue
-            self._post_deadline.pop(oid, None)
-            order = self._system.order_book.order(oid)
-            if order is None or not order.is_open:
-                continue
-            ref = self._orders.get(oid)
-            if ref is not None:
-                self.ulog().warning("후주문 %d세트 %s #%s 잔량 %g 미체결(기한 초과) → 취소",
-                                    ref.index + 1, ref.block.value, oid, order.remaining_qty)
-            self._spawn(self._cancel_post(oid))
-
-    async def _cancel_post(self, order_id: str) -> None:
-        try:
-            await self._system.cancel(order_id)
-        except Exception as exc:  # noqa: BLE001 - 이미 체결/취소됐으면 통보로 정리된다
-            self._log.warning("[자동M] 후주문 취소 실패 #%s — %s", order_id, exc)
-
     # ------------------------------------------------------------ 주문 통보 ---
+    def _register(self, oid: str, ref: _OrderRef) -> None:
+        """주문번호 ↔ 세트 연결. 발주 응답 안에 이미 실린 체결(HL 즉시체결)은 place()가 끝나기
+        전에 훅으로 먼저 오므로 그때는 주인을 모른다 — 모아 뒀다가 여기서 되돌려 반영한다
+        (실측 2026-09-07: 후주문 0.588 즉시체결이 세트에 안 잡혀 hl_net 0·HL 대기 1 남음)."""
+        self._orders[oid] = ref
+        for order, qty, price in self._orphan_fills.pop(oid, []):
+            self._apply_fill(ref, order, qty, price)
+
     def _on_fill_applied(self, order: TrackedOrder, qty: float, price: float,
                          _fill_id: str) -> None:
         ref = self._orders.get(order.order_id)
         if ref is None:
+            if order.intent.source == SOURCE:  # 우리 주문인데 아직 등록 전 — 등록 때 되돌려 반영
+                self._orphan_fills.setdefault(order.order_id, []).append((order, qty, price))
             return
+        self._apply_fill(ref, order, qty, price)
+
+    def _apply_fill(self, ref: _OrderRef, order: TrackedOrder, qty: float,
+                    price: float) -> None:
         s = self.screen.sets[ref.index]
         mono = time.monotonic()
         leg = s.leg(ref.block)
         if ref.leg == "pre":
             self._apply(ref.index, ref.block,
                         on_pre_fill(s, ref.block, int(round(qty)), price, mono))
-            self.ulog().info("체결 %d세트 %s 선주문 #%s %g @ %g → 누적 %d/%d, HL 대기 %d",
+            self.ulog().info("체결 %d세트 %s 선주문 #%s %g @ %g → 누적 %d/%d, HL 대기 %g",
                              ref.index + 1, ref.block.value, order.order_id, qty, price,
                              leg.pre_filled, leg.pre_qty, leg.post_pending)
         else:
@@ -316,7 +313,7 @@ class AutoMEngine:
                 s, ref.block, qty, price, fx, mono, self.screen.settings))
             acc = leg.acc
             self.ulog().info(
-                "체결 %d세트 %s 후주문 #%s HL %g @ %g 환 %g → RT %d 체결차 %d HL대기 %d | "
+                "체결 %d세트 %s 후주문 #%s HL %g @ %g 환 %g → RT %d 체결차 %g HL대기 %g | "
                 "누적 HL %g SF %d 환평균 %s HL평균 %s SF평균 %s",
                 ref.index + 1, ref.block.value, order.order_id, qty, price, fx,
                 s.rt, s.fill_diff, leg.post_pending, acc.hl_qty, acc.sf_qty,
@@ -349,9 +346,11 @@ class AutoMEngine:
                     self._forget(oid)
                 elif status == "filled":
                     self._forget(oid)
-            elif status in ("cancelled", "rejected"):  # 후주문 IOC 잔량·거부 → 체결차
-                unfilled = int(round(order.intent.qty - order.filled_qty))
-                if unfilled > 0:
+            elif status in ("cancelled", "rejected"):
+                # 후주문이 밖에서 취소(사람·거래소)되거나 거부됨 — 엔진은 후주문을 취소하지 않는다
+                # (사용자 확정 2026-09-07). 미체결분(소수 그대로)만큼 체결차 → 중지.
+                unfilled = round(order.intent.qty - order.filled_qty, 6)
+                if unfilled > 1e-9:
                     self._apply(ref.index, ref.block,
                                 on_post_partial_reject(s, ref.block, unfilled))
                 self._forget(oid)
@@ -362,7 +361,6 @@ class AutoMEngine:
     def _forget(self, oid: str) -> None:
         self._orders.pop(oid, None)
         self._seen_status.pop(oid, None)
-        self._post_deadline.pop(oid, None)
 
     # ---------------------------------------------------------------- 명령 ---
     def set_running(self, index: int, block: Block, value: bool) -> None:

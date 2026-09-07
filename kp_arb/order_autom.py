@@ -2,7 +2,7 @@
 
     python -m kp_arb.order_autom     (운영은 main.bat 메뉴에서)
 
-원본: docs/STG_2 목업(layout_1·체결쏴 설정·세트설정) + DESIGN-auto-m.md.
+원본: docs/STG_2 목업(layout_1·체결쏴 설정·세트설정) + DESIGN-auto-m-exec.md §11(전략·화면 스펙).
 화면 뼈대는 자동T(order_autot)와 거의 같고, 아래 3가지만 다르다:
   1) 진입 기준 컬럼이 2개(SF·S) — 청산은 SF 1개.
   2) 상단 모니터가 3칸(진입 SF / 진입 S / 청산 SF).
@@ -392,6 +392,22 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         w = sets[(dtag, i)]
         key = f"run_{side}"
         turning_on = not w[key]
+        release = False
+        if turning_on and dtag == "fwd":
+            # 중지(HALTED)는 사람이 직접 풀어야 재개(exec §2) — 확인 뒤 해제 + 실행(2026-09-07)
+            live_sets = ((state_box.get("data") or {}).get("autom_live") or {}).get("sets") or []
+            leg_live = ((live_sets[i] if i < len(live_sets) else {})
+                        .get("entry" if side == "en" else "exit") or {})
+            if leg_live.get("status") == "halted":
+                from .ui_dialog import ask_yes_no
+
+                name = f"{i + 1}세트 {'진입' if side == 'en' else '청산'}"
+                reason = str(leg_live.get("halt_reason") or "")
+                if not ask_yes_no(root, "중지 해제",
+                                  f"{name}이(가) 중지 상태입니다.\n{reason}\n\n"
+                                  "헤지 정리를 마쳤으면 '예' — 중지를 풀고 실행합니다."):
+                    return
+                release = True
         if turning_on:  # 실행 시작 전 필수 입력 + 리스크방지 검증(인라인 현재값 확정)
             en_sf = parse_threshold(w["e_en_sf"].get())
             en_s = parse_threshold(w["e_en_s"].get())
@@ -434,6 +450,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             block = "entry" if side == "en" else "exit"
             if on:
                 send(set_payload(i, w), "세트 설정")
+                if release:  # 중지 해제 먼저(같은 큐라 순서 보장) → 실행
+                    send({"cmd": "autom_release", "set": i, "block": block}, "중지 해제")
             send({"cmd": "autom_run", "set": i, "block": block, "value": on},
                  "실행" if on else "정지")
         else:

@@ -55,15 +55,26 @@ class OrderUpdate:
         return self.status == "rejected" or self.status.endswith("Rejected")
 
     @property
+    def ended_with_remainder(self) -> bool:
+        """거래소가 잔량을 버리고 끝낸 주문 — 상태 'filled'인데 남은 수량(sz) > 0.
+
+        실측 2026-09-07(xyz:SKHX 매도 10): 증거금 한도로 0.588만 체결하고 9.412는 버린 채
+        open→filled(sz 9.412)로 끝냈다. 공식 문서의 perpMarginRejected/marginCanceled가 아니라
+        'filled'로 와서, 이걸 안 잡으면 잔량이 잡히길 영원히 기다린다. 정상 전량 체결은 sz 0.
+        """
+        return self.status == "filled" and self.sz > 0
+
+    @property
     def is_terminal_cancel(self) -> bool:
         """체결 제외 종료(취소·거부 계열) — 더 이상 미체결 아님 → OrderBook 제거 대상.
 
         상태값(공식): canceled·marginCanceled·reduceOnlyCanceled·selfTradeCanceled 등
-        ``*Canceled`` 계열 + rejected·``*Rejected`` 계열. 'filled'은 userFills가 담당(제외),
-        'open'·'triggered'은 살아있음(제외).
+        ``*Canceled`` 계열 + rejected·``*Rejected`` 계열 + **잔량 버림 종료**(ended_with_remainder).
+        정상 'filled'(sz 0)은 userFills가 담당(제외), 'open'·'triggered'은 살아있음(제외).
         """
         s = self.status
-        return s == "canceled" or s.endswith("Canceled") or self.is_rejected
+        return (s == "canceled" or s.endswith("Canceled") or self.is_rejected
+                or self.ended_with_remainder)
 
 
 class HLWebSocketClient:
