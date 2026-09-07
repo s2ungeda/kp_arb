@@ -506,7 +506,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 e.insert(0, "" if blank else str(val))
             e.grid(row=r, column=1, padx=6, pady=3)
             ents[key] = e
-        rt_var = tk.BooleanVar(value=w.get("rt_manual") is not None)
+        # RT 수동 입력·체결차 Clear는 **1회성** — 열 때마다 꺼진 상태로 시작하고 저장하지 않는다
+        # (사용자 확정 2026-09-07). 값이 남아 있으면 실행 켤 때마다 RT를 덮어쓰는 사고가 난다.
+        rt_var = tk.BooleanVar(value=False)
         rt_ent = tk.Entry(win, width=10, justify="right", validate="key",
                           validatecommand=vcmd_int)
         tk.Checkbutton(win, text="RT 진입수량 수동 입력", variable=rt_var).grid(
@@ -534,6 +536,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             if ex_sf is None:
                 errs.append("청산을 입력하세요")
             errs += check_risk(dtag, en_sf, en_s, ex_sf, *_risk_of(dtag))
+            if rt_var.get() and not rt_ent.get().strip():  # 체크만 하고 값 없음 → 확인창
+                errs.append("RT 진입수량 수동 입력이 켜져 있는데 값이 없습니다")
             if errs:  # 필수 미입력·위반 — 경고만, 저장·닫기 안 함
                 warn_center("\n".join(errs))
                 return
@@ -546,7 +550,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             win.destroy()
             if dtag == "fwd":  # 코어에 세트 설정 전송(실행 중에도 가능 — 코어가 다음 판정부터 반영)
                 send(set_payload(i, w), "세트 설정")
-                w["clear_diff"] = False  # 체결차 Clear는 1회성
+            # 1회성 항목은 보낸 즉시 비운다 — 뒤의 실행 켬(set_payload 재전송)·저장에 안 실리게
+            w["rt_manual"] = None
+            w["clear_diff"] = False
 
         btns = tk.Frame(win)
         btns.grid(row=len(rows) + 2, column=0, columnspan=2, pady=(4, 6))
@@ -763,7 +769,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         for (dtag, i), w in sets.items():
             sets_data[f"{dtag}{i}"] = {
                 "target": w["target"], "per": w["per"], "delay": w["delay"],
-                "rt_manual": w["rt_manual"], "clear_diff": w["clear_diff"],
+                # rt_manual·clear_diff는 1회성 — 저장하지 않음(사용자 확정 2026-09-07)
                 "en_sf": w["e_en_sf"].get(), "en_s": w["e_en_s"].get(),
                 "ex_sf": w["e_ex_sf"].get()}
         return {
@@ -818,9 +824,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 w["target"] = d["target"] if isinstance(d.get("target"), int) else 0
                 w["per"] = d["per"] if isinstance(d.get("per"), int) else 0
                 w["delay"] = d["delay"] if isinstance(d.get("delay"), int) else 0
-                w["rt_manual"] = (d["rt_manual"] if isinstance(d.get("rt_manual"), int)
-                                  else None)
-                w["clear_diff"] = bool(d.get("clear_diff", False))
+                w["rt_manual"], w["clear_diff"] = None, False  # 1회성 — 복원 안 함
                 for fld in ("en_sf", "en_s", "ex_sf"):
                     txt = d.get(fld)
                     w[fld] = parse_threshold(txt) if isinstance(txt, str) else None

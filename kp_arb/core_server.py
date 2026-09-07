@@ -1118,7 +1118,8 @@ async def _serve() -> None:
             from .auto_m_engine import AutoMEngine as _AutoMEngine
 
             autom_engine = _AutoMEngine(  # 자동M 실행(정방향) — 실행은 화면 버튼
-                state, system, log_dir=_base_dir() / "logs")
+                state, system, log_dir=_base_dir() / "logs",
+                save=lambda: save_state(STATE_PATH, state))  # 체결마다 RT·체결차 저장
             tasks.append(asyncio.create_task(engine.run()))
             tasks.append(asyncio.create_task(fx_service.run()))
             tasks.append(asyncio.create_task(autom_engine.run()))

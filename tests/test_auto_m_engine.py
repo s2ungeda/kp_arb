@@ -123,6 +123,29 @@ async def test_immediate_partial_fill_is_applied_and_remainder_is_fractional() -
     assert "9.412" in s.entry.halt_reason
 
 
+async def test_engine_saves_state_after_fills_and_halt() -> None:
+    # RT·체결차·순잔고는 체결로 바뀐다 → 명령 때만 저장하면 재시동 때 잃는다(사용자 2026-09-07).
+    state = CoreState()
+    state.screens[ScreenKind.AUTO_M].underlying = U
+    sys_ = FakeSystem()
+    saves: list[int] = []
+    eng = AutoMEngine(state, sys_, save=lambda: saves.append(1))  # type: ignore[arg-type]
+    s = state.autom.sets[0]
+    s.target_qty, s.per_qty, s.en_sf, s.en_s, s.ex_sf = 100, 10, 0.005, 0.005, -0.001
+    state.autom.settings.windows = (("09:00:00", "15:20:00"),)
+    eng.set_running(0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    before = len(saves)
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=2, price=1_602_000.0, ts=0))
+    await _settle()
+    assert len(saves) > before  # 선주문 체결 → 저장
+    before = len(saves)
+    sys_.order_book.on_cancel("O2")  # 후주문이 밖에서 끝남 → 체결차 → 중지 → 저장
+    await _settle()
+    assert len(saves) > before and s.entry.status is LegStatus.HALTED
+
+
 async def test_engine_round_trip_pre_fill_post_fill() -> None:
     # 실행 → 선주문 LS SF 매수 10 @201,000 → 4계약 체결 → 후주문 HL 매도 40(IOC) → 체결 → RT 4
     eng, sys_, state = _engine()

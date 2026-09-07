@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -86,9 +87,13 @@ class AutoMEngine:
     """자동M 실행 엔진 — CoreState.autom(세트·설정)과 LiveSystem을 묶는다."""
 
     def __init__(self, state: CoreState, system: _SystemLike,
-                 log_dir: Path | None = None) -> None:
+                 log_dir: Path | None = None,
+                 save: Callable[[], None] | None = None) -> None:
         self._state = state
         self._system = system
+        # 상태 저장 훅(core_state.json) — RT·체결차·순잔고는 체결로 바뀌므로 명령 때만 저장하면
+        # 재시동 때 잃는다. 체결·취소·중지 뒤마다 저장(사용자 2026-09-07: 재접속 때 물고 옴).
+        self._save = save
         self._log = logging.getLogger("kp_arb.autom")  # 굵직한 줄 → 코어 로그
         self._log_dir = log_dir
         self._orders: dict[str, _OrderRef] = {}
@@ -319,6 +324,16 @@ class AutoMEngine:
                 s.rt, s.fill_diff, leg.post_pending, acc.hl_qty, acc.sf_qty,
                 acc.fx_avg(), acc.hl_avg(), acc.sf_avg())
         self._trace(ref.index, ref.block, leg)
+        self._persist()  # RT·체결차·순잔고 바뀜 → core_state.json
+
+    def _persist(self) -> None:
+        """코어 상태 저장(세대 백업 포함) — 실패해도 판정을 멈추지 않는다."""
+        if self._save is None:
+            return
+        try:
+            self._save()
+        except Exception as exc:  # noqa: BLE001 - 저장 실패는 로그만
+            self._log.warning("[자동M] 상태 저장 실패 — %s", exc)
 
     def _on_book_change(self) -> None:
         """취소·거부는 상태 변화로 온다 — 추적 주문의 상태 전이를 한 번씩 처리."""
@@ -357,6 +372,7 @@ class AutoMEngine:
             elif status == "filled":
                 self._forget(oid)
             self._trace(ref.index, ref.block, s.leg(ref.block))
+            self._persist()  # 취소·거부로 바뀐 상태(체결차·중지) 저장
 
     def _forget(self, oid: str) -> None:
         self._orders.pop(oid, None)
