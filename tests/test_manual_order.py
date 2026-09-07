@@ -308,6 +308,20 @@ async def test_manual_hl_merge_raw_is_none() -> None:
     assert r["ok"] and sys.merges == [(Underlying.SAMSUNG, None, None)]
 
 
+async def test_manual_hl_merge_remembered_in_state() -> None:
+    # 코어 상태에 종목별로 남겨 재시동 때 복원(단일 진실=코어, 2026-09-07). 원시면 항목 제거.
+    from kp_arb.strategy_core import CoreState
+
+    sys = _fake_system(OrderBook())
+    state = CoreState()
+    await _manual_command(sys, {"cmd": "manual_hl_merge", "underlying": "samsung",
+                                "n_sig_figs": 5, "mantissa": 2}, state)
+    assert state.hl_merge == {"samsung": [5, 2]}
+    await _manual_command(sys, {"cmd": "manual_hl_merge", "underlying": "samsung",
+                                "n_sig_figs": None, "mantissa": None}, state)
+    assert state.hl_merge == {}
+
+
 async def test_manual_refresh_resyncs() -> None:
     sys = _fake_system(OrderBook())
     r = await _manual_command(sys, {"cmd": "manual_refresh"})

@@ -4,7 +4,41 @@ from typing import Any
 
 import pytest
 
-from kp_arb.main_window import _restart_step, launch_command
+from kp_arb.main_window import (
+    _restart_step,
+    launch_command,
+    layout_choices,
+    screens_to_save,
+)
+
+
+def test_layout_choices_lists_generations_with_names() -> None:
+    # ui_state 세대 → (세대, "시각  화면이름들", 토큰) — 깨진 JSON은 건너뛰고 빈 목록은 "(없음)".
+    gens = [
+        (1, 0.0, '{"core": true, "screens": ["kp_arb.monitor", "kp_arb.order_autom"]}'),
+        (2, 0.0, "not json"),
+        (3, 0.0, '{"screens": []}'),
+        (4, 0.0, '{"screens": ["kp_arb.order_hl 1", "evil.module"]}'),
+    ]
+    out = layout_choices(gens)
+    assert [n for n, _l, _s in out] == [1, 3, 4]
+    assert out[0][2] == ["kp_arb.monitor", "kp_arb.order_autom"]
+    assert "시세 모니터, 체결쏴" in out[0][1]
+    assert "(없음)" in out[1][1]
+    assert out[2][2] == ["kp_arb.order_hl 1"]  # kp_arb. 밖 모듈은 버림
+    assert "HL 일반주문" in out[2][1]
+
+
+def test_screens_to_save_keeps_saved_list_until_restored() -> None:
+    # 복원 전(코어 시동 대기·복원 포기)엔 저장 목록 보존 — 2초 주기 저장이 빈 목록으로
+    # 덮어써 이전 화면들이 날아가던 문제(실측 2026-09-07).
+    saved = ["kp_arb.monitor", "kp_arb.order_autom"]
+    assert screens_to_save([], restore_done=False, saved=saved) == saved
+    assert screens_to_save(["kp_arb.order_hl"], restore_done=False, saved=saved) == saved
+    # 복원 뒤(또는 사용자가 직접 창을 연 뒤)부터는 실제 열린 창이 진실 — 빈 목록도 그대로
+    now = ["kp_arb.order_hl"]
+    assert screens_to_save(now, restore_done=True, saved=saved) == now
+    assert screens_to_save([], restore_done=True, saved=saved) == []
 
 
 def _fresh(**over: Any) -> dict[str, Any]:

@@ -106,6 +106,22 @@ def test_state_persistence_roundtrip(tmp_path: Path) -> None:
     assert not screen.entry_sets[0].running  # 실행 상태는 복원 안 함 (안전)
 
 
+def test_state_persists_hl_merge(tmp_path: Path) -> None:
+    # HL 호가단위(종목별)는 코어 재시동 때 복원 — 형식 틀린 항목·모르는 종목은 버린다.
+    state = CoreState()
+    state.hl_merge["samsung"] = [5, 2]
+    state.hl_merge["sk_hynix"] = [4, None]
+    path = tmp_path / "core_state.json"
+    save_state(path, state)
+    restored = load_state(path)
+    assert restored.hl_merge == {"samsung": [5, 2], "sk_hynix": [4, None]}
+
+    from kp_arb.strategy_core import state_from_dict
+    bad = state_from_dict({"hl_merge": {"samsung": [5, 2], "nope": [5, 2],
+                                        "hyundai": "x", "sk_hynix": [None, 2]}})
+    assert bad.hl_merge == {"samsung": [5, 2]}
+
+
 def test_settings_global_fx_spot_window_user_input() -> None:
     # 현물환율 사용시간은 공통설정 사용자 입력(2026-09-04) — HH:MM 저장, 형식 오류는 거부.
     state = CoreState()

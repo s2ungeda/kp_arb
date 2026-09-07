@@ -233,8 +233,40 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             send({"cmd": "manual_hl_merge", "underlying": u,
                   "n_sig_figs": nsf, "mantissa": mant}, "호가단위")
         send({"cmd": "settings", "future_month": MONTH_MAP[cb_month.get()]}, "선물 월물")
-        send({"cmd": "autom_ref_qty", "qty": parse_qty(ent_refqty.get())}, "기준수량")
+        send_ref_qty(force=True)
         state_box["_applied"] = True  # 모니터 수치는 '적'을 누른 뒤부터 표시(사용자 2026-09-04)
+
+    # 마지막으로 보낸 기준수량(같으면 다시 안 보냄) · 입력칸 평소 배경(깜빡임 뒤 복귀)
+    ref_sent: dict[str, Any] = {"qty": -1, "bg": "white"}
+
+    def send_ref_qty(force: bool = False) -> None:
+        """기준수량만 코어로 — Enter·포커스 이동 시 바로 반영(사용자 확정 2026-09-07).
+
+        모니터 est 계산용 수량이라 세트 실행 중에도 바꿀 수 있고, '적'과 달리
+        종목·호가단위·월물은 건드리지 않는다.
+        """
+        qty = parse_qty(ent_refqty.get())
+        if not force and qty == ref_sent["qty"]:
+            return
+        ref_sent["qty"] = qty
+        send({"cmd": "autom_ref_qty", "qty": qty}, "기준수량")
+        flash_ref_qty()
+
+    def revert_ref_qty() -> None:
+        """Enter 없이 포커스가 나가면 입력을 **마지막으로 보낸 값**으로 되돌린다(사용자 2026-09-07).
+
+        보낸 적이 없으면(창 연 직후, '적' 전) 입력을 그대로 둔다.
+        """
+        last = ref_sent["qty"]
+        if last < 0 or ent_refqty.get() == str(last):
+            return
+        ent_refqty.delete(0, "end")
+        ent_refqty.insert(0, str(last))
+
+    def flash_ref_qty() -> None:
+        """보냈다는 표시 — 입력칸 배경을 잠깐 바꿨다 되돌린다(버튼 눌림처럼, 사용자 2026-09-07)."""
+        ent_refqty.config(bg="#bfe0ff")
+        ent_refqty.after(180, lambda: ent_refqty.config(bg=ref_sent["bg"]))
 
     ttk.Style().configure("Ap.TButton", padding=(6, 2))  # 콤보 높이(≈26)에 맞춤
     btn_apply = ttk.Button(top, text="적", width=3, style="Ap.TButton", command=apply_market)
@@ -243,6 +275,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                           validatecommand=vcmd_int, font=T.FONT_NUM_LG)
     ent_refqty.insert(0, "0")
     ent_refqty.pack(side="left", padx=(0, 6))
+    ref_sent["bg"] = ent_refqty.cget("bg")  # 깜빡임 뒤 되돌릴 평소 배경(중첩 호출에도 안전)
+    ent_refqty.bind("<Return>", lambda _e: send_ref_qty())
+    ent_refqty.bind("<FocusOut>", lambda _e: revert_ref_qty())  # Enter 없이 나가면 수정 취소
+    ent_refqty.bind("<Escape>", lambda _e: revert_ref_qty())
 
     # 오른쪽 끝 = 설정, 그 왼쪽 = 주문가능시간 표시 (모니터 수치는 방향 제목 옆으로 이동)
     tk.Button(top, text="설정", command=lambda: open_common_dialog()).pack(side="right")
@@ -920,7 +956,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         # 상단 모니터 3칸 — 코어가 기준수량으로 계산한 est 괴리(%), 정/역 각각.
         # '적'을 누른 뒤부터 표시(종목·호가단위·기준수량이 코어에 적용된 값이라야 뜻이 있음).
         monitor = ((data.get("autom_live") or {}).get("monitor")) or {}
-        applied = bool(state_box.get("_applied")) and parse_qty(ent_refqty.get()) > 0
+        # 표시 여부는 화면 입력칸이 아니라 **코어가 실제로 쓰는 기준수량**으로 판단 —
+        # 입력칸을 지우는 중에도 수치가 사라지지 않게(사용자 2026-09-07).
+        core_ref = int((data.get("autom") or {}).get("ref_qty") or 0)
+        applied = bool(state_box.get("_applied")) and core_ref > 0
         for dtag in ("fwd", "rev"):
             vals = monitor.get(dtag) or {}
             for skey in ("en_sf", "en_s", "ex_sf"):

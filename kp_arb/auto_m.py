@@ -313,7 +313,8 @@ def evaluate(
         leg.status = LegStatus.ARMED
     # G2 주문가능시간
     if not settings.in_window(sig.now.time()):
-        return hold(f"G2 주문가능시간 밖 {sig.now:%H:%M:%S}", _cancel_if_resting(leg))
+        # 근거에 현재 시각을 넣지 않는다 — 매초 "바뀐 근거"가 되어 초당 한 줄씩 쌓임(실측 09-07)
+        return hold("G2 주문가능시간 밖", _cancel_if_resting(leg))
     # G3 전환대기 · G4 여유 계약수 — 새로 내지 않음(걸어둔 것은 유지)
     if _switch_wait(s, leg, sig.mono):
         return hold(f"G3 전환대기 {s.switch_delay_s}초")

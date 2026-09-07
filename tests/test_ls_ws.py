@@ -220,6 +220,34 @@ async def test_reconnect_counter_resets_after_data() -> None:
     assert [q.bid for q in quotes] == [1, 2, 3, 4, 9]
 
 
+async def test_ack_summary_one_line_when_all_answered(caplog: pytest.LogCaptureFixture) -> None:
+    # 정상 구독 응답은 건별 INFO 대신 전부 왔을 때 한 줄 요약(2026-09-07) — 거부는 그대로 경고.
+    import logging
+
+    ok = json.dumps({"header": {"tr_cd": "JIF", "rsp_cd": "00000"}, "body": None})
+    bad = json.dumps({"header": {"tr_cd": "CUR", "rsp_cd": "99999",
+                                 "rsp_msg": "키 오류"}, "body": None})
+    session = FakeConnection([ok, bad, ok])
+    client = LSWebSocketClient(FakeConnector([session]))
+    client.subscribe_market_status()  # JIF
+    client.subscribe_quotes(Underlying.SAMSUNG)  # 여러 건 → 총 구독 수 > 2
+    n_subs = len(client._subs)
+    session_all = FakeConnection([ok] * n_subs)
+    client_all = LSWebSocketClient(FakeConnector([session_all]))
+    client_all.subscribe_market_status()
+    client_all.subscribe_quotes(Underlying.SAMSUNG)
+
+    with caplog.at_level(logging.DEBUG, logger="kp_arb.ls_ws"):
+        await client.run()
+        await client_all.run()
+
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert sum("구독 응답 정상" in m for m in infos) == 1  # 전부 응답한 쪽만 요약 1줄
+    assert any(f"정상 {n_subs}건 (요청 {n_subs}건 전부)" in m for m in infos)
+    assert any("구독 응답 거부 CUR" in m for m in warns)  # 거부는 건별 경고 유지
+
+
 async def test_ack_frame_without_body_is_skipped() -> None:
     # LS 구독 등록 ACK 등 body 없는 프레임은 크래시 없이 무시(on_raw로는 관측).
     frame = json.dumps({"header": {"tr_cd": "JIF", "rsp_cd": "00000"}, "body": None})

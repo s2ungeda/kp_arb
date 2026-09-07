@@ -65,6 +65,22 @@ def test_l2_aggregation_reports_active_merge() -> None:
     assert client.l2_aggregation(Underlying.SAMSUNG) == (None, None)
 
 
+def test_same_merge_skips_resubscribe() -> None:
+    # 같은 단위를 다시 요청하면 취소/재구독을 안 보낸다 — 재구독 순간 호가창이 비어
+    # est·판정이 잠깐 끊기므로(자동M '적' 반복 누름, 사용자 확정 2026-09-07).
+    client = HLWebSocketClient(FakeConnector([]))
+    client.subscribe_l2book()
+    client.set_l2_aggregation(Underlying.SAMSUNG, None, None)  # 원시 → 원시: 아무것도 없음
+    assert len(client._control) == 0
+    client.set_l2_aggregation(Underlying.SAMSUNG, 5, 2)
+    assert len(client._control) == 2  # 취소 + 재구독
+    client.set_l2_aggregation(Underlying.SAMSUNG, 5, 2)  # 같은 단위 반복
+    assert len(client._control) == 2
+    client.set_l2_aggregation(Underlying.SAMSUNG, 5, 5)  # 다른 단위면 다시 2개
+    assert len(client._control) == 4
+    assert client.l2_aggregation(Underlying.SAMSUNG) == (5, 5)
+
+
 async def test_subscribes_marks_and_fills() -> None:
     connector = FakeConnector([])
     client = HLWebSocketClient(connector)

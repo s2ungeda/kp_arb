@@ -166,14 +166,16 @@ class HLWebSocketClient:
                        if s.get("type") == "l2Book" and s.get("coin") == coin), None)
         if target is None:
             return  # l2Book 미구독
-        self._control.append({"method": "unsubscribe", "subscription": dict(target)})
-        target.pop("nSigFigs", None)
-        target.pop("mantissa", None)
         extra: dict[str, int] = {}
         if n_sig_figs is not None:
             extra["nSigFigs"] = n_sig_figs
             if mantissa is not None:
                 extra["mantissa"] = mantissa
+        if self._l2_extra.get(coin, {}) == extra:
+            return  # 같은 단위 — 재구독하면 호가창만 잠깐 비니 건너뜀(자동M '적' 반복, 2026-09-07)
+        self._control.append({"method": "unsubscribe", "subscription": dict(target)})
+        target.pop("nSigFigs", None)
+        target.pop("mantissa", None)
         target.update(extra)
         self._l2_extra[coin] = extra
         self._depth.pop(underlying, None)  # 옛 단위 호가창 폐기

@@ -267,7 +267,7 @@ HL 웹이나 다른 데서 거래하면 이 화면에 안 잡힌다.
   **[신규]** 레버리지·마진모드는 **여기서 받지 않는다** — 주문과 별개 액션이라 아래 `manual_leverage` 로 뺀다.
 - `manual_amend` {order_id, price} → `amend_price`(LS 전용, 잔량 기준 정정). **HL이면 거부**("HL은 정정 미지원 — 취소 후 신규", 코어에서 차단).
 - `manual_cancel` {order_id} → `cancel`.
-- `manual_hl_merge` {underlying, n_sig_figs, mantissa} → `set_hl_aggregation`(HL 호가단위 머지, WS 재구독).
+- `manual_hl_merge` {underlying, n_sig_figs, mantissa} → `set_hl_aggregation`(HL 호가단위 머지, WS 재구독). 같은 단위면 재구독 생략(호가창이 잠깐 비는 것 방지). 종목별 선택은 코어 상태(`hl_merge`)에 저장돼 **코어 재시동 때 다시 적용**되고, 시세·일반주문·자동M 콤보는 모두 코어 적용값을 따른다(단일 진실=코어, 2026-09-07).
 - `manual_refresh` {} → `refresh_snapshot`(잔고/포지션 재조회 → OrderBook 재동기, '적' 버튼·HTS 외부거래 반영).
 - **[신규]** `manual_leverage` {underlying, is_cross, leverage} → `updateLeverage`. **주문과 별개** (§1-3).
 - **[신규·나중]** `hl_dex_abstraction` {enabled} → `userDexAbstraction`. **계정 단위라 주문창이 아니라 설정 화면에 둔다.** 이 창의 개발 범위 밖.

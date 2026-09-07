@@ -65,11 +65,10 @@ def _read(key: str) -> dict[str, Any]:
 
 
 def _write(key: str, data: dict[str, Any]) -> None:
-    try:
-        _STATE_DIR.mkdir(exist_ok=True)
-        _key_path(key).write_text(json.dumps(data), encoding="utf-8")
-    except OSError:
-        pass
+    """바뀔 때만·원자적·세대 백업 3개(.win_state/backup/) — state_backup 공통."""
+    from .state_backup import write_if_changed
+
+    write_if_changed(_key_path(key), json.dumps(data), generations=3)
 
 
 def saved_position(name: str) -> str | None:

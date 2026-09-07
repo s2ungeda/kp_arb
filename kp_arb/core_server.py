@@ -226,11 +226,10 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
 
 
 def save_state(path: Path, state: CoreState) -> None:
-    """상태를 JSON 파일로 저장 — 실패(잠김 등)는 무시(다음 명령 때 재시도)."""
-    try:
-        path.write_text(_dumps(snapshot(state)), encoding="utf-8")
-    except OSError:
-        pass
+    """상태를 JSON 파일로 저장 — 바뀔 때만·원자적·세대 백업 5개(state_backup). 실패는 무시."""
+    from .state_backup import write_if_changed
+
+    write_if_changed(path, _dumps(snapshot(state)), generations=5)
 
 
 def load_state(path: Path) -> CoreState:
@@ -534,7 +533,7 @@ async def _autom_command(
 
 
 async def _manual_command(
-    system: LiveSystem | None, body: dict[str, Any]
+    system: LiveSystem | None, body: dict[str, Any], state: CoreState | None = None
 ) -> dict[str, Any]:
     """수동 주문 명령 (일반 주문창 → 코어). DESIGN-manual-order.md §6.3.
 
@@ -554,6 +553,11 @@ async def _manual_command(
         except (KeyError, ValueError) as exc:
             return _fail([f"잘못된 머지 인자: {exc}"])
         system.set_hl_aggregation(underlying, n_sig_figs, mantissa)
+        if state is not None:  # 코어 재시동 때 복원(단일 진실=코어). 원시면 항목 제거.
+            if n_sig_figs is None:
+                state.hl_merge.pop(underlying.value, None)
+            else:
+                state.hl_merge[underlying.value] = [n_sig_figs, mantissa]
         return _ok()
     if cmd == "manual_refresh":  # 잔고/포지션 재조회 → OrderBook 재동기 ('적' 버튼)
         # refresh_snapshot은 LS/HL REST라 느려, 응답을 막으면 화면 core_request가
@@ -705,8 +709,15 @@ def monitor_snapshot(
     from .domain.enums import Account
 
     fx_used, fx_src = system.usdkrw_effective()
+    merges: dict[str, Any] = {}  # 종목별 현재 적용 HL 호가단위 — 시세 화면 콤보가 따라감
+    if hasattr(system, "hl_merge_active"):
+        for u in Underlying:
+            active = system.hl_merge_active(u)
+            merges[u.value] = ({"n_sig_figs": active[0], "mantissa": active[1]}
+                               if active is not None else None)
     out: dict[str, Any] = {
         "connected": True,
+        "hl_merge": merges,
         "fx": {"used": fx_used, "src": fx_src, "futures": system.usdkrw_futures,
                # 상태줄에 셋을 나란히(엑셀 시세!N11·N12 배치) — 현물 출처(LS/하나고시)도 함께
                "spot": system.usdkrw_spot, "theory": system.usdkrw_theory,
@@ -965,7 +976,9 @@ def make_app(
         # fx_auction_* 는 fx_* 보다 **먼저** 검사(둘 다 "fx_"로 시작 — 순서 중요).
         if isinstance(cmd, str) and (cmd.startswith("manual_")
                                      or cmd.startswith("fx_auction_")):
-            result = await _manual_command(system, payload)
+            result = await _manual_command(system, payload, state)
+            if cmd == "manual_hl_merge" and result.get("ok") and save:
+                save()  # HL 호가단위 저장 — 코어 재시동 때 복원
             return web.json_response(result, dumps=_dumps)
         if isinstance(cmd, str) and cmd.startswith("fx_"):
             result = _fx_command(fx_service, payload)
@@ -1095,6 +1108,11 @@ async def _serve() -> None:
 
             system = await bootstrap_live(http)
             await system.start()
+            # 저장된 HL 호가단위 복원 — WS 접속 전이라 희망 구독 상태만 바뀌고 접속 시 그대로 구독.
+            for key, pair in state.hl_merge.items():
+                system.set_hl_aggregation(Underlying(key), pair[0], pair[1])
+            if state.hl_merge:
+                log.info("HL 호가단위 복원: %s", state.hl_merge)
             engine = RehearsalEngine(state, system)
             fx_service = FxReportService(system)
             from .auto_m_engine import AutoMEngine as _AutoMEngine

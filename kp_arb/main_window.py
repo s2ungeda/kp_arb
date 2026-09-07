@@ -17,12 +17,20 @@ from typing import Any, cast
 
 from . import sound, win_state
 from .core_client import core_request
+from .state_backup import list_generations, restore_generation, write_if_changed
 
 # 메인 화면 마지막 상태(코어 실행 여부·띄운 화면 목록) — gitignore
 # 배포판(exe)은 실행파일 옆, 개발은 프로젝트 루트 (frozen에서 _internal 안 방지)
 _BASE_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
              else Path(__file__).resolve().parent.parent)
 UI_STATE_PATH = _BASE_DIR / "ui_state.json"
+# 화면 모듈 → 메뉴 이름 (화면 구성 되돌리기 목록 표시용)
+_SCREEN_NAMES = {
+    "kp_arb.order_autot": "바로쏴", "kp_arb.order_autom": "체결쏴",
+    "kp_arb.monitor": "시세 모니터", "kp_arb.fx_monitor": "FX 노출 감시",
+    "kp_arb.order_hl": "HL 일반주문", "kp_arb.order_list": "주문 리스트",
+    "kp_arb.fx_auction_order": "원달러선물 동시호가", "kp_arb.settings_window": "공통설정",
+}
 
 _MUTEX_HANDLES: list[int] = []  # 단일 인스턴스 뮤텍스 핸들 유지(프로세스 수명 동안)
 
@@ -104,6 +112,39 @@ def _restart_step(
     return "restart"
 
 
+def screens_to_save(open_now: list[str], restore_done: bool, saved: list[str]) -> list[str]:
+    """ui_state에 남길 화면 목록(순수).
+
+    저장은 2초마다 돈다. 저장된 화면을 아직 다시 열기 전(코어 시동 대기 중·복원 포기)에
+    "지금 열린 창"을 쓰면 빈 목록으로 덮어써 이전 목록이 날아간다(실측 2026-09-07) —
+    복원이 끝났거나 사용자가 직접 창을 연 뒤부터 실제 열린 창을 저장한다.
+    """
+    return open_now if restore_done else list(saved)
+
+
+def layout_choices(
+    gens: list[tuple[int, float, str]]
+) -> list[tuple[int, str, list[str]]]:
+    """ui_state 세대 목록 → 되돌리기 선택지 [(세대, 표시 문구, 화면 토큰들)] (순수).
+
+    표시 문구 = 저장 시각 + 화면 이름들(메뉴 이름). JSON이 깨진 세대는 건너뛴다.
+    """
+    import time as _time
+
+    out: list[tuple[int, str, list[str]]] = []
+    for n, mtime, text in gens:
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        screens = ([m for m in raw.get("screens", []) if isinstance(m, str)
+                    and m.startswith("kp_arb.")] if isinstance(raw, dict) else [])
+        names = ", ".join(_SCREEN_NAMES.get(t.split(" ", 1)[0], t) for t in screens) or "(없음)"
+        stamp = _time.strftime("%m-%d %H:%M:%S", _time.localtime(mtime))
+        out.append((n, f"{stamp}   {names}", screens))
+    return out
+
+
 def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
     """실행 명령 구성 — 개발(파이썬)과 배포판(exe, app.py 분기)을 모두 지원."""
     if not getattr(sys, "frozen", False):
@@ -172,6 +213,10 @@ def main() -> None:
     except (OSError, json.JSONDecodeError):
         saved_raw = {}
     saved = saved_raw if isinstance(saved_raw, dict) else {}
+    saved_screens = [m for m in saved.get("screens", [])
+                     if isinstance(m, str) and m.startswith("kp_arb.")]
+    # 복원 전엔 저장 목록을 보존(screens_to_save) — 저장할 게 없으면 처음부터 '복원 끝'.
+    restore_box: dict[str, Any] = {"done": not saved_screens, "saved": saved_screens}
 
     # 코어 생존 확인은 HTTP 왕복(최대 1초)이라 화면 스레드에서 하면 창 끌기·
     # 메뉴가 그 순간 얼어붙는다 → 뒷단 스레드가 확인하고 화면은 결과만 읽는다.
@@ -186,7 +231,10 @@ def main() -> None:
     # 코어 자동 재시작(Phase 8-5) — 연속 미접속이 임계 이상이면 재기동. cooldown은 시작
     # 직후 부팅 유예(초기값으로 시동 자체를 크래시로 오인하지 않게).
     RESTART_AFTER = 3       # 연속 미접속 3회(~6초)면 재기동
-    RESTART_COOLDOWN = 6    # 시작/재기동 후 6회(~12초)는 부팅 유예
+    # 시작/재기동 후 부팅 유예. 코어 시동은 LS 순차 조회(초당 한도) 때문에 30~60초 걸린다 —
+    # 유예가 짧으면(옛 12초) 멀쩡히 뜨는 중인 코어 옆에 두 번째 코어를 띄워 LS 조회·토큰을
+    # 두 배로 쏘고("주식 WS 중단: Server disconnected"), 포트 충돌로 죽는다(실측 2026-09-07).
+    RESTART_COOLDOWN = 60   # 60회(~120초)
     MAX_RESTARTS = 5        # 이만큼 연속 실패하면 자동 재기동 중단(수동 점검)
     restart: dict[str, Any] = {"intentional": False, "down": 0,
                                "cooldown": RESTART_COOLDOWN, "fails": 0, "gave_up": False}
@@ -209,12 +257,11 @@ def main() -> None:
 
     def save_ui_state() -> None:
         """마지막 상태 저장 — 다음 실행 때 그대로 복원."""
+        open_now = [tok for tok, _slot, p in launched if p.poll() is None]
         data = {"core": alive_box["alive"],
-                "screens": [tok for tok, _slot, p in launched if p.poll() is None]}
-        try:
-            UI_STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
-        except OSError:
-            pass
+                "screens": screens_to_save(open_now, restore_box["done"], restore_box["saved"])}
+        # 바뀔 때만·원자적·세대 백업 5개(backup/ui_state.N.json) — state_backup 공통
+        write_if_changed(UI_STATE_PATH, json.dumps(data), generations=5)
 
     # 알람 사운드 — /state의 fill_seq·error_seq 증가 + WS 끊김 전이를 감지해 재생.
     # 시동 시점 값은 기준으로만 잡고 재생 안 함(첫 관측은 None→값).
@@ -340,6 +387,7 @@ def main() -> None:
                          "코어가 아직 연결되지 않았습니다.\n"
                          "'코어: 연결됨'이 표시된 뒤 화면을 여세요.")
             return
+        restore_box["done"] = True  # 창을 실제로 열기 시작 — 이제부터 열린 창 목록이 진실
         token = " ".join([module, *args])  # ui_state 저장/복원용 식별자
         slot = _next_slot(module)  # 인스턴스별 슬롯 → win_state 키 분리(각 창 위치 따로)
         launched.append((token, slot, launch_module(module, *args, slot=slot)))
@@ -409,6 +457,53 @@ def main() -> None:
         else:
             status.config(text="종료 거부 — " + "; ".join(result.get("errors", [])))
 
+    def restore_layout() -> None:
+        """화면 구성 되돌리기 — ui_state 세대(최대 5)를 골라 그 화면들을 다시 연다."""
+        from .ui_dialog import center_on_parent, show_message
+
+        if not alive_box["alive"]:
+            show_message(root, "코어 연결 전", "코어가 연결된 뒤 되돌리세요.")
+            return
+        items = layout_choices(list_generations(UI_STATE_PATH, generations=5))
+        if not items:
+            show_message(root, "화면 구성 되돌리기", "저장된 이전 화면 구성이 없습니다.")
+            return
+        win = tk.Toplevel(root)
+        win.title("화면 구성 되돌리기")
+        win.transient(root)
+        tk.Label(win, text="되돌릴 화면 구성을 고르세요 (위가 최근)").pack(
+            padx=10, pady=(10, 4), anchor="w")
+        lb = tk.Listbox(win, width=64, height=min(6, len(items)))
+        for _n, label, _s in items:
+            lb.insert("end", label)
+        lb.selection_set(0)
+        lb.pack(padx=10)
+
+        def apply() -> None:
+            sel = lb.curselection()  # type: ignore[no-untyped-call]  # tk 스텁 미타입
+            if not sel:
+                return
+            n, _label, screens_sel = items[int(sel[0])]
+            restore_generation(UI_STATE_PATH, n, generations=5)  # 지금 구성은 1세대로 밀림
+            restore_box["saved"] = list(screens_sel)
+            restore_box["done"] = True
+            open_now = {tok for tok, _slot, p in launched if p.poll() is None}
+            for token in screens_sel:
+                if token not in open_now:
+                    module, *args = token.split()
+                    open_screen(module, *args)
+            win.destroy()
+
+        row = tk.Frame(win)
+        row.pack(pady=8)
+        tk.Button(row, text="되돌리기", width=10, command=apply).pack(side="left", padx=4)
+        tk.Button(row, text="취소", width=10, command=win.destroy).pack(side="left", padx=4)
+        win.bind("<Return>", lambda _e: apply())
+        win.bind("<Escape>", lambda _e: win.destroy())
+        center_on_parent(win, root)
+        win.grab_set()
+        lb.focus_set()
+
     menubar = tk.Menu(root)
     m_screen = tk.Menu(menubar, tearoff=0)
     m_screen.add_command(label="바로쏴 (자동T)",
@@ -428,6 +523,8 @@ def main() -> None:
     m_screen.add_separator()
     m_screen.add_command(label="공통설정",
                          command=lambda: open_screen("kp_arb.settings_window"))
+    m_screen.add_separator()
+    m_screen.add_command(label="화면 구성 되돌리기 (이전 세대)", command=restore_layout)
     menubar.add_cascade(label="화면", menu=m_screen)
     m_core = tk.Menu(menubar, tearoff=0)
     m_core.add_command(label="코어 시작", command=start_core)
@@ -475,18 +572,19 @@ def main() -> None:
     if not core_alive():
         launch_module("kp_arb.core_server", console=False, watch_parent=False)
         status.config(text="코어 시작 중 ...")
-    screens = [m for m in saved.get("screens", [])
-               if isinstance(m, str) and m.startswith("kp_arb.")]
+    screens = list(restore_box["saved"])
     if screens:
         # 저장된 화면은 **코어 연결된 뒤** 연다 — 코어 미접속 상태에서 화면 조작을 막기 위함
-        # (사용자 확정). 코어가 30초 내 안 뜨면 자동 복원 포기(메뉴로 수동 오픈 유도).
+        # (사용자 확정). 코어 시동이 30~60초 걸리므로(LS 순차 조회) 120초까지 기다리고,
+        # 그래도 안 뜨면 자동 복원 포기(메뉴로 수동 오픈 유도). 옛 30초는 시동 중에 만료돼
+        # "저장된 화면이 안 뜬다"가 됐다(실측 2026-09-07).
         def reopen_when_ready(waited_ms: int = 0) -> None:
             if alive_box["alive"]:
                 for token in screens:
                     module, *args = token.split()
                     open_screen(module, *args)
                 return
-            if waited_ms >= 30_000:
+            if waited_ms >= 120_000:
                 status.config(text="코어 미접속 — 저장된 화면 자동 복원 안 함(메뉴에서 여세요)")
                 return
             root.after(500, lambda: reopen_when_ready(waited_ms + 500))

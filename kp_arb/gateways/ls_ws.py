@@ -204,6 +204,7 @@ class LSWebSocketClient:
         self._max_reconnects = max_reconnects
         self._reconnect_backoff_s = reconnect_backoff_s
         self._subs: list[tuple[str, str, str]] = []  # (tr_cd, tr_key, tr_type) 희망 구독 상태
+        self._ack_ok = 0  # 이번 접속에서 정상 처리된 구독 응답 수 — 전부 오면 한 줄 요약
         self._conn: WSConnection | None = None
         self.on_quote: list[Callable[[Quote], None]] = []
         self.on_trade: list[Callable[[TradeTick], None]] = []          # 체결(현재가)
@@ -344,6 +345,7 @@ class LSWebSocketClient:
                 return
 
     async def _resubscribe(self, conn: WSConnection) -> None:
+        self._ack_ok = 0  # 접속마다 응답 수 다시 셈
         for tr_cd, tr_key, tr_type in self._subs:
             await conn.send(self._register_msg(tr_cd, tr_key, tr_type))
         import logging
@@ -381,8 +383,14 @@ class LSWebSocketClient:
             if rsp_cd and rsp_cd != "00000":
                 log.warning("%s 구독 응답 거부 %s: %s", self.status.name, tr_cd, header)
             else:
-                log.info("%s 구독 응답 %s %s", self.status.name, tr_cd,
-                         header.get("rsp_msg", ""))
+                # 정상 응답은 건별로 DEBUG만(응답에 종목키가 없어 44줄이 똑같이 보임 —
+                # 사용자 2026-09-07). 전부 오면 INFO 한 줄 요약. 요약이 없으면 응답 누락.
+                self._ack_ok += 1
+                log.debug("%s 구독 응답 %s %s", self.status.name, tr_cd,
+                          header.get("rsp_msg", ""))
+                if self._subs and self._ack_ok == len(self._subs):
+                    log.info("%s 구독 응답 정상 %d건 (요청 %d건 전부)",
+                             self.status.name, self._ack_ok, len(self._subs))
             return
         if tr_cd in QUOTE_TRS:
             quote = self._parse_quote(msg)

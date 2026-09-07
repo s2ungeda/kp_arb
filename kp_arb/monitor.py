@@ -226,6 +226,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                       "n_sig_figs": n_sig_figs, "mantissa": mantissa})
         return _apply
 
+    agg_combos: dict[str, ttk.Combobox] = {}  # 종목 → 콤보 (코어 적용값 따라가기)
     for agg_u in Underlying:
         if agg_u.value in HIDDEN_UNDERLYINGS:
             continue
@@ -235,6 +236,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         agg_combo.set("원시")
         agg_combo.pack(side="left")
         agg_combo.bind("<<ComboboxSelected>>", agg_handler(agg_u, agg_combo))
+        agg_combos[agg_u.value] = agg_combo
 
     # est 입력 — 수량(국내: 주식 쌍=주 1:1, 선물 쌍=계약 1:10 환산)·기준값(%). 코어가 계산.
     est_input = tk.Frame(root)
@@ -288,6 +290,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             fill_ls(ls_rows(snap))
             fill_hl(hl_rows(snap))
             fill_board(board_rows(snap))
+            # HL 호가단위 콤보는 코어 적용값을 따른다(단일 진실=코어 — 재시동·다른 창 변경 반영)
+            for key, active in (snap.get("hl_merge") or {}).items():
+                combo = agg_combos.get(key)
+                if combo is None:
+                    continue
+                pair = ((active.get("n_sig_figs"), active.get("mantissa"))
+                        if isinstance(active, dict) else (None, None))
+                label = next((s for s, v in agg_choices.items() if v == pair), None)
+                if label is not None and combo.get() != label:
+                    combo.set(label)
             fx = snap.get("fx") or {}
             # 환율 3개를 나란히 — 쓰는 쪽에 [ ]. 엑셀 시세!N11(현물CUR)·N12(선물역산)과 같은 배치.
             src = fx.get("src")
