@@ -212,18 +212,20 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     ])
 
     # HL 호가단위 머지(종목별) — 코어에 재구독 명령. est·호가창에 적용, 1호가 표시는 원시 유지.
-    # 배수는 최소 호가단위 기준(184달러대: 원시 0.01 → 2배 0.02, 5배 0.05, 10배 0.1, 100배 1)
-    agg_choices = {"원시": (None, None), "2배": (5, 2), "5배": (5, 5),
-                   "10배": (4, None), "100배": (3, None)}
+    # 콤보 항목은 일반주문창·자동M과 같은 **숫자 틱**(0.01·0.02·0.05·0.1·1·10 — 코어가 가격
+    # 자릿수로 계산해 /monitor의 hl_merge_ticks로 줌). 옛 '원시/2배/5배'는 헷갈려 폐기(09-07).
+    agg_maps: dict[str, dict[str, tuple[int | None, int | None]]] = {}  # 종목 → 틱표시 → 머지
     agg_row = tk.Frame(root)
     agg_row.pack(fill="x", padx=4, pady=(2, 0))
     tk.Label(agg_row, text="HL 호가단위:", font=font).pack(side="left")
 
     def agg_handler(u: Underlying, combo: ttk.Combobox) -> Callable[[object], None]:
         def _apply(_event: object) -> None:
-            n_sig_figs, mantissa = agg_choices[combo.get()]
+            pair = agg_maps.get(u.value, {}).get(combo.get())
+            if pair is None:
+                return  # 틱 목록이 아직 없음(가격 미수신)
             jobs.put({"cmd": "manual_hl_merge", "underlying": u.value,
-                      "n_sig_figs": n_sig_figs, "mantissa": mantissa})
+                      "n_sig_figs": pair[0], "mantissa": pair[1]})
         return _apply
 
     agg_combos: dict[str, ttk.Combobox] = {}  # 종목 → 콤보 (코어 적용값 따라가기)
@@ -231,9 +233,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if agg_u.value in HIDDEN_UNDERLYINGS:
             continue
         tk.Label(agg_row, text=_NAMES[agg_u.value], font=font).pack(side="left", padx=(8, 2))
-        agg_combo = ttk.Combobox(agg_row, values=list(agg_choices), width=5,
-                                 state="readonly", font=font)
-        agg_combo.set("원시")
+        agg_combo = ttk.Combobox(agg_row, values=[], width=5, state="readonly", font=font)
+        agg_combo.set("-")  # 틱 목록은 코어가 가격을 받은 뒤 채움
         agg_combo.pack(side="left")
         agg_combo.bind("<<ComboboxSelected>>", agg_handler(agg_u, agg_combo))
         agg_combos[agg_u.value] = agg_combo
@@ -290,14 +291,24 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             fill_ls(ls_rows(snap))
             fill_hl(hl_rows(snap))
             fill_board(board_rows(snap))
-            # HL 호가단위 콤보는 코어 적용값을 따른다(단일 진실=코어 — 재시동·다른 창 변경 반영)
+            # HL 호가단위 콤보: 항목은 코어가 준 숫자 틱 표(hl_merge_ticks), 현재값은 코어 적용값
+            # (hl_merge)을 따른다 — 단일 진실=코어(재시동·다른 창에서 바꾼 것도 반영).
+            ticks_by_u = snap.get("hl_merge_ticks") or {}
             for key, active in (snap.get("hl_merge") or {}).items():
                 combo = agg_combos.get(key)
                 if combo is None:
                     continue
+                ticks = ticks_by_u.get(key) or []
+                if ticks:
+                    labels = [str(t.get("tick")) for t in ticks]
+                    if list(combo["values"]) != labels:  # 가격 자릿수가 바뀌면 표도 바뀜
+                        agg_maps[key] = {
+                            str(t.get("tick")): (t.get("n_sig_figs"), t.get("mantissa"))
+                            for t in ticks}
+                        combo["values"] = labels
                 pair = ((active.get("n_sig_figs"), active.get("mantissa"))
                         if isinstance(active, dict) else (None, None))
-                label = next((s for s, v in agg_choices.items() if v == pair), None)
+                label = next((s for s, v in agg_maps.get(key, {}).items() if v == pair), None)
                 if label is not None and combo.get() != label:
                     combo.set(label)
             fx = snap.get("fx") or {}

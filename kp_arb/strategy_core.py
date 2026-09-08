@@ -351,7 +351,12 @@ def state_from_dict(data: dict[str, object]) -> CoreState:
     if fx in ("near", "next"):
         state.fx_month = str(fx)
     _global_settings_from_dict(state.settings, data.get("settings"))
-    autom_from_dict(state.autom, data.get("autom"))
+    # 옛 단일 자동M 형식(2026-09-08 이전)은 그때 자동M 화면이 가리키던 종목 책으로 이전
+    legacy_u = "samsung"
+    raw_screens = data.get("screens")
+    if isinstance(raw_screens, dict) and isinstance(raw_screens.get("autoM"), dict):
+        legacy_u = str(raw_screens["autoM"].get("underlying", legacy_u))
+    autom_from_dict(state.autom, data.get("autom"), legacy_underlying=legacy_u)
     merges = data.get("hl_merge")
     if isinstance(merges, dict):  # 종목별 [nSigFigs, mantissa] — 형식 틀린 항목만 버림
         valid = {u.value for u in Underlying}

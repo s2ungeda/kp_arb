@@ -819,6 +819,10 @@ def test_monitor_snapshot_structure() -> None:
     assert set(snap) >= {"fx", "phase", "balances", "ls", "hl", "board"}
     assert all("theory" in r and "disp" in r for r in snap["ls"])   # LS 행: 이론가·괴리
     assert all("mark" in r and "oracle" in r for r in snap["hl"])   # HL 행: 마크·오라클
+    # 시세 화면 HL 호가단위 콤보용 — 종목별 적용값 + 숫자 틱 표(가격 미수신이면 빈 목록)
+    assert set(snap["hl_merge"]) == {u.value for u in Underlying}
+    assert set(snap["hl_merge_ticks"]) == {u.value for u in Underlying}
+    assert all(v == [] for v in snap["hl_merge_ticks"].values())  # HL 시세 없음 → 빈 표
 
 
 def test_monitor_snapshot_merges_krx_nxt() -> None:

@@ -18,9 +18,9 @@ from datetime import time as dtime
 from enum import StrEnum
 
 from .disparity import maker_price_for_spread
-from .domain.enums import Block, Side, Underlying
+from .domain.enums import Block, Instrument, Side, Underlying
 from .theory import in_time_window
-from .ticks import ceil_to_tick, floor_to_tick
+from .ticks import ceil_to_tick, floor_to_tick, tick_for
 
 HL_PER_SF = 10  # SF 1계약 = HL 10계약 (§1)
 
@@ -161,6 +161,7 @@ class Leg:
     post_pending: float = 0.0   # 후주문(HL) 체결 대기 계약수 — HL은 소수 체결(0.588 등, 실측 09-07)
     delay_until: float | None = None
     replace_pending: bool = False   # 역산가 바뀜 → 취소 보냄, 취소 확인 대기
+    cancel_sent: bool = False       # 관문(G2·G5·G6) 취소를 이미 보냄 — 확인 올 때까지 재전송 안 함
     await_post_then_delay: bool = False  # 취소 확인됨, 병행 후주문 체결 확인 뒤 딜레이
     halt_reason: str = ""
     # 마지막 판정 결과 한 줄(어느 게이트에서 막혔나·통과했나 + 숫자) — 로그는 바뀔 때만 남긴다
@@ -178,6 +179,7 @@ class Leg:
     def _clear_pre(self) -> None:
         self.pre_order_id = self.pre_price = None
         self.pre_qty = self.pre_filled = 0
+        self.cancel_sent = False
 
 
 @dataclass
@@ -266,7 +268,10 @@ def _cancel_if_resting(leg: Leg) -> list[Action]:
     (실측 2026-09-07 "정정/취소할 수량이 없습니다", 중지 뒤 실행 끔에서).
     """
     resting = leg.pre_order_id is not None and not leg.replace_pending
-    if resting and (leg.pre_qty <= 0 or leg.pre_filled < leg.pre_qty):
+    if resting and not leg.cancel_sent and (leg.pre_qty <= 0 or leg.pre_filled < leg.pre_qty):
+        # 한 번만 보낸다 — 관문에 막힌 채 매 틱 재전송하면 취소 확인이 오기 전 같은 요청이 여러 번
+        # 나간다(실측 2026-09-08: 0.2초에 3번). 확인(취소/거부/체결)이 오면 _clear_pre가 되돌린다.
+        leg.cancel_sent = True
         return [Action("cancel_pre", order_id=leg.pre_order_id)]
     return []
 
@@ -357,17 +362,21 @@ def evaluate(
            else rel_quote(sig.sf_bids, settings.rel_sell))
     if rel is None:
         return hold("G6 SF 호가 없음")
-    limit = limit_price(side, rel, tick, settings.pre_range)
+    # 한계의 "상대N호가 ∓ 1틱"에서 1틱은 **시세(호가창)의 호가단위** = 한 호가 옆(사용자 확정
+    # 2026-09-08). 선주문 주문단위(settings.pre_tick)는 역산가를 주문 단위로 맞추는 데만 쓴다.
+    mkt_tick = tick_for(Instrument.KR_STOCK_FUTURE, rel)
+    limit = limit_price(side, rel, mkt_tick, settings.pre_range)
     if not within_limit(side, price, limit):
-        return hold(f"G6 한계 밖 역산가 {price:,.0f} 한계 {limit:,.0f} (상대호가 {rel:,.0f})",
-                    _cancel_if_resting(leg))
+        return hold(f"G6 한계 밖 역산가 {price:,.0f} 한계 {limit:,.0f} "
+                    f"(상대호가 {rel:,.0f} 호가단위 {mkt_tick})", _cancel_if_resting(leg))
     basis = (f"역산가 {price:,.0f} = 이론가 {sig.sf_theory:,.0f}×(1+{pct(hl_disp)}−{pct(thr)}) "
-             f"틱 {tick} 한계 {limit:,.0f}")
+             f"주문단위 {tick} 한계 {limit:,.0f}(호가단위 {mkt_tick})")
     # 통과 — 없으면 발주, 있고 역산가가 바뀌었으면 재발주 규칙(취소→후주문 확인→딜레이→신규)
     if leg.pre_order_id is None and leg.status is LegStatus.ARMED:
         if qty < 1:
             return hold(f"G4 여유 없음 (목표 {s.target_qty} RT {s.rt})")
         leg.pre_price, leg.pre_qty, leg.pre_filled = price, qty, 0
+        leg.cancel_sent = False
         leg.status = LegStatus.PRE_RESTING
         return hold(f"통과 → 선주문 {qty}계약 {basis}",
                     [Action("place_pre", side=side, qty=qty, price=price)])
@@ -396,6 +405,7 @@ def on_pre_reject(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
     """선주문 거부 → 딜레이 뒤 다시 냄(멈추지 않음, exec ㄴ5)."""
     leg = s.leg(block)
     leg.replace_pending = False
+    leg._clear_pre()  # 거부된 주문은 취소할 것도 없음 — 번호·취소 표시 정리
     _start_delay(leg, mono, settings)
     return [Action("notify", reason="선주문 거부 — 딜레이 뒤 재시도")]
 
@@ -473,26 +483,39 @@ def on_post_fill(
     return []
 
 
-def on_post_reject(s: AutoMSet, block: Block, reason: str = "") -> list[Action]:
-    """후주문 거부 → 국내는 체결됐는데 HL 미체결 = 체결차 → 중지 + 알림(exec ㄹ2, 재시도 없음)."""
+def _halt_set(s: AutoMSet, block: Block, reason: str) -> list[Action]:
+    """세트 중지(exec §2·결정 로그 7·9: 헤지 깨진 **세트**는 멈춤 — 사용자 확인 2026-09-07).
+
+    체결차를 낸 다리뿐 아니라 **다른 다리도** 실행을 끄고 중지로 둔다(청산 체결차인데 진입이 계속
+    새 선주문을 내면 안 됨). 다른 다리에 걸린 선주문은 취소. 해제(release_halt)도 세트 단위.
+    """
     leg = s.leg(block)
     leg.status = LegStatus.HALTED
-    leg.running = False  # 중지 = 실행 꺼짐(버튼 원색). 다시 켜려면 사람이 해제(release_halt)
+    leg.running = False  # 중지 = 실행 꺼짐(버튼 원색). 다시 켜려면 사람이 해제
+    leg.halt_reason = reason
+    acts: list[Action] = [Action("halt", reason=reason), Action("notify", reason=reason)]
+    other = s.leg(Block.EXIT if block is Block.ENTRY else Block.ENTRY)
+    if other.status is not LegStatus.HALTED:
+        acts += _cancel_if_resting(other)  # 걸린 선주문 취소(취소 확인은 통보로)
+        other.status = LegStatus.HALTED
+        other.running = False
+        other.halt_reason = f"{'청산' if block is Block.EXIT else '진입'} 체결차로 세트 중지"
+    return acts
+
+
+def on_post_reject(s: AutoMSet, block: Block, reason: str = "") -> list[Action]:
+    """후주문 거부 → 국내는 체결됐는데 HL 미체결 = 체결차 → 세트 중지 + 알림(ㄹ2, 재시도 없음)."""
     s.fill_diff = round(fill_diff(s.sf_net, s.hl_net), 6)  # 화면 체결차 칸 — 미헤지분(소수)
-    leg.halt_reason = f"후주문 거부 — 체결차 발생{(': ' + reason) if reason else ''}"
-    return [Action("halt", reason=leg.halt_reason), Action("notify", reason=leg.halt_reason)]
+    return _halt_set(s, block, f"후주문 거부 — 체결차 발생{(': ' + reason) if reason else ''}")
 
 
 def halt_if_unhedged(s: AutoMSet, block: Block, diff: float) -> list[Action]:
-    """체결차 감지(exec ㅂ1) — 후주문 대기분이 없는데 ≠0이면 중지. 코어가 잔고로 diff를 넣는다."""
+    """체결차 감지(exec ㅂ1) — 후주문 대기분이 없는데 ≠0이면 세트 중지(diff는 코어가 넣는다)."""
     leg = s.leg(block)
     s.fill_diff = round(diff, 6)  # HL 소수 계약 그대로(0.412 등) — 정수로 깎으면 체결차가 사라진다
     if abs(diff) < _EPS or not post_done(leg) or leg.status is LegStatus.HALTED:
         return []
-    leg.status = LegStatus.HALTED
-    leg.running = False  # 중지 = 실행 꺼짐 — 해제는 사람이(release_halt)
-    leg.halt_reason = f"체결차 {diff:g} ≠ 0"
-    return [Action("halt", reason=leg.halt_reason), Action("notify", reason=leg.halt_reason)]
+    return _halt_set(s, block, f"체결차 {diff:g} ≠ 0")
 
 
 def set_running(s: AutoMSet, block: Block, value: bool) -> list[Action]:
@@ -517,14 +540,17 @@ def on_post_partial_reject(s: AutoMSet, block: Block, unfilled: float) -> list[A
 
 
 def release_halt(s: AutoMSet, block: Block) -> None:
-    """중지 해제 — 사람이 정리한 뒤 직접 푼다(exec §2). 실행은 꺼진 대기로 돌아간다."""
-    leg = s.leg(block)
-    leg.status = LegStatus.IDLE
-    leg.running = False
-    leg.halt_reason = ""
-    leg._clear_pre()
-    leg.post_pending = 0.0
-    leg.replace_pending = leg.await_post_then_delay = False
+    """중지 해제 — 사람이 정리한 뒤 직접 푼다(exec §2). **세트 단위**(중지가 세트 단위이므로):
+    어느 다리에서 풀든 두 다리 모두 꺼진 대기(idle)로 돌아간다."""
+    for leg in (s.entry, s.exit):
+        if leg.status is not LegStatus.HALTED:
+            continue
+        leg.status = LegStatus.IDLE
+        leg.running = False
+        leg.halt_reason = ""
+        leg._clear_pre()
+        leg.post_pending = 0.0
+        leg.replace_pending = leg.await_post_then_delay = False
 
 
 # ---------------------------------------------------------- 화면 단위 묶음 ---
@@ -533,22 +559,48 @@ SET_COUNT = 3
 
 
 @dataclass
-class AutoMScreen:
-    """자동M 화면 전체(정방향 3세트 + 체결쏴 공통설정 + 리스크방지). core_state.json에 저장.
+class AutoMBook:
+    """종목 하나의 자동M 상태 — 정방향 3세트 + 기준수량 + 월물(사용자 확정 2026-09-08: 종목별 독립).
 
-    복원(autom_from_dict)은 **입력값·RT·누적**만 되살리고 실행 상태(running·status·주문번호)는
-    항상 꺼진 채로 시작한다(자동T와 같은 원칙)."""
+    창(order_autom)은 종목 콤보로 어느 책을 보여줄지 고를 뿐이고, 실행은 코어가 종목마다 따로 돈다.
+    같은 종목을 두 창에서 열면 같은 책을 함께 보여준다(중복 실행 아님)."""
 
     sets: list[AutoMSet] = field(default_factory=lambda: [AutoMSet() for _ in range(SET_COUNT)])
-    settings: AutoMSettings = field(default_factory=AutoMSettings)
     ref_qty: int = 1  # 상단 기준수량(계약) — 모니터 3칸(진입SF·진입S·청산SF) est 계산용
-    # 리스크방지(DESIGN-auto-m §10, 화면 입력 검증용) — 정방향 진입 > en, 청산 < ex, 진입−청산 > gap
+    future_month: str = "near"  # 선물 월물 "near"|"next" (exec §11.9, DESIGN §5.11)
+
+    def any_running(self) -> bool:
+        return any(s.entry.running or s.exit.running for s in self.sets)
+
+    @property
+    def counterpart(self) -> Instrument:
+        return (Instrument.KR_STOCK_FUTURE_NEXT if self.future_month == "next"
+                else Instrument.KR_STOCK_FUTURE)
+
+
+@dataclass
+class AutoMScreen:
+    """자동M 전체 = 종목별 책(books) + 체결쏴 공통설정 + 리스크방지. core_state.json에 저장.
+
+    복원(autom_from_dict)은 **입력값·RT·누적**만 되살리고 실행 상태(running·status·주문번호)는
+    항상 꺼진 채로 시작한다(자동T와 같은 원칙). 설정·리스크방지는 모든 종목 공통(09-08)."""
+
+    books: dict[str, AutoMBook] = field(
+        default_factory=lambda: {u.value: AutoMBook() for u in Underlying})
+    settings: AutoMSettings = field(default_factory=AutoMSettings)
+    # 리스크방지(exec §11.9, 화면 입력 검증용) — 정방향 진입 > en, 청산 < ex, 진입−청산 > gap
     risk_fwd_en: float = 0.0
     risk_fwd_ex: float = 0.005
     risk_fwd_gap: float = 0.001
 
+    def book(self, u: Underlying) -> AutoMBook:
+        return self.books.setdefault(u.value, AutoMBook())
+
     def any_running(self) -> bool:
-        return any(s.entry.running or s.exit.running for s in self.sets)
+        return any(b.any_running() for b in self.books.values())
+
+    def running_underlyings(self) -> list[str]:
+        return [k for k, b in self.books.items() if b.any_running()]
 
 
 def _opt_float(raw: object) -> float | None:
@@ -557,13 +609,19 @@ def _opt_float(raw: object) -> float | None:
     return float(raw)  # type: ignore[arg-type]
 
 
-def autom_from_dict(screen: AutoMScreen, raw: object) -> None:
-    """저장 스냅샷 → AutoMScreen(입력값·RT·누적만). 값 오류는 그 필드만 기본값."""
+def _book_from_dict(book: AutoMBook, raw: object) -> None:
+    """저장 스냅샷의 책 하나(sets·ref_qty·future_month) → AutoMBook. 값 오류는 그 필드만 기본값."""
     if not isinstance(raw, dict):
         return
+    try:
+        book.ref_qty = int(raw.get("ref_qty", book.ref_qty))
+    except (TypeError, ValueError):
+        pass
+    month = str(raw.get("future_month", book.future_month))
+    book.future_month = month if month in ("near", "next") else "near"
     sets = raw.get("sets")
     if isinstance(sets, list):
-        for target, rs in zip(screen.sets, sets, strict=False):
+        for target, rs in zip(book.sets, sets, strict=False):
             if not isinstance(rs, dict):
                 continue
             try:
@@ -591,6 +649,30 @@ def autom_from_dict(screen: AutoMScreen, raw: object) -> None:
                         leg.acc.sf_px_sum = float(acc.get("sf_px_sum", 0) or 0)
                     except (TypeError, ValueError):
                         pass
+
+
+def autom_from_dict(screen: AutoMScreen, raw: object, legacy_underlying: str = "samsung") -> None:
+    """저장 스냅샷 → AutoMScreen(입력값·RT·누적만). 값 오류는 그 필드만 기본값.
+
+    새 형식은 ``books: {종목: {sets, ref_qty, future_month}}``. 옛 형식(2026-09-08 이전, 단일
+    ``sets``·``ref_qty``)은 그때 화면이 가리키던 종목(legacy_underlying)의 책으로 옮긴다.
+    """
+    if not isinstance(raw, dict):
+        return
+    books = raw.get("books")
+    if isinstance(books, dict):
+        for key, rb in books.items():
+            try:
+                u = Underlying(str(key))
+            except ValueError:
+                continue
+            _book_from_dict(screen.book(u), rb)
+    elif "sets" in raw:  # 옛 단일 형식 → 그 종목 책으로 이전
+        try:
+            u = Underlying(legacy_underlying)
+        except ValueError:
+            u = Underlying.SAMSUNG
+        _book_from_dict(screen.book(u), raw)
     st = raw.get("settings")
     if isinstance(st, dict):
         s = screen.settings
@@ -615,7 +697,6 @@ def autom_from_dict(screen: AutoMScreen, raw: object) -> None:
         except (TypeError, ValueError):
             pass
     try:
-        screen.ref_qty = int(raw.get("ref_qty", screen.ref_qty))
         screen.risk_fwd_en = float(raw.get("risk_fwd_en", screen.risk_fwd_en))
         screen.risk_fwd_ex = float(raw.get("risk_fwd_ex", screen.risk_fwd_ex))
         screen.risk_fwd_gap = float(raw.get("risk_fwd_gap", screen.risk_fwd_gap))

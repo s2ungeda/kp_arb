@@ -154,14 +154,45 @@ def test_signal_gate_uses_only_s_for_entry_and_nothing_for_exit() -> None:
     s2 = _set()
     s2.rt = 10  # 청산할 RT가 있어야 G4 통과
     set_running(s2, Block.EXIT, True)
-    # 옛 규칙이면 SF괴리 0.05 > 청산 −0.001로 미달. hl_disp_ask 0 → 역산가 201,000 ≤ 한계(G6 통과)
-    acts2 = evaluate(s2, Block.EXIT, _sig(sf_spread_exit=0.05, hl_disp_ask=0.0), SETTINGS, U)
+    # 옛 규칙이면 SF괴리 0.05 > 청산 −0.001로 미달. hl_disp_ask −1.2% → 역산가 197,800 → 주문단위
+    # 3,000 올림 198,000 ≤ 매도 한계 (198,500 + 500) × 1.004 = 199,796 (G6 통과)
+    acts2 = evaluate(s2, Block.EXIT, _sig(sf_spread_exit=0.05, hl_disp_ask=-0.012), SETTINGS, U)
     assert [a.kind for a in acts2] == ["place_pre"]  # 청산은 조건 비교 없음
     s3 = _set()
     s3.ex_sf = None
     s3.rt = 10
     set_running(s3, Block.EXIT, True)
     assert evaluate(s3, Block.EXIT, _sig(), SETTINGS, U) == []  # 기준값 없으면 역산 불가 → 안 냄
+
+
+def test_limit_uses_market_tick_not_order_unit() -> None:
+    # 사용자 확정 2026-09-08: 한계의 "상대1호가 − 1틱"에서 1틱은 시세 호가단위(20만 원대 500),
+    # 선주문 주문단위(설정 3,000)는 역산가를 주문 단위로 맞출 때만. 매도1호가 201,500 →
+    # 한계 (201,500 − 500) × 0.996 = 200,196 (옛 계산은 3,000을 빼 197,706).
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    acts = evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"]
+    assert "한계 200,196" in s.entry.block_reason and "호가단위 500" in s.entry.block_reason
+    assert "주문단위 3000" in s.entry.block_reason  # 역산가 반올림 단위는 그대로 설정값
+
+
+def test_gate_cancel_is_sent_once_until_confirmed() -> None:
+    # 실측 2026-09-08: G2로 막힌 채 매 틱 취소를 다시 보내 0.2초에 3번 나감 → 확인 올 때까지 1번만.
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
+    on_pre_ack(s, Block.ENTRY, "7244")
+    off = _sig(mono=101, now=datetime(2026, 9, 4, 16, 0))
+    assert [a.kind for a in evaluate(s, Block.ENTRY, off, SETTINGS, U)] == ["cancel_pre"]
+    assert evaluate(s, Block.ENTRY, _sig(mono=101.1, now=off.now), SETTINGS, U) == []  # 재전송 없음
+    assert evaluate(s, Block.ENTRY, _sig(mono=101.2, now=off.now), SETTINGS, U) == []
+    on_pre_cancelled(s, Block.ENTRY, mono=102, settings=SETTINGS)  # 확인 → 표시 정리
+    assert not s.entry.cancel_sent and s.entry.pre_order_id is None
+    evaluate(s, Block.ENTRY, _sig(mono=103), SETTINGS, U)  # 다시 시간 안 → 새 선주문
+    on_pre_ack(s, Block.ENTRY, "7245")
+    assert [a.kind for a in evaluate(s, Block.ENTRY, _sig(mono=104, now=off.now), SETTINGS, U)] \
+        == ["cancel_pre"]  # 새 주문은 다시 1번 취소 가능
 
 
 def test_block_reason_records_gate_and_basis() -> None:

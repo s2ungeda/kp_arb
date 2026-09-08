@@ -5,8 +5,8 @@ from kp_arb.order_autom import pct_to_frac, set_payload, settings_payload, sum_a
 def test_set_payload_converts_percent_to_fraction() -> None:
     w = {"target": 100, "per": 10, "delay": 30, "en_sf": 0.5, "en_s": 0.5, "ex_sf": -0.1,
          "rt_manual": None, "clear_diff": True}
-    p = set_payload(1, w)
-    assert p["cmd"] == "autom_set" and p["set"] == 1
+    p = set_payload(1, w, "samsung")
+    assert p["cmd"] == "autom_set" and p["set"] == 1 and p["underlying"] == "samsung"
     assert (p["target_qty"], p["per_qty"], p["switch_delay_s"]) == (100, 10, 30)
     assert (p["en_sf"], p["en_s"], p["ex_sf"]) == (0.005, 0.005, -0.001)
     assert p["rt_manual"] is None and p["clear_diff"] is True

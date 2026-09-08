@@ -458,18 +458,30 @@ def _autom_set_from_body(target: Any, body: dict[str, Any]) -> None:
 async def _autom_command(
     engine: AutoMEngine | None, state: CoreState, body: dict[str, Any]
 ) -> dict[str, Any]:
-    """자동M 명령(화면 → 코어) — DESIGN-auto-m(-exec). 실행/정지는 엔진이 있어야 한다.
+    """자동M 명령(화면 → 코어) — DESIGN-auto-m-exec. 실행/정지는 엔진이 있어야 한다.
 
-    autom_set(세트 설정) · autom_settings(체결쏴 설정) · autom_run(실행 토글) ·
-    autom_release(중지 해제) · autom_clear_acc(누적 clear) · autom_stop_all(전 세트 정지)
+    종목별 명령(``underlying`` 필수, 2026-09-08): autom_set(세트 설정) · autom_run(실행 토글) ·
+    autom_release(중지 해제) · autom_clear_acc(누적 clear) · autom_ref_qty(기준수량) ·
+    autom_month(월물) · autom_stop_all(그 종목 전 세트 정지, underlying 없으면 전 종목).
+    공통: autom_settings(체결쏴 설정 + 리스크방지).
     """
     from .auto_m import parse_hms
 
     cmd = body.get("cmd")
     am = state.autom
+
+    def _book() -> Any:
+        return am.book(Underlying(str(body["underlying"])))
+
     try:
         if cmd == "autom_set":
-            _autom_set_from_body(am.sets[int(body["set"])], body)
+            _autom_set_from_body(_book().sets[int(body["set"])], body)
+            return _ok()
+        if cmd == "autom_month":  # 선물 월물(근/차근) — 종목별(exec §11.9)
+            month = str(body["month"]).strip()
+            if month not in ("near", "next"):
+                return _fail([f"월물 값 오류: {month!r}"])
+            _book().future_month = month
             return _ok()
         if cmd == "autom_settings":
             st = am.settings
@@ -492,19 +504,29 @@ async def _autom_command(
             for key in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap"):
                 if key in body:
                     setattr(am, key, float(body[key]))
+            # 설정 변경은 코어 로그에 남긴다 — "왜 그때 주문이 나갔/막혔나"를 따질 근거
+            # (실측 2026-09-08: 주문가능시간을 줄인 순간 걸린 선주문이 취소됐는데 기록이 없었음).
+            logging.getLogger("kp_arb.autom").info(
+                "[자동M] 체결쏴 설정 변경: 주문가능시간 %s 선주문딜레이 %dms 재개 %ds 범위 %.3f%% "
+                "상대호가 매수%d/매도%d 후주문HP 매수%.2f%%/매도%.2f%% 주문단위 %s 리스크 %s/%s/%s",
+                st.windows, st.pre_delay_ms, st.resume_delay_s, st.pre_range * 100,
+                st.rel_buy, st.rel_sell, st.hl_margin_buy * 100, st.hl_margin_sell * 100,
+                {u.value: t for u, t in st.pre_tick.items()},
+                am.risk_fwd_en, am.risk_fwd_ex, am.risk_fwd_gap)
             return _ok()
         if cmd == "autom_clear_acc":
-            am.sets[int(body["set"])].leg(Block(str(body["block"]))).acc.clear()
+            _book().sets[int(body["set"])].leg(Block(str(body["block"]))).acc.clear()
             return _ok()
-        if cmd == "autom_ref_qty":  # 상단 기준수량 — 모니터 3칸 est 계산 수량
-            am.ref_qty = max(0, int(body["qty"]))
+        if cmd == "autom_ref_qty":  # 상단 기준수량 — 모니터 3칸 est 계산 수량(종목별)
+            _book().ref_qty = max(0, int(body["qty"]))
             return _ok()
         if engine is None:
             return _fail(["코어 시세 미접속 — 자동M 실행 불가"])
         if cmd == "autom_run":
+            u = Underlying(str(body["underlying"]))
             index, block = int(body["set"]), Block(str(body["block"]))
             value = bool(body["value"])
-            target = am.sets[index]
+            target = am.book(u).sets[index]
             if value:
                 errors: list[str] = []
                 if target.per_qty <= 0:
@@ -519,13 +541,15 @@ async def _autom_command(
                     errors.append("중지 상태 — 먼저 해제하세요")
                 if errors:
                     return _fail(errors)
-            engine.set_running(index, block, value)
+            engine.set_running(u, index, block, value)
             return _ok()
         if cmd == "autom_release":
-            engine.release(int(body["set"]), Block(str(body["block"])))
+            engine.release(Underlying(str(body["underlying"])), int(body["set"]),
+                           Block(str(body["block"])))
             return _ok()
-        if cmd == "autom_stop_all":
-            engine.stop_all()
+        if cmd == "autom_stop_all":  # 창 닫기 = 그 창의 종목만 정지, 안전종료 = 전 종목
+            raw_u = body.get("underlying")
+            engine.stop_all(Underlying(str(raw_u)) if raw_u else None)
             return _ok()
     except (KeyError, ValueError, TypeError, IndexError) as exc:
         return _fail([f"잘못된 자동M 인자: {exc!r}"])
@@ -710,14 +734,23 @@ def monitor_snapshot(
 
     fx_used, fx_src = system.usdkrw_effective()
     merges: dict[str, Any] = {}  # 종목별 현재 적용 HL 호가단위 — 시세 화면 콤보가 따라감
+    # 종목별 호가단위(틱) 옵션 — 일반주문창·자동M과 같은 표(가격 자릿수 기반, §5.10). 시세 화면
+    # 콤보도 '원시/2배'가 아니라 숫자 틱으로(사용자 2026-09-07: 헷갈림).
+    merge_ticks: dict[str, list[dict[str, Any]]] = {}
     if hasattr(system, "hl_merge_active"):
         for u in Underlying:
             active = system.hl_merge_active(u)
             merges[u.value] = ({"n_sig_figs": active[0], "mantissa": active[1]}
                                if active is not None else None)
+            hq = system.quotes.get((u, Instrument.HL_PERP, "hl"))
+            ref = (hq.ask or hq.bid) if hq is not None else None
+            merge_ticks[u.value] = ([{"tick": s, "n_sig_figs": nsf, "mantissa": mant}
+                                     for s, nsf, mant in merge_tick_options(float(ref))]
+                                    if ref else [])
     out: dict[str, Any] = {
         "connected": True,
         "hl_merge": merges,
+        "hl_merge_ticks": merge_ticks,
         "fx": {"used": fx_used, "src": fx_src, "futures": system.usdkrw_futures,
                # 상태줄에 셋을 나란히(엑셀 시세!N11·N12 배치) — 현물 출처(LS/하나고시)도 함께
                "spot": system.usdkrw_spot, "theory": system.usdkrw_theory,

@@ -49,3 +49,26 @@ def test_halt_turns_running_off_and_release_allows_rerun() -> None:
     release_halt(s, Block.ENTRY)
     set_running(s, Block.ENTRY, True)          # 해제 뒤 켬 → 감시
     assert s.entry.status is LegStatus.ARMED and s.entry.running
+
+
+def test_halt_is_set_wide_and_cancels_other_leg_resting_order() -> None:
+    # 실측 2026-09-07: 청산 체결차로 청산만 검정, 진입은 빨강(감시 계속) → 세트 단위여야 함
+    # (결정 로그 7·9 "헤지 깨진 세트는 멈춤"). 다른 다리의 걸린 선주문은 취소, 해제도 세트 단위.
+    from kp_arb.auto_m import LegStatus, on_post_reject, release_halt
+
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    s.entry.pre_qty = 2
+    on_pre_ack(s, Block.ENTRY, "E1")               # 진입 선주문이 걸려 있음
+    set_running(s, Block.EXIT, True)
+    s.exit.pre_qty = 1
+    on_pre_ack(s, Block.EXIT, "X1")
+    on_pre_fill(s, Block.EXIT, 1, 1_780_000.0, mono=10.0)
+    acts = on_post_reject(s, Block.EXIT, "HL order not accepted")
+    assert [a.kind for a in acts] == ["halt", "notify", "cancel_pre"]
+    assert acts[2].order_id == "E1"                # 진입 쪽 걸린 선주문 취소
+    assert s.exit.status is LegStatus.HALTED and not s.exit.running
+    assert s.entry.status is LegStatus.HALTED and not s.entry.running
+    assert "청산 체결차로 세트 중지" in s.entry.halt_reason
+    release_halt(s, Block.ENTRY)                   # 어느 다리에서 풀든 세트 전체
+    assert s.entry.status is LegStatus.IDLE and s.exit.status is LegStatus.IDLE

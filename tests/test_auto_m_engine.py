@@ -85,12 +85,15 @@ class FakeSystem:
         self.order_book.on_cancel(order_id)
 
 
+RUN = {"cmd": "autom_run", "underlying": U.value}  # 종목별 명령(2026-09-08) — 세트·다리는 호출마다
+
+
 def _engine(log_dir: Any = None) -> tuple[AutoMEngine, FakeSystem, CoreState]:
     state = CoreState()
     state.screens[ScreenKind.AUTO_M].underlying = U
     sys_ = FakeSystem()
     eng = AutoMEngine(state, sys_, log_dir=log_dir)  # type: ignore[arg-type]
-    s = state.autom.sets[0]
+    s = state.autom.book(U).sets[0]
     s.target_qty, s.per_qty, s.en_sf, s.en_s, s.ex_sf = 100, 10, 0.005, 0.005, -0.001
     state.autom.settings.windows = (("09:00:00", "15:20:00"),)
     return eng, sys_, state
@@ -107,13 +110,13 @@ async def test_immediate_partial_fill_is_applied_and_remainder_is_fractional() -
     eng, sys_, state = _engine()
     sys_.immediate_fill = 0.588
     now, mono = datetime(2026, 9, 4, 10, 0, 0), 100.0
-    await _autom_command(eng, state, {"cmd": "autom_run", "set": 0, "block": "entry",
+    await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry",
                                       "value": True})
     eng.tick(now, mono)
     await _settle()
     sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
     await _settle()
-    s = state.autom.sets[0]
+    s = state.autom.book(U).sets[0]
     assert s.hl_net == -0.588 and abs(s.entry.post_pending - 9.412) < 1e-9
     assert s.rt == 0 and abs(s.hl_rt_carry - 0.588) < 1e-9  # 10 미만은 RT로 안 올라감
     sys_.order_book.on_cancel("O2")  # 잔량 취소 확인 → 미체결 9.412 체결차 → 중지
@@ -130,10 +133,10 @@ async def test_engine_saves_state_after_fills_and_halt() -> None:
     sys_ = FakeSystem()
     saves: list[int] = []
     eng = AutoMEngine(state, sys_, save=lambda: saves.append(1))  # type: ignore[arg-type]
-    s = state.autom.sets[0]
+    s = state.autom.book(U).sets[0]
     s.target_qty, s.per_qty, s.en_sf, s.en_s, s.ex_sf = 100, 10, 0.005, 0.005, -0.001
     state.autom.settings.windows = (("09:00:00", "15:20:00"),)
-    eng.set_running(0, Block.ENTRY, True)
+    eng.set_running(U, 0, Block.ENTRY, True)
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
     before = len(saves)
@@ -146,11 +149,53 @@ async def test_engine_saves_state_after_fills_and_halt() -> None:
     assert len(saves) > before and s.entry.status is LegStatus.HALTED
 
 
+async def test_books_run_independently_per_underlying() -> None:
+    # 사용자 확정 2026-09-08: 삼성이 도는 중에도 다른 창에서 하이닉스를 따로 돌린다.
+    # 종목별 책 — 한 종목 실행/정지가 다른 종목에 영향 없음, 스냅샷은 종목 키로.
+    eng, sys_, state = _engine()
+    other = Underlying.SAMSUNG
+    ob = state.autom.book(other)
+    ob.sets[0].target_qty, ob.sets[0].per_qty = 100, 10
+    ob.sets[0].en_sf, ob.sets[0].en_s, ob.sets[0].ex_sf = 0.005, 0.005, -0.001
+    eng.set_running(U, 0, Block.ENTRY, True)
+    assert state.autom.book(U).any_running() and not ob.any_running()
+    assert state.autom.running_underlyings() == [U.value]
+    snap = eng.live_snapshot()
+    assert snap[U.value]["any_running"] is True and snap[other.value]["any_running"] is False
+    res = await _autom_command(eng, state, {"cmd": "autom_run", "underlying": other.value,
+                                            "set": 0, "block": "entry", "value": True})
+    assert res["ok"] and ob.any_running()
+    eng.stop_all(other)  # 창 닫기 = 그 창 종목만 정지
+    assert not ob.any_running() and state.autom.book(U).any_running()
+    eng.stop_all()       # 안전종료 = 전 종목
+    assert not state.autom.any_running()
+    # 월물·기준수량도 종목별
+    await _autom_command(eng, state, {"cmd": "autom_month", "underlying": other.value,
+                                      "month": "next"})
+    assert ob.future_month == "next" and state.autom.book(U).future_month == "near"
+    bad = await _autom_command(eng, state, {"cmd": "autom_month", "underlying": other.value,
+                                            "month": "far"})
+    assert not bad["ok"]
+
+
+def test_legacy_single_autom_state_migrates_to_screen_underlying_book() -> None:
+    # 2026-09-08 이전 저장 형식(단일 sets·ref_qty)은 그때 자동M 창이 가리키던 종목 책으로 이전
+    from kp_arb.strategy_core import state_from_dict
+
+    raw = {"screens": {"autoM": {"kind": "autoM", "underlying": "samsung"}},
+           "autom": {"sets": [{"target_qty": 7, "per_qty": 2, "rt": 3, "sf_net": 1,
+                               "hl_net": -10.0}], "ref_qty": 300}}
+    st = state_from_dict(raw)
+    b = st.autom.book(Underlying.SAMSUNG)
+    assert (b.sets[0].target_qty, b.sets[0].per_qty, b.sets[0].rt, b.ref_qty) == (7, 2, 3, 300)
+    assert st.autom.book(Underlying.SK_HYNIX).sets[0].target_qty == 0  # 다른 종목은 빈 책
+
+
 async def test_engine_round_trip_pre_fill_post_fill() -> None:
     # 실행 → 선주문 LS SF 매수 10 @201,000 → 4계약 체결 → 후주문 HL 매도 40(IOC) → 체결 → RT 4
     eng, sys_, state = _engine()
     now, mono = datetime(2026, 9, 4, 10, 0, 0), 100.0
-    res = await _autom_command(eng, state, {"cmd": "autom_run", "set": 0, "block": "entry",
+    res = await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry",
                                             "value": True})
     assert res["ok"]
     eng.tick(now, mono)
@@ -159,7 +204,7 @@ async def test_engine_round_trip_pre_fill_post_fill() -> None:
     pre = sys_.placed[0]
     assert (pre.venue, pre.instrument, pre.side, pre.qty, pre.price, pre.source) == (
         Venue.LS, SF, Side.BUY, 10, 1_602_000.0, "자동M")
-    s = state.autom.sets[0]
+    s = state.autom.book(U).sets[0]
     assert s.entry.status is LegStatus.PRE_RESTING and s.entry.pre_order_id == "O1"
 
     sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=1_602_000.0, ts=0))
@@ -175,15 +220,16 @@ async def test_engine_round_trip_pre_fill_post_fill() -> None:
     sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1184.0, ts=0))
     await _settle()
     assert s.rt == 4 and s.entry.post_pending == 0 and s.entry.acc.fx_avg() == 1355.9
-    snap = eng.live_snapshot()
+    snap = eng.live_snapshot()[U.value]  # 종목별 스냅샷(2026-09-08)
     live = snap["sets"][0]
     assert live["rt"] == 4 and live["entry"]["status"] == "pre_partial"
     assert live["entry"]["sprd"] is not None
     # 상단 모니터 3칸 — 정방향 진입 = 진입 스프레드, 역방향 진입 = 청산 스프레드(반대 호가창)
     assert snap["monitor"]["fwd"] == {"en_sf": 0.01, "en_s": 0.01, "ex_sf": -0.01}
     assert snap["monitor"]["rev"]["en_sf"] == -0.01 and snap["monitor"]["rev"]["ex_sf"] == 0.01
-    res = await _autom_command(eng, state, {"cmd": "autom_ref_qty", "qty": 5})
-    assert res["ok"] and state.autom.ref_qty == 5
+    res = await _autom_command(eng, state, {"cmd": "autom_ref_qty", "underlying": U.value,
+                                            "qty": 5})
+    assert res["ok"] and state.autom.book(U).ref_qty == 5
     # HL 호가단위 옵션 — 1184.5 USD → 기준틱 0.1, 그 배수(일반주문창과 같은 표)
     ticks = [t["tick"] for t in snap["hl_merge_ticks"]]
     assert ticks[:3] == ["0.1", "0.2", "0.5"] and snap["hl_merge_active"] is None
@@ -199,7 +245,7 @@ async def test_engine_writes_per_underlying_log(tmp_path: Any) -> None:
     eng, sys_, state = _engine(log_dir=tmp_path)
     assert isinstance(eng, _E)
     now = datetime(2026, 9, 4, 10, 0, 0)
-    eng.set_running(0, Block.ENTRY, True)
+    eng.set_running(U, 0, Block.ENTRY, True)
     eng.tick(now, 100.0)
     eng.tick(now, 100.1)  # 같은 판정 → 로그 추가 없음
     await _settle()
@@ -210,25 +256,27 @@ async def test_engine_writes_per_underlying_log(tmp_path: Any) -> None:
     files = list(tmp_path.glob("autom_sk_hynix_*.log"))
     assert len(files) == 1
     text = files[0].read_text(encoding="utf-8")
-    assert "명령 1세트 entry 실행 켬" in text
-    assert text.count("판정 1세트 진입: 통과") == 1  # 바뀔 때만
-    assert "상태 1세트 진입: - → armed" in text and "armed → pre_resting" in text  # 전이 순서
-    assert "행동 1세트 entry: place_pre buy 10 1602000" in text
-    assert "체결 1세트 entry 선주문 #O1" in text and "누적 4/10, HL 대기 40" in text
-    assert "행동 1세트 entry: place_post sell 40" in text
+    # 세트 표기 = "정방향 N세트 진입/청산" — 정/역 구분이 로그에 보이게(사용자 2026-09-08)
+    assert "명령 정방향 1세트 진입 실행 켬" in text
+    assert text.count("판정 정방향 1세트 진입: 통과") == 1  # 바뀔 때만
+    assert ("상태 정방향 1세트 진입: - → armed" in text
+            and "armed → pre_resting" in text)  # 전이 순서
+    assert "행동 정방향 1세트 진입: place_pre buy 10 1602000" in text
+    assert "체결 정방향 1세트 진입 선주문 #O1" in text and "누적 4/10, HL 대기 40" in text
+    assert "행동 정방향 1세트 진입: place_post sell 40" in text
 
 
 async def test_engine_cancel_on_signal_loss_and_halt_on_post_reject() -> None:
     eng, sys_, state = _engine()
     now = datetime(2026, 9, 4, 10, 0, 0)
-    eng.set_running(0, Block.ENTRY, True)
+    eng.set_running(U, 0, Block.ENTRY, True)
     eng.tick(now, 100.0)
     await _settle()
     sys_.s_entry = 0.0  # S괴리 미달 → 걸어둔 선주문 취소
     eng.tick(now, 101.0)
     await _settle()
     assert sys_.cancelled == ["O1"]
-    s = state.autom.sets[0]
+    s = state.autom.book(U).sets[0]
     assert s.entry.status is LegStatus.ARMED and s.entry.pre_order_id is None
 
     # 다시 조건 충족 → 신규 → 전량 체결 → 후주문(지정가) 발주 → 잔량이 걸려 있어도 엔진은 취소 안 함
@@ -249,23 +297,25 @@ async def test_engine_cancel_on_signal_loss_and_halt_on_post_reject() -> None:
     await _settle()
     assert s.entry.status is LegStatus.HALTED and "체결차" in s.entry.halt_reason
     assert sys_.error_seq == 1  # 에러 알람
-    res = await _autom_command(eng, state, {"cmd": "autom_run", "set": 0, "block": "entry",
+    res = await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry",
                                             "value": True})
     assert not res["ok"] and "중지" in res["errors"][0]
-    await _autom_command(eng, state, {"cmd": "autom_release", "set": 0, "block": "entry"})
+    await _autom_command(eng, state, {"cmd": "autom_release", "underlying": U.value, "set": 0,
+                                      "block": "entry"})
     assert s.entry.status is LegStatus.IDLE
 
 
 async def test_autom_commands_set_settings_and_validation() -> None:
     eng, _sys, state = _engine()
     res = await _autom_command(eng, state, {
-        "cmd": "autom_set", "set": 1, "target_qty": 50, "per_qty": 5, "switch_delay_s": 20,
+        "cmd": "autom_set", "underlying": U.value, "set": 1, "target_qty": 50, "per_qty": 5,
+        "switch_delay_s": 20,
         "en_sf": 0.004, "en_s": "", "ex_sf": -0.002, "rt_manual": 7})
     assert res["ok"]
-    s1 = state.autom.sets[1]
+    s1 = state.autom.book(U).sets[1]
     assert (s1.target_qty, s1.per_qty, s1.switch_delay_s, s1.en_sf, s1.en_s, s1.ex_sf, s1.rt) == (
         50, 5, 20, 0.004, None, -0.002, 7)
-    res = await _autom_command(eng, state, {"cmd": "autom_run", "set": 1, "block": "entry",
+    res = await _autom_command(eng, state, {**RUN, "set": 1, "block": "entry",
                                             "value": True})
     assert not res["ok"] and "진입SF·진입S" in res["errors"][0]  # en_s 없음
     res = await _autom_command(eng, state, {
@@ -280,7 +330,7 @@ async def test_autom_commands_set_settings_and_validation() -> None:
     assert st.pre_tick[Underlying.SAMSUNG] == 500 and state.autom.risk_fwd_ex == 0.006
     bad = await _autom_command(eng, state, {"cmd": "autom_settings", "windows": [["25:00", "x"]]})
     assert not bad["ok"]
-    none = await _autom_command(None, state, {"cmd": "autom_run", "set": 0, "block": "entry",
+    none = await _autom_command(None, state, {**RUN, "set": 0, "block": "entry",
                                               "value": True})
     assert not none["ok"] and "미접속" in none["errors"][0]
 
@@ -293,14 +343,14 @@ def test_autom_state_persists_inputs_not_runtime() -> None:
     from kp_arb.strategy_core import state_from_dict
 
     state = CoreState()
-    s = state.autom.sets[2]
+    s = state.autom.book(U).sets[2]
     s.target_qty, s.per_qty, s.en_sf, s.rt = 30, 3, 0.007, 5
     s.entry.running, s.entry.status, s.entry.pre_order_id = True, LegStatus.PRE_RESTING, "X"
     s.entry.acc.hl_qty, s.entry.acc.fx_sum, s.entry.acc.hl_px_sum = 40, 1356 * 40, 1184 * 40
     state.autom.settings.rel_buy = 3
     raw: dict[str, Any] = json.loads(json.dumps(dataclasses.asdict(state), default=str))
     restored = state_from_dict(raw)
-    r = restored.autom.sets[2]
+    r = restored.autom.book(U).sets[2]
     assert (r.target_qty, r.per_qty, r.en_sf, r.rt) == (30, 3, 0.007, 5)
     assert r.entry.acc.fx_avg() == 1356 and restored.autom.settings.rel_buy == 3
     assert not r.entry.running and r.entry.status is LegStatus.IDLE and r.entry.pre_order_id is None
