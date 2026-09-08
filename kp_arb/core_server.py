@@ -2,13 +2,19 @@
 
     코어 시작/안전종료는 메인 화면(main.bat)에서. 단독: python -m kp_arb.core_server
 
-시동 시 LS/HL에 접속(LiveSystem)하고 리허설 판정 루프(7-3a — 발주 없음)를 돌린다.
+시동 시 LS/HL에 접속(LiveSystem)하고 판정 루프를 돌린다 — 자동T는 리허설(발주 없음),
+자동M(auto_m_engine)·수동 주문·원달러선물 동시호가(fx_service)는 실제 발주한다.
 접속 실패(키 없음 등)여도 API는 계속 떠서 화면 조작·입력은 가능("시세 없음" 표시).
-로그는 콘솔 + logs/core_날짜.log 파일에 남는다.
+로그는 콘솔 + logs/core_날짜.log(+ 주문·WS 원본·종목별 자동M 로그) 파일에 남는다.
 
-화면(자동T/자동M 주문·모니터·웹)은 http://127.0.0.1:8787 로 접속한다.
-- GET  /state    : CoreState 스냅샷 + live(신호·현재가·환율·가상포지션)
-- POST /command  : {"cmd": ..., "screen": "autoT"|"autoM", ...} — apply_command 참조
+화면은 모두 tkinter 별도 프로세스(웹 화면 없음)이고 코어 주소는 http://127.0.0.1:8787 이다.
+- 실시간: 메인창만 ws://…/ws 채널(manual·state)에 붙어 공유 파일(mmap)로 다른 화면에 넘긴다
+  (DESIGN §12.1). 화면은 공유 파일이 없거나 낡으면 아래 GET으로 폴백 조회한다.
+- GET  /state        : CoreState 스냅샷 + live + autom_live(종목별) — 자동T/자동M·설정 화면
+- GET  /manual_state : 잔고·호가·미체결(일반주문·주문리스트)
+- GET  /monitor      : 시세 화면(괴리보드·est·환율·HL 호가단위)
+- POST /command      : {"cmd": ...} — autoT는 apply_command, 자동M은 autom_*(underlying 필수),
+                       수동 주문은 manual_*, 동시호가는 fx_auction_*, 환율 월물은 fx_*
 """
 from __future__ import annotations
 
@@ -1176,8 +1182,9 @@ async def _serve() -> None:
         log.info("코어 시동: http://%s:%s (안전종료는 메인 화면에서)", HOST, DEFAULT_PORT)
         await stop.wait()
         if autom_engine is not None:
-            autom_engine.stop_all()  # 안전종료 1단계 — 자동M 전 세트 정지(미체결 선주문 취소 요청)
-            await asyncio.sleep(0.3)
+            # 안전종료 1단계 — 자동M 전 종목 정지 + 미체결 선주문 취소가 **끝날 때까지**(최대 3초)
+            # 기다린다. 0.3초만 기다리던 때 취소가 한도에 걸려 선주문이 LS에 남았다(실측 09-08).
+            await autom_engine.shutdown()
         if system is not None:
             await system.stop()  # WS(_guarded_ws)·시동 태스크 명시 취소 — 종료 중 재접속 방지
         for task in tasks:

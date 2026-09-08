@@ -195,6 +195,19 @@ def test_gate_cancel_is_sent_once_until_confirmed() -> None:
         == ["cancel_pre"]  # 새 주문은 다시 1번 취소 가능
 
 
+def test_accum_matched_uses_smaller_side() -> None:
+    # 사용자 확정 2026-09-08: 매매결과 수량은 LS·HL 누적 체결량 중 적은 쪽(SF 1 = HL 10).
+    acc = Accum(hl_qty=0.588, hl_px_sum=0.588 * 1313.1, fx_sum=0.588 * 1340.0,
+                sf_qty=1, sf_px_sum=1_836_000.0)
+    assert acc.matched_hl() == pytest.approx(0.588) and acc.matched_sf() == pytest.approx(0.0588)
+    full = Accum(hl_qty=40.0, hl_px_sum=40 * 1184.0, fx_sum=40 * 1356.0, sf_qty=4,
+                 sf_px_sum=4 * 1_602_000.0)
+    assert full.matched_hl() == 40 and full.matched_sf() == 4
+    more_hl = Accum(hl_qty=45.0, hl_px_sum=45 * 1184.0, fx_sum=45 * 1356.0, sf_qty=4,
+                    sf_px_sum=4 * 1_602_000.0)
+    assert more_hl.matched_hl() == 40  # HL이 더 많아도 SF 4계약(=40) 기준
+
+
 def test_block_reason_records_gate_and_basis() -> None:
     # 판정 근거 한 줄 — 어느 게이트에서 막혔는지·통과 시 역산가 계산 근거(로그는 바뀔 때만).
     s = _set()

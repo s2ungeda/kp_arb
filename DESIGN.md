@@ -124,7 +124,7 @@
 | `get_open_orders()` | `CSPAQ13700`(미체결) | 계좌별 |
 
 - **이벤트:** `on_market_status`, `on_quote`, `on_fill`, `on_order_ack`, `on_disconnect`
-- **제약:** 일 5,000 REST + TR별 초당 한도(예 조회 초당 2회). 시세·체결·장운영은 WS, REST는 주문·주기 대사. 참고 래퍼: `LsApiHelper`/`programgarden-finance`(현물·선물·실시간 포함).
+- **제약:** 일 5,000 REST + TR별 초당 한도 — LS 공식 TR 목록의 값 그대로(`ls_rest.LS_PER_SECOND`, 2026-09-08: 선물 주문·정정·취소 10, 현물 주문 10·정정/취소 3, 현재가 조회 10, 증거금·예수금·체결내역 1; 표에 없는 TR은 2). 코어의 한도 지킴이가 이 표로 먼저 막으므로 "per-second limit … exceeded"는 LS가 아니라 우리 쪽 메시지다. 시세·체결·장운영은 WS, REST는 주문·주기 대사. 참고 래퍼: `LsApiHelper`/`programgarden-finance`(현물·선물·실시간 포함).
 
 ### 5.2 HLGateway
 - **메서드:** `connect()`, `subscribe_mark(coin)`, `subscribe_fills()`, `place_order(...)`, `cancel_order(...)`, `get_positions()`, `get_margin()`, `get_funding(coin)`

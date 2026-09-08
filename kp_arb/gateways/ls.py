@@ -26,6 +26,7 @@ from ..routing import account_for
 from .base import LSGateway
 from .ls_auth import TokenManager, TokenTransport
 from .ls_rest import (
+    LS_PER_SECOND,
     LSRestClient,
     RateLimiter,
     RateLimitError,
@@ -133,7 +134,7 @@ class LSApiGateway(LSGateway):
         for account in load:
             cred = accounts.for_account(account)
             tokens = TokenManager(cred.appkey, cred.appsecret, token_transport, now=now)
-            limiter = RateLimiter(now=now)
+            limiter = RateLimiter(now=now, per_tr_per_second=LS_PER_SECOND)  # 공식 TR별 한도
             # 재시도에 지수 백오프 — LS 서버가 가끔 뱉는 일시적 500을 텀 없는 3연속
             # 재시도로는 못 벗어난다. 0.3s→0.6s 간격을 줘 순간 500이 지나가면 회복.
             rest_by_account[account] = LSRestClient(

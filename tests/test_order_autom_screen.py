@@ -35,3 +35,14 @@ def test_sum_acc_weights_by_hl_qty() -> None:
     assert agg["hl_qty"] == 100 and agg["sf_qty"] == 10
     assert agg["fx_avg"] == 1356.0 and abs(agg["sprd"] - 0.016) < 1e-12
     assert sum_acc([], "exit")["fx_avg"] is None
+
+
+def test_sum_acc_uses_matched_smaller_side() -> None:
+    # 사용자 확정 2026-09-08: LS·HL 누적 체결량이 다르면 적은 쪽 기준. SF 1계약 체결 + HL 0.588
+    # 체결 → HL 0.588 / SF 0.0588 로 표시(코어가 matched_* 로 줌, 없으면 화면이 min으로 계산).
+    rows = [{"entry": {"hl_qty": 0.588, "sf_qty": 1, "matched_hl": 0.588, "matched_sf": 0.0588,
+                       "fx_avg": 1340.0, "sprd": 0.001}}]
+    agg = sum_acc(rows, "entry")
+    assert abs(agg["hl_qty"] - 0.588) < 1e-9 and abs(agg["sf_qty"] - 0.0588) < 1e-9
+    old = sum_acc([{"entry": {"hl_qty": 25, "sf_qty": 4}}], "entry")  # matched 키 없는 옛 스냅샷
+    assert old["hl_qty"] == 25 and old["sf_qty"] == 2.5

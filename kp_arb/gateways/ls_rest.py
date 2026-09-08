@@ -21,7 +21,18 @@ from pydantic import BaseModel
 from .ls_auth import TokenManager
 
 DEFAULT_DAILY_CAP = 5_000
-DEFAULT_PER_SECOND = 2  # 조회 TR 기본 초당 한도
+DEFAULT_PER_SECOND = 2  # 표에 없는 TR의 기본 초당 한도(보수적)
+# TR별 초당 한도 — LS OpenAPI 공식 TR 목록(transaction_per_sec, 2026-09-03 수집) 그대로.
+# 실측 2026-09-08: 기본값 2를 전 TR에 적용해 선물 취소(공식 10)를 우리 쪽에서 막았고,
+# 그 사이 종료 취소가 실패해 선주문이 LS에 남았다. 조회 TR 중 1회짜리도 2로 느슨했음.
+LS_PER_SECOND: dict[str, int] = {
+    "CFOAT00100": 10, "CFOAT00200": 10, "CFOAT00300": 10,  # 선물옵션 주문·정정·취소
+    "CSPAT00601": 10, "CSPAT00701": 3, "CSPAT00801": 3,    # 현물 주문·정정·취소
+    "t1102": 10, "t8402": 10,                              # 주식·주식선물 현재가
+    "t8401": 2, "t0441": 2,                                # 주식선물 마스터·선물 잔고
+    "CFOBQ10500": 1, "CSPAQ12300": 1, "CSPAQ13700": 1, "CSPAQ22200": 1,  # 증거금·예수금·체결
+    "t1901": 1, "t8426": 1,                                # ETF 현재가·상품선물 마스터
+}
 
 _log = logging.getLogger(__name__)
 

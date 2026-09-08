@@ -419,3 +419,70 @@ depth[level - 1][0]   # [(가격, 잔량), ...] 에서 N번째 호가의 가격
 - `PegAction`(NONE/PLACE/AMEND/WAIT) — AMEND는 추상 판단, 실행은 거래소별 분기(LS 정정 / HL 취소+신규)는 peg_order.py 몫.
 - `None`에 의미 부여("주문 없음")할 땐 docstring에 못 박는다.
 - 28행 주석의 `CANCEL_PLACE`는 사라진 멤버의 잔재 — 주석도 낡는다.
+
+---
+
+## 15. asyncio — 협력적 멀티태스킹
+
+### 정의
+단일 스레드에서 **협력적(cooperative) 스케줄링**으로 동시성을 구현하는 표준 라이브러리.
+OS의 선점형(preemptive) 스레드 스케줄링과 달리, 태스크가 `await` 지점에서 **명시적으로 제어권을 반환**할 때만 전환이 일어난다.
+
+### 구성 요소
+| 요소 | 정의 |
+|---|---|
+| 코루틴(coroutine) | `async def`로 정의된 함수. 호출 시 실행되지 않고 코루틴 객체를 반환 |
+| `await` | 다른 awaitable의 완료를 기다리며 제어권을 이벤트 루프에 반환하는 suspension point |
+| 이벤트 루프 | 실행 가능한 태스크를 선택·재개하는 스케줄러. `asyncio.run()`이 생성·구동 |
+| 태스크(Task) | 이벤트 루프에 등록된 코루틴 실행 단위. `asyncio.create_task()`로 생성 |
+| Future | 미래에 값이 채워질 자리표시자. 태스크는 Future의 서브클래스 |
+
+### 스레드와의 비교
+| | OS 스레드 | asyncio 태스크 |
+|---|---|---|
+| 스케줄링 | 선점형 (커널이 타임슬라이스로 강제 전환) | 협력형 (`await`에서만 전환) |
+| 컨텍스트 전환 | 커널 모드 전환 + 레지스터 저장/복원 (~1-10μs) | 사용자 공간 함수 호출 수준 (~100ns) |
+| 스택 | 스레드당 기본 1MB (Windows) | 코루틴 프레임 수백 바이트~KB |
+| 동기화 | 뮤텍스·임계영역 필수 | **`await` 없는 구간은 원자적** → 대부분 불필요 |
+| 병렬성 | 멀티코어 실제 병렬 | 단일 코어. CPython은 GIL로 스레드도 사실상 직렬 |
+
+### 원자성 보장의 근거
+이벤트 루프는 코루틴을 `await` 지점까지 실행한 뒤에만 다른 태스크로 전환한다.
+따라서 `await`를 포함하지 않는 코드 블록은 **중단 없이 완주**하며, 이는 임계영역과 동등한 보장을 제공한다.
+
+```python
+def on_fill(self, fill):          # 동기 함수 — await 없음 → 원자적
+    self._orders[oid].filled_qty += fill.qty
+    self._positions[key].qty += fill.qty
+    self._balances[account] -= fill.qty * price
+```
+OrderBook이 락 없이 안전한 이유. 단 **`await`를 하나라도 삽입하면 그 지점에서 재진입(reentrancy) 가능성이 생긴다.**
+
+### 블로킹 제약
+이벤트 루프를 점유하는 연산(동기 I/O, `time.sleep`, CPU 집약 계산)은 **모든 태스크를 정지**시킨다.
+실측: `time.sleep(0.5)` 삽입 시 0.1초 주기 태스크가 0.5초간 완전 정지.
+
+대응:
+- `time.sleep()` → `await asyncio.sleep()`
+- 동기 라이브러리 → `await asyncio.to_thread(fn, *args)` (ThreadPoolExecutor 위임)
+  - 이 프로젝트: `hl_live.py`가 hyperliquid SDK(requests 기반 동기) 호출을 전부 `to_thread`로 감쌈
+- CPU 집약 작업 → `run_in_executor(ProcessPoolExecutor, ...)`
+
+### 이 프로젝트의 적용 (core_server._serve)
+```python
+tasks.append(asyncio.create_task(engine.run()))        # 판정 루프
+tasks.append(asyncio.create_task(fx_service.run()))    # FX 보고
+tasks.append(asyncio.create_task(autom_engine.run()))  # 자동M
+tasks.append(asyncio.create_task(hub.run()))           # WS 허브
+await site.start()                                      # aiohttp TCPSite
+await stop.wait()                                       # asyncio.Event — 종료 신호 대기
+```
+- `create_task`는 코루틴을 루프 스케줄에 등록만 하고 즉시 반환(fire-and-forget). 스레드 생성 없음.
+- `await stop.wait()`가 메인 코루틴의 suspension point. 이후 루프는 등록된 태스크들을 계속 스케줄링 → **프로세스 상주의 실체**.
+- 종료: `stop.set()` → `wait()` 재개 → `task.cancel()`로 각 태스크에 `CancelledError` 주입 → 정리.
+
+### 문법 규칙
+- `await`는 `async def` 본문 안에서만 사용 가능
+- 코루틴은 `await` 또는 `create_task`/`gather`로만 실행됨. 그냥 호출하면 코루틴 객체만 생성되고 실행 안 됨(RuntimeWarning)
+- `asyncio.gather(*coros)` — 여러 코루틴을 동시 실행하고 전부 완료될 때까지 대기
+- `asyncio.Event` — 태스크 간 신호. `set()` / `wait()` / `clear()`

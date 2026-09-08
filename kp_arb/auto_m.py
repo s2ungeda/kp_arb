@@ -120,8 +120,29 @@ class Accum:
     hl_qty: float = 0.0
     hl_px_sum: float = 0.0   # HL 체결가 × 수량 합
     fx_sum: float = 0.0      # 환진입가(원달러선물 호가) × HL 수량 합
-    sf_qty: int = 0          # SF 체결 계약수
+    sf_qty: float = 0.0      # SF 체결 계약수(중지 때 짝 맞은 몫만 넣으면 소수 가능)
     sf_px_sum: float = 0.0
+
+    def add_round(self, pending: Accum, matched_only: bool = False) -> None:
+        """한 판(pending)을 누적에 합친다 — 후주문 전량 체결이 확인된 뒤에만(사용자 확정 2026-09-08,
+        부분값 표시 없음). matched_only=True(중지로 판이 끝남): 짝이 맞은 적은 쪽 몫만 넣는다."""
+        if not matched_only:
+            self.hl_qty += pending.hl_qty
+            self.hl_px_sum += pending.hl_px_sum
+            self.fx_sum += pending.fx_sum
+            self.sf_qty += pending.sf_qty
+            self.sf_px_sum += pending.sf_px_sum
+            return
+        hl_take = pending.matched_hl()
+        if hl_take <= 0:
+            return
+        sf_take = hl_take / HL_PER_SF
+        hl_avg, fx_avg, sf_avg = pending.hl_avg(), pending.fx_avg(), pending.sf_avg()
+        self.hl_qty += hl_take
+        self.hl_px_sum += (hl_avg or 0.0) * hl_take
+        self.fx_sum += (fx_avg or 0.0) * hl_take
+        self.sf_qty += sf_take
+        self.sf_px_sum += (sf_avg or 0.0) * sf_take
 
     def hl_avg(self) -> float | None:
         return self.hl_px_sum / self.hl_qty if self.hl_qty > 0 else None
@@ -131,6 +152,15 @@ class Accum:
 
     def sf_avg(self) -> float | None:
         return self.sf_px_sum / self.sf_qty if self.sf_qty > 0 else None
+
+    def matched_hl(self) -> float:
+        """짝이 맞은 체결량(HL 계약) — LS·HL 누적 체결량이 다르면 **적은 쪽** 기준(사용자 확정
+        2026-09-08; 보통 HL이 적다 — 부분 체결·거부). SF 1계약 = HL 10계약으로 맞춰 비교."""
+        return min(self.hl_qty, self.sf_qty * HL_PER_SF)
+
+    def matched_sf(self) -> float:
+        """짝이 맞은 체결량(SF 계약, 소수 가능 — HL 0.588 체결이면 0.0588)."""
+        return self.matched_hl() / HL_PER_SF
 
     def sprd(self, stock_last: float | None, sf_theory: float | None) -> float | None:
         """Sprd = (환×HL평균가 − S현재가)/S현재가 − (SF평균가 − SF이론가)/SF이론가 (엑셀 메인 I25).
@@ -144,7 +174,7 @@ class Accum:
 
     def clear(self) -> None:
         self.hl_qty = self.hl_px_sum = self.fx_sum = self.sf_px_sum = 0.0
-        self.sf_qty = 0
+        self.sf_qty = 0.0
 
 
 @dataclass
@@ -166,7 +196,8 @@ class Leg:
     halt_reason: str = ""
     # 마지막 판정 결과 한 줄(어느 게이트에서 막혔나·통과했나 + 숫자) — 로그는 바뀔 때만 남긴다
     block_reason: str = ""
-    acc: Accum = field(default_factory=Accum)
+    acc: Accum = field(default_factory=Accum)      # 매매결과 누적 — 후주문 전량 체결 확인된 판만
+    pending: Accum = field(default_factory=Accum)  # 진행 중인 한 판(SF·HL 체결 버퍼) — 표시 안 함
 
     @property
     def pre_side(self) -> Side:
@@ -196,7 +227,6 @@ class AutoMSet:
     fill_diff: float = 0.0                  # 체결차 = SF잔고×10 + HL잔고 (이 세트 체결 기준, 소수)
     sf_net: int = 0                         # 이 세트가 잡은 SF 순잔고(계약, 매수 +)
     hl_net: float = 0.0                     # 이 세트가 잡은 HL 순잔고(계약, 매도 −)
-    hl_rt_carry: float = 0.0                # RT 환산 전 HL 체결 잔여분(10 미만) — 소수 체결 누적용
     entry: Leg = field(default_factory=lambda: Leg(Block.ENTRY))
     exit: Leg = field(default_factory=lambda: Leg(Block.EXIT))
     last_entry_fill_mono: float | None = None
@@ -261,14 +291,20 @@ def fill_diff(sf_net_contracts: int, hl_net_contracts: float) -> float:
 
 # ---------------------------------------------------------------- 상태변화 ---
 
-def _cancel_if_resting(leg: Leg) -> list[Action]:
+def _cancel_if_resting(leg: Leg, force: bool = False) -> list[Action]:
     """걸어둔 선주문이 있으면 취소 요청(취소 확인은 on_pre_cancelled).
 
     전부 체결된 선주문(pre_filled ≥ pre_qty)은 취소할 잔량이 없다 — 보내면 LS가 거부한다
     (실측 2026-09-07 "정정/취소할 수량이 없습니다", 중지 뒤 실행 끔에서).
+    force=True(실행 끔·정지·종료): 재발주 취소 대기(replace_pending)·이미 보냄(cancel_sent)
+    표시와 무관하게 다시 보낸다 — 앞 취소가 LS 한도에 걸려 실패했을 수 있다(실측 2026-09-08:
+    종료 때 취소를 건너뛰어 선주문이 LS에 남음).
     """
+    if force:
+        leg.replace_pending = False
     resting = leg.pre_order_id is not None and not leg.replace_pending
-    if resting and not leg.cancel_sent and (leg.pre_qty <= 0 or leg.pre_filled < leg.pre_qty):
+    if resting and (force or not leg.cancel_sent) and (leg.pre_qty <= 0
+                                                      or leg.pre_filled < leg.pre_qty):
         # 한 번만 보낸다 — 관문에 막힌 채 매 틱 재전송하면 취소 확인이 오기 전 같은 요청이 여러 번
         # 나간다(실측 2026-09-08: 0.2초에 3번). 확인(취소/거부/체결)이 오면 _clear_pre가 되돌린다.
         leg.cancel_sent = True
@@ -385,7 +421,9 @@ def evaluate(
         return hold(f"역산가 변경 {leg.pre_price:,.0f}→{price:,.0f} → 취소 후 재발주 ({basis})",
                     [Action("cancel_pre", order_id=leg.pre_order_id,
                             reason=f"역산가 변경 {leg.pre_price:g}→{price:g}")])
-    return hold(f"유지 {basis}")
+    # '유지'는 역산가·한계가 바뀔 때만 새 근거가 되게 짧게 — 이론가·괴리까지 넣으면 매 틱 바뀌어
+    # 분당 170줄이 쌓였다(실측 2026-09-08). 상세 근거는 '통과'·'역산가 변경' 줄에 남는다.
+    return hold(f"유지 역산가 {price:,.0f} 한계 {limit:,.0f}")
 
 
 # ------------------------------------------------------------ 주문 사건 처리 ---
@@ -399,6 +437,14 @@ def _start_delay(leg: Leg, mono: float, settings: AutoMSettings) -> None:
 def on_pre_ack(s: AutoMSet, block: Block, order_id: str) -> None:
     """선주문 접수 — 주문번호 보관(취소·체결 매칭용)."""
     s.leg(block).pre_order_id = order_id
+
+
+def on_pre_cancel_failed(s: AutoMSet, block: Block) -> None:
+    """취소 **요청**이 실패(LS 초당 한도 등) — 주문은 그대로 걸려 있으니 표시만 되돌려 다음
+    판정에서 다시 취소를 보내게 한다(실측 2026-09-08: 표시가 남아 재시도·종료 취소가 막힘)."""
+    leg = s.leg(block)
+    leg.replace_pending = False
+    leg.cancel_sent = False
 
 
 def on_pre_reject(s: AutoMSet, block: Block, mono: float, settings: AutoMSettings) -> list[Action]:
@@ -416,10 +462,17 @@ def on_pre_fill(
     """선주문 체결(일부/전부) → 체결분 × 10 후주문 즉시(exec ㄴ6·ㄴ7). 누적 SF 갱신."""
     leg = s.leg(block)
     leg.pre_filled += qty
-    leg.acc.sf_qty += qty
-    leg.acc.sf_px_sum += price * qty
+    # 선주문 체결은 판 버퍼(pending)에 보관 — 매매결과(acc)는 후주문 전량 체결 확인 뒤 합친다
+    leg.pending.sf_qty += qty
+    leg.pending.sf_px_sum += price * qty
     leg.post_pending += float(qty * HL_PER_SF)
     s.sf_net += qty if block is Block.ENTRY else -qty
+    # RT선진입은 **선주문(SF) 체결 계약수** 기준(사용자 확정 2026-09-08) — HL 체결(소수·부분)로
+    # 환산하지 않는다. 진입 체결 +, 청산 체결 −.
+    if block is Block.ENTRY:
+        s.rt += qty
+    else:
+        s.rt = max(0, s.rt - qty)
     if leg.pre_filled >= leg.pre_qty and leg.pre_qty > 0:
         leg.status = LegStatus.POST_PENDING
     else:
@@ -452,24 +505,23 @@ def on_post_fill(
     fx_quote = 체결 시점 원달러선물 호가(진입 −환은 매수1호가, 청산 +환은 매도1호가).
     """
     leg = s.leg(block)
-    leg.acc.hl_qty += hl_qty
-    leg.acc.hl_px_sum += hl_price * hl_qty
-    leg.acc.fx_sum += fx_quote * hl_qty
+    leg.pending.hl_qty += hl_qty
+    leg.pending.hl_px_sum += hl_price * hl_qty
+    leg.pending.fx_sum += fx_quote * hl_qty
     leg.post_pending = max(0.0, leg.post_pending - hl_qty)
-    # RT(SF 계약)는 HL 체결을 10계약 단위로 환산 — 소수 체결(0.588 등)은 잔여분에 모아 둔다
-    s.hl_rt_carry += hl_qty
-    sf_contracts = int(s.hl_rt_carry // HL_PER_SF + _EPS)
-    s.hl_rt_carry -= sf_contracts * HL_PER_SF
+    # RT는 선주문(SF) 체결에서 갱신(on_pre_fill) — 여기서는 HL 순잔고·전환딜레이 기준 시각만
     if block is Block.ENTRY:
-        s.rt += sf_contracts
         s.hl_net -= hl_qty
         s.last_entry_fill_mono = mono
     else:
-        s.rt = max(0, s.rt - sf_contracts)
         s.hl_net += hl_qty
         s.last_exit_fill_mono = mono
     if not post_done(leg):
         return []
+    # 후주문 전량 체결 확인 — 이 판(선주문 SF + 후주문 HL 체결)을 매매결과에 합친다(사용자 확정
+    # 2026-09-08: 선·후주문 체결량이 맞은 뒤에 계산, 부분값 표시 없음).
+    leg.acc.add_round(leg.pending)
+    leg.pending.clear()
     # 헤지 완성 시점의 체결차 확인(exec ㄹ1) — 이 세트 체결 기준. ≠0이면 중지.
     halted = halt_if_unhedged(s, block, fill_diff(s.sf_net, s.hl_net))
     if halted:
@@ -493,6 +545,9 @@ def _halt_set(s: AutoMSet, block: Block, reason: str) -> list[Action]:
     leg.status = LegStatus.HALTED
     leg.running = False  # 중지 = 실행 꺼짐(버튼 원색). 다시 켜려면 사람이 해제
     leg.halt_reason = reason
+    # 판이 중지로 끝남 — 짝이 맞은(적은 쪽) 몫만 매매결과에 넣고 버퍼를 비운다(사용자 확정 09-08)
+    leg.acc.add_round(leg.pending, matched_only=True)
+    leg.pending.clear()
     acts: list[Action] = [Action("halt", reason=reason), Action("notify", reason=reason)]
     other = s.leg(Block.EXIT if block is Block.ENTRY else Block.ENTRY)
     if other.status is not LegStatus.HALTED:
@@ -526,7 +581,7 @@ def set_running(s: AutoMSet, block: Block, value: bool) -> list[Action]:
         if leg.status is LegStatus.IDLE:
             leg.status = LegStatus.ARMED
         return []
-    acts = _cancel_if_resting(leg)
+    acts = _cancel_if_resting(leg, force=True)  # 끔·정지·종료 — 취소 대기 표시와 무관하게 취소
     if leg.pre_order_id is None and post_done(leg) and leg.status is not LegStatus.HALTED:
         leg.status = LegStatus.IDLE
     return acts
@@ -634,7 +689,6 @@ def _book_from_dict(book: AutoMBook, raw: object) -> None:
                 target.rt = int(rs.get("rt", target.rt))
                 target.sf_net = int(rs.get("sf_net", target.sf_net))
                 target.hl_net = float(rs.get("hl_net", target.hl_net))
-                target.hl_rt_carry = float(rs.get("hl_rt_carry", target.hl_rt_carry))
                 target.fill_diff = round(fill_diff(target.sf_net, target.hl_net), 6)
             except (TypeError, ValueError):
                 pass
@@ -645,7 +699,7 @@ def _book_from_dict(book: AutoMBook, raw: object) -> None:
                         leg.acc.hl_qty = float(acc.get("hl_qty", 0) or 0)
                         leg.acc.hl_px_sum = float(acc.get("hl_px_sum", 0) or 0)
                         leg.acc.fx_sum = float(acc.get("fx_sum", 0) or 0)
-                        leg.acc.sf_qty = int(acc.get("sf_qty", 0) or 0)
+                        leg.acc.sf_qty = float(acc.get("sf_qty", 0) or 0)
                         leg.acc.sf_px_sum = float(acc.get("sf_px_sum", 0) or 0)
                     except (TypeError, ValueError):
                         pass

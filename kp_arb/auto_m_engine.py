@@ -36,6 +36,7 @@ from .auto_m import (
     on_post_partial_reject,
     on_post_reject,
     on_pre_ack,
+    on_pre_cancel_failed,
     on_pre_cancelled,
     on_pre_fill,
     on_pre_reject,
@@ -261,10 +262,20 @@ class AutoMEngine:
                           order_id: str, reason: str) -> None:
         self._log.info("[자동M] %s 선주문 취소 %s #%s %s",
                        u.value, self._tag(u, index, block), order_id, reason)
-        try:
-            await self._system.cancel(order_id)
-        except Exception as exc:  # noqa: BLE001 - 이미 체결/취소됐으면 통보로 정리된다
-            self._log.warning("[자동M] 취소 실패 #%s — %s", order_id, exc)
+        # LS 초당 한도(CFOAT00300 2회)에 걸리면 잠깐 뒤 다시 — 실측 2026-09-08: 한 번 실패한 채
+        # 두면 "취소 대기" 표시만 남아 재시도도 종료 취소도 안 됐다. 끝내 실패하면 표시를 되돌려
+        # 다음 판정이 다시 보낸다(이미 체결/취소된 주문의 거부도 통보로 정리된다).
+        for attempt in range(3):
+            try:
+                await self._system.cancel(order_id)
+                return
+            except Exception as exc:  # noqa: BLE001 - 한도·통신 오류 등
+                self._log.warning("[자동M] 취소 실패 #%s (%d/3) — %s", order_id, attempt + 1, exc)
+                if attempt < 2:
+                    await asyncio.sleep(0.6)
+        s = self._book(u).sets[index]
+        if s.leg(block).pre_order_id == order_id:
+            on_pre_cancel_failed(s, block)
 
     async def _place_post(self, u: Underlying, index: int, block: Block, act: Action) -> None:
         s = self._book(u).sets[index]
@@ -418,6 +429,18 @@ class AutoMEngine:
                     if self._book(tu).sets[index].leg(block).running:
                         self.set_running(tu, index, block, False)
 
+    async def shutdown(self, timeout_s: float = 3.0) -> None:
+        """안전종료 — 전 종목 정지(미체결 선주문 취소 요청)하고 그 취소 요청이 끝날 때까지 기다린다.
+
+        실측 2026-09-08: 0.3초만 기다리고 닫아 취소가 LS 한도에 걸린 선주문이 그대로 남았다.
+        """
+        self.stop_all()
+        if self._bg:
+            await asyncio.wait(list(self._bg), timeout=timeout_s)
+        left = [oid for oid, ref in self._orders.items() if ref.leg == "pre"]
+        if left:
+            self._log.warning("[자동M] 종료 — 취소 확인 못 한 선주문 %s (LS에서 확인 필요)", left)
+
     # ------------------------------------------------------------- 스냅샷 ---
     def live_snapshot(self) -> dict[str, Any]:
         """화면용 — 종목별 {세트 상태·RT·체결차·누적, 모니터 3칸, HL 호가단위}. 키 = 종목."""
@@ -445,6 +468,8 @@ class AutoMEngine:
                     "pre_price": leg.pre_price, "pre_qty": leg.pre_qty,
                     "pre_filled": leg.pre_filled, "post_pending": leg.post_pending,
                     "hl_qty": leg.acc.hl_qty, "sf_qty": leg.acc.sf_qty,
+                    # 매매결과 표시는 짝이 맞은(적은 쪽) 체결량 기준(사용자 확정 2026-09-08)
+                    "matched_hl": leg.acc.matched_hl(), "matched_sf": leg.acc.matched_sf(),
                     "fx_avg": leg.acc.fx_avg(), "sprd": leg.acc.sprd(stock, theory),
                 }
             out.append(row)

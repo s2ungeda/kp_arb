@@ -81,6 +81,10 @@ class FakeSystem:
         return oid
 
     async def cancel(self, order_id: str) -> None:
+        fails = getattr(self, "cancel_fail_times", 0)  # LS 초당 한도 흉내 — 처음 n번 실패
+        if fails > 0:
+            self.cancel_fail_times = fails - 1
+            raise RuntimeError("per-second limit 10 for CFOAT00300 exceeded")
         self.cancelled.append(order_id)
         self.order_book.on_cancel(order_id)
 
@@ -118,7 +122,7 @@ async def test_immediate_partial_fill_is_applied_and_remainder_is_fractional() -
     await _settle()
     s = state.autom.book(U).sets[0]
     assert s.hl_net == -0.588 and abs(s.entry.post_pending - 9.412) < 1e-9
-    assert s.rt == 0 and abs(s.hl_rt_carry - 0.588) < 1e-9  # 10 미만은 RT로 안 올라감
+    assert s.rt == 1  # RT는 선주문(SF) 체결 계약수 기준(2026-09-08) — HL 부분 체결과 무관
     sys_.order_book.on_cancel("O2")  # 잔량 취소 확인 → 미체결 9.412 체결차 → 중지
     await _settle()
     assert s.entry.status is LegStatus.HALTED and not s.entry.running
@@ -189,6 +193,21 @@ def test_legacy_single_autom_state_migrates_to_screen_underlying_book() -> None:
     b = st.autom.book(Underlying.SAMSUNG)
     assert (b.sets[0].target_qty, b.sets[0].per_qty, b.sets[0].rt, b.ref_qty) == (7, 2, 3, 300)
     assert st.autom.book(Underlying.SK_HYNIX).sets[0].target_qty == 0  # 다른 종목은 빈 책
+
+
+async def test_shutdown_waits_for_cancel_and_retries_rate_limit() -> None:
+    # 실측 2026-09-08: 종료 때 취소가 한도에 걸려 실패 → 0.3초 대기 뒤 닫혀 선주문이 LS에 남음.
+    # 종료는 취소 요청을 재시도하고 끝날 때까지 기다린다.
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert state.autom.book(U).sets[0].entry.pre_order_id == "O1"
+    sys_.cancel_fail_times = 1  # 첫 취소는 한도 초과로 실패 → 0.6초 뒤 재시도 성공
+    await eng.shutdown(timeout_s=3.0)
+    assert sys_.cancelled == ["O1"]
+    assert not state.autom.any_running()
+    assert state.autom.book(U).sets[0].entry.pre_order_id is None  # 취소 확인까지 반영됨
 
 
 async def test_engine_round_trip_pre_fill_post_fill() -> None:

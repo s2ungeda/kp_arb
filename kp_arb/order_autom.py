@@ -76,15 +76,19 @@ def settings_payload(common: dict[str, Any]) -> dict[str, Any]:
 
 
 def sum_acc(rows: list[dict[str, Any]], leg: str) -> dict[str, float | None]:
-    """세트별 누적(autom_live)을 방향 하나로 합산 — HL·SF 수량은 합, 환·Sprd는 HL 수량 가중."""
+    """세트별 누적(autom_live)을 방향 하나로 합산 — 수량은 **짝이 맞은(적은 쪽)** 체결량 합
+    (사용자 확정 2026-09-08: LS·HL 누적 체결량이 다르면 적은 쪽 기준, SF 1 = HL 10), 환·Sprd는
+    그 HL 수량 가중."""
     hl = sf = 0.0
     fx_w = sprd_w = 0.0
     sprd_q = 0.0
     for row in rows:
         acc = row.get(leg) or {}
-        q = float(acc.get("hl_qty") or 0)
+        raw_hl = float(acc.get("hl_qty") or 0)
+        raw_sf = float(acc.get("sf_qty") or 0)
+        q = float(acc.get("matched_hl", min(raw_hl, raw_sf * 10)) or 0)
         hl += q
-        sf += float(acc.get("sf_qty") or 0)
+        sf += float(acc.get("matched_sf", q / 10) or 0)
         if q > 0 and acc.get("fx_avg") is not None:
             fx_w += float(acc["fx_avg"]) * q
         if q > 0 and acc.get("sprd") is not None:
@@ -1055,9 +1059,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 continue
             agg = sum_acc(rows, leg)
             hp_key, s_key, fx_key = ("-HP", "+S", "-환") if leg == "entry" else ("+HP", "-S", "+환")
-            labels["누적"].config(text=_fmt_num(agg["sf_qty"]))
-            labels[hp_key].config(text=_fmt_num(agg["hl_qty"]))
-            labels[s_key].config(text=_fmt_num(agg["sf_qty"]))
+            # 짝이 맞은 체결량 — HL 부분 체결이면 SF도 소수(0.0588 등)라 소수면 자릿수를 붙인다
+            sf_q, hl_q = float(agg["sf_qty"] or 0), float(agg["hl_qty"] or 0)
+            sf_txt = _fmt_num(sf_q, 2 if sf_q % 1 else 0)
+            labels["누적"].config(text=sf_txt)
+            labels[hp_key].config(text=_fmt_num(hl_q, 3 if hl_q % 1 else 0))
+            labels[s_key].config(text=sf_txt)
             labels[fx_key].config(text=_fmt_num(agg["fx_avg"], 1))
             sprd = agg["sprd"]
             labels["Sprd"].config(text=f"{sprd * 100:.3f}" if sprd is not None else "-")
