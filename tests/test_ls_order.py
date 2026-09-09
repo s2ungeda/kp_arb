@@ -202,6 +202,10 @@ async def test_future_cancel_uses_cfoat00300() -> None:
     blk = inblk(req, LSApiGateway.FUTURE_CANCEL_TR)
     assert blk["OrgOrdNo"] == int(oid)
     assert blk["CancQty"] == 10  # 원주문 수량
+    # 남은 수량을 넘기면 그 수량으로 — 원주문 수량으로 보내면 부분체결 뒤 01443 거부(실측 09-09)
+    await gw.cancel_order(oid, qty=7)
+    blk2 = inblk(transport.requests[-1], LSApiGateway.FUTURE_CANCEL_TR)
+    assert blk2["CancQty"] == 7
 
 
 async def test_fx_futures_uses_cfoat00100_on_kr_fx() -> None:

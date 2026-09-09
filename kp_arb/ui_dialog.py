@@ -11,24 +11,69 @@ from typing import Any
 
 
 def centered_geometry(win_w: int, win_h: int,
-                      px: int, py: int, pw: int, ph: int) -> str:
-    """부모 창(px,py,pw,ph) 중앙에 놓는 tk geometry 위치부('+X+Y'). 음수는 0으로. (순수 함수)"""
-    x = max(px + (pw - win_w) // 2, 0)
-    y = max(py + (ph - win_h) // 2, 0)
+                      px: int, py: int, pw: int, ph: int,
+                      bounds: tuple[int, int, int, int] | None = None) -> str:
+    """부모 창(px,py,pw,ph) 중앙에 놓는 tk geometry 위치부('+X+Y'). (순수 함수)
+
+    bounds=(left, top, right, bottom): 부모가 있는 **모니터 작업 영역**. 주면 팝업이 그 안에
+    다 들어오게 밀어 넣는다(음수 좌표 허용 — 왼쪽·위쪽 모니터). 없으면 옛 방식(음수는 0으로).
+    실측 2026-09-09(사용자): 멀티모니터에서 음수를 0으로 밀어 팝업이 보이는 범위 밖에 떠
+    모달 잠금으로 창 전체가 안 눌렸다.
+    """
+    x = px + (pw - win_w) // 2
+    y = py + (ph - win_h) // 2
+    if bounds is None:
+        return f"+{max(x, 0)}+{max(y, 0)}"
+    left, top, right, bottom = bounds
+    x = max(min(x, right - win_w), left)
+    y = max(min(y, bottom - win_h), top)
     return f"+{x}+{y}"
 
 
+def monitor_work_area(widget: Any) -> tuple[int, int, int, int] | None:
+    """위젯이 놓인 모니터의 작업 영역(left, top, right, bottom, 물리 픽셀 = tk 좌표) — Windows만.
+
+    tk는 winfo_screenwidth()로 주 모니터 크기만 주므로, 다른 모니터에 있는 창의 팝업 위치는
+    Win32 MonitorFromWindow로 그 모니터를 찾아 계산한다. 실패하면 None(호출자가 옛 방식)."""
+    import sys
+
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MonitorInfo(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetAncestor(widget.winfo_id(), 2)  # GA_ROOT — 최상위 창 핸들
+        mon = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        info = _MonitorInfo()
+        info.cbSize = ctypes.sizeof(info)
+        if not user32.GetMonitorInfoW(mon, ctypes.byref(info)):
+            return None
+        r = info.rcWork
+        return (int(r.left), int(r.top), int(r.right), int(r.bottom))
+    except Exception:  # noqa: BLE001 - 위치 보정은 편의 기능, 실패해도 팝업은 뜬다
+        return None
+
+
 def center_on_parent(win: Any, parent: Any) -> None:
-    """Toplevel을 부모 창 중앙으로 옮긴다(크기 확정 후 호출). 부모가 안 보이면 모니터 중앙."""
+    """Toplevel을 부모 창 중앙으로 옮긴다(크기 확정 후 호출). 부모가 안 보이면 모니터 중앙.
+    부모가 있는 모니터 안에 다 들어오게 맞춘다(멀티모니터, 2026-09-09)."""
     win.update_idletasks()
     # 아직 화면에 안 그려진 창은 winfo_width()가 1이라 요청 크기(req)로 계산한다(실측 2026-09-04).
     w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+    bounds = None
     if parent is not None and parent.winfo_viewable() and parent.winfo_width() > 1:
         px, py, pw, ph = (parent.winfo_rootx(), parent.winfo_rooty(),
                           parent.winfo_width(), parent.winfo_height())
+        bounds = monitor_work_area(parent)
     else:
         px, py, pw, ph = 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
-    win.geometry(centered_geometry(w, h, px, py, pw, ph))
+    win.geometry(centered_geometry(w, h, px, py, pw, ph, bounds))
 
 
 def _dialog(parent: Any, title: str, message: str,

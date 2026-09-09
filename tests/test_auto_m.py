@@ -195,6 +195,47 @@ def test_gate_cancel_is_sent_once_until_confirmed() -> None:
         == ["cancel_pre"]  # 새 주문은 다시 1번 취소 가능
 
 
+def test_cancel_resent_after_confirm_timeout_and_alarm_after_limit() -> None:
+    # exec ㅂ3(2026-09-09): 취소를 보내고 3초 안에 확인이 없으면 "보냄" 표시를 풀고 다시 보낸다.
+    # 재전송이 3회를 넘으면 한 번 알람(alarm) — 상태줄 "취소실패", 사람이 수동 취소.
+    from kp_arb.auto_m import CANCEL_ALARM_TRIES, CANCEL_CONFIRM_S
+
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    s.entry.pre_qty = 1
+    on_pre_ack(s, Block.ENTRY, "7001")
+    acts = set_running(s, Block.ENTRY, False, mono=100.0)     # 끔 → 취소 1회
+    assert [a.kind for a in acts] == ["cancel_pre"] and s.entry.cancel_tries == 1
+    assert evaluate(s, Block.ENTRY, _sig(mono=101.0), SETTINGS, U) == []  # 아직 확인 대기
+    late = _sig(mono=100.0 + CANCEL_CONFIRM_S)
+    acts = evaluate(s, Block.ENTRY, late, SETTINGS, U)         # 3초 지남 → 재전송
+    assert [a.kind for a in acts] == ["cancel_pre"] and "재전송 2회" in acts[0].reason
+    assert s.entry.cancel_tries == 2 and not s.entry.cancel_alarmed
+    mono = late.mono
+    kinds: list[str] = []
+    while s.entry.cancel_tries <= CANCEL_ALARM_TRIES:
+        mono += CANCEL_CONFIRM_S
+        kinds += [a.kind for a in evaluate(s, Block.ENTRY, _sig(mono=mono), SETTINGS, U)]
+    assert kinds == ["cancel_pre", "cancel_pre", "alarm"]     # 4회째에 알람 한 번
+    assert s.entry.cancel_alarmed and s.entry.pre_order_id == "7001"
+    mono += CANCEL_CONFIRM_S                                   # 그 뒤로도 재전송 계속, 알람 없음
+    again = evaluate(s, Block.ENTRY, _sig(mono=mono), SETTINGS, U)
+    assert [a.kind for a in again] == ["cancel_pre"]
+    on_pre_cancelled(s, Block.ENTRY, mono=mono, settings=SETTINGS)  # 확인 → 표시 전부 정리
+    assert s.entry.cancel_tries == 0 and not s.entry.cancel_alarmed and not s.entry.cancel_sent
+    # 시각 없이 보낸 취소(접수 때 등)는 다음 판정 시각부터 확인을 기다린다
+    s2 = _set()
+    set_running(s2, Block.ENTRY, True)
+    s2.entry.status, s2.entry.pre_qty = LegStatus.PRE_RESTING, 1
+    set_running(s2, Block.ENTRY, False)
+    assert [a.kind for a in on_pre_ack(s2, Block.ENTRY, "7002")] == ["cancel_pre"]
+    assert s2.entry.cancel_sent_mono is None
+    assert evaluate(s2, Block.ENTRY, _sig(mono=200.0), SETTINGS, U) == []
+    assert s2.entry.cancel_sent_mono == 200.0
+    resend = evaluate(s2, Block.ENTRY, _sig(mono=203.0), SETTINGS, U)
+    assert [a.kind for a in resend] == ["cancel_pre"]
+
+
 def test_accum_matched_uses_smaller_side() -> None:
     # 사용자 확정 2026-09-08: 매매결과 수량은 LS·HL 누적 체결량 중 적은 쪽(SF 1 = HL 10).
     acc = Accum(hl_qty=0.588, hl_px_sum=0.588 * 1313.1, fx_sum=0.588 * 1340.0,

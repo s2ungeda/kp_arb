@@ -23,6 +23,9 @@ FIXTURES: dict[str, dict[str, Any]] = {
         ],
     },
     "CFOBQ10500": {"rsp_cd": "00136", "CFOBQ10500OutBlock2": {"MnyOrdAbleAmt": 3_000_000}},
+    # 스냅샷으로 알게 된 주문의 취소(재시동 뒤 취소 문맥 복원 검증용)
+    "CFOAT00300": {"rsp_cd": "00000"},
+    "CSPAT00801": {"rsp_cd": "00000"},
     # 실측 v6.5: 미체결 행 — IsuNo "A"접두, OrdPrc 문자열, MrcAbleQty=정정취소가능수량.
     "CSPAQ13700": {
         "rsp_cd": "00136",
@@ -34,6 +37,22 @@ FIXTURES: dict[str, dict[str, Any]] = {
              "OrdPrc": "0.00", "ExecQty": 2, "ExecPrc": "292000.00",
              "MrcAbleQty": 0, "OrdprcPtnCode": "03"},  # 전량 체결 → 제외 대상
         ],
+    },
+    # t0434 공식 문서 예시 행(2026-09-09, 실측 대기): ordrem(잔량)>0만 미체결. 첫 행은 전량 체결.
+    "t0434": {
+        "rsp_cd": "00000",
+        "t0434OutBlock1": [
+            {"orgordno": 0, "hogatype": "L", "ordrem": 0, "ordgb": "지정가", "cheqty": 5,
+             "ordno": 69104, "price": "34225.00", "qty": 5, "expcode": "A1167000",
+             "medosu": "매수", "cheprice": "34225.00", "status": "완료"},
+            {"orgordno": 0, "hogatype": "L", "ordrem": 4, "ordgb": "지정가", "cheqty": 1,
+             "ordno": 69105, "price": "34225.00", "qty": 5, "expcode": "A1167000",
+             "medosu": "매도", "cheprice": "34225.00", "status": "접수"},
+            {"orgordno": 0, "hogatype": "L", "ordrem": 1, "ordgb": "지정가", "cheqty": 0,
+             "ordno": 69106, "price": "1000.00", "qty": 1, "expcode": "ZZZ",
+             "medosu": "매수", "cheprice": "0.00", "status": "접수"},  # 취급 외 종목
+        ],
+        "t0434OutBlock": {"cts_ordno": ""},
     },
     # t0441 실측 행(운영): expcode(선물코드)/medocd(1매도 2매수)/jqty/pamt.
     "t0441": {
@@ -210,9 +229,58 @@ async def test_open_orders_parsed_and_filtered() -> None:
     assert o.intent.price == 265_000.0
 
 
-async def test_open_orders_deriv_not_implemented_returns_empty() -> None:
-    gw = _gateway(AccountTransport())
-    assert await gw.get_open_orders(Account.KR_DERIV) == []  # 선물 미체결 TR 미확인
+async def test_deriv_open_orders_use_t0434_and_gate_reconcile() -> None:
+    # 2026-09-09: 선물 미체결은 t0434(취급 코드마다 전체 조회 → ordrem>0만). 실제로 성공한 뒤에만
+    # open_orders_supported(KR_DERIV)가 참 — 그 전엔 재동기 유령 정리에서 제외(#20851 재발 방지).
+    from kp_arb.order_book import OrderStatus
+
+    transport = AccountTransport()
+    gw = _gateway(transport, futures_symbols={Underlying.SAMSUNG: "A1167000"},
+                  next_futures_symbols={Underlying.SAMSUNG: "A1168000"})
+    assert not gw.open_orders_supported(Account.KR_DERIV)  # 조회 성공 전
+    orders = await gw.get_open_orders(Account.KR_DERIV)
+    assert transport.seen_trs == ["t0434", "t0434"]  # 근·차근 코드마다 1회
+    blk = transport.bodies[0]["t0434InBlock"]
+    assert blk["expcode"] == "A1167000" and blk["chegb"] == "2"  # 공식 문서: 2=미체결
+    assert blk["cts_ordno"] == " "  # 처음 조회는 Space
+    assert transport.bodies[1]["t0434InBlock"]["expcode"] == "A1168000"
+    # 잔량 0(전량 체결)·취급 외 종목 제외, 같은 주문은 한 번만
+    assert [o.order_id for o in orders] == ["69105"]
+    o = orders[0]
+    assert o.intent.account is Account.KR_DERIV and o.intent.underlying is Underlying.SAMSUNG
+    assert o.intent.instrument is Instrument.KR_STOCK_FUTURE and o.intent.side is Side.SELL
+    assert o.intent.qty == 5 and o.intent.price == 34_225.0
+    assert o.status is OrderStatus.PARTIAL and o.filled_qty == 1
+    assert gw.open_orders_supported(Account.KR_DERIV)  # 성공 뒤 유령 정리 대상
+
+
+async def test_snapshot_orders_can_be_cancelled_after_restart() -> None:
+    # 2026-09-09(사용자): 재시동 뒤에도 시동 미체결 조회로 알게 된 주문은 취소돼야 한다.
+    # 주문 문맥(_orders)이 비어 "unknown order"였던 것을 스냅샷 행으로 복원.
+    transport = AccountTransport()
+    gw = _gateway(transport)
+    await gw.get_open_orders(Account.KR_DERIV)
+    await gw.get_open_orders(Account.KR_STOCK)
+    await gw.cancel_order("69105", qty=4)          # 선물 — 남은 수량 4
+    await gw.cancel_order("7267", qty=1)           # 주식
+    assert transport.seen_trs[-2:] == ["CFOAT00300", "CSPAT00801"]
+    fut = transport.bodies[-2]["CFOAT00300InBlock1"]
+    assert fut["FnoIsuNo"] == "A1167000" and fut["OrgOrdNo"] == 69105 and fut["CancQty"] == 4
+    spot = transport.bodies[-1]["CSPAT00801InBlock1"]
+    assert spot["IsuNo"] == "A005930" and spot["OrgOrdNo"] == 7267 and spot["OrdQty"] == 1
+
+
+async def test_deriv_open_orders_paper_unsupported_stays_unreconciled() -> None:
+    # 모의 미제공(01900)이면 빈 결과 + 유령 정리 제외 유지(빈 결과를 성공으로 보면 안 됨).
+    transport = AccountTransport()
+    saved = FIXTURES["t0434"]
+    FIXTURES["t0434"] = {"rsp_cd": "01900", "rsp_msg": "모의투자 미제공"}
+    try:
+        gw = _gateway(transport)
+        assert await gw.get_open_orders(Account.KR_DERIV) == []
+        assert not gw.open_orders_supported(Account.KR_DERIV)
+    finally:
+        FIXTURES["t0434"] = saved
 
 
 # --- 응답 오류 ---

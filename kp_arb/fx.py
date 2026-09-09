@@ -1,6 +1,6 @@
 """FX 노출 계산 (DESIGN.md §9). 외부 #2로 보고할 값. 순수 로직.
 
-- `domestic_krw_notional`: 외부 #2로 전송하는 `total_coin`(국내 롱 다리 KRW 명목).
+- `domestic_krw_notional`: 외부 #2로 전송하는 `total_coin`(국내 롱 포지션 KRW 명목).
 - `usd_exposure`: HL perp USD 명목(내부 감사/기록용).
 """
 from __future__ import annotations
@@ -23,10 +23,10 @@ def domestic_krw_notional(
     positions: Iterable[Position],
     multipliers: Mapping[Instrument, float] | None = None,
 ) -> float:
-    """외부 #2 `total_coin`: 국내 롱 다리 KRW 명목 합.
+    """외부 #2 `total_coin`: 국내 롱 포지션 KRW 명목 합.
 
     (주식잔고×평단×1) + (주식선물 매수계약×평단×10) + (레버ETF×평단×2).
-    국내 다리는 전략상 매수(롱) 전용 → BUY만 집계. HL/미지 instrument는 제외.
+    국내 포지션은 전략상 매수(롱) 전용 → BUY만 집계. HL/미지 instrument는 제외.
     """
     mult = dict(multipliers) if multipliers is not None else dict(_DEFAULT_MULTIPLIERS)
     total = 0.0

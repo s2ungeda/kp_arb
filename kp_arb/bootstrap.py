@@ -284,27 +284,35 @@ class LiveSystem:
 
     # --- 스냅샷 (최초 실행 + 온디맨드/UI 조회 버튼) ---
 
-    async def refresh_snapshot(self) -> None:
+    async def refresh_snapshot(self, scope: set[Account | None] | None = None) -> None:
+        """거래소 실제값(REST)으로 장부 재동기. scope=None이면 전체(시동·수동 '적'),
+        지정하면 그 계좌(HL은 None)만 조회·갱신 — 재연결은 끊긴 시장만(사용자 2026-09-09)."""
         import logging
 
         positions: list[Position] = []
         balances: dict[Account, float] = {}
         open_orders: list[TrackedOrder] = []
         reconciled: set[Account | None] = set()  # 조회 성공한 계좌만 phantom 정리 대상
-        for account in (Account.KR_STOCK, Account.KR_DERIV):
+        ls_accounts = [a for a in (Account.KR_STOCK, Account.KR_DERIV)
+                       if scope is None or a in scope]
+        for account in ls_accounts:
             # 실계좌 환경 편차(선물 계좌 없음, 형식 거부 등)로 한 계좌 조회가
             # 실패해도 시동을 멈추지 않는다 — 해당 계좌만 빼고 계속.
             try:
                 balances[account] = await self._gw.get_balance(account)
                 positions.extend(await self._gw.get_positions(account))
                 open_orders.extend(await self._gw.get_open_orders(account))
-                reconciled.add(account)
+                # 실제 조회가 되는 계좌만 유령 정리 대상. 선물 미체결 TR은 미확인이라 빈 결과가
+                # 오는데, 이를 "조회 성공"으로 보고 걸린 선주문(#20851)을 지웠다(실측 2026-09-09) —
+                # 그 뒤 체결 통보가 미아가 되고 자동M은 없는 주문 취소를 되풀이했다.
+                if self._gw.open_orders_supported(account):
+                    reconciled.add(account)
             except RestError:
                 logging.getLogger("kp_arb.bootstrap").warning(
                     "%s 계좌 스냅샷 실패 — 이 계좌 없이 계속", account.value, exc_info=True
                 )
                 balances.setdefault(account, 0.0)
-        if self._hl is not None:
+        if self._hl is not None and (scope is None or None in scope):
             hl_pos, self.hl_detail = await self._hl.get_positions_and_details()  # 1회 조회
             positions.extend(hl_pos)
             open_orders.extend(await self._hl.get_open_orders())
@@ -316,9 +324,10 @@ class LiveSystem:
                 d.setdefault("leverage", lev["leverage"])
                 d.setdefault("leverage_cross", lev["leverage_cross"])
         # 조회 실패 계좌의 살아있는 미체결이 빈 스냅샷 탓에 지워지지 않도록 성공 계좌만 정리.
+        # scope가 있으면 그 계좌의 포지션·잔고만 갈아 끼운다(다른 시장 장부는 그대로).
         self.order_book.load_snapshot(
             positions=positions, balances=balances, open_orders=open_orders,
-            reconcile_accounts=reconciled,
+            reconcile_accounts=reconciled, scope=scope,
         )
 
     def _record_fill(self, order: TrackedOrder, qty: float, price: float,
@@ -538,10 +547,16 @@ class LiveSystem:
         거래소 실제값으로 재동기(백그라운드). 수신 루프를 막지 않게 태스크로 던진다. Phase 8-4."""
         import logging
 
-        logging.getLogger("kp_arb.core").warning("%s WS 재연결 — 포지션/잔고 재동기", label)
+        logging.getLogger("kp_arb.core").warning(
+            "%s WS 재연결 — 그 시장만 포지션/잔고 재동기", label)
         task = asyncio.create_task(self._resync_after_reconnect(label))
         self._bg.add(task)
         task.add_done_callback(self._bg.discard)
+
+    # 재연결 채널 → 재동기 범위(계좌; HL은 None). 끊긴 시장만 다시 조회한다 — HL 재연결이
+    # LS 장부까지 갈아 끼우다 선물 선주문을 지웠던 사고(2026-09-09) 방지.
+    _RECONNECT_SCOPE: dict[str, set[Account | None]] = {
+        "주식": {Account.KR_STOCK}, "선물": {Account.KR_DERIV}, "HL": {None}}
 
     async def _resync_after_reconnect(self, label: str) -> None:
         import asyncio as _asyncio
@@ -550,7 +565,7 @@ class LiveSystem:
         from . import alert
 
         try:
-            await self.refresh_snapshot()
+            await self.refresh_snapshot(scope=self._RECONNECT_SCOPE.get(label))
         except Exception:  # noqa: BLE001 - 재동기 실패가 수신 루프를 죽이지 않게
             logging.getLogger("kp_arb.core").warning(
                 "%s 재연결 재동기 실패", label, exc_info=True)
@@ -643,7 +658,8 @@ class LiveSystem:
         if order is None:
             raise ValueError(f"unknown order {order_id}")
         if order.intent.venue is Venue.LS:
-            await self._gw.cancel_order(order_id)  # 상태는 SC3/H01 통보로 전이
+            # 취소수량은 장부의 남은 수량 — 원주문 수량이면 부분체결 뒤 01443 거부(실측 09-09)
+            await self._gw.cancel_order(order_id, qty=order.remaining_qty)  # 상태는 통보로 전이
         else:
             assert self._hl is not None
             await self._hl.cancel_order(order_id)
@@ -862,7 +878,8 @@ class LiveSystem:
         positions: list[Position] = []
         balances: dict[Account, float] = {}
         open_orders: list[TrackedOrder] = []
-        reconciled: set[Account | None] = {Account.KR_STOCK, Account.KR_DERIV}
+        # 유령 정리 대상은 미체결 조회가 실제로 된 계좌만(refresh_snapshot과 같은 규칙, 2026-09-09)
+        reconciled: set[Account | None] = set()
         # 2) 잔고
         try:
             for account in accounts:
@@ -893,6 +910,8 @@ class LiveSystem:
         try:
             for account in accounts:
                 open_orders.extend(await self._gw.get_open_orders(account))
+                if self._gw.open_orders_supported(account):
+                    reconciled.add(account)
             if self._hl is not None:
                 open_orders.extend(await self._hl.get_open_orders())
             log.info("시동 로드 OK: 주문 (미체결 %d건)", len(open_orders))
@@ -1503,7 +1522,7 @@ class LiveSystem:
                 a: self.order_book.balance(a)
                 for a in (Account.KR_STOCK, Account.KR_DERIV)
             },
-            hl_margin_ratio=None,  # HL 마진비율 산출은 추후(§8)
+            hl_margin_ratio=None,  # HL 마진비율은 안 쓴다(사용자 2026-09-09) — 옛 전략 루프 관문용
         )
 
     async def run_strategy_loop(

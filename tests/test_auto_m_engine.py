@@ -67,6 +67,9 @@ class FakeSystem:
         return self.halted
 
     async def place(self, intent: OrderIntent) -> str:
+        delay = getattr(self, "place_delay", 0.0)  # LS 접수 응답 지연 흉내(실측 0.9초)
+        if delay > 0:
+            await asyncio.sleep(delay)
         self._ids += 1
         oid = f"O{self._ids}"
         self.placed.append(intent)
@@ -89,7 +92,7 @@ class FakeSystem:
         self.order_book.on_cancel(order_id)
 
 
-RUN = {"cmd": "autom_run", "underlying": U.value}  # 종목별 명령(2026-09-08) — 세트·다리는 호출마다
+RUN = {"cmd": "autom_run", "underlying": U.value}  # 종목별 명령(2026-09-08) — 세트·진입/청산은 매번
 
 
 def _engine(log_dir: Any = None) -> tuple[AutoMEngine, FakeSystem, CoreState]:
@@ -208,6 +211,99 @@ async def test_shutdown_waits_for_cancel_and_retries_rate_limit() -> None:
     assert sys_.cancelled == ["O1"]
     assert not state.autom.any_running()
     assert state.autom.book(U).sets[0].entry.pre_order_id is None  # 취소 확인까지 반영됨
+
+
+async def test_stop_during_placement_cancels_on_ack() -> None:
+    # 실측 2026-09-09 #13865: 발주 요청 중(응답 전) 실행 끔 → 응답이 오면 즉시 취소해야 한다.
+    eng, sys_, state = _engine()
+    sys_.place_delay = 0.05  # LS 응답이 늦게 온다
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()                               # 발주 요청은 나갔지만 응답 전
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id is None and sys_.placed == []
+    eng.set_running(U, 0, Block.ENTRY, False)     # 응답 전에 실행 끔 → 취소할 번호 없음
+    assert s.entry.status is LegStatus.IDLE
+    await asyncio.sleep(0.1)                      # 응답 도착 → 접수 → 실행 꺼짐 → 즉시 취소
+    await _settle()
+    assert [p.instrument for p in sys_.placed] == [SF]
+    assert sys_.cancelled == ["O1"] and s.entry.pre_order_id is None
+
+
+async def test_late_pre_fill_after_stop_still_hedges() -> None:
+    # 사용자 확정 2026-09-09(결정 로그 19): 진입 중지 → 취소 실패 → 뒤늦게 선주문 체결이 오면
+    # 주문번호 표로 우리 선주문임이 확실하므로 그대로 후주문(헤지)을 낸다.
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    sys_.cancel_fail_times = 10                   # 취소가 계속 한도에 막힘 → 선주문이 남아 있음
+    eng.set_running(U, 0, Block.ENTRY, False)
+    await _settle()
+    assert sys_.cancelled == [] and sys_.order_book.order("O1") is not None
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    await _settle()
+    assert [p.instrument for p in sys_.placed] == [SF, Instrument.HL_PERP]
+    assert sys_.placed[1].qty == 100 and s.entry.post_pending == 100  # 10계약 × 10
+    assert s.entry.status is LegStatus.POST_PENDING and not s.entry.running
+    for task in list(eng._bg):                    # 남은 취소 재시도 정리
+        task.cancel()
+    await _settle()
+
+
+async def test_cancel_alarm_raises_error_seq_and_snapshot_flags_it() -> None:
+    # exec ㅂ3: 취소 재전송이 한도를 넘으면 에러 알람(error_seq) + 스냅샷 cancel_failed(상태줄).
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    sys_.cancel_fail_times = 100                  # 취소 요청이 계속 실패(확인도 안 옴)
+    eng.set_running(U, 0, Block.ENTRY, False)     # 1회
+    before = sys_.error_seq
+    mono = 100.0
+    for _ in range(3):                            # 3초마다 재전송 → 4회째에 알람
+        mono += 3.0
+        eng.tick(datetime(2026, 9, 4, 10, 0, 0), mono)
+    assert s.entry.cancel_tries == 4 and s.entry.cancel_alarmed
+    assert sys_.error_seq == before + 1
+    row = eng.live_snapshot()[U.value]["sets"][0]["entry"]
+    assert row["cancel_failed"] is True and row["cancel_tries"] == 4
+    for task in list(eng._bg):
+        task.cancel()
+    await _settle()
+
+
+async def test_vanished_pre_order_is_cleared_and_vanished_post_order_halts() -> None:
+    # 실측 2026-09-09 #20851: 재동기가 장부에서 선주문을 지워 상태는 '접수'인데 장부엔 없음 →
+    # 'unknown order' 취소 되풀이. 장부에서 사라진 선주문은 취소로 정리, 후주문은 체결차 → 중지.
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    sys_.order_book.load_snapshot(open_orders=(), reconcile_accounts=None)  # 유령 정리처럼 삭제
+    for o in list(sys_.order_book._orders):  # 유예(15초) 안이라 남았으면 강제로 지움
+        del sys_.order_book._orders[o]
+    eng._on_book_change()
+    assert s.entry.pre_order_id is None and s.entry.status is LegStatus.ARMED  # 다시 감시
+    assert "O1" not in eng._orders
+    # 후주문이 사라지면: 미체결분만큼 체결차 → 세트 중지
+    eng2, sys2, state2 = _engine()
+    eng2.set_running(U, 0, Block.ENTRY, True)
+    eng2.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    sys2.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    await _settle()
+    s2 = state2.autom.book(U).sets[0]
+    assert s2.entry.status is LegStatus.POST_PENDING and s2.entry.post_pending == 100
+    for o in list(sys2.order_book._orders):
+        del sys2.order_book._orders[o]
+    eng2._on_book_change()
+    assert s2.entry.status is LegStatus.HALTED and "100" in s2.entry.halt_reason
 
 
 async def test_engine_round_trip_pre_fill_post_fill() -> None:

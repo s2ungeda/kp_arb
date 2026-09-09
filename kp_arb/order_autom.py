@@ -98,8 +98,8 @@ def sum_acc(rows: list[dict[str, Any]], leg: str) -> dict[str, float | None]:
             "fx_avg": fx_w / hl if hl > 0 else None,
             "sprd": sprd_w / sprd_q if sprd_q > 0 else None}
 
-# 다리 진행 상태(exec §2)의 짧은 표시 — 상태줄 상세용(버튼 캡션은 항상 '진입'/'청산')
-# 상태줄 다리 상태 표기 — pre_resting은 '접수'(옛 '걸림', 사용자 2026-09-08)
+# 진입/청산 진행 상태(exec §2)의 짧은 표시 — 상태줄 상세용(버튼 캡션은 항상 '진입'/'청산')
+# 상태줄 진행 상태 표기 — pre_resting은 '접수'(옛 '걸림', 사용자 2026-09-08)
 _STATUS_TEXT = {"armed": "감시", "pre_resting": "접수", "pre_partial": "부분",
                 "post_pending": "HL", "settle_delay": "쉼", "halted": "중지"}
 
@@ -151,7 +151,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     from . import ui_theme as T
     from . import win_state
-    from .core_client import box_is_live, core_request, run_state_feed, watch_parent_exit
+    from .core_client import (
+        box_is_live,
+        core_request,
+        run_state_feed,
+        screen_log,
+        watch_parent_exit,
+    )
     from .ui_close import attach_auto_close
     from .ui_dialog import center_on_parent
 
@@ -917,6 +923,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             px = f"{float(price):,.0f}" if isinstance(price, int | float) else "-"
             parts.append(f"선주문 #{leg['pre_order_id']} {leg.get('pre_qty', 0)}계약 @{px}"
                          f" (체결 {leg.get('pre_filled', 0)}/{leg.get('pre_qty', 0)})")
+        if leg.get("cancel_failed"):  # 취소 재전송 한도 초과(exec ㅂ3) — 수동 취소 유도
+            parts.append(f"취소실패 {leg.get('cancel_tries', 0)}회 — 수동 취소 확인")
         if leg.get("post_pending"):
             parts.append(f"HL {leg['post_pending']} 대기")
         if st == "halted" and leg.get("halt_reason"):
@@ -1051,7 +1059,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 text = (f"{float(v) * 100:.2f}"
                         if applied and isinstance(v, int | float) else "-")
                 mon[f"{dtag}_{skey}"].config(text=text)
-        # 매매결과 누적(정방향) — 진입 = entry 다리, 청산 = exit 다리(세트 합산)
+        # 매매결과 누적(정방향) — 진입 = entry 누적, 청산 = exit 누적(세트 합산)
         accs = sets[("fwd", 0)].get("_acc", {})
         for glabel, leg in (("진입", "entry"), ("청산", "exit")):
             labels = accs.get(glabel, {})
@@ -1094,6 +1102,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 apply_live()
         except tk.TclError:
             return
+        except Exception:  # noqa: BLE001 - 갱신 한 번의 오류로 화면이 죽은 것처럼 멈추면 안 됨
+            # 예외가 새면 after 사슬이 끊겨 값이 멈추고 버튼을 눌러도 반응이 없어 보인다
+            # (실측 2026-09-09 "컨트롤이 안 눌린다"). 원인은 화면 로그에 남기고 계속 돈다.
+            now = time.time()
+            if now - float(state_box.get("_err_logged", 0.0)) > 5.0:
+                state_box["_err_logged"] = now
+                screen_log().exception("자동M 화면 갱신 오류 — 계속")
         _reschedule(refresh, 300)
 
     def _reschedule(fn: Callable[[], None], ms: int) -> None:

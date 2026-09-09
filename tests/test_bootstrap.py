@@ -231,6 +231,47 @@ def test_ws_statuses_collects_present_clients() -> None:
     assert [s.to_dict()["connected"] for s in statuses] == [False, False]  # 시동 전
 
 
+async def test_refresh_snapshot_keeps_futures_orders_without_open_order_query() -> None:
+    # 실측 2026-09-09: 선물 미체결 TR이 없어 빈 결과인데 "조회 성공"으로 보고 걸린 선주문 #20851을
+    # 유령으로 지움 → 체결 통보 미아 → 자동M이 없는 주문 취소 되풀이. 조회가 되는 계좌(주식)만 정리.
+    import time as _t
+
+    from kp_arb.domain.models import OrderIntent
+
+    system, _, _ = _system([])
+    ob = system.order_book
+
+    def intent(inst: Instrument, account: Account) -> OrderIntent:
+        return OrderIntent(venue=Venue.LS, underlying=SAMSUNG, instrument=inst, side=Side.BUY,
+                           qty=1, order_type=OrderType.LIMIT, price=1.0, account=account)
+
+    fut = ob.track("D1", intent(Instrument.KR_STOCK_FUTURE, Account.KR_DERIV))
+    stk = ob.track("S1", intent(Instrument.KR_STOCK, Account.KR_STOCK))
+    fut.placed_ts = stk.placed_ts = _t.monotonic() - 60  # 유예(15초) 지난 옛 주문
+    await system.refresh_snapshot()  # mock: 미체결 조회는 둘 다 빈 결과
+    assert ob.order("D1") is not None   # 선물: 조회 불가 계좌 → 보존
+    assert ob.order("S1") is None       # 주식: 실제 조회 결과에 없음 → 유령 정리
+
+
+async def test_hl_reconnect_resync_leaves_ls_book_alone() -> None:
+    # 사용자 확정 2026-09-09: 재연결 재동기는 끊긴 시장만. HL 재연결이 LS 주식 주문·포지션을
+    # 건드리면 안 된다(옛: 전체 재동기 → 주식 미체결이 빈 결과라 유령 정리 대상).
+    import time as _t
+
+    system, _, _ = _system([])
+    ob = system.order_book
+    stk = ob.track("S1", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK, side=Side.BUY,
+        qty=1, order_type=OrderType.LIMIT, price=1.0, account=Account.KR_STOCK))
+    stk.placed_ts = _t.monotonic() - 60
+    before = ob.position_qty(SAMSUNG, Instrument.KR_STOCK, Account.KR_STOCK)
+    await system.refresh_snapshot(scope=system._RECONNECT_SCOPE["HL"])  # HL만
+    assert ob.order("S1") is not None                                    # LS 주문 보존
+    assert ob.position_qty(SAMSUNG, Instrument.KR_STOCK, Account.KR_STOCK) == before
+    await system.refresh_snapshot(scope=system._RECONNECT_SCOPE["주식"])  # 주식 재연결
+    assert ob.order("S1") is None                                        # 주식은 실제 조회 → 정리
+
+
 def test_fx_spot_backup_due_only_when_never_or_long_silent() -> None:
     # 하나고시 대체는 CUR을 한 번도 못 받았거나 10분 넘게 조용할 때만 — 개장 전후 1~2분 간격
     # 체결에 60초 기준이 계속 걸려 출처가 널뛰던 것을 고침(2026-09-04 실측).
@@ -298,16 +339,16 @@ async def test_ws_reconnect_triggers_resync() -> None:
     # Phase 8-4b — 재연결 훅이 OrderBook 재스냅샷(refresh_snapshot)을 백그라운드로 부른다.
     system, _, _ = _system([], deriv_frames=[])
     system._wire()  # on_reconnect 콜백 등록
-    calls: list[int] = []
+    calls: list[object] = []
 
-    async def spy() -> None:
-        calls.append(1)
+    async def spy(scope: object = None) -> None:
+        calls.append(scope)
 
     system.refresh_snapshot = spy  # type: ignore[method-assign]
     system._stock_ws.on_reconnect[0]()  # 재연결 발화(동기) → 백그라운드 재동기 태스크
     for task in list(system._bg):
         await task
-    assert calls == [1]
+    assert calls == [{Account.KR_STOCK}]  # 끊긴 시장(주식 계좌)만 재동기(2026-09-09)
 
 
 async def test_start_loads_snapshot_then_streams() -> None:

@@ -91,7 +91,7 @@ def test_plan_order_auto_m_legs() -> None:
 
 
 def test_plan_order_ls_unchecked_hl_only() -> None:
-    # 세트별 LS주문 체크 해제 → 그 세트만 HL 다리 (§6.2-2, 사용자 확정: 세트 단위)
+    # 세트별 LS주문 체크 해제 → 그 세트만 HL 주문 (§6.2-2, 사용자 확정: 세트 단위)
     screen = _screen()
     screen.entry_sets[0].ls_order = False
     plan, errors = plan_order(screen, Block.ENTRY, 0, position_qty=0, now=NOON)

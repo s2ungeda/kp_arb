@@ -142,7 +142,7 @@ class RehearsalEngine:
 
     @staticmethod
     def _kr_qty(screen: ScreenState, legs: tuple[Leg, ...]) -> int:
-        """계획의 국내 수량 — LS 다리가 있으면 그 수량, HL만이면 역환산."""
+        """계획의 국내 수량 — LS 주문이 있으면 그 수량, HL만이면 역환산."""
         for leg in legs:
             if leg.venue is Venue.LS:
                 return leg.qty

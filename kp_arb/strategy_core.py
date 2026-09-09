@@ -102,8 +102,8 @@ class SpreadSet:
 class ScreenSettings:
     """설정창 값 (§6.2-4·6)."""
 
-    kr_margin_ticks: int = 10        # taker 주문가 여유 — 국내 다리(틱)
-    hl_margin_pct: float = 0.01      # taker 주문가 여유 — HL 다리(1% = 0.01)
+    kr_margin_ticks: int = 10        # taker 주문가 여유 — 국내 주문(틱)
+    hl_margin_pct: float = 0.01      # taker 주문가 여유 — HL 주문(1% = 0.01)
     delay_ms: int = 500              # 자동M: 체결/거부/취소 후 재주문 딜레이
     pre_order_range_ticks: int = 0   # 자동M: 선주문진입범위(틱, 0=제한 없음)
     max_position: int = 0            # 종목보유최대수량 — 한 방향 최대(국내 단위)
@@ -237,7 +237,7 @@ def allowed_order_qty(
 
 @dataclass(frozen=True)
 class Leg:
-    """주문 계획의 한 다리."""
+    """주문 계획 안의 거래소별 주문 하나(LS 또는 HL)."""
 
     venue: Venue
     side: Side
@@ -246,7 +246,7 @@ class Leg:
 
 @dataclass(frozen=True)
 class OrderPlan:
-    """검증 통과한 주문 계획 (LS 다리는 LS주문 체크 시에만)."""
+    """검증 통과한 주문 계획 (LS 주문은 LS주문 체크 시에만)."""
 
     block: Block
     legs: tuple[Leg, ...]
@@ -261,7 +261,7 @@ def plan_order(
 ) -> tuple[OrderPlan | None, list[str]]:
     """세트 1회 주문 계획 — 운영시간·한도·목표 잔여까지 검증 (§6.2).
 
-    LS 다리는 블록의 LS주문 체크 시에만 포함(해제 = HL 주문만). HL 다리는 항상.
+    LS 주문은 블록의 LS주문 체크 시에만 포함(해제 = HL 주문만). HL 주문은 항상.
     """
     errors = validate_run(screen, block, index)
     if not in_screen_operating_window(screen, now):

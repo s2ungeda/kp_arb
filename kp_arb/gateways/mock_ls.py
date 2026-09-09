@@ -48,8 +48,11 @@ class MockLSGateway(LSGateway):
         self.fx_placed.append((code, side, qty, price))
         return f"FX-{next(self._ids)}"
 
-    async def cancel_order(self, order_id: str) -> None:
+    async def cancel_order(self, order_id: str, qty: float | None = None) -> None:
         return None
+
+    def open_orders_supported(self, account: Account) -> bool:
+        return account is Account.KR_STOCK  # mock은 선물 미체결 없음(라이브는 t0434 성공 뒤 참)
 
     async def get_positions(self, account: Account) -> Sequence[Position]:
         return list(self._positions[account])

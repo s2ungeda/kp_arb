@@ -1,7 +1,7 @@
 """자동M 코어 결선 — 순수 상태변화(auto_m)를 실시세·발주·체결통보에 붙인다 (②단계).
 
 - 100ms마다 **종목별로**(삼성·하이닉스… 각각 독립, 사용자 확정 2026-09-08) 정방향 3세트의
-  진입·청산 다리를 판정(``evaluate``)하고, 나온 Action을 실제 주문(LiveSystem.place/cancel)으로
+  진입·청산을 각각 판정(``evaluate``)하고, 나온 Action을 실제 주문(LiveSystem.place/cancel)으로
   옮긴다. 선주문 = 국내 SF 지정가(maker, source "자동M"), 후주문 = HL 지정가(Gtc, 상대 1호가
   ± HP 여유, 체결 계약 × 10 — IOC·FOK 안 씀).
 - 체결·취소·거부는 OrderBook 통보(on_fill_applied·on_change)로 받아 ``on_*``에 넣는다.
@@ -160,7 +160,7 @@ class AutoMEngine:
             await asyncio.sleep(TICK_S)
 
     def tick(self, now: datetime, mono: float) -> None:
-        """전 종목·세트·다리 1회 판정(now/mono 주입 — 테스트 가능)."""
+        """전 종목·세트·진입/청산 1회 판정(now/mono 주입 — 테스트 가능)."""
         self._mono = mono
         halted = self._system.futures_halted()
         if halted:
@@ -182,7 +182,7 @@ class AutoMEngine:
 
     def build_signals(self, u: Underlying, book: AutoMBook, s: AutoMSet, block: Block,
                       now: datetime, mono: float, halted: bool) -> Signals:
-        """세트·다리 하나의 판정 입력 — 수량은 이번에 낼 계약수(없으면 걸어둔 수량)."""
+        """세트의 진입(또는 청산) 하나의 판정 입력 — 수량은 이번에 낼 계약수(없으면 걸어둔 수량)."""
         inst = self._counterpart(book)
         qty = order_qty(block, s.per_qty, s.target_qty, s.rt) or s.leg(block).pre_qty or 1
         sf_entry, sf_exit = self._system.pair_signal(u, inst, qty, qty)
@@ -231,6 +231,10 @@ class AutoMEngine:
             elif act.kind == "notify":
                 self._log.warning("[자동M] %s %s — %s",
                                   u.value, self._tag(u, index, block), act.reason)
+            elif act.kind == "alarm":  # 중지는 아니지만 사람이 봐야 함(취소실패, exec ㅂ3)
+                self._log.error("[자동M] %s %s — %s",
+                                u.value, self._tag(u, index, block), act.reason)
+                self._system.error_seq += 1
 
     def _spawn(self, coro: Any) -> None:
         task = asyncio.ensure_future(coro)
@@ -253,7 +257,11 @@ class AutoMEngine:
                 s, block, time.monotonic(), self.screen.settings))
             return
         self._register(oid, _OrderRef(u, index, block, "pre"))
-        on_pre_ack(s, block, oid)
+        late = on_pre_ack(s, block, oid, mono=self._mono)  # 발주 중 꺼졌/중지됐으면 취소 행동
+        if late:
+            self._log.warning("[자동M] %s 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → 즉시 취소",
+                              u.value, self._tag(u, index, block), oid)
+            self._apply(u, index, block, late)
         self._log.info("[자동M] %s 선주문 %s %s %d @ %g → #%s",
                        u.value, self._tag(u, index, block), act.side.value, act.qty, act.price,
                        oid)
@@ -341,12 +349,18 @@ class AutoMEngine:
             self._apply(u, ref.index, ref.block, on_post_fill(
                 s, ref.block, qty, price, fx, mono, self.screen.settings))
             acc = leg.acc
+            # Sprd 계산에 쓰는 시점 값도 남긴다(사용자 2026-09-09): 환진입가 = 이 체결 시점
+            # 원달러선물 호가(fx), S현재가·SF이론가 = 지금 시세. 누적은 전량 체결 확인된 판까지.
+            stock = self._system.stock_last(u)
+            theory = self._system.stock_futures_theory(u, self._counterpart(self._book(u)))
+            sprd = acc.sprd(stock, theory)
             self.ulog(u).info(
-                "체결 %s 후주문 #%s HL %g @ %g 환 %g → RT %d 체결차 %g HL대기 %g | "
-                "누적 HL %g SF %d 환평균 %s HL평균 %s SF평균 %s",
+                "체결 %s 후주문 #%s HL %g @ %g 환진입가 %g S현재가 %s SF이론가 %s → RT %d "
+                "체결차 %g HL대기 %g | 누적 HL %g SF %g 환평균 %s HL평균 %s SF평균 %s Sprd %s",
                 self._tag(u, ref.index, ref.block), order.order_id, qty, price, fx,
-                s.rt, s.fill_diff, leg.post_pending, acc.hl_qty, acc.sf_qty,
-                acc.fx_avg(), acc.hl_avg(), acc.sf_avg())
+                stock, f"{theory:,.0f}" if theory else None, s.rt, s.fill_diff,
+                leg.post_pending, acc.hl_qty, acc.sf_qty, acc.fx_avg(), acc.hl_avg(),
+                acc.sf_avg(), f"{sprd * 100:.3f}%" if sprd is not None else "-(판 미완)")
         self._trace(u, ref.index, ref.block, leg)
         self._persist()  # RT·체결차·순잔고 바뀜 → core_state.json
 
@@ -364,6 +378,10 @@ class AutoMEngine:
         for oid, ref in list(self._orders.items()):
             order = self._system.order_book.order(oid)
             if order is None:
+                # 장부에서 사라진 추적 주문(재동기 유령 정리 등) — 그대로 두면 "걸려 있다"고
+                # 믿고 없는 주문 취소를 되풀이한다(실측 2026-09-09 #20851). 선주문은 취소된 것으로
+                # 정리해 다음 판으로, 후주문은 밖에서 끝난 것으로 보고 체결차 → 중지(사람 확인).
+                self._recover_vanished(oid, ref)
                 continue
             status = order.status.value
             if self._seen_status.get(oid) == status:
@@ -399,6 +417,29 @@ class AutoMEngine:
             self._trace(u, ref.index, ref.block, s.leg(ref.block))
             self._persist()  # 취소·거부로 바뀐 상태(체결차·중지) 저장
 
+    def _recover_vanished(self, oid: str, ref: _OrderRef) -> None:
+        """장부에서 사라진 추적 주문 정리(실측 2026-09-09 — 재동기가 선물 선주문 #20851을 유령으로
+        지워 체결 통보가 미아가 되고 자동M은 'unknown order' 취소를 되풀이). 선주문은 취소 확인과
+        같게 다음 판으로, 후주문은 밖에서 끝난 것으로 보고 미체결분 체결차 → 중지(사람이 확인)."""
+        u = ref.underlying
+        s = self._book(u).sets[ref.index]
+        leg = s.leg(ref.block)
+        tag = self._tag(u, ref.index, ref.block)
+        kind = "선" if ref.leg == "pre" else "후"
+        self._log.warning("[자동M] %s %s %s주문 #%s 장부에서 사라짐(재동기 등) — 정리",
+                          u.value, tag, kind, oid)
+        self.ulog(u).warning("통보 %s %s주문 #%s 장부에서 사라짐 — %s", tag, kind, oid,
+                             "취소로 정리" if ref.leg == "pre" else "미체결분 체결차 → 중지")
+        if ref.leg == "pre":
+            if leg.pre_order_id == oid:
+                on_pre_cancelled(s, ref.block, time.monotonic(), self.screen.settings)
+        elif leg.post_pending > 1e-9:
+            self._apply(u, ref.index, ref.block,
+                        on_post_partial_reject(s, ref.block, leg.post_pending))
+        self._forget(oid)
+        self._trace(u, ref.index, ref.block, s.leg(ref.block))
+        self._persist()
+
     def _forget(self, oid: str) -> None:
         self._orders.pop(oid, None)
         self._seen_status.pop(oid, None)
@@ -410,7 +451,7 @@ class AutoMEngine:
             "명령 %s 실행 %s | 목표 %d 1회 %d 전환 %ds 진입SF %s 진입S %s 청산 %s RT %d",
             self._tag(u, index, block), "켬" if value else "끔", s.target_qty,
             s.per_qty, s.switch_delay_s, s.en_sf, s.en_s, s.ex_sf, s.rt)
-        self._apply(u, index, block, set_running(s, block, value))
+        self._apply(u, index, block, set_running(s, block, value, mono=self._mono))
         self._trace(u, index, block, s.leg(block))
 
     def release(self, u: Underlying, index: int, block: Block) -> None:
@@ -467,6 +508,8 @@ class AutoMEngine:
                     "halt_reason": leg.halt_reason, "pre_order_id": leg.pre_order_id,
                     "pre_price": leg.pre_price, "pre_qty": leg.pre_qty,
                     "pre_filled": leg.pre_filled, "post_pending": leg.post_pending,
+                    # 취소 재전송 한도 초과 → 상태줄 "취소실패 #번호 n회"(exec ㅂ3)
+                    "cancel_failed": leg.cancel_alarmed, "cancel_tries": leg.cancel_tries,
                     "hl_qty": leg.acc.hl_qty, "sf_qty": leg.acc.sf_qty,
                     # 매매결과 표시는 짝이 맞은(적은 쪽) 체결량 기준(사용자 확정 2026-09-08)
                     "matched_hl": leg.acc.matched_hl(), "matched_sf": leg.acc.matched_sf(),

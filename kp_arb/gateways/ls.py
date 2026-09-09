@@ -82,6 +82,7 @@ class LSApiGateway(LSGateway):
     STOCK_OPEN_ORDERS_TR = "CSPAQ13700" # 주식 체결/미체결 (InBlock1 래핑, 실측 v6.5)
     DERIV_DEPOSIT_TR = "CFOBQ10500"     # 선물옵션 예탁금·증거금 (get_balance)
     DERIV_POSITIONS_TR = "t0441"        # 선물옵션 잔고평가 (운영 실측 — CFOAQ50600은 거부)
+    DERIV_OPEN_ORDERS_TR = "t0434"      # 선물옵션 체결/미체결 (문서 확인·실측 대기 2026-09-09)
     STOCK_ACC_PATH = "/stock/accno"
     DERIV_ACC_PATH = "/futureoption/accno"
     FUTURES_MASTER_TR = "t8401"         # 주식선물 마스터 (종목코드 조회, 실측 v6.7)
@@ -111,6 +112,9 @@ class LSApiGateway(LSGateway):
         self._etf_symbols: dict[Underlying, str] = dict(etf_symbols or {})
         self._etf_underlying = {v: k for k, v in self._etf_symbols.items()}
         self._orders: dict[str, OrderContext] = {}
+        # 선물 미체결 조회(t0434)가 실제로 성공한 적이 있는가 — 성공 전엔 재동기 유령 정리 대상에서
+        # 제외(빈 결과를 "조회 성공"으로 봐 걸린 선주문을 지운 사고, 실측 2026-09-09 #20851).
+        self._deriv_open_orders_ok = False
         self.connected = False
 
     @classmethod
@@ -233,14 +237,21 @@ class LSApiGateway(LSGateway):
         order_log.order_amended(Venue.LS, order_id, new_id, qty, price)
         return new_id
 
-    async def cancel_order(self, order_id: str) -> None:
+    def open_orders_supported(self, account: Account) -> bool:
+        """주식 계좌는 항상 실제 조회(CSPAQ13700). 선물 계좌는 t0434가 **실제로 성공한 뒤**에만
+        참 — 모의 미제공(01900)·형식 거부면 빈 결과라 유령 정리에 쓰면 안 된다."""
+        if account is Account.KR_STOCK:
+            return True
+        return account is Account.KR_DERIV and self._deriv_open_orders_ok
+
+    async def cancel_order(self, order_id: str, qty: float | None = None) -> None:
         ctx = self._require(order_id)
         if ctx.intent.instrument in self._SPOT:
             tr_cd, path = self.SPOT_CANCEL_TR, self.SPOT_PATH
-            body = self._cancel_body(ctx)
+            body = self._cancel_body(ctx, qty)
         else:
             tr_cd, path = self.FUTURE_CANCEL_TR, self.FUTURE_PATH
-            body = self._future_cancel_body(ctx)
+            body = self._future_cancel_body(ctx, qty)
         resp = await self._rest_for(ctx.account).request(tr_cd, body, path=path)
         self._check_ok(resp, tr_cd)
         order_log.order_canceled(Venue.LS, order_id)
@@ -282,9 +293,11 @@ class LSApiGateway(LSGateway):
         return self._amount(resp, self.DERIV_DEPOSIT_TR, "MnyOrdAbleAmt")
 
     async def get_open_orders(self, account: Account) -> Sequence[TrackedOrder]:
-        """미체결 주문 스냅샷(주식 CSPAQ13700). 선물 미체결 TR은 미확인 → 빈 결과."""
+        """미체결 주문 스냅샷 — 주식 CSPAQ13700 / 선물 t0434(취급 종목코드마다 1회)."""
+        if account is Account.KR_DERIV:
+            return await self._deriv_open_orders()
         if account is not Account.KR_STOCK:
-            return []  # 선물 미체결 조회 TR 확인 후 구현
+            return []
         body = {
             f"{self.STOCK_OPEN_ORDERS_TR}InBlock1": {
                 **self._order_account_fields(account),  # 실측: 13700도 InptPwd 스타일
@@ -303,10 +316,23 @@ class LSApiGateway(LSGateway):
         )
         rows = self._rows(resp, self.STOCK_OPEN_ORDERS_TR)
         return [
-            o for row in rows
+            self._adopt(o) for row in rows
             if float(row.get("MrcAbleQty", 0)) > 0
             and (o := self._open_order(row)) is not None
         ]
+
+    def _adopt(self, order: TrackedOrder) -> TrackedOrder:
+        """스냅샷으로 알게 된 미체결 주문의 취소·정정 문맥을 만들어 둔다(2026-09-09).
+
+        주문 문맥(_orders)은 메모리라 코어 재시동 전에 낸 주문은 "unknown order"로 취소가 안 됐다.
+        취소·정정 본문에 필요한 것은 계좌·종목(의도)·주문번호뿐이라 스냅샷 행으로 충분하다.
+        이미 아는 주문(이 프로세스가 낸 것)은 원래 문맥을 유지한다.
+        """
+        if order.order_id not in self._orders:
+            account = order.intent.account or account_for(order.intent.instrument)
+            self._orders[order.order_id] = OrderContext(
+                order.order_id, order.intent, account, request_body={})
+        return order
 
     def _open_order(self, row: dict[str, Any]) -> TrackedOrder | None:
         # 실측 행: IsuNo "A005930", BnsTpCode 1매도/2매수, OrdPrc 문자열, ExecQty 체결누계.
@@ -333,6 +359,75 @@ class LSApiGateway(LSGateway):
             status=OrderStatus.PARTIAL if exec_qty > 0 else OrderStatus.ACCEPTED,
             filled_qty=exec_qty,
             avg_fill_price=float(row.get("ExecPrc", 0) or 0),
+        )
+
+    async def _deriv_open_orders(self) -> list[TrackedOrder]:
+        """선물 미체결(t0434, 공식 문서 확인 2026-09-09) — 취급 중인 선물 코드(근·차근)마다
+        미체결(chegb "2")을 받고, 안전하게 잔량(ordrem) > 0만 남긴다.
+        요청 InBlock: expcode(8)·chegb(0전체/1체결/2미체결)·sortgb(1역순/2순)·cts_ordno(처음 Space).
+        응답 OutBlock1: ordno·orgordno·medosu·ordgb·qty·price(9.2)·cheqty·cheprice·ordrem·status·
+        ordtime·expcode·hogatype. 연속조회는 응답 헤더 tr_cont_key가 필요한데 RestResponse가 헤더를
+        안 담아 첫 페이지만(초과 시 경고 로그). 모의 미제공(01900)이면 빈 결과이고
+        open_orders_supported도 거짓으로 남는다(유령 정리 제외). price 단위는 실측으로 확인."""
+        fields = self._account_fields(Account.KR_DERIV)
+        out: list[TrackedOrder] = []
+        seen: set[str] = set()
+        codes = list(dict.fromkeys(self._futures_codes.values()))  # 중복 제거·순서 유지
+        for code in codes:
+            body = {f"{self.DERIV_OPEN_ORDERS_TR}InBlock": {
+                "accno": fields.get("AcntNo", ""), "passwd": fields.get("Pwd", ""),
+                "expcode": code, "chegb": "2", "sortgb": "2", "cts_ordno": " ",
+            }}
+            resp = await self._request_paced(
+                Account.KR_DERIV, self.DERIV_OPEN_ORDERS_TR, body, self.DERIV_ACC_PATH)
+            if str(resp.body.get("rsp_cd", "")) in _PAPER_UNSUPPORTED_RSP_CDS:
+                self._deriv_open_orders_ok = False
+                return []  # 모의 미제공 → 빈 결과, 유령 정리 제외
+            self._check_ok(resp, self.DERIV_OPEN_ORDERS_TR)
+            raw_rows = resp.body.get(f"{self.DERIV_OPEN_ORDERS_TR}OutBlock1")
+            rows = list(raw_rows) if isinstance(raw_rows, list) else []
+            for row in rows:
+                if float(row.get("ordrem") or 0) <= 0:
+                    continue  # 전량 체결·취소 완료 행
+                o = self._deriv_open_order(row)
+                if o is not None and o.order_id not in seen:
+                    seen.add(o.order_id)
+                    out.append(self._adopt(o))
+            tail = resp.body.get(f"{self.DERIV_OPEN_ORDERS_TR}OutBlock") or {}
+            if str(tail.get("cts_ordno") or "").strip():
+                # 연속 조회 키가 왔다 — 미체결이 한 페이지를 넘는 경우(자동M은 세트당 1건이라 드묾).
+                order_log.logger_for(Venue.LS).warning(
+                    "t0434 %s 미체결이 한 페이지를 넘음(cts_ordno=%s) — 다음 페이지는 미조회",
+                    code, tail.get("cts_ordno"))
+        self._deriv_open_orders_ok = True
+        return out
+
+    def _deriv_open_order(self, row: dict[str, Any]) -> TrackedOrder | None:
+        # t0434 행(공식 문서): ordno(Number 7)·qty·cheqty·ordrem(미체결잔량)·price(Number 9.2)·
+        # medosu(구분 "매수"/"매도")·ordgb(유형 "지정가")·status·expcode. 예시의 price는 문자열.
+        key = self._futures_key.get(str(row.get("expcode", "")))
+        if key is None:
+            return None  # 취급 외 종목(원달러선물 등) — 추적 대상 아님
+        underlying, instrument = key
+        try:
+            order_id = str(int(str(row["ordno"]).strip()))  # WS 통보와 같게 zero-pad 제거
+        except (KeyError, ValueError):
+            return None
+        price = float(row.get("price") or 0)
+        intent = OrderIntent(
+            venue=Venue.LS, underlying=underlying, instrument=instrument,
+            side=Side.BUY if "매수" in str(row.get("medosu", "")) else Side.SELL,
+            qty=float(row.get("qty") or 0),
+            order_type=OrderType.LIMIT if "지정" in str(row.get("ordgb", "지정가"))
+            else OrderType.MARKET,
+            price=price if price > 0 else None,
+            account=Account.KR_DERIV,
+        )
+        exec_qty = float(row.get("cheqty") or 0)
+        return TrackedOrder(
+            order_id=order_id, intent=intent,
+            status=OrderStatus.PARTIAL if exec_qty > 0 else OrderStatus.ACCEPTED,
+            filled_qty=exec_qty, avg_fill_price=float(row.get("cheprice") or 0),
         )
 
     STOCK_PRICE_TR = "t1102"    # 주식/ETF 현재가 (실측: OutBlock.price)
@@ -624,13 +719,16 @@ class LSApiGateway(LSGateway):
             }
         }
 
-    def _future_cancel_body(self, ctx: OrderContext) -> dict[str, Any]:
+    def _future_cancel_body(self, ctx: OrderContext,
+                            qty: float | None = None) -> dict[str, Any]:
+        # 취소수량 = 장부의 남은 수량. 원주문 수량으로 보내면 부분체결 뒤 LS가 01443("취소수량이
+        # 취소가능수량을 초과")으로 거부한다(실측 2026-09-09 #21579).
         return {
             f"{self.FUTURE_CANCEL_TR}InBlock1": {
                 **self._order_account_fields(ctx.account),
                 "FnoIsuNo": self._futures_symbol(ctx.intent),
                 "OrgOrdNo": int(ctx.order_id),  # 원주문 보존
-                "CancQty": int(ctx.intent.qty),
+                "CancQty": int(qty if qty is not None else ctx.intent.qty),
             }
         }
 
@@ -659,13 +757,14 @@ class LSApiGateway(LSGateway):
             }
         }
 
-    def _cancel_body(self, ctx: OrderContext) -> dict[str, Any]:
+    def _cancel_body(self, ctx: OrderContext, qty: float | None = None) -> dict[str, Any]:
+        # 취소수량 = 장부의 남은 수량(호출자 전달). 없으면 원주문 수량(옛 동작).
         return {
             f"{self.SPOT_CANCEL_TR}InBlock1": {
                 **self._order_account_fields(ctx.account),
                 "OrgOrdNo": int(ctx.order_id),  # 원주문 보존
                 "IsuNo": self._spot_isu(ctx.intent),
-                "OrdQty": int(ctx.intent.qty),
+                "OrdQty": int(qty if qty is not None else ctx.intent.qty),
             }
         }
 

@@ -100,18 +100,27 @@ class OrderBook:
         balances: dict[Account, float] | None = None,
         open_orders: Iterable[TrackedOrder] = (),
         reconcile_accounts: Collection[Account | None] | None = None,
+        scope: Collection[Account | None] | None = None,
     ) -> None:
         """REST 스냅샷으로 상태 초기화. 이후 갱신은 이벤트로만.
 
         reconcile_accounts: phantom 정리를 적용할 계좌 목록(조회에 성공한 계좌만).
         None이면 전 계좌 정리(기존 동작). 지정하면 **그 계좌의 주문만** 정리 대상 —
         조회 실패한 계좌의 살아있는 미체결이 빈 스냅샷 때문에 지워지는 것을 막는다.
+        scope: 이번 스냅샷이 다루는 계좌(HL은 None). 지정하면 **그 계좌의 포지션·잔고만** 갈아
+        끼우고 나머지는 그대로 둔다 — 한 시장(HL)의 재연결이 다른 시장(LS) 장부를 건드리지 않게
+        (실측 2026-09-09: HL 재연결 때 LS까지 전체 재동기 → 선물 선주문이 유령으로 지워짐).
         """
-        self._positions.clear()
+        if scope is None:
+            self._positions.clear()
+            self._balances = dict(balances or {})
+        else:
+            for key in [k for k in self._positions if k[2] in scope]:
+                del self._positions[key]
+            self._balances.update(balances or {})
         for p in positions:
             key = (p.underlying, p.instrument, p.account)
             self._positions[key] = _Pos(qty=p.signed_qty, avg_price=p.avg_price)
-        self._balances = dict(balances or {})
         # 미체결 재조정: 스냅샷(거래소 실측)에 있으면 갱신, 없으면 **오래된 것만** 제거 —
         # HL 취소/체결 통보 누락으로 남은 phantom 정리. 방금 낸 주문(유예 내)은 보존.
         snapshot = {o.order_id: o for o in open_orders}

@@ -53,7 +53,7 @@ def test_halt_turns_running_off_and_release_allows_rerun() -> None:
 
 def test_halt_is_set_wide_and_cancels_other_leg_resting_order() -> None:
     # 실측 2026-09-07: 청산 체결차로 청산만 검정, 진입은 빨강(감시 계속) → 세트 단위여야 함
-    # (결정 로그 7·9 "헤지 깨진 세트는 멈춤"). 다른 다리의 걸린 선주문은 취소, 해제도 세트 단위.
+    # (결정 로그 7·9 "헤지 깨진 세트는 멈춤"). 다른 쪽(진입)에 걸린 선주문은 취소, 해제도 세트 단위.
     from kp_arb.auto_m import LegStatus, on_post_reject, release_halt
 
     s = _set()
@@ -70,7 +70,7 @@ def test_halt_is_set_wide_and_cancels_other_leg_resting_order() -> None:
     assert s.exit.status is LegStatus.HALTED and not s.exit.running
     assert s.entry.status is LegStatus.HALTED and not s.entry.running
     assert "청산 체결차로 세트 중지" in s.entry.halt_reason
-    release_halt(s, Block.ENTRY)                   # 어느 다리에서 풀든 세트 전체
+    release_halt(s, Block.ENTRY)                   # 진입·청산 어느 쪽에서 풀든 세트 전체
     assert s.entry.status is LegStatus.IDLE and s.exit.status is LegStatus.IDLE
 
 
@@ -125,3 +125,22 @@ def test_trade_result_commits_only_after_full_post_fill() -> None:
     on_post_reject(s, Block.ENTRY, "HL order not accepted")
     assert abs(s.entry.acc.hl_qty - 10.588) < 1e-9 and abs(s.entry.acc.sf_qty - 1.0588) < 1e-9
     assert s.entry.pending.hl_qty == 0 and s.entry.pending.sf_qty == 0
+
+
+def test_stop_before_ack_cancels_when_ack_arrives() -> None:
+    # 실측 2026-09-09: 발주 요청과 접수 응답 사이(0.9초)에 실행 끔 → 번호가 없어 취소 못 함 →
+    # 응답으로 온 #13865가 꺼진 진입에 기록만 되고 LS에 남음. 접수 때 실행이 꺼져 있으면 즉시 취소.
+    from kp_arb.auto_m import LegStatus
+
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    s.entry.status, s.entry.pre_qty = LegStatus.PRE_RESTING, 1  # 발주 요청 나감(번호 아직 없음)
+    assert set_running(s, Block.ENTRY, False) == []              # 취소할 번호 없음 → idle
+    assert s.entry.status is LegStatus.IDLE
+    acts = on_pre_ack(s, Block.ENTRY, "13865")                    # 뒤늦게 접수 응답
+    assert [a.kind for a in acts] == ["cancel_pre"] and acts[0].order_id == "13865"
+    # 정상 경로(실행 중)에서는 접수만 하고 취소 없음
+    s2 = _set()
+    set_running(s2, Block.ENTRY, True)
+    s2.entry.status, s2.entry.pre_qty = LegStatus.PRE_RESTING, 1
+    assert on_pre_ack(s2, Block.ENTRY, "1") == [] and s2.entry.pre_order_id == "1"

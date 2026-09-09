@@ -23,6 +23,8 @@ from .theory import in_time_window
 from .ticks import ceil_to_tick, floor_to_tick, tick_for
 
 HL_PER_SF = 10  # SF 1계약 = HL 10계약 (§1)
+CANCEL_CONFIRM_S = 3.0   # 취소 보낸 뒤 확인(취소·체결·거부) 기다리는 시간 — 지나면 재전송(exec ㅂ3)
+CANCEL_ALARM_TRIES = 3   # 취소 전송이 이 횟수를 넘으면 에러 알람 + "취소실패" 표시(exec ㅂ3)
 
 Levels = Sequence[tuple[float, float]]  # 호가창 [(가격, 잔량), …] 1호가부터
 
@@ -101,7 +103,10 @@ class Signals:
 
 @dataclass(frozen=True)
 class Action:
-    """코어가 실행할 일. kind: place_pre | cancel_pre | place_post | halt | notify."""
+    """코어가 실행할 일. kind: place_pre | cancel_pre | place_post | halt | notify | alarm.
+
+    alarm = 중지는 아니지만 사람이 봐야 하는 일(취소실패 등) — 에러 알람 소리만, 상태는 그대로.
+    """
 
     kind: str
     side: Side | None = None
@@ -192,6 +197,9 @@ class Leg:
     delay_until: float | None = None
     replace_pending: bool = False   # 역산가 바뀜 → 취소 보냄, 취소 확인 대기
     cancel_sent: bool = False       # 관문(G2·G5·G6) 취소를 이미 보냄 — 확인 올 때까지 재전송 안 함
+    cancel_sent_mono: float | None = None  # 마지막 취소 전송 시각 — 3초 확인 없으면 재전송(ㅂ3)
+    cancel_tries: int = 0           # 이번 선주문에 취소를 보낸 횟수(재전송 포함)
+    cancel_alarmed: bool = False    # 취소 재전송 한도 초과 알람을 이미 냈음 → 상태줄 "취소실패"
     await_post_then_delay: bool = False  # 취소 확인됨, 병행 후주문 체결 확인 뒤 딜레이
     halt_reason: str = ""
     # 마지막 판정 결과 한 줄(어느 게이트에서 막혔나·통과했나 + 숫자) — 로그는 바뀔 때만 남긴다
@@ -211,6 +219,9 @@ class Leg:
         self.pre_order_id = self.pre_price = None
         self.pre_qty = self.pre_filled = 0
         self.cancel_sent = False
+        self.cancel_sent_mono = None
+        self.cancel_tries = 0
+        self.cancel_alarmed = False
 
 
 @dataclass
@@ -291,7 +302,7 @@ def fill_diff(sf_net_contracts: int, hl_net_contracts: float) -> float:
 
 # ---------------------------------------------------------------- 상태변화 ---
 
-def _cancel_if_resting(leg: Leg, force: bool = False) -> list[Action]:
+def _cancel_if_resting(leg: Leg, force: bool = False, mono: float | None = None) -> list[Action]:
     """걸어둔 선주문이 있으면 취소 요청(취소 확인은 on_pre_cancelled).
 
     전부 체결된 선주문(pre_filled ≥ pre_qty)은 취소할 잔량이 없다 — 보내면 LS가 거부한다
@@ -299,17 +310,36 @@ def _cancel_if_resting(leg: Leg, force: bool = False) -> list[Action]:
     force=True(실행 끔·정지·종료): 재발주 취소 대기(replace_pending)·이미 보냄(cancel_sent)
     표시와 무관하게 다시 보낸다 — 앞 취소가 LS 한도에 걸려 실패했을 수 있다(실측 2026-09-08:
     종료 때 취소를 건너뛰어 선주문이 LS에 남음).
+    확인 타임아웃(exec ㅂ3, 2026-09-09): 보낸 지 CANCEL_CONFIRM_S가 지나도 확인이 없으면 "보냄"
+    표시를 풀고 다시 보낸다 — 표시가 영원히 남아 주문이 LS에 걸린 채 방치되는 것을 막는다.
+    재전송이 CANCEL_ALARM_TRIES를 넘으면 한 번 alarm(에러 소리 + 상태줄 "취소실패")을 낸다.
     """
     if force:
         leg.replace_pending = False
     resting = leg.pre_order_id is not None and not leg.replace_pending
-    if resting and (force or not leg.cancel_sent) and (leg.pre_qty <= 0
-                                                      or leg.pre_filled < leg.pre_qty):
-        # 한 번만 보낸다 — 관문에 막힌 채 매 틱 재전송하면 취소 확인이 오기 전 같은 요청이 여러 번
-        # 나간다(실측 2026-09-08: 0.2초에 3번). 확인(취소/거부/체결)이 오면 _clear_pre가 되돌린다.
-        leg.cancel_sent = True
-        return [Action("cancel_pre", order_id=leg.pre_order_id)]
-    return []
+    if not resting or (leg.pre_qty > 0 and leg.pre_filled >= leg.pre_qty):
+        return []
+    if leg.cancel_sent and leg.cancel_sent_mono is None and mono is not None:
+        leg.cancel_sent_mono = mono  # 시각 없이 보낸 취소(접수 때 등)는 지금부터 확인을 기다린다
+    timed_out = (leg.cancel_sent and mono is not None and leg.cancel_sent_mono is not None
+                 and mono - leg.cancel_sent_mono >= CANCEL_CONFIRM_S)
+    if not (force or not leg.cancel_sent or timed_out):
+        return []
+    # 한 번만 보낸다 — 관문에 막힌 채 매 틱 재전송하면 취소 확인이 오기 전 같은 요청이 여러 번
+    # 나간다(실측 2026-09-08: 0.2초에 3번). 확인(취소/거부/체결)이 오면 _clear_pre가 되돌린다.
+    leg.cancel_sent = True
+    leg.cancel_sent_mono = mono
+    leg.cancel_tries += 1
+    reason = ""
+    if timed_out:
+        reason = f"취소 확인 없음 {CANCEL_CONFIRM_S:g}초 → 재전송 {leg.cancel_tries}회"
+    acts = [Action("cancel_pre", order_id=leg.pre_order_id, reason=reason)]
+    if leg.cancel_tries > CANCEL_ALARM_TRIES and not leg.cancel_alarmed:
+        leg.cancel_alarmed = True
+        acts.append(Action("alarm", order_id=leg.pre_order_id,
+                           reason=f"선주문 #{leg.pre_order_id} 취소 {leg.cancel_tries}회째 실패 — "
+                                  "수동 취소 확인 필요"))
+    return acts
 
 
 def _passes_signal(s: AutoMSet, leg: Leg, sig: Signals) -> bool:
@@ -346,10 +376,11 @@ def evaluate(
         return f"{v * 100:.3f}%" if v is not None else "-"
 
     if leg.status is LegStatus.HALTED:
-        return hold("중지")
+        # 중지 뒤에도 걸린 선주문의 취소 확인은 지켜본다(안 오면 재전송, exec ㅂ3)
+        return hold("중지", _cancel_if_resting(leg, mono=sig.mono))
     # G1 실행 꺼짐 → 미체결 취소, 대기
     if not leg.running:
-        acts = _cancel_if_resting(leg)
+        acts = _cancel_if_resting(leg, mono=sig.mono)
         if post_done(leg) and leg.pre_order_id is None:
             leg.status = LegStatus.IDLE
         return hold("G1 실행 꺼짐", acts)
@@ -357,7 +388,7 @@ def evaluate(
         leg.status = LegStatus.ARMED
     # 시장 정지(exec §8) — 신규·정정 중단 + 미체결 취소, HL은 손대지 않음
     if sig.market_halted:
-        return hold("시장 정지 — 신규·정정 중단", _cancel_if_resting(leg))
+        return hold("시장 정지 — 신규·정정 중단", _cancel_if_resting(leg, mono=sig.mono))
     if sig.resumed_mono is not None and sig.mono - sig.resumed_mono < settings.resume_delay_s:
         return hold(f"재개 딜레이 {settings.resume_delay_s}초")
     # 사건 대기 중인 상태는 시세로 바꾸지 않는다
@@ -371,7 +402,7 @@ def evaluate(
     # G2 주문가능시간
     if not settings.in_window(sig.now.time()):
         # 근거에 현재 시각을 넣지 않는다 — 매초 "바뀐 근거"가 되어 초당 한 줄씩 쌓임(실측 09-07)
-        return hold("G2 주문가능시간 밖", _cancel_if_resting(leg))
+        return hold("G2 주문가능시간 밖", _cancel_if_resting(leg, mono=sig.mono))
     # G3 전환대기 · G4 여유 계약수 — 새로 내지 않음(걸어둔 것은 유지)
     if _switch_wait(s, leg, sig.mono):
         return hold(f"G3 전환대기 {s.switch_delay_s}초")
@@ -385,7 +416,7 @@ def evaluate(
                    f"(SF {pct(sig.sf_spread_entry)})")
         else:
             why = "G5 청산 기준값 없음"
-        return hold(why, _cancel_if_resting(leg))
+        return hold(why, _cancel_if_resting(leg, mono=sig.mono))
     # G6 역산가 → 허용범위
     thr = s.threshold(block)
     hl_disp = sig.hl_disp_bid if block is Block.ENTRY else sig.hl_disp_ask
@@ -404,7 +435,8 @@ def evaluate(
     limit = limit_price(side, rel, mkt_tick, settings.pre_range)
     if not within_limit(side, price, limit):
         return hold(f"G6 한계 밖 역산가 {price:,.0f} 한계 {limit:,.0f} "
-                    f"(상대호가 {rel:,.0f} 호가단위 {mkt_tick})", _cancel_if_resting(leg))
+                    f"(상대호가 {rel:,.0f} 호가단위 {mkt_tick})",
+                    _cancel_if_resting(leg, mono=sig.mono))
     basis = (f"역산가 {price:,.0f} = 이론가 {sig.sf_theory:,.0f}×(1+{pct(hl_disp)}−{pct(thr)}) "
              f"주문단위 {tick} 한계 {limit:,.0f}(호가단위 {mkt_tick})")
     # 통과 — 없으면 발주, 있고 역산가가 바뀌었으면 재발주 규칙(취소→후주문 확인→딜레이→신규)
@@ -434,9 +466,19 @@ def _start_delay(leg: Leg, mono: float, settings: AutoMSettings) -> None:
     leg.status = LegStatus.SETTLE_DELAY
 
 
-def on_pre_ack(s: AutoMSet, block: Block, order_id: str) -> None:
-    """선주문 접수 — 주문번호 보관(취소·체결 매칭용)."""
-    s.leg(block).pre_order_id = order_id
+def on_pre_ack(s: AutoMSet, block: Block, order_id: str,
+               mono: float | None = None) -> list[Action]:
+    """선주문 접수 — 주문번호 보관(취소·체결 매칭용).
+
+    발주 요청과 접수 응답 사이에 실행이 꺼지거나(끔·정지·종료) 중지되면 취소할 번호가 없어
+    취소가 빠진다(실측 2026-09-09: #13865가 LS에 남음). 접수 때 그 진입/청산이 이미 꺼져
+    있으면 그 자리에서 취소 행동을 돌려준다.
+    """
+    leg = s.leg(block)
+    leg.pre_order_id = order_id
+    if not leg.running or leg.status in (LegStatus.IDLE, LegStatus.HALTED):
+        return _cancel_if_resting(leg, force=True, mono=mono)
+    return []
 
 
 def on_pre_cancel_failed(s: AutoMSet, block: Block) -> None:
@@ -538,8 +580,8 @@ def on_post_fill(
 def _halt_set(s: AutoMSet, block: Block, reason: str) -> list[Action]:
     """세트 중지(exec §2·결정 로그 7·9: 헤지 깨진 **세트**는 멈춤 — 사용자 확인 2026-09-07).
 
-    체결차를 낸 다리뿐 아니라 **다른 다리도** 실행을 끄고 중지로 둔다(청산 체결차인데 진입이 계속
-    새 선주문을 내면 안 됨). 다른 다리에 걸린 선주문은 취소. 해제(release_halt)도 세트 단위.
+    체결차를 낸 쪽뿐 아니라 **진입·청산 모두** 실행을 끄고 중지로 둔다(청산 체결차인데 진입이 계속
+    새 선주문을 내면 안 됨). 다른 쪽에 걸린 선주문은 취소. 해제(release_halt)도 세트 단위.
     """
     leg = s.leg(block)
     leg.status = LegStatus.HALTED
@@ -573,7 +615,8 @@ def halt_if_unhedged(s: AutoMSet, block: Block, diff: float) -> list[Action]:
     return _halt_set(s, block, f"체결차 {diff:g} ≠ 0")
 
 
-def set_running(s: AutoMSet, block: Block, value: bool) -> list[Action]:
+def set_running(s: AutoMSet, block: Block, value: bool,
+                mono: float | None = None) -> list[Action]:
     """실행 켬/끔(exec ㅂ2) — 끄면 미체결 선주문 취소(체결 포지션 유지). 중지 상태는 끄기만 허용."""
     leg = s.leg(block)
     leg.running = value
@@ -581,7 +624,8 @@ def set_running(s: AutoMSet, block: Block, value: bool) -> list[Action]:
         if leg.status is LegStatus.IDLE:
             leg.status = LegStatus.ARMED
         return []
-    acts = _cancel_if_resting(leg, force=True)  # 끔·정지·종료 — 취소 대기 표시와 무관하게 취소
+    # 끔·정지·종료 — 취소 대기 표시와 무관하게 취소(mono는 확인 타임아웃 기준 시각)
+    acts = _cancel_if_resting(leg, force=True, mono=mono)
     if leg.pre_order_id is None and post_done(leg) and leg.status is not LegStatus.HALTED:
         leg.status = LegStatus.IDLE
     return acts
@@ -596,7 +640,7 @@ def on_post_partial_reject(s: AutoMSet, block: Block, unfilled: float) -> list[A
 
 def release_halt(s: AutoMSet, block: Block) -> None:
     """중지 해제 — 사람이 정리한 뒤 직접 푼다(exec §2). **세트 단위**(중지가 세트 단위이므로):
-    어느 다리에서 풀든 두 다리 모두 꺼진 대기(idle)로 돌아간다."""
+    진입·청산 어느 쪽에서 풀든 둘 다 꺼진 대기(idle)로 돌아간다."""
     for leg in (s.entry, s.exit):
         if leg.status is not LegStatus.HALTED:
             continue
