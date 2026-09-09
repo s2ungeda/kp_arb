@@ -1,5 +1,28 @@
 """자동M 화면(order_autom) 순수 부분 — 코어 명령 페이로드·누적 합산."""
-from kp_arb.order_autom import pct_to_frac, set_payload, settings_payload, sum_acc
+from kp_arb.order_autom import (
+    pct_to_frac,
+    set_inputs_sig,
+    set_payload,
+    settings_payload,
+    sum_acc,
+)
+
+
+def test_set_inputs_sig_changes_only_with_set_inputs() -> None:
+    # 실측 2026-09-09: 두 창 중 한 창의 세트설정 저장이 다른 창에 안 보임 → 코어 책의 세트
+    # 입력값 서명이 바뀔 때 다시 읽는다. 실행 상태·RT 같은 실시간 값은 서명에 안 들어간다.
+    book = {"sets": [{"target_qty": 100, "per_qty": 10, "switch_delay_s": 30,
+                      "en_sf": 0.005, "en_s": 0.005, "ex_sf": -0.001, "rt": 3},
+                     {"target_qty": 0, "per_qty": 0, "switch_delay_s": 0,
+                      "en_sf": None, "en_s": None, "ex_sf": None, "rt": 0},
+                     {"target_qty": 0, "per_qty": 0, "switch_delay_s": 0,
+                      "en_sf": None, "en_s": None, "ex_sf": None, "rt": 0}]}
+    base = set_inputs_sig(book)
+    book["sets"][0]["rt"] = 7                     # 실시간 값 변화 → 서명 그대로
+    assert set_inputs_sig(book) == base
+    book["sets"][0]["en_sf"] = 0.006              # 세트설정 변경 → 서명 달라짐
+    assert set_inputs_sig(book) != base
+    assert set_inputs_sig({}) == "" and set_inputs_sig({"sets": None}) == ""
 
 
 def test_set_payload_converts_percent_to_fraction() -> None:

@@ -33,8 +33,9 @@ _DIRECTIONS = (
     ("rev", "역방향", "+HP/-SF", "+HP/-S", "-HP/+SF"),
 )
 # 누적결과 3성분 라벨 (진입/청산별). 환 부호 = HP 부호 (목업 STG_2 대조).
-_ACC_ROWS_FWD = (("진입", ("-HP", "+S", "-환")), ("청산", ("+HP", "-S", "+환")))
-_ACC_ROWS_REV = (("진입", ("+HP", "-S", "+환")), ("청산", ("-HP", "+S", "-환")))
+# 국내 체결은 SF라 목업의 'S'를 'SF'로 표기(사용자 2026-09-09).
+_ACC_ROWS_FWD = (("진입", ("-HP", "+SF", "-환")), ("청산", ("+HP", "-SF", "+환")))
+_ACC_ROWS_REV = (("진입", ("+HP", "-SF", "+환")), ("청산", ("-HP", "+SF", "-환")))
 
 # 선물 월물 콤보(상단) — 표시 → 코어 settings.future_month 값 (DESIGN §5.11)
 MONTH_MAP = {"최근": "near", "차근": "next"}  # 표시는 '최근/차근'(사용자 2026-09-03)
@@ -110,28 +111,44 @@ _REL_CHOICES_BUY = [f"상대{n}호가 - 1틱" for n in range(1, 6)]
 _REL_CHOICES_SELL = [f"상대{n}호가 + 1틱" for n in range(1, 6)]
 
 
-def check_risk(dtag: str, en_sf: float | None, en_s: float | None,
-               ex_sf: float | None, risk_en: float, risk_ex: float,
-               risk_gap: float) -> list[str]:
-    """자동M 리스크방지 입력 검증 (DESIGN-auto-m §10). 위반 메시지 목록(빈 목록=통과).
+_SET_INPUT_KEYS = ("target_qty", "per_qty", "switch_delay_s", "en_sf", "en_s", "ex_sf")
 
-    None(미입력) 값은 건너뛴다. gap 검증은 진입SF·청산SF 둘 다 있을 때만.
-    정방향: 진입 > 기준, 청산 < 기준, 진입SF−청산 > gap.
-    역방향: 진입 < 기준, 청산 > 기준, 청산−진입SF > gap.
+
+def set_inputs_sig(book: dict[str, Any]) -> str:
+    """코어 책의 세트 입력값(3세트) 서명 — 바뀌었을 때만 화면을 다시 채우기 위한 비교 키.
+
+    세트설정이 코어에 반영되는 시점은 두 곳뿐(사용자 확정 2026-09-09): 세트설정 창 '확인'과
+    진입/청산 실행 버튼을 켤 때. 그때 코어 값이 바뀌므로 같은 종목을 연 다른 창도 이 서명이
+    달라진 것을 보고 입력값을 다시 읽는다.
+    """
+    rows = book.get("sets")
+    if not isinstance(rows, list):
+        return ""
+    return json.dumps([[r.get(k) for k in _SET_INPUT_KEYS] for r in rows[:3]
+                       if isinstance(r, dict)], sort_keys=True)
+
+
+def check_risk(dtag: str, en_sf: float | None, ex_sf: float | None,
+               risk_en: float, risk_ex: float, risk_gap: float) -> list[str]:
+    """자동M 리스크방지 입력 검증 (exec §11.9). 위반 메시지 목록(빈 목록=통과).
+
+    검사 시점은 실행 버튼을 켤 때와 세트설정 저장 때뿐(사용자 2026-09-09). 진입S는 검사하지
+    않는다(사용자 2026-09-09) — 진입SF·청산만. None(미입력) 값은 건너뛴다. gap 검증은
+    진입SF·청산 둘 다 있을 때만.
+    정방향: 진입SF > 기준, 청산 < 기준, 진입SF−청산 > gap.
+    역방향: 진입SF < 기준, 청산 > 기준, 청산−진입SF > gap.
     """
     errs: list[str] = []
     if dtag == "fwd":
-        for label, v in (("진입SF", en_sf), ("진입S", en_s)):
-            if v is not None and v <= risk_en:
-                errs.append(f"정방향 {label}는 {risk_en:g} 초과여야 합니다")
+        if en_sf is not None and en_sf <= risk_en:
+            errs.append(f"정방향 진입SF는 {risk_en:g} 초과여야 합니다")
         if ex_sf is not None and ex_sf >= risk_ex:
             errs.append(f"정방향 청산은 {risk_ex:g} 미만이어야 합니다")
         if en_sf is not None and ex_sf is not None and en_sf - ex_sf <= risk_gap:
             errs.append(f"정방향 진입SF−청산은 {risk_gap:g} 초과여야 합니다")
     else:
-        for label, v in (("진입SF", en_sf), ("진입S", en_s)):
-            if v is not None and v >= risk_en:
-                errs.append(f"역방향 {label}는 {risk_en:g} 미만이어야 합니다")
+        if en_sf is not None and en_sf >= risk_en:
+            errs.append(f"역방향 진입SF는 {risk_en:g} 미만이어야 합니다")
         if ex_sf is not None and ex_sf <= risk_ex:
             errs.append(f"역방향 청산은 {risk_ex:g} 초과여야 합니다")
         if en_sf is not None and ex_sf is not None and ex_sf - en_sf <= risk_gap:
@@ -401,7 +418,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             btn_en.config(command=partial(toggle_run, dtag, i, "en"))
             btn_ex.config(command=partial(toggle_run, dtag, i, "ex"))
 
-        # 매매결과 값 — Sprd=컬럼헤더 줄, -HP/+S/-환=세트1~3 줄. 탑·끝 라인 정렬.
+        # 매매결과 값 — Sprd=컬럼헤더 줄, -HP/+SF/-환=세트1~3 줄. 탑·끝 라인 정렬.
         for glabel, (lcol, vcol, comps) in acc_cols.items():
             labels: dict[str, tk.Label] = {"누적": cum_labels[glabel]}
             for ri, comp in enumerate(("Sprd", *comps)):
@@ -454,7 +471,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     errs.append("1회주문수량을 입력하세요")
                 if ex_sf is None:
                     errs.append("청산을 입력하세요")
-            errs += check_risk(dtag, en_sf, en_s, ex_sf, *_risk_of(dtag))
+            errs += check_risk(dtag, en_sf, ex_sf, *_risk_of(dtag))
             if errs:  # 필수 미입력·위반 — 경고, 실행 시작 안 함(버튼 상태 유지)
                 warn_center("\n".join(errs))
                 return
@@ -565,7 +582,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 errs.append("진입S를 입력하세요")
             if ex_sf is None:
                 errs.append("청산을 입력하세요")
-            errs += check_risk(dtag, en_sf, en_s, ex_sf, *_risk_of(dtag))
+            errs += check_risk(dtag, en_sf, ex_sf, *_risk_of(dtag))
             if rt_var.get() and not rt_ent.get().strip():  # 체크만 하고 값 없음 → 확인창
                 errs.append("RT 진입수량 수동 입력이 켜져 있는데 값이 없습니다")
             if errs:  # 필수 미입력·위반 — 경고만, 저장·닫기 안 함
@@ -751,7 +768,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     if preview:  # 최대 폭 샘플로 칸 폭 테스트 (세트설정 목업: 진입SF 0.5·진입S 0.5·청산 -0.1)
         acc_sample = {"누적": "99,999", "Sprd": "-0.825", "-HP": "9,999",
-                      "+HP": "9,999", "+S": "99,999", "-S": "99,999",
+                      "+HP": "9,999", "+SF": "99,999", "-SF": "99,999",
                       "-환": "1,418.5", "+환": "1,418.5"}
         for (dtag, _i), w in sets.items():
             w["target"], w["per"], w["delay"] = 10000, 100, 30  # 상태도 채워 설정창과 일관
@@ -954,8 +971,19 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             ent_refqty.delete(0, "end")
             ent_refqty.insert(0, str(ref))
             ref_sent["qty"] = ref
+        state_box["_sets_sig"] = set_inputs_sig(book)
+        _load_set_inputs(rows)
+
+    def _load_set_inputs(rows: list[Any], skip_focused: bool = False) -> None:
+        """코어 책의 세트 입력값(목표·1회·전환초·진입SF·진입S·청산)을 3세트 칸에 채운다.
+        skip_focused: 지금 인라인 칸을 편집 중인 세트는 건너뛴다(입력 중 값이 튀지 않게)."""
+        focused = root.focus_get() if skip_focused else None
         for i, raw in enumerate(rows[:3]):
+            if not isinstance(raw, dict):
+                continue
             w = sets[("fwd", i)]
+            if focused is not None and focused in (w["e_en_sf"], w["e_en_s"], w["e_ex_sf"]):
+                continue
             w["target"] = int(raw.get("target_qty") or 0)
             w["per"] = int(raw.get("per_qty") or 0)
             w["delay"] = int(raw.get("switch_delay_s") or 0)
@@ -963,6 +991,20 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 v = raw.get(key)
                 w[key] = float(v) * 100.0 if isinstance(v, int | float) else None
             apply_set_display("fwd", i)
+
+    def _sync_set_inputs_from_core(data: dict[str, Any]) -> None:
+        """다른 창에서 같은 종목의 세트설정을 바꿨으면(코어 값 변경) 이 창도 따라간다.
+
+        실측 2026-09-09: 두 창을 열고 한 창에서 세트설정을 저장했는데 다른 창은 옛 값 그대로 —
+        그 창에서 다시 저장하면 옛 값으로 덮어쓴다. 코어가 원본이므로 바뀔 때만 다시 채운다
+        (세트설정이 코어에 가는 시점 = 설정창 '확인'·실행 켬, 사용자 확정 2026-09-09).
+        """
+        book = ((data.get("autom") or {}).get("books") or {}).get(cur_under()) or {}
+        sig = set_inputs_sig(book)
+        if not sig or sig == state_box.get("_sets_sig"):
+            return
+        state_box["_sets_sig"] = sig
+        _load_set_inputs(book.get("sets") or [], skip_focused=True)
 
     def _load_common_from_core(data: dict[str, Any]) -> None:
         """체결쏴 설정(공통)을 코어 값으로 맞춘다 — 코어가 원본(단일 진실).
@@ -1031,6 +1073,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if state_box.get("_loaded_under") != cur_under() and data.get("autom"):
             state_box["_loaded_under"] = cur_under()  # 종목이 바뀌면 그 책으로 다시 채움
             _load_inputs_from_core(data)
+        else:
+            _sync_set_inputs_from_core(data)  # 다른 창이 바꾼 세트설정 반영(같은 종목)
         rows = _live_sets()
         details: list[str] = []
         for i, row in enumerate(rows[:3]):
@@ -1066,12 +1110,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             if not labels or not rows:
                 continue
             agg = sum_acc(rows, leg)
-            hp_key, s_key, fx_key = ("-HP", "+S", "-환") if leg == "entry" else ("+HP", "-S", "+환")
+            hp_key, s_key, fx_key = (("-HP", "+SF", "-환") if leg == "entry"
+                                     else ("+HP", "-SF", "+환"))
             # 짝이 맞은 체결량 — HL 부분 체결이면 SF도 소수(0.0588 등)라 소수면 자릿수를 붙인다
             sf_q, hl_q = float(agg["sf_qty"] or 0), float(agg["hl_qty"] or 0)
             sf_txt = _fmt_num(sf_q, 2 if sf_q % 1 else 0)
-            labels["누적"].config(text=sf_txt)
-            labels[hp_key].config(text=_fmt_num(hl_q, 3 if hl_q % 1 else 0))
+            hl_txt = _fmt_num(hl_q, 3 if hl_q % 1 else 0)
+            labels["누적"].config(text=hl_txt)  # 위 누적체결량 칸은 HL 기준(사용자 2026-09-09)
+            labels[hp_key].config(text=hl_txt)
             labels[s_key].config(text=sf_txt)
             labels[fx_key].config(text=_fmt_num(agg["fx_avg"], 1))
             sprd = agg["sprd"]
