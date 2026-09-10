@@ -37,6 +37,11 @@ _DIRECTIONS = (
 _ACC_ROWS_FWD = (("진입", ("-HP", "+SF", "-환")), ("청산", ("+HP", "-SF", "+환")))
 _ACC_ROWS_REV = (("진입", ("+HP", "-SF", "+환")), ("청산", ("-HP", "+SF", "-환")))
 
+# 바탕색 선택(상단 콤보, 사용자 2026-09-10) — 채도 낮은 옅은 색만(흰 칸·노란 칸·빨강/파랑
+# 모니터 칸이 묻히지 않게). "기본"은 시스템 기본(회색).
+_BG_CHOICES: dict[str, str | None] = {"기본": None, "하늘": "#e8f0f8", "민트": "#eaf4ee",
+                                      "베이지": "#f5f0e6"}
+
 # 선물 월물 콤보(상단) — 표시 → 코어 settings.future_month 값 (DESIGN §5.11)
 MONTH_MAP = {"최근": "near", "차근": "next"}  # 표시는 '최근/차근'(사용자 2026-09-03)
 
@@ -158,6 +163,7 @@ def check_risk(dtag: str, en_sf: float | None, ex_sf: float | None,
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
     """자동M 화면 실행."""
+    import os
     import queue
     import sys
     import threading
@@ -182,7 +188,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     if not preview:
         watch_parent_exit()
     root = tk.Tk()
-    root.title("체결쏴 (자동M)")
+    root.title("체결쏴(자동M)-주식선물")  # 캡션에 상품명(사용자 2026-09-10)
     root.resizable(True, True)
     win_state.attach(root, "autoM")
     T.apply_base(root)
@@ -327,12 +333,41 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 오른쪽 끝 = 설정, 그 왼쪽 = 주문가능시간 표시 (모니터 수치는 방향 제목 옆으로 이동)
     tk.Button(top, text="설정", command=lambda: open_common_dialog()).pack(side="right")
     mon: dict[str, tk.Label] = {}  # 방향 제목 옆 모니터 라벨 — build_section에서 채움
+    # 바탕색 콤보(사용자 2026-09-10) — 설정 버튼 왼쪽. 창 구분용으로 바탕(창·프레임·헤더 라벨)만
+    # 물들이고 입력칸·모니터 칸·중지 행 색은 그대로. 선택은 창 저장(win_state)에 남긴다.
+    default_bg = root.cget("bg")
+    bg_state = {"cur": default_bg}
+    cb_bg = ttk.Combobox(top, values=list(_BG_CHOICES), width=5, state="readonly")
+    cb_bg.set("기본")
+    cb_bg.pack(side="right", padx=(0, 6))
+    # 주문가능시간 표시 — '주문가능' 글자는 뺀다(콤보 자리 확보, 사용자 2026-09-10)
     lbl_windows = tk.Label(top, text="", fg="gray25")
     lbl_windows.pack(side="right", padx=(0, 8))
 
+    def apply_bg(name: str) -> None:
+        """바탕색 적용 — 지금 바탕색을 쓰는 창·프레임·라벨만 새 색으로(칸 색은 건드리지 않음)."""
+        target = _BG_CHOICES.get(name) or default_bg
+        cur = bg_state["cur"]
+
+        def walk(w: Any) -> None:
+            for child in w.winfo_children():
+                if isinstance(child, tk.Frame | tk.Label | tk.LabelFrame):
+                    try:
+                        if child.cget("bg") == cur:
+                            child.config(bg=target)
+                    except tk.TclError:
+                        pass
+                walk(child)
+
+        root.config(bg=target)
+        walk(root)
+        bg_state["cur"] = target
+
+    cb_bg.bind("<<ComboboxSelected>>", lambda _e: apply_bg(cb_bg.get()))
+
     def refresh_windows_bar() -> None:
         w = common["windows"]
-        lbl_windows.config(text=f"주문가능  {w[0]}~{w[1]}  /  {w[2]}~{w[3]}")
+        lbl_windows.config(text=f"{w[0]}~{w[1]}  /  {w[2]}~{w[3]}")
 
     # ===================== 방향 섹션 2개 =====================
     def build_section(grid: Any, rbase: int, dtag: str, name: str, en_sf: str,
@@ -342,8 +377,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                  "설정", "RT선진입", "체결차", "초")
         nset = len(heads)  # 11 (자동T 10 + 진입 S 한 칸)
 
-        tk.Label(grid, text=name, font=T.FONT_NUM_LG).grid(
-            row=rbase, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        # 제목 "정방향 (주식선물)" — 상품명은 작은 글씨로 붙여 목표수량·1회주문 두 칸 안에 들어가게
+        # (모니터 수치 칸을 밀지 않게, 사용자 2026-09-10)
+        title = tk.Frame(grid)
+        title.grid(row=rbase, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        tk.Label(title, text=name, font=T.FONT_NUM_LG).pack(side="left")
+        tk.Label(title, text="(주식선물)", font=T.FONT_LABEL, fg="gray25").pack(
+            side="left", padx=(2, 0), pady=(3, 0))
         # 모니터 수치를 제목 옆, 각 기준값 컬럼(진입SF=2·진입S=3·청산SF=5) 위치에 맞춰 배치
         for mcol, skey, color in ((2, "en_sf", T.C_BUY), (3, "en_s", T.C_BUY),
                                   (5, "ex_sf", T.C_SELL)):
@@ -821,7 +861,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 정지 대상은 **이 창이 보여주는 종목**뿐 — 다른 종목은 다른 창/코어에서 계속(2026-09-08).
     if not preview:
         attach_auto_close(
-            root, title="체결쏴 (자동M)", is_running=_any_running,
+            root, title="체결쏴(자동M)-주식선물", is_running=_any_running,
             send_stop=lambda: send({"cmd": "autom_stop_all", "underlying": cur_under()},
                                    "이 종목 전 세트 정지"),
             set_status=_set_status)
@@ -832,6 +872,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         # 창은 종목·호가단위·기준수량 표시값과 체결쏴 설정(공통)만 저장한다.
         return {
             "under": cb_under.get(), "agg": cb_agg.get(), "refqty": ent_refqty.get(),
+            "bg": cb_bg.get(),
             "common": {"windows": list(common["windows"]),
                        "pre_tick": dict(common["pre_tick"]),
                        "pre_delay": common["pre_delay"], "resume_delay": common["resume_delay"],
@@ -852,6 +893,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if isinstance(saved.get("refqty"), str):
             ent_refqty.delete(0, "end")
             ent_refqty.insert(0, saved["refqty"])
+        if saved.get("bg") in _BG_CHOICES:  # 바탕색 — 창을 다 그린 뒤 적용
+            cb_bg.set(saved["bg"])
+            apply_bg(saved["bg"])
         sc = saved.get("common")
         if isinstance(sc, dict):
             if isinstance(sc.get("windows"), list) and len(sc["windows"]) == 4:
@@ -875,6 +919,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         # 세트 값은 창 저장에서 복원하지 않는다 — 코어 책(종목별)이 원본(_load_inputs_from_core)
         refresh_windows_bar()
 
+    if preview and os.environ.get("KP_PREVIEW_BG") in _BG_CHOICES:  # 미리보기 캡처용 바탕색
+        cb_bg.set(os.environ["KP_PREVIEW_BG"])
+        apply_bg(cb_bg.get())
     if not preview:  # 미리보기는 저장/복원 제외(샘플과 실제 저장 분리)
         _restore_saved()
 
