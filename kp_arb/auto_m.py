@@ -438,8 +438,9 @@ def evaluate(
     # G5 판정
     if not _passes_signal(s, leg, sig):
         if block is Block.ENTRY:
-            why = (f"G5 미달 S {pct(sig.s_spread_entry)}>{pct(s.en_s)}? "
-                   f"(SF {pct(sig.sf_spread_entry)})")
+            # 실시간 괴리값을 넣지 않는다 — 틱마다 "바뀐 근거"가 되어 줄이 쌓임(실측 09-10).
+            # 이 근거는 파일 로그에도 안 남긴다(엔진 _trace가 "G5 미달" 건너뜀, 사용자 09-10).
+            why = f"G5 미달 S괴리 < 진입S {pct(s.en_s)}"
         else:
             why = "G5 청산 기준값 없음"
         return hold(why, _cancel_if_resting(leg, mono=sig.mono))
@@ -605,21 +606,49 @@ def on_post_fill(
     _refresh_fill_diff(s)  # 중지 상태에서 들어온 체결도 칸에 반영(실측 09-10: −20 → −10)
     if not post_done(leg):
         return []
-    # 후주문 전량 체결 확인 — 이 판(선주문 SF + 후주문 HL 체결)을 매매결과에 합친다(사용자 확정
-    # 2026-09-08: 선·후주문 체결량이 맞은 뒤에 계산, 부분값 표시 없음).
-    leg.acc.add_round(leg.pending)
+    return _finish_round(s, block, mono, settings)
+
+
+def diff_limit(s: AutoMSet) -> float:
+    """체결차 중지 한도(HL 계약) = 1회주문수량 × 10(사용자 확정 2026-09-10). 1회주문수량이 0이면
+    어떤 차이든 중지."""
+    return s.per_qty * HL_PER_SF
+
+
+def _over_limit(s: AutoMSet, diff: float) -> bool:
+    limit = diff_limit(s)
+    return abs(diff) >= (limit - _EPS if limit > 0 else _EPS)
+
+
+def _finish_round(s: AutoMSet, block: Block, mono: float, settings: AutoMSettings,
+                  shortfall: str = "") -> list[Action]:
+    """후주문 대기가 0이 된 순간(판 끝) — 매매결과 합산·체결차 판정(사용자 확정 2026-09-10).
+
+    - 이 판의 HL 체결이 SF 체결×10에 맞으면 전량, 모자라면(잔량 버림·거부) 짝 맞은 몫만 누적(§10).
+    - 체결차(세트 누적 장부)는 계속 누적하고 **|체결차| ≥ 1회주문수량×10 이면 그때 중지**.
+      그 미만이면 경고만 남기고 딜레이 → 다음 판으로 계속 간다(작은 잔량으로는 멈추지 않음).
+    """
+    leg = s.leg(block)
+    diff = round(fill_diff(s.sf_net, s.hl_net), 6)
+    s.fill_diff = diff
+    clean = leg.pending.hl_qty + _EPS >= leg.pending.sf_qty * HL_PER_SF
+    leg.acc.add_round(leg.pending, matched_only=not clean)
     leg.pending.clear()
-    # 헤지 완성 시점의 체결차 확인(exec ㄹ1) — 이 세트 체결 기준. ≠0이면 중지.
-    halted = halt_if_unhedged(s, block, fill_diff(s.sf_net, s.hl_net))
-    if halted:
-        return halted
-    # 이번 판의 헤지 완성 — 남은 선주문 없으면 딜레이, 부분체결 잔량이 남아 있으면 계속 대기
+    limit = diff_limit(s)
+    if _over_limit(s, diff):
+        return _halt_set(s, block, f"체결차 {diff:g} ≥ 한도 {limit:g}(1회주문수량 {s.per_qty}×10)"
+                         + (f" — {shortfall}" if shortfall else ""))
+    acts: list[Action] = []
+    if abs(diff) >= _EPS or shortfall:
+        acts.append(Action("notify", reason=f"체결차 {diff:g} (한도 {limit:g} 미만, 계속)"
+                                            + (f" — {shortfall}" if shortfall else "")))
+    # 이번 판 끝 — 남은 선주문 없으면 딜레이, 부분체결 잔량이 남아 있으면 계속 대기
     if leg.await_post_then_delay or leg.pre_order_id is None or leg.pre_filled >= leg.pre_qty:
         leg.await_post_then_delay = False
         _start_delay(leg, mono, settings)
     else:
         leg.status = LegStatus.PRE_PARTIAL
-    return []
+    return acts
 
 
 def _halt_set(s: AutoMSet, block: Block, reason: str) -> list[Action]:
@@ -645,19 +674,35 @@ def _halt_set(s: AutoMSet, block: Block, reason: str) -> list[Action]:
     return acts
 
 
-def on_post_reject(s: AutoMSet, block: Block, reason: str = "") -> list[Action]:
-    """후주문 거부 → 국내는 체결됐는데 HL 미체결 = 체결차 → 세트 중지 + 알림(ㄹ2, 재시도 없음)."""
-    s.fill_diff = round(fill_diff(s.sf_net, s.hl_net), 6)  # 화면 체결차 칸 — 미헤지분(소수)
-    return _halt_set(s, block, f"후주문 거부 — 체결차 발생{(': ' + reason) if reason else ''}")
+def on_post_reject(
+    s: AutoMSet, block: Block, reason: str = "", qty: float | None = None,
+    mono: float | None = None, settings: AutoMSettings | None = None,
+) -> list[Action]:
+    """후주문이 안 잡힌 채 끝남(통째 거부·잔량 버림·밖에서 취소·장부에서 사라짐) — 미체결분을
+    후주문 대기에서 빼고, 대기가 0이 되면 판을 끝내며 체결차를 판정한다(사용자 확정 2026-09-10:
+    바로 멈추지 않고 |체결차| ≥ 1회주문수량×10 일 때만 중지, ㄹ2 정정). 아직 다른 후주문이 대기
+    중이면 그 체결까지 본 뒤 판정. qty가 없으면 남은 대기분 전부가 미체결.
+    """
+    leg = s.leg(block)
+    unfilled = leg.post_pending if qty is None else min(float(qty), leg.post_pending)
+    leg.post_pending = max(0.0, leg.post_pending - unfilled)
+    _refresh_fill_diff(s)
+    note = f"후주문 미체결 HL {unfilled:g}계약{(': ' + reason) if reason else ''}"
+    if not post_done(leg):
+        return [Action("notify", reason=f"{note} — 남은 후주문 확인 뒤 판정")]
+    return _finish_round(s, block, mono if mono is not None else 0.0,
+                         settings if settings is not None else AutoMSettings(), shortfall=note)
 
 
 def halt_if_unhedged(s: AutoMSet, block: Block, diff: float) -> list[Action]:
-    """체결차 감지(exec ㅂ1) — 후주문 대기분이 없는데 ≠0이면 세트 중지(diff는 코어가 넣는다)."""
+    """체결차 판정(exec ㅂ1) — 후주문 대기분이 없을 때 |diff| ≥ 1회주문수량×10 이면 세트 중지.
+    그 미만은 그대로 진행(사용자 확정 2026-09-10). diff는 코어가 넣는다."""
     leg = s.leg(block)
     s.fill_diff = round(diff, 6)  # HL 소수 계약 그대로(0.412 등) — 정수로 깎으면 체결차가 사라진다
-    if abs(diff) < _EPS or not post_done(leg) or leg.status is LegStatus.HALTED:
+    if not post_done(leg) or leg.status is LegStatus.HALTED or not _over_limit(s, diff):
         return []
-    return _halt_set(s, block, f"체결차 {diff:g} ≠ 0")
+    return _halt_set(s, block,
+                     f"체결차 {diff:g} ≥ 한도 {diff_limit(s):g}(1회주문수량 {s.per_qty}×10)")
 
 
 def set_running(s: AutoMSet, block: Block, value: bool,
@@ -676,20 +721,22 @@ def set_running(s: AutoMSet, block: Block, value: bool,
     return acts
 
 
-def on_post_partial_reject(s: AutoMSet, block: Block, unfilled: float) -> list[Action]:
-    """후주문 일부만 체결되고 나머지가 취소/거부됨 — 미체결분(소수 그대로)만큼 체결차 → 중지."""
-    leg = s.leg(block)
-    leg.post_pending = max(0.0, leg.post_pending - unfilled)
-    return on_post_reject(s, block, f"HL {unfilled:g}계약 미체결")
+def on_post_partial_reject(
+    s: AutoMSet, block: Block, unfilled: float,
+    mono: float | None = None, settings: AutoMSettings | None = None,
+) -> list[Action]:
+    """후주문 일부만 체결되고 나머지가 취소/거부/버려짐 — 미체결분(소수 그대로)을 대기에서 빼고
+    판 끝 판정(on_post_reject와 같은 규칙: 한도 미만이면 계속)."""
+    return on_post_reject(s, block, "", qty=unfilled, mono=mono, settings=settings)
 
 
 def release_halt(s: AutoMSet, block: Block) -> None:
     """중지 해제 — 사람이 정리한 뒤 직접 푼다(exec §2). **세트 단위**(중지가 세트 단위이므로):
     진입·청산 어느 쪽에서 풀든 둘 다 꺼진 대기(idle)로 돌아간다.
 
-    해제 = 헤지 정리 완료(사용자 확정 2026-09-10) → 세트 장부(sf_net·hl_net·체결차)와 후주문 대기·
-    판 버퍼를 0으로 되돌려 그 시점부터 다시 센다. 실측 10:45: 정리 안 된 −10이 장부에 남아 다음 판이
-    끝나자마자 다시 중지. RT(포지션 수량)·매매결과 누적(acc)은 장부와 별개라 그대로 둔다.
+    세트 장부(sf_net·hl_net·체결차)는 **건드리지 않는다**(사용자 확정 2026-09-10 오후): 사람이
+    헤지를 정리한 뒤 세트설정 "체결차 Clear"로 직접 0으로 만든다. 해제가 장부를 지우면 정리 안 한
+    차이가 사라져 보이므로. 진행 중이던 판 버퍼·후주문 대기·딜레이 표시만 정리한다.
     """
     for leg in (s.entry, s.exit):
         if leg.status is not LegStatus.HALTED:
@@ -702,7 +749,6 @@ def release_halt(s: AutoMSet, block: Block) -> None:
         leg.pending.clear()
         leg.replace_pending = leg.await_post_then_delay = False
         leg.delay_until = None
-    s.sf_net, s.hl_net, s.fill_diff = 0, 0.0, 0.0
 
 
 # ---------------------------------------------------------- 화면 단위 묶음 ---

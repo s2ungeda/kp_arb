@@ -57,6 +57,7 @@ def test_halt_is_set_wide_and_cancels_other_leg_resting_order() -> None:
     from kp_arb.auto_m import LegStatus, on_post_reject, release_halt
 
     s = _set()
+    s.per_qty = 1                                  # 한도 10 — 후주문 10 통째 거부면 중지(결정 25)
     set_running(s, Block.ENTRY, True)
     s.entry.pre_qty = 2
     on_pre_ack(s, Block.ENTRY, "E1")               # 진입 선주문이 걸려 있음
@@ -127,10 +128,10 @@ def test_trade_result_commits_only_after_full_post_fill() -> None:
     assert s.entry.pending.hl_qty == 0 and s.entry.pending.sf_qty == 0
 
 
-def test_release_resets_ledger_and_next_round_does_not_rehalt() -> None:
-    # 운영 실측 2026-09-10(real_log 0910, 결정 로그 22): 청산 후주문 2건 중 1건 거부 → 중지(칸 −20),
-    # 다른 1건 HL 10 체결 → 장부 SF 1·HL −20(실제 −10). 칸은 체결마다 장부값으로 갱신돼야 하고,
-    # 해제 = 정리 완료 → 장부 0 → 다음 판(1+1, 10+10)이 끝나도 다시 멈추지 않는다.
+def test_shortfall_accumulates_and_halts_only_at_per_qty_limit() -> None:
+    # 결정 로그 25(사용자 확정 2026-09-10 오후): 후주문이 덜 잡혀도 바로 멈추지 않는다. 체결차를
+    # 누적하다 |체결차| ≥ 1회주문수량×10(여기선 20)이 되는 판 끝에 중지. 해제는 장부를 안 건드리고,
+    # 0은 사람이 "체결차 Clear"로. 실측 10:14(A 거부·B 체결) 재현: 체결차 −10 → 계속.
     from kp_arb.auto_m import AutoMSettings, LegStatus, on_post_fill, on_post_reject, release_halt
 
     st = AutoMSettings(windows=(("09:00:00", "15:20:00"),), pre_delay_ms=100)
@@ -142,25 +143,36 @@ def test_release_resets_ledger_and_next_round_does_not_rehalt() -> None:
     on_pre_fill(s, Block.EXIT, 1, 260_500.0, mono=10.0)         # 후주문 A(10)
     on_pre_fill(s, Block.EXIT, 1, 260_500.0, mono=10.1)         # 후주문 B(10) → HL 대기 20
     assert s.fill_diff == -20                                    # 칸 = 장부 실시간(SF 1, HL −30)
-    on_post_reject(s, Block.EXIT, "Invalid nonce")               # A 거부 → 중지
-    assert s.exit.status is LegStatus.HALTED and s.fill_diff == -20
-    on_post_fill(s, Block.EXIT, 10.0, 196.9, 1338.0, 11.0, st)  # B는 중지 상태에서 체결
-    assert (s.sf_net, s.hl_net) == (1, -20.0)
-    assert s.fill_diff == -10                                    # 옛 코드는 −20에 멈춰 있었음
-    assert s.exit.post_pending == 10                             # 거부된 A 몫은 대기로 남음
-    release_halt(s, Block.EXIT)                                  # 사람이 HL 10을 정리한 뒤 해제
-    assert (s.sf_net, s.hl_net, s.fill_diff) == (0, 0.0, 0.0)
-    assert s.exit.post_pending == 0 and s.exit.pending.hl_qty == 0
-    assert s.rt == 1                                             # RT(포지션)는 장부와 별개로 유지
+    acts = on_post_reject(s, Block.EXIT, "Invalid nonce", qty=10, mono=10.5, settings=st)
+    assert [a.kind for a in acts] == ["notify"]                  # A 거부 — B 대기 중이라 판정 보류
+    assert s.exit.status is LegStatus.POST_PENDING and s.exit.post_pending == 10
+    acts = on_post_fill(s, Block.EXIT, 10.0, 196.9, 1338.0, 11.0, st)  # B 체결 → 대기 0 → 판 끝
+    assert (s.sf_net, s.hl_net, s.fill_diff) == (1, -20.0, -10.0)
+    assert [a.kind for a in acts] == ["notify"]                  # |−10| < 20 → 경고만, 계속
+    assert s.exit.status is LegStatus.SETTLE_DELAY and s.exit.running
+    assert s.exit.acc.hl_qty == 10 and s.exit.acc.sf_qty == 1    # 짝 맞은 몫(HL 10 ↔ SF 1)만 누적
+    assert s.rt == 1                                             # RT는 선주문 체결 기준 그대로
+    # 다음 청산 판에서 또 10이 빠지면 −20 → 한도 도달 → 중지(세트 단위)
+    s.exit.status, s.exit.pre_qty, s.exit.pre_filled = LegStatus.PRE_RESTING, 1, 0
+    on_pre_ack(s, Block.EXIT, "10012")
+    on_pre_fill(s, Block.EXIT, 1, 260_500.0, mono=30.0)         # 후주문 10
+    acts = on_post_reject(s, Block.EXIT, "Invalid nonce", qty=10, mono=30.5, settings=st)
+    assert [a.kind for a in acts][:2] == ["halt", "notify"]
+    assert s.exit.status is LegStatus.HALTED and "한도 20" in s.exit.halt_reason
+    assert s.fill_diff == -20
+    release_halt(s, Block.EXIT)                                  # 해제 — 장부는 그대로
+    assert (s.sf_net, s.hl_net, s.fill_diff) == (0, -20.0, -20.0)
+    assert s.exit.status is LegStatus.IDLE and s.exit.post_pending == 0
+    s.fill_diff, s.sf_net, s.hl_net = 0, 0, 0.0                  # 사람이 정리 뒤 "체결차 Clear"
     # 다음 진입 판: 선주문 1+1 → 후주문 10+10 → 중지 없이 딜레이대기
     set_running(s, Block.ENTRY, True)
     s.entry.status, s.entry.pre_qty = LegStatus.PRE_RESTING, 2
     on_pre_ack(s, Block.ENTRY, "14153")
-    on_pre_fill(s, Block.ENTRY, 1, 261_000.0, mono=20.0)
-    on_pre_fill(s, Block.ENTRY, 1, 261_000.0, mono=20.1)
-    on_post_fill(s, Block.ENTRY, 10.0, 197.73, 1339.1, 21.0, st)
+    on_pre_fill(s, Block.ENTRY, 1, 261_000.0, mono=40.0)
+    on_pre_fill(s, Block.ENTRY, 1, 261_000.0, mono=40.1)
+    on_post_fill(s, Block.ENTRY, 10.0, 197.73, 1339.1, 41.0, st)
     assert s.fill_diff == 10 and s.entry.status is LegStatus.POST_PENDING  # 대기 중 +값 정상
-    acts = on_post_fill(s, Block.ENTRY, 10.0, 197.72, 1339.1, 21.7, st)
+    acts = on_post_fill(s, Block.ENTRY, 10.0, 197.72, 1339.1, 41.7, st)
     assert acts == [] and s.entry.status is LegStatus.SETTLE_DELAY and s.fill_diff == 0
 
 
@@ -187,7 +199,7 @@ def test_halted_state_survives_restart() -> None:
     assert r.exit.status is LegStatus.HALTED and not r.exit.running
     assert r.exit.halt_reason.startswith("재시동 전 ") and "Invalid nonce" in r.exit.halt_reason
     assert r.entry.status is LegStatus.HALTED                    # 세트 단위 중지도 그대로
-    assert r.exit.post_pending == 10 and (r.sf_net, r.hl_net, r.fill_diff) == (1, -20.0, -10.0)
+    assert r.exit.post_pending == 0 and (r.sf_net, r.hl_net, r.fill_diff) == (1, -20.0, -10.0)
 
 
 def test_stop_before_ack_cancels_when_ack_arrives() -> None:

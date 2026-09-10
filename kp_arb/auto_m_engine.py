@@ -156,7 +156,10 @@ class AutoMEngine:
         tag = self._tag(u, index, block)
         if leg.block_reason and leg.block_reason != self._logged_reason.get(key):
             self._logged_reason[key] = leg.block_reason
-            self.ulog(u).info("판정 %s: %s", tag, leg.block_reason)
+            # G5 미달(조건 안 맞아 기다리는 평상시)은 파일에 안 남긴다 — 하루 종일 쌓여 로그가
+            # 넘침(사용자 2026-09-10). 통과·G6·취소 등 나머지 근거는 그대로.
+            if not leg.block_reason.startswith("G5 미달"):
+                self.ulog(u).info("판정 %s: %s", tag, leg.block_reason)
         status = leg.status.value
         if status != self._logged_status.get(key):
             prev = self._logged_status.get(key, "-")
@@ -307,7 +310,9 @@ class AutoMEngine:
         if hl is None or not hl.bid or not hl.ask:
             self._log.error("[자동M] %s 후주문 불가 %s — HL 호가 없음",
                             u.value, self._tag(u, index, block))
-            self._apply(u, index, block, on_post_reject(s, block, "HL 호가 없음"))
+            self._apply(u, index, block, on_post_reject(
+                s, block, "HL 호가 없음", qty=act.qty, mono=time.monotonic(),
+                settings=self.screen.settings))
             return
         raw_price = self.screen.settings.post_price(act.side, hl.bid, hl.ask)
         # HL 가격 격자(유효숫자 5·소수 6−szDecimals)에 맞춘다 — 안 맞으면 통째로 거부(실측 09-07)
@@ -318,10 +323,12 @@ class AutoMEngine:
                              price=price, source=SOURCE)
         try:
             oid = await self._system.place(intent)
-        except Exception as exc:  # noqa: BLE001 - 후주문 거부 → 체결차 → 중지(exec ㄹ2)
+        except Exception as exc:  # noqa: BLE001 - 후주문 거부 → 체결차 누적, 한도 넘으면 중지(ㄹ2)
             self._log.error("[자동M] %s 후주문 실패 %s — %s",
                             u.value, self._tag(u, index, block), exc)
-            self._apply(u, index, block, on_post_reject(s, block, str(exc)[:80]))
+            self._apply(u, index, block, on_post_reject(
+                s, block, str(exc)[:80], qty=act.qty, mono=time.monotonic(),
+                settings=self.screen.settings))
             return
         self._register(oid, _OrderRef(u, index, block, "post"))
         # 후주문은 취소하지 않는다(사용자 확정 2026-09-07) — 잔량이 걸려 있어도 후주문대기로 둔다.
@@ -430,8 +437,8 @@ class AutoMEngine:
                 # (사용자 확정 2026-09-07). 미체결분(소수 그대로)만큼 체결차 → 중지.
                 unfilled = round(order.intent.qty - order.filled_qty, 6)
                 if unfilled > 1e-9:
-                    self._apply(u, ref.index, ref.block,
-                                on_post_partial_reject(s, ref.block, unfilled))
+                    self._apply(u, ref.index, ref.block, on_post_partial_reject(
+                        s, ref.block, unfilled, mono=mono, settings=self.screen.settings))
                 self._forget(oid)
             elif status == "filled":
                 self._forget(oid)
@@ -455,8 +462,9 @@ class AutoMEngine:
             if leg.pre_order_id == oid:
                 on_pre_cancelled(s, ref.block, time.monotonic(), self.screen.settings)
         elif leg.post_pending > 1e-9:
-            self._apply(u, ref.index, ref.block,
-                        on_post_partial_reject(s, ref.block, leg.post_pending))
+            self._apply(u, ref.index, ref.block, on_post_partial_reject(
+                s, ref.block, leg.post_pending, mono=time.monotonic(),
+                settings=self.screen.settings))
         self._forget(oid)
         self._trace(u, ref.index, ref.block, s.leg(ref.block))
         self._persist()
@@ -476,20 +484,13 @@ class AutoMEngine:
         self._trace(u, index, block, s.leg(block))
 
     def release(self, u: Underlying, index: int, block: Block) -> None:
-        """중지 해제 = 사람이 헤지 정리를 마침(사용자 확정 2026-09-10) — 세트 장부 0에서 재시작.
-
-        중지 시점에 HL에 남아 있던 후주문의 추적도 끊는다: 해제 뒤 그 주문이 체결돼도 새 장부에
-        섞이지 않는다(그 주문은 사람이 정리, 후주문은 엔진이 취소하지 않는 규칙 그대로).
-        """
+        """중지 해제 — 상태만 대기로. 세트 장부(SF·HL 순잔고·체결차)는 그대로 두고, 사람이 정리한 뒤
+        세트설정 "체결차 Clear"로 0을 만든다(사용자 확정 2026-09-10). 남아 있던 후주문 추적도 유지 —
+        그 주문이 나중에 체결되면 장부에 반영된다."""
         s = self._book(u).sets[index]
-        self.ulog(u).info("명령 %s 중지 해제(세트 단위) — 초기화 전 %s",
+        self.ulog(u).info("명령 %s 중지 해제(세트 단위) — %s (장부는 유지, Clear는 세트설정에서)",
                           self._tag(u, index, block), self._ledger(s))
         release_halt(s, block)
-        for oid, ref in list(self._orders.items()):
-            if ref.underlying is u and ref.index == index and ref.leg == "post":
-                self.ulog(u).info("통보 %s 후주문 #%s 추적 해제(중지 해제) — 이후 체결은 장부 밖",
-                                  self._tag(u, index, ref.block), oid)
-                self._forget(oid)
         for b in (Block.ENTRY, Block.EXIT):
             self._trace(u, index, b, s.leg(b))
         self._persist()

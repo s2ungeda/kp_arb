@@ -258,7 +258,9 @@ def test_block_reason_records_gate_and_basis() -> None:
     evaluate(s, Block.ENTRY, _sig(now=datetime(2026, 9, 4, 16, 0)), SETTINGS, U)
     assert s.entry.block_reason.startswith("G2")
     evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.001), SETTINGS, U)
-    assert "G5" in s.entry.block_reason and "0.100%" in s.entry.block_reason
+    # G5 미달 근거엔 실시간 괴리값을 안 넣는다(틱마다 바뀌어 로그 도배, 2026-09-10) — 기준값만
+    assert "G5 미달" in s.entry.block_reason and "0.500%" in s.entry.block_reason
+    assert "0.100%" not in s.entry.block_reason
     evaluate(s, Block.ENTRY, _sig(hl_disp_bid=-0.01), SETTINGS, U)
     assert "G6 한계 밖" in s.entry.block_reason
     evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
@@ -310,10 +312,11 @@ def test_halts_and_running_off() -> None:
     evaluate(s, Block.ENTRY, _sig(mono=105), SETTINGS, U)
     on_pre_reject(s, Block.ENTRY, mono=106, settings=SETTINGS)
     assert s.entry.status is LegStatus.SETTLE_DELAY
-    # 체결차 감지(후주문 대기 없음) → 중지
+    # 체결차 판정(후주문 대기 없음) — 한도 = 1회주문수량×10 = 100(사용자 확정 2026-09-10)
     s2 = _set()
     set_running(s2, Block.ENTRY, True)
-    assert [a.kind for a in halt_if_unhedged(s2, Block.ENTRY, 10)] == ["halt", "notify"]
+    assert halt_if_unhedged(s2, Block.ENTRY, 10) == [] and s2.fill_diff == 10  # 한도 미만 → 계속
+    assert [a.kind for a in halt_if_unhedged(s2, Block.ENTRY, 100)] == ["halt", "notify"]
     assert halt_if_unhedged(_set(), Block.ENTRY, 0) == []
 
 

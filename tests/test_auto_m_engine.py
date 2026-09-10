@@ -126,11 +126,10 @@ async def test_immediate_partial_fill_is_applied_and_remainder_is_fractional() -
     s = state.autom.book(U).sets[0]
     assert s.hl_net == -0.588 and abs(s.entry.post_pending - 9.412) < 1e-9
     assert s.rt == 1  # RT는 선주문(SF) 체결 계약수 기준(2026-09-08) — HL 부분 체결과 무관
-    sys_.order_book.on_cancel("O2")  # 잔량 취소 확인 → 미체결 9.412 체결차 → 중지
+    sys_.order_book.on_cancel("O2")  # 잔량 취소 → 미체결 9.412 = 체결차 누적(한도 100 미만 → 계속)
     await _settle()
-    assert s.entry.status is LegStatus.HALTED and not s.entry.running
-    assert abs(s.fill_diff - 9.412) < 1e-9
-    assert "9.412" in s.entry.halt_reason
+    assert s.entry.status is LegStatus.PRE_PARTIAL and s.entry.running  # 결정 25: 멈추지 않음
+    assert abs(s.fill_diff - 9.412) < 1e-9 and s.entry.post_pending == 0
 
 
 async def test_engine_saves_state_after_fills_and_halt() -> None:
@@ -151,9 +150,9 @@ async def test_engine_saves_state_after_fills_and_halt() -> None:
     await _settle()
     assert len(saves) > before  # 선주문 체결 → 저장
     before = len(saves)
-    sys_.order_book.on_cancel("O2")  # 후주문이 밖에서 끝남 → 체결차 → 중지 → 저장
+    sys_.order_book.on_cancel("O2")  # 후주문이 밖에서 끝남 → 체결차 20 누적(한도 100 미만) → 저장
     await _settle()
-    assert len(saves) > before and s.entry.status is LegStatus.HALTED
+    assert len(saves) > before and s.fill_diff == 20 and s.entry.status is LegStatus.PRE_PARTIAL
 
 
 async def test_books_run_independently_per_underlying() -> None:
@@ -276,8 +275,9 @@ async def test_cancel_alarm_raises_error_seq_and_snapshot_flags_it() -> None:
     await _settle()
 
 
-async def test_release_drops_post_tracking_and_logs_fill_before_action(tmp_path: Any) -> None:
-    # 결정 로그 22: 해제 뒤 남은 후주문 체결은 장부 밖 / 체결 줄이 행동 줄보다 먼저 + 장부 원값.
+async def test_release_keeps_ledger_and_logs_fill_before_action(tmp_path: Any) -> None:
+    # 결정 로그 22: 해제는 장부·후주문 추적 유지(0은 "체결차 Clear"로만) / 체결 줄이 행동 줄보다
+    # 먼저 + 장부 원값.
     import logging
 
     logging.getLogger("kp_arb.autom.sk_hynix").handlers.clear()  # 다른 테스트의 조용한 핸들러 제거
@@ -292,18 +292,19 @@ async def test_release_drops_post_tracking_and_logs_fill_before_action(tmp_path:
     sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1184.0, ts=0))
     await _settle()
     assert s.fill_diff == 60                              # 칸 = 장부 실시간(SF 10, HL −40)
-    sys_.order_book.on_cancel("O2")                       # 잔량 60 밖에서 취소 → 체결차 → 중지
+    s.per_qty = 5                                         # 한도 50 → 잔량 60은 한도 이상
+    sys_.order_book.on_cancel("O2")                       # 잔량 60 밖에서 취소 → 60 ≥ 50 → 중지
     await _settle()
-    assert s.entry.status is LegStatus.HALTED
-    eng.release(U, 0, Block.ENTRY)                        # 사람이 정리 → 해제 = 장부 0
-    assert (s.sf_net, s.hl_net, s.fill_diff) == (0, 0.0, 0.0) and "O2" not in eng._orders
+    assert s.entry.status is LegStatus.HALTED and "한도 50" in s.entry.halt_reason
+    eng.release(U, 0, Block.ENTRY)                        # 해제 — 장부·후주문 추적 그대로
+    assert (s.sf_net, s.hl_net, s.fill_diff) == (10, -40.0, 60.0)  # 장부 그대로(Clear는 사용자)
     for h in logging.getLogger("kp_arb.autom.sk_hynix").handlers:
         h.flush()
     text = "\n".join(p.read_text(encoding="utf-8") for p in tmp_path.glob("autom_*.log"))
     fill_at = text.index("체결 정방향 1세트 진입 후주문 #O2")
     assert "장부 SF 10 HL -40 체결차 60" in text
     assert text.index("행동 정방향 1세트 진입: halt") > fill_at
-    assert "중지 해제(세트 단위) — 초기화 전 장부 SF 10 HL -40 체결차 60" in text
+    assert "중지 해제(세트 단위) — 장부 SF 10 HL -40 체결차 60 (장부는 유지" in text
 
 
 async def test_vanished_pre_order_is_cleared_and_vanished_post_order_halts() -> None:
@@ -391,6 +392,9 @@ async def test_engine_writes_per_underlying_log(tmp_path: Any) -> None:
     assert isinstance(eng, _E)
     now = datetime(2026, 9, 4, 10, 0, 0)
     eng.set_running(U, 0, Block.ENTRY, True)
+    sys_.s_entry = 0.0  # 처음엔 G5 미달 — 이 근거는 파일에 안 남긴다(사용자 2026-09-10, 로그 도배)
+    eng.tick(now, 99.0)
+    sys_.s_entry = 0.01
     eng.tick(now, 100.0)
     eng.tick(now, 100.1)  # 같은 판정 → 로그 추가 없음
     await _settle()
@@ -401,6 +405,7 @@ async def test_engine_writes_per_underlying_log(tmp_path: Any) -> None:
     files = list(tmp_path.glob("autom_sk_hynix_*.log"))
     assert len(files) == 1
     text = files[0].read_text(encoding="utf-8")
+    assert "G5 미달" not in text
     # 세트 표기 = "정방향 N세트 진입/청산" — 정/역 구분이 로그에 보이게(사용자 2026-09-08)
     assert "명령 정방향 1세트 진입 실행 켬" in text
     assert text.count("판정 정방향 1세트 진입: 통과") == 1  # 바뀔 때만
