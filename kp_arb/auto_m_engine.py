@@ -114,6 +114,19 @@ class AutoMEngine:
         self._bg: set[asyncio.Task[None]] = set()
         system.order_book.on_fill_applied.append(self._on_fill_applied)
         system.order_book.on_change.append(self._on_book_change)
+        self._log_restored_halts()
+
+    def _log_restored_halts(self) -> None:
+        """재시동 복원된 중지 세트를 로그에 남긴다(2026-09-10: 중지는 재시동 뒤에도 유지)."""
+        for key, book in self.screen.books.items():
+            u = Underlying(key)
+            for index, s in enumerate(book.sets):
+                for block in (Block.ENTRY, Block.EXIT):
+                    leg = s.leg(block)
+                    if leg.status is LegStatus.HALTED:
+                        self.ulog(u).warning("복원 %s: 중지 유지(%s) | %s — 정리 뒤 화면에서 해제",
+                                             self._tag(u, index, block), leg.halt_reason,
+                                             self._ledger(s))
 
     # ----------------------------------------------------------------- 편의 ---
     @property
@@ -225,8 +238,9 @@ class AutoMEngine:
             elif act.kind == "place_post":
                 self._spawn(self._place_post(u, index, block, act))
             elif act.kind == "halt":
-                self._log.error("[자동M] %s %s 중지 — %s",
-                                u.value, self._tag(u, index, block), act.reason)
+                s = self._book(u).sets[index]
+                self._log.error("[자동M] %s %s 중지 — %s | %s",
+                                u.value, self._tag(u, index, block), act.reason, self._ledger(s))
                 self._system.error_seq += 1  # 메인창 에러 알람 소리(공통설정)
             elif act.kind == "notify":
                 self._log.warning("[자동M] %s %s — %s",
@@ -338,16 +352,16 @@ class AutoMEngine:
         s = self._book(u).sets[ref.index]
         mono = time.monotonic()
         leg = s.leg(ref.block)
+        # 체결 줄을 먼저 찍고 행동(후주문 발주·중지)을 적용한다 — 행동 줄이 체결 줄보다 앞에 찍혀
+        # "체결 전에 판단했다"로 읽힌 실측(2026-09-10 10:45:47.536/537)을 막는다.
         if ref.leg == "pre":
-            self._apply(u, ref.index, ref.block,
-                        on_pre_fill(s, ref.block, int(round(qty)), price, mono))
-            self.ulog(u).info("체결 %s 선주문 #%s %g @ %g → 누적 %d/%d, HL 대기 %g",
+            acts = on_pre_fill(s, ref.block, int(round(qty)), price, mono)
+            self.ulog(u).info("체결 %s 선주문 #%s %g @ %g → 누적 %d/%d, HL 대기 %g | %s",
                               self._tag(u, ref.index, ref.block), order.order_id, qty, price,
-                              leg.pre_filled, leg.pre_qty, leg.post_pending)
+                              leg.pre_filled, leg.pre_qty, leg.post_pending, self._ledger(s))
         else:
             fx = self._system.fx_entry_rate(order.intent.side) or 0.0
-            self._apply(u, ref.index, ref.block, on_post_fill(
-                s, ref.block, qty, price, fx, mono, self.screen.settings))
+            acts = on_post_fill(s, ref.block, qty, price, fx, mono, self.screen.settings)
             acc = leg.acc
             # Sprd 계산에 쓰는 시점 값도 남긴다(사용자 2026-09-09): 환진입가 = 이 체결 시점
             # 원달러선물 호가(fx), S현재가·SF이론가 = 지금 시세. 누적은 전량 체결 확인된 판까지.
@@ -356,13 +370,19 @@ class AutoMEngine:
             sprd = acc.sprd(stock, theory)
             self.ulog(u).info(
                 "체결 %s 후주문 #%s HL %g @ %g 환진입가 %g S현재가 %s SF이론가 %s → RT %d "
-                "체결차 %g HL대기 %g | 누적 HL %g SF %g 환평균 %s HL평균 %s SF평균 %s Sprd %s",
+                "HL대기 %g | %s | 누적 HL %g SF %g 환평균 %s HL평균 %s SF평균 %s Sprd %s",
                 self._tag(u, ref.index, ref.block), order.order_id, qty, price, fx,
-                stock, f"{theory:,.0f}" if theory else None, s.rt, s.fill_diff,
-                leg.post_pending, acc.hl_qty, acc.sf_qty, acc.fx_avg(), acc.hl_avg(),
+                stock, f"{theory:,.0f}" if theory else None, s.rt, leg.post_pending,
+                self._ledger(s), acc.hl_qty, acc.sf_qty, acc.fx_avg(), acc.hl_avg(),
                 acc.sf_avg(), f"{sprd * 100:.3f}%" if sprd is not None else "-(판 미완)")
+        self._apply(u, ref.index, ref.block, acts)
         self._trace(u, ref.index, ref.block, leg)
         self._persist()  # RT·체결차·순잔고 바뀜 → core_state.json
+
+    @staticmethod
+    def _ledger(s: AutoMSet) -> str:
+        """세트 장부 원값 — 체결차의 출처를 로그에서 따라갈 수 있게(실측 2026-09-10)."""
+        return f"장부 SF {s.sf_net} HL {s.hl_net:g} 체결차 {s.fill_diff:g}"
 
     def _persist(self) -> None:
         """코어 상태 저장(세대 백업 포함) — 실패해도 판정을 멈추지 않는다."""
@@ -455,11 +475,23 @@ class AutoMEngine:
         self._trace(u, index, block, s.leg(block))
 
     def release(self, u: Underlying, index: int, block: Block) -> None:
-        self.ulog(u).info("명령 %s 중지 해제(세트 단위)", self._tag(u, index, block))
+        """중지 해제 = 사람이 헤지 정리를 마침(사용자 확정 2026-09-10) — 세트 장부 0에서 재시작.
+
+        중지 시점에 HL에 남아 있던 후주문의 추적도 끊는다: 해제 뒤 그 주문이 체결돼도 새 장부에
+        섞이지 않는다(그 주문은 사람이 정리, 후주문은 엔진이 취소하지 않는 규칙 그대로).
+        """
         s = self._book(u).sets[index]
+        self.ulog(u).info("명령 %s 중지 해제(세트 단위) — 초기화 전 %s",
+                          self._tag(u, index, block), self._ledger(s))
         release_halt(s, block)
+        for oid, ref in list(self._orders.items()):
+            if ref.underlying is u and ref.index == index and ref.leg == "post":
+                self.ulog(u).info("통보 %s 후주문 #%s 추적 해제(중지 해제) — 이후 체결은 장부 밖",
+                                  self._tag(u, index, ref.block), oid)
+                self._forget(oid)
         for b in (Block.ENTRY, Block.EXIT):
             self._trace(u, index, b, s.leg(b))
+        self._persist()
 
     def stop_all(self, u: Underlying | None = None) -> None:
         """실행 해제(창 닫기·안전종료) — 미체결 선주문 취소. u=None이면 전 종목."""

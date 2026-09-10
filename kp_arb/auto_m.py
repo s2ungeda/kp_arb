@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from datetime import time as dtime
 from enum import StrEnum
+from typing import Any
 
 from .disparity import maker_price_for_spread
 from .domain.enums import Block, Instrument, Side, Underlying
@@ -519,7 +520,18 @@ def on_pre_fill(
         leg.status = LegStatus.POST_PENDING
     else:
         leg.status = LegStatus.PRE_PARTIAL
+    _refresh_fill_diff(s)  # 화면 체결차 칸 = 장부 실시간(후주문 대기 중엔 +값이 잠깐 보임 — 정상)
     return [Action("place_post", side=leg.post_side, qty=qty * HL_PER_SF)]
+
+
+def _refresh_fill_diff(s: AutoMSet) -> None:
+    """화면 체결차 칸을 장부(sf_net·hl_net)로 다시 계산 — 표시용, 판정과 무관.
+
+    실측 2026-09-10 10:14:54: 중지 뒤 들어온 후주문 체결로 장부는 −10인데 칸은 중지 때 값 −20에
+    멈춰 있었다(칸은 판이 끝날 때·중지 때만 갱신). 사람이 정리할 수량을 잘못 보게 되므로 체결마다
+    갱신한다.
+    """
+    s.fill_diff = round(fill_diff(s.sf_net, s.hl_net), 6)
 
 
 def on_pre_cancelled(s: AutoMSet, block: Block, mono: float, settings: AutoMSettings) -> None:
@@ -558,6 +570,7 @@ def on_post_fill(
     else:
         s.hl_net += hl_qty
         s.last_exit_fill_mono = mono
+    _refresh_fill_diff(s)  # 중지 상태에서 들어온 체결도 칸에 반영(실측 09-10: −20 → −10)
     if not post_done(leg):
         return []
     # 후주문 전량 체결 확인 — 이 판(선주문 SF + 후주문 HL 체결)을 매매결과에 합친다(사용자 확정
@@ -640,7 +653,12 @@ def on_post_partial_reject(s: AutoMSet, block: Block, unfilled: float) -> list[A
 
 def release_halt(s: AutoMSet, block: Block) -> None:
     """중지 해제 — 사람이 정리한 뒤 직접 푼다(exec §2). **세트 단위**(중지가 세트 단위이므로):
-    진입·청산 어느 쪽에서 풀든 둘 다 꺼진 대기(idle)로 돌아간다."""
+    진입·청산 어느 쪽에서 풀든 둘 다 꺼진 대기(idle)로 돌아간다.
+
+    해제 = 헤지 정리 완료(사용자 확정 2026-09-10) → 세트 장부(sf_net·hl_net·체결차)와 후주문 대기·
+    판 버퍼를 0으로 되돌려 그 시점부터 다시 센다. 실측 10:45: 정리 안 된 −10이 장부에 남아 다음 판이
+    끝나자마자 다시 중지. RT(포지션 수량)·매매결과 누적(acc)은 장부와 별개라 그대로 둔다.
+    """
     for leg in (s.entry, s.exit):
         if leg.status is not LegStatus.HALTED:
             continue
@@ -649,7 +667,10 @@ def release_halt(s: AutoMSet, block: Block) -> None:
         leg.halt_reason = ""
         leg._clear_pre()
         leg.post_pending = 0.0
+        leg.pending.clear()
         leg.replace_pending = leg.await_post_then_delay = False
+        leg.delay_until = None
+    s.sf_net, s.hl_net, s.fill_diff = 0, 0.0, 0.0
 
 
 # ---------------------------------------------------------- 화면 단위 묶음 ---
@@ -737,7 +758,22 @@ def _book_from_dict(book: AutoMBook, raw: object) -> None:
             except (TypeError, ValueError):
                 pass
             for name, leg in (("entry", target.entry), ("exit", target.exit)):
-                acc = (rs.get(name) or {}).get("acc") if isinstance(rs.get(name), dict) else None
+                found = rs.get(name)
+                raw_leg: dict[str, Any] = found if isinstance(found, dict) else {}
+                # 중지는 재시동 뒤에도 유지(사용자 확정 2026-09-10, exec §2 "사람이 직접 풀어야
+                # 재개"). 실측 10:42 재시동이 중지를 대기로 되살려 정리·해제 없이 다음 판이 돌았다.
+                # 다른 진행 상태(접수·후주문대기 등)는 주문 추적이 끊기므로 지금처럼 대기로.
+                if str(raw_leg.get("status", "")) == LegStatus.HALTED.value:
+                    leg.status = LegStatus.HALTED
+                    leg.running = False
+                    reason = str(raw_leg.get("halt_reason") or "")
+                    leg.halt_reason = (reason if reason.startswith("재시동 전")
+                                       else f"재시동 전 {reason}")
+                    try:
+                        leg.post_pending = float(raw_leg.get("post_pending") or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                acc = raw_leg.get("acc")
                 if isinstance(acc, dict):
                     try:
                         leg.acc.hl_qty = float(acc.get("hl_qty", 0) or 0)

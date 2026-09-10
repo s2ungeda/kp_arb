@@ -127,6 +127,69 @@ def test_trade_result_commits_only_after_full_post_fill() -> None:
     assert s.entry.pending.hl_qty == 0 and s.entry.pending.sf_qty == 0
 
 
+def test_release_resets_ledger_and_next_round_does_not_rehalt() -> None:
+    # 운영 실측 2026-09-10(real_log 0910, 결정 로그 22): 청산 후주문 2건 중 1건 거부 → 중지(칸 −20),
+    # 다른 1건 HL 10 체결 → 장부 SF 1·HL −20(실제 −10). 칸은 체결마다 장부값으로 갱신돼야 하고,
+    # 해제 = 정리 완료 → 장부 0 → 다음 판(1+1, 10+10)이 끝나도 다시 멈추지 않는다.
+    from kp_arb.auto_m import AutoMSettings, LegStatus, on_post_fill, on_post_reject, release_halt
+
+    st = AutoMSettings(windows=(("09:00:00", "15:20:00"),), pre_delay_ms=100)
+    s = _set()
+    s.sf_net, s.hl_net, s.rt = 3, -30.0, 3                      # 진입 5·청산 2 뒤 헤지 상태
+    set_running(s, Block.EXIT, True)
+    s.exit.status, s.exit.pre_qty = LegStatus.PRE_RESTING, 2
+    on_pre_ack(s, Block.EXIT, "10011")
+    on_pre_fill(s, Block.EXIT, 1, 260_500.0, mono=10.0)         # 후주문 A(10)
+    on_pre_fill(s, Block.EXIT, 1, 260_500.0, mono=10.1)         # 후주문 B(10) → HL 대기 20
+    assert s.fill_diff == -20                                    # 칸 = 장부 실시간(SF 1, HL −30)
+    on_post_reject(s, Block.EXIT, "Invalid nonce")               # A 거부 → 중지
+    assert s.exit.status is LegStatus.HALTED and s.fill_diff == -20
+    on_post_fill(s, Block.EXIT, 10.0, 196.9, 1338.0, 11.0, st)  # B는 중지 상태에서 체결
+    assert (s.sf_net, s.hl_net) == (1, -20.0)
+    assert s.fill_diff == -10                                    # 옛 코드는 −20에 멈춰 있었음
+    assert s.exit.post_pending == 10                             # 거부된 A 몫은 대기로 남음
+    release_halt(s, Block.EXIT)                                  # 사람이 HL 10을 정리한 뒤 해제
+    assert (s.sf_net, s.hl_net, s.fill_diff) == (0, 0.0, 0.0)
+    assert s.exit.post_pending == 0 and s.exit.pending.hl_qty == 0
+    assert s.rt == 1                                             # RT(포지션)는 장부와 별개로 유지
+    # 다음 진입 판: 선주문 1+1 → 후주문 10+10 → 중지 없이 딜레이대기
+    set_running(s, Block.ENTRY, True)
+    s.entry.status, s.entry.pre_qty = LegStatus.PRE_RESTING, 2
+    on_pre_ack(s, Block.ENTRY, "14153")
+    on_pre_fill(s, Block.ENTRY, 1, 261_000.0, mono=20.0)
+    on_pre_fill(s, Block.ENTRY, 1, 261_000.0, mono=20.1)
+    on_post_fill(s, Block.ENTRY, 10.0, 197.73, 1339.1, 21.0, st)
+    assert s.fill_diff == 10 and s.entry.status is LegStatus.POST_PENDING  # 대기 중 +값 정상
+    acts = on_post_fill(s, Block.ENTRY, 10.0, 197.72, 1339.1, 21.7, st)
+    assert acts == [] and s.entry.status is LegStatus.SETTLE_DELAY and s.fill_diff == 0
+
+
+def test_halted_state_survives_restart() -> None:
+    # 사용자 확정 2026-09-10: 중지는 재시동 뒤에도 유지(사람이 직접 풀어야 재개). 실측 10:42
+    # 재시동이 중지를 대기로 되살려 정리·해제 없이 다음 판이 돌았다.
+    import dataclasses
+    import json
+
+    from kp_arb.auto_m import LegStatus, on_post_reject
+    from kp_arb.domain.enums import Underlying
+    from kp_arb.strategy_core import CoreState, state_from_dict
+
+    state = CoreState()
+    u = Underlying.SAMSUNG
+    s = state.autom.book(u).sets[0]
+    s.sf_net, s.hl_net = 1, -20.0
+    set_running(s, Block.EXIT, True)
+    s.exit.status, s.exit.pre_qty = LegStatus.POST_PENDING, 2
+    s.exit.post_pending = 10.0
+    on_post_reject(s, Block.EXIT, "Invalid nonce")
+    raw = json.loads(json.dumps(dataclasses.asdict(state), default=str))
+    r = state_from_dict(raw).autom.book(u).sets[0]
+    assert r.exit.status is LegStatus.HALTED and not r.exit.running
+    assert r.exit.halt_reason.startswith("재시동 전 ") and "Invalid nonce" in r.exit.halt_reason
+    assert r.entry.status is LegStatus.HALTED                    # 세트 단위 중지도 그대로
+    assert r.exit.post_pending == 10 and (r.sf_net, r.hl_net, r.fill_diff) == (1, -20.0, -10.0)
+
+
 def test_stop_before_ack_cancels_when_ack_arrives() -> None:
     # 실측 2026-09-09: 발주 요청과 접수 응답 사이(0.9초)에 실행 끔 → 번호가 없어 취소 못 함 →
     # 응답으로 온 #13865가 꺼진 진입에 기록만 되고 LS에 남음. 접수 때 실행이 꺼져 있으면 즉시 취소.

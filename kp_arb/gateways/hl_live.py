@@ -8,13 +8,18 @@
 - 주문 왕복(접수 oid→취소) 실계정 검증 완료.
 
 SDK는 동기(requests) — asyncio에서는 ``asyncio.to_thread``로 감싼다.
+**nonce(실측 2026-09-10):** SDK는 주문·취소·정정·레버리지 액션마다 nonce를 벽시계 밀리초로
+스스로 찍고 호출자가 정할 수 없다. 같은 ms에 두 액션이 시작되면 ``Invalid nonce: duplicate nonce``로
+뒤의 것이 거부된다 → ``_exchange_action``이 이런 액션을 잠금으로 한 번에 하나만, 직전과 1ms 이상
+떨어뜨려 보내고, nonce 거부(주문이 안 들어간 거부)만 2회 재전송한다.
 비밀: ``HL_AGENT_KEY``(에이전트 프라이빗 키)·``HL_ACCOUNT_ADDRESS``(메인 주소) — keyring/env.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .. import order_log
@@ -26,6 +31,7 @@ from .hl import HLError
 from .ls import OrderGoneError
 
 HL_DEX = "xyz"
+NONCE_RETRIES = 2  # nonce 충돌 거부 재전송 횟수(주문 미접수 거부라 중복 주문 없음)
 
 
 def _safe_float(v: Any) -> float | None:
@@ -42,6 +48,14 @@ def _safe_int(v: Any) -> int | None:
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+def _is_nonce_reject(resp: Any) -> bool:
+    """서버가 nonce 때문에 액션을 안 받은 거부인가(실측 "Invalid nonce: duplicate nonce N").
+    이 거부는 주문이 접수되지 않은 것이라 다시 보내도 중복이 안 생긴다."""
+    if not isinstance(resp, dict) or resp.get("status") == "ok":
+        return False
+    return "nonce" in str(resp.get("response", "")).lower()
 
 
 def _lev_from_active_asset(resp: Any) -> dict[str, Any] | None:
@@ -89,6 +103,10 @@ class HLSdkGateway(HLGateway):
         # 발주 응답이 즉시체결(filled)이면 (체결수량, 평균가) — place() 직후 꺼내 OrderBook에
         # 반영한다(userFills 놓쳐도 미체결로 안 남게). pop_place_fill로 1회 소비.
         self._last_place_fill: tuple[float, float] | None = None
+        # nonce를 쓰는 액션(주문·취소·정정·레버리지)은 한 번에 하나만, 직전과 1ms 이상 간격으로
+        # 보낸다(실측 2026-09-10: 같은 ms에 두 후주문 → "duplicate nonce" 거부 → 체결차 중지 오탐).
+        self._action_lock = asyncio.Lock()
+        self._last_action_ms = 0
         self.connected = False
 
     @classmethod
@@ -124,6 +142,30 @@ class HLSdkGateway(HLGateway):
 
     # --- 주문 ---
 
+    async def _exchange_action(self, what: str, fn: Callable[..., Any],
+                               *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """nonce가 붙는 SDK 액션 한 건 — 직렬화 + 1ms 간격 + nonce 거부 재전송.
+
+        SDK가 스레드 안에서 nonce(벽시계 ms)를 찍으므로, 잠금을 응답까지 쥐어 두 액션의 시작 시각이
+        겹치지 않게 하고, 직전 액션과 같은 ms면 1ms 기다린다. 그래도 서버가 nonce 거부를 주면(주문은
+        안 들어간 상태) 새 nonce로 최대 NONCE_RETRIES회 다시 보낸다. 그 밖의 거부·예외는 그대로
+        돌려준다(호출부의 _check_ok/_parse_oid가 처리).
+        """
+        log = order_log.logger_for(Venue.HYPERLIQUID)
+        async with self._action_lock:
+            for attempt in range(NONCE_RETRIES + 1):
+                now_ms = int(time.time() * 1000)
+                while now_ms <= self._last_action_ms:
+                    await asyncio.sleep(0.001)
+                    now_ms = int(time.time() * 1000)
+                self._last_action_ms = now_ms
+                resp = await asyncio.to_thread(fn, *args, **kwargs)
+                if not _is_nonce_reject(resp) or attempt == NONCE_RETRIES:
+                    return resp  # type: ignore[no-any-return]
+                log.warning("HL nonce 충돌 재전송 %d/%d (%s) — %s",
+                            attempt + 1, NONCE_RETRIES, what, resp.get("response"))
+        return resp  # type: ignore[no-any-return]  # (도달 안 함 — mypy용)
+
     async def place_order(self, intent: OrderIntent) -> str:
         if intent.venue is not Venue.HYPERLIQUID:
             raise ValueError("HLSdkGateway only handles Hyperliquid orders")
@@ -143,8 +185,8 @@ class HLSdkGateway(HLGateway):
         order_log.order_requested(intent, price=price)  # 보내기 직전(응답 전) — 단계 추적
         self._log_wire(coin, is_buy, float(intent.qty), price, order_type, intent.reduce_only)
         try:
-            resp = await asyncio.to_thread(
-                self._ex.order, coin, is_buy, float(intent.qty), price, order_type,
+            resp = await self._exchange_action(
+                "order", self._ex.order, coin, is_buy, float(intent.qty), price, order_type,
                 reduce_only=intent.reduce_only,
             )
             oid = self._parse_oid(resp)
@@ -223,8 +265,8 @@ class HLSdkGateway(HLGateway):
         order_log.logger_for(Venue.HYPERLIQUID).info(
             "정정요청 #%s coin=%s buy=%s sz=%s px=%s tif=%s reduce=%s",
             order_id, coin, is_buy, new_sz, new_px, tif, reduce_only)
-        resp = await asyncio.to_thread(
-            self._ex.modify_order, int(order_id), coin, is_buy, new_sz, new_px,
+        resp = await self._exchange_action(
+            "modify", self._ex.modify_order, int(order_id), coin, is_buy, new_sz, new_px,
             {"limit": {"tif": tif}}, reduce_only,
         )
         try:
@@ -250,7 +292,7 @@ class HLSdkGateway(HLGateway):
         coin = self._order_coin.get(order_id)
         if coin is None:
             raise HLError(f"unknown order_id {order_id} (coin required for cancel)")
-        resp = await asyncio.to_thread(self._ex.cancel, coin, int(order_id))
+        resp = await self._exchange_action("cancel", self._ex.cancel, coin, int(order_id))
         self._check_ok(resp)
         order_log.order_canceled(Venue.HYPERLIQUID, order_id)
 
@@ -263,8 +305,8 @@ class HLSdkGateway(HLGateway):
         SDK 시그니처: update_leverage(leverage, name, is_cross).
         """
         coin = self._symbol(underlying)
-        resp = await asyncio.to_thread(
-            self._ex.update_leverage, int(leverage), coin, is_cross)
+        resp = await self._exchange_action(
+            "leverage", self._ex.update_leverage, int(leverage), coin, is_cross)
         self._check_ok(resp)  # 거부 시 사유와 함께 HLError
 
     # --- 조회 ---

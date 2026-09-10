@@ -30,11 +30,43 @@ class StubExchange:
     def __init__(self) -> None:
         self.orders: list[tuple[Any, ...]] = []
         self.cancels: list[tuple[str, int]] = []
+        # nonce 직렬화 검증용 — SDK처럼 호출 시각(ms)을 찍고, 동시 진행 수를 센다
+        self.nonces: list[int] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.nonce_reject_times = 0   # 처음 n번은 "duplicate nonce" 거부 흉내
+        self.reject_response: str | None = None  # 지정하면 그 사유로 항상 거부(nonce 아님)
+
+    def _enter(self) -> None:
+        import threading
+        import time
+
+        self.nonces.append(int(time.time() * 1000))
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        time.sleep(0.003)  # 서버 왕복 흉내 — 겹치면 max_in_flight가 2 이상이 된다
+        self._thread = threading.current_thread().name
+
+    def _exit(self) -> None:
+        self.in_flight -= 1
 
     def order(self, coin: str, is_buy: bool, sz: float, px: float,
               order_type: dict[str, Any], reduce_only: bool = False) -> dict[str, Any]:
+        self._enter()
+        try:
+            return self._order(coin, is_buy, sz, px, order_type, reduce_only)
+        finally:
+            self._exit()
+
+    def _order(self, coin: str, is_buy: bool, sz: float, px: float,
+               order_type: dict[str, Any], reduce_only: bool) -> dict[str, Any]:
         self.orders.append((coin, is_buy, sz, px, order_type))
         self.last_reduce_only = reduce_only
+        if self.reject_response is not None:
+            return {"status": "err", "response": self.reject_response}
+        if self.nonce_reject_times > 0:
+            self.nonce_reject_times -= 1
+            return {"status": "err", "response": "Invalid nonce: duplicate nonce 1789002894144"}
         if getattr(self, "fill_on_place", False):  # 발주 즉시체결(크로싱) 흉내
             statuses: list[dict[str, Any]] = [
                 {"filled": {"totalSz": str(sz), "avgPx": "168.23", "oid": 485478010353}}]
@@ -43,8 +75,13 @@ class StubExchange:
         return {"status": "ok", "response": {"type": "order", "data": {"statuses": statuses}}}
 
     def cancel(self, coin: str, oid: int) -> dict[str, Any]:
-        self.cancels.append((coin, oid))
-        return {"status": "ok", "response": {"type": "cancel", "data": {"statuses": ["success"]}}}
+        self._enter()
+        try:
+            self.cancels.append((coin, oid))
+            return {"status": "ok",
+                    "response": {"type": "cancel", "data": {"statuses": ["success"]}}}
+        finally:
+            self._exit()
 
     def update_leverage(self, leverage: int, name: str, is_cross: bool) -> dict[str, Any]:
         self.leverage_calls: list[tuple[int, str, bool]] = getattr(self, "leverage_calls", [])
@@ -147,6 +184,47 @@ async def test_cancel_requires_tracked_coin() -> None:
     assert ex.cancels == [("xyz:SMSN", 485478010353)]
     with pytest.raises(HLError):
         await gw.cancel_order("999")  # 미지 주문 — coin을 모름
+
+
+async def test_hl_actions_are_serialized_with_1ms_gap() -> None:
+    # 실측 2026-09-10: 같은 ms에 두 후주문 → SDK nonce(벽시계 ms) 겹침 → "duplicate nonce" 거부.
+    # nonce 액션은 한 번에 하나만, 직전과 1ms 이상 떨어뜨려 보낸다.
+    import asyncio
+
+    gw, ex, _ = _gw()
+    first = await gw.place_order(_intent())
+    await asyncio.gather(gw.place_order(_intent()), gw.place_order(_intent(Side.BUY)),
+                         gw.place_order(_intent()), gw.cancel_order(first))
+    assert ex.max_in_flight == 1                      # 겹쳐 돈 적 없음
+    assert len(ex.nonces) == 5
+    assert ex.nonces == sorted(ex.nonces) and len(set(ex.nonces)) == 5  # 전부 다른 ms
+
+
+async def test_nonce_reject_is_retried_and_order_placed_once() -> None:
+    # nonce 거부는 주문이 안 들어간 것 — 새 nonce로 다시 보내면 되고 중복 주문이 안 생긴다.
+    gw, ex, _ = _gw()
+    ex.nonce_reject_times = 1
+    oid = await gw.place_order(_intent())
+    assert oid == "485478010353" and len(ex.orders) == 2  # 거부 1회 + 재전송 성공
+
+
+async def test_nonce_reject_gives_up_after_retries() -> None:
+    from kp_arb.gateways.hl_live import NONCE_RETRIES
+
+    gw, ex, _ = _gw()
+    ex.nonce_reject_times = 10
+    with pytest.raises(HLError, match="nonce"):
+        await gw.place_order(_intent())
+    assert len(ex.orders) == NONCE_RETRIES + 1
+
+
+async def test_non_nonce_reject_is_not_retried() -> None:
+    # 증거금 부족 같은 진짜 거부는 그대로 — 엔진의 ㄹ2(후주문 거부 → 중지) 규칙 유지.
+    gw, ex, _ = _gw()
+    ex.reject_response = "Insufficient margin"
+    with pytest.raises(HLError, match="Insufficient margin"):
+        await gw.place_order(_intent())
+    assert len(ex.orders) == 1
 
 
 async def test_positions_parsed_from_xyz_dex() -> None:

@@ -276,6 +276,36 @@ async def test_cancel_alarm_raises_error_seq_and_snapshot_flags_it() -> None:
     await _settle()
 
 
+async def test_release_drops_post_tracking_and_logs_fill_before_action(tmp_path: Any) -> None:
+    # 결정 로그 22: 해제 뒤 남은 후주문 체결은 장부 밖 / 체결 줄이 행동 줄보다 먼저 + 장부 원값.
+    import logging
+
+    logging.getLogger("kp_arb.autom.sk_hynix").handlers.clear()  # 다른 테스트의 조용한 핸들러 제거
+    eng, sys_, state = _engine(log_dir=tmp_path)
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    await _settle()                                       # 후주문 O2(100) 발주됨
+    assert s.entry.post_pending == 100 and "O2" in eng._orders
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1184.0, ts=0))
+    await _settle()
+    assert s.fill_diff == 60                              # 칸 = 장부 실시간(SF 10, HL −40)
+    sys_.order_book.on_cancel("O2")                       # 잔량 60 밖에서 취소 → 체결차 → 중지
+    await _settle()
+    assert s.entry.status is LegStatus.HALTED
+    eng.release(U, 0, Block.ENTRY)                        # 사람이 정리 → 해제 = 장부 0
+    assert (s.sf_net, s.hl_net, s.fill_diff) == (0, 0.0, 0.0) and "O2" not in eng._orders
+    for h in logging.getLogger("kp_arb.autom.sk_hynix").handlers:
+        h.flush()
+    text = "\n".join(p.read_text(encoding="utf-8") for p in tmp_path.glob("autom_*.log"))
+    fill_at = text.index("체결 정방향 1세트 진입 후주문 #O2")
+    assert "장부 SF 10 HL -40 체결차 60" in text
+    assert text.index("행동 정방향 1세트 진입: halt") > fill_at
+    assert "중지 해제(세트 단위) — 초기화 전 장부 SF 10 HL -40 체결차 60" in text
+
+
 async def test_vanished_pre_order_is_cleared_and_vanished_post_order_halts() -> None:
     # 실측 2026-09-09 #20851: 재동기가 장부에서 선주문을 지워 상태는 '접수'인데 장부엔 없음 →
     # 'unknown order' 취소 되풀이. 장부에서 사라진 선주문은 취소로 정리, 후주문은 체결차 → 중지.

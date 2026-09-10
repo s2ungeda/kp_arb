@@ -447,8 +447,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
                 name = f"{i + 1}세트 {'진입' if side == 'en' else '청산'}"
                 reason = str(leg_live.get("halt_reason") or "")
+                row_live = live_sets[i] if i < len(live_sets) else {}
+                diff = row_live.get("fill_diff") if isinstance(row_live, dict) else None
+                diff_txt = _fmt_num(diff) if isinstance(diff, int | float) else "-"
                 if not ask_yes_no(root, "중지 해제",
-                                  f"{name}이(가) 중지 상태입니다.\n{reason}\n\n"
+                                  f"{name}이(가) 중지 상태입니다.\n{reason}\n"
+                                  f"세트 체결차(장부): {diff_txt}\n\n"
+                                  "해제하면 이 세트의 체결차 장부(SF·HL 순잔고)를 0으로 "
+                                  "초기화합니다.\n"
                                   "헤지 정리를 마쳤으면 '예' — 중지를 풀고 실행합니다."):
                     return
                 release = True
