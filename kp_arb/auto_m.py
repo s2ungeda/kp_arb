@@ -128,6 +128,11 @@ class Accum:
     fx_sum: float = 0.0      # 환진입가(원달러선물 호가) × HL 수량 합
     sf_qty: float = 0.0      # SF 체결 계약수(중지 때 짝 맞은 몫만 넣으면 소수 가능)
     sf_px_sum: float = 0.0
+    # Sprd 기준값도 **후주문 체결 시점** 값(사용자 확정 2026-09-10 — 실시간을 쓰면 판이 끝나도
+    # 값이 계속 움직임): S현재가·SF이론가 × HL 체결수량 합. 없으면(시세 미수신) 0 → Sprd 계산 불가.
+    s_px_sum: float = 0.0
+    theory_sum: float = 0.0
+    ref_qty: float = 0.0     # 위 두 기준값이 기록된 HL 수량(옛 누적·시세 없던 체결 제외) — 분모
 
     def add_round(self, pending: Accum, matched_only: bool = False) -> None:
         """한 판(pending)을 누적에 합친다 — 후주문 전량 체결이 확인된 뒤에만(사용자 확정 2026-09-08,
@@ -136,6 +141,9 @@ class Accum:
             self.hl_qty += pending.hl_qty
             self.hl_px_sum += pending.hl_px_sum
             self.fx_sum += pending.fx_sum
+            self.s_px_sum += pending.s_px_sum
+            self.theory_sum += pending.theory_sum
+            self.ref_qty += pending.ref_qty
             self.sf_qty += pending.sf_qty
             self.sf_px_sum += pending.sf_px_sum
             return
@@ -147,6 +155,10 @@ class Accum:
         self.hl_qty += hl_take
         self.hl_px_sum += (hl_avg or 0.0) * hl_take
         self.fx_sum += (fx_avg or 0.0) * hl_take
+        if pending.ref_qty > 0:  # 기준값이 있던 판만 — 짝 맞은 몫만큼
+            self.s_px_sum += (pending.s_avg() or 0.0) * hl_take
+            self.theory_sum += (pending.theory_avg() or 0.0) * hl_take
+            self.ref_qty += hl_take
         self.sf_qty += sf_take
         self.sf_px_sum += (sf_avg or 0.0) * sf_take
 
@@ -155,6 +167,14 @@ class Accum:
 
     def fx_avg(self) -> float | None:
         return self.fx_sum / self.hl_qty if self.hl_qty > 0 else None
+
+    def s_avg(self) -> float | None:
+        """후주문 체결 시점 S현재가의 HL 수량 가중평균(기록된 체결이 없으면 None)."""
+        return self.s_px_sum / self.ref_qty if self.ref_qty > 0 else None
+
+    def theory_avg(self) -> float | None:
+        """후주문 체결 시점 SF이론가의 HL 수량 가중평균(기록된 체결이 없으면 None)."""
+        return self.theory_sum / self.ref_qty if self.ref_qty > 0 else None
 
     def sf_avg(self) -> float | None:
         return self.sf_px_sum / self.sf_qty if self.sf_qty > 0 else None
@@ -168,18 +188,23 @@ class Accum:
         """짝이 맞은 체결량(SF 계약, 소수 가능 — HL 0.588 체결이면 0.0588)."""
         return self.matched_hl() / HL_PER_SF
 
-    def sprd(self, stock_last: float | None, sf_theory: float | None) -> float | None:
+    def sprd(self) -> float | None:
         """Sprd = (환×HL평균가 − S현재가)/S현재가 − (SF평균가 − SF이론가)/SF이론가 (엑셀 메인 I25).
 
-        평균가는 누적 체결 가중, S현재가·SF이론가는 실시간 값(사용자 확정 2026-09-04)."""
+        네 값 모두 **후주문 체결 시점** 값의 HL 수량 가중평균(사용자 확정 2026-09-10) — 판이 끝나면
+        고정된다. (09-04의 "S현재가·SF이론가는 실시간" 결정은 폐기: 시세 따라 계속 바뀌어 매매결과로
+        쓸 수 없었음.)"""
         fx, hl, sf = self.fx_avg(), self.hl_avg(), self.sf_avg()
-        if None in (fx, hl, sf) or not stock_last or not sf_theory:
+        stock, theory = self.s_avg(), self.theory_avg()
+        if None in (fx, hl, sf, stock, theory):
             return None
         assert fx is not None and hl is not None and sf is not None
-        return (fx * hl - stock_last) / stock_last - (sf - sf_theory) / sf_theory
+        assert stock is not None and theory is not None
+        return (fx * hl - stock) / stock - (sf - theory) / theory
 
     def clear(self) -> None:
         self.hl_qty = self.hl_px_sum = self.fx_sum = self.sf_px_sum = 0.0
+        self.s_px_sum = self.theory_sum = self.ref_qty = 0.0
         self.sf_qty = 0.0
 
 
@@ -553,15 +578,22 @@ def on_pre_cancelled(s: AutoMSet, block: Block, mono: float, settings: AutoMSett
 def on_post_fill(
     s: AutoMSet, block: Block, hl_qty: float, hl_price: float, fx_quote: float,
     mono: float, settings: AutoMSettings,
+    stock_last: float | None = None, sf_theory: float | None = None,
 ) -> list[Action]:
     """후주문(HL) 체결 → RT 증감·누적(§9a)·헤지 완성 판정(exec ㄹ1).
 
     fx_quote = 체결 시점 원달러선물 호가(진입 −환은 매수1호가, 청산 +환은 매도1호가).
+    stock_last·sf_theory = 체결 시점 S현재가·SF이론가 — Sprd 기준값(사용자 확정 2026-09-10,
+    실시간 아님). 없으면 그 판의 Sprd는 계산 불가.
     """
     leg = s.leg(block)
     leg.pending.hl_qty += hl_qty
     leg.pending.hl_px_sum += hl_price * hl_qty
     leg.pending.fx_sum += fx_quote * hl_qty
+    if stock_last and sf_theory:  # 둘 다 있을 때만 기준값 기록(분모 ref_qty도 같이)
+        leg.pending.s_px_sum += stock_last * hl_qty
+        leg.pending.theory_sum += sf_theory * hl_qty
+        leg.pending.ref_qty += hl_qty
     leg.post_pending = max(0.0, leg.post_pending - hl_qty)
     # RT는 선주문(SF) 체결에서 갱신(on_pre_fill) — 여기서는 HL 순잔고·전환딜레이 기준 시각만
     if block is Block.ENTRY:
@@ -779,6 +811,9 @@ def _book_from_dict(book: AutoMBook, raw: object) -> None:
                         leg.acc.hl_qty = float(acc.get("hl_qty", 0) or 0)
                         leg.acc.hl_px_sum = float(acc.get("hl_px_sum", 0) or 0)
                         leg.acc.fx_sum = float(acc.get("fx_sum", 0) or 0)
+                        leg.acc.s_px_sum = float(acc.get("s_px_sum", 0) or 0)
+                        leg.acc.theory_sum = float(acc.get("theory_sum", 0) or 0)
+                        leg.acc.ref_qty = float(acc.get("ref_qty", 0) or 0)  # 옛 저장분은 0
                         leg.acc.sf_qty = float(acc.get("sf_qty", 0) or 0)
                         leg.acc.sf_px_sum = float(acc.get("sf_px_sum", 0) or 0)
                     except (TypeError, ValueError):

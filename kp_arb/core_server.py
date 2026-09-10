@@ -22,6 +22,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import os
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -1153,7 +1154,10 @@ async def _serve() -> None:
             if state.hl_merge:
                 log.info("HL 호가단위 복원: %s", state.hl_merge)
             engine = RehearsalEngine(state, system)
-            fx_service = FxReportService(system)
+            # FX 노출 보고 자동 송신 — .env KP_FX_AUTO_SEND=0이면 일시정지로 시작(테스트 기간)
+            fx_auto = os.environ.get("KP_FX_AUTO_SEND", "1").strip().lower()
+            fx_service = FxReportService(
+                system, auto_send=fx_auto not in ("0", "false", "off", "no"))
             from .auto_m_engine import AutoMEngine as _AutoMEngine
 
             autom_engine = _AutoMEngine(  # 자동M 실행(정방향) — 실행은 화면 버튼

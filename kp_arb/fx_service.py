@@ -26,7 +26,7 @@ class FxReportService:
 
     def __init__(
         self, system: LiveSystem, *,
-        interval_s: float = 10.0, system_name: str = "kp-arb",
+        interval_s: float = 10.0, system_name: str = "kp-arb", auto_send: bool = True,
     ) -> None:
         self._system = system
         # 수신은 token="Meme"만 처리(sink가 필터) — 받은 메시지는 로그에 남긴다
@@ -34,7 +34,9 @@ class FxReportService:
         self._reporter = FXExposureReporter(
             self._sink, token="Meme", notional_fn=hl_coin_notional)
         self.interval_s = interval_s
-        self.paused = False
+        # auto_send=False(.env KP_FX_AUTO_SEND=0)면 일시정지 상태로 시작 — 감시 화면 '재개'로 켠다
+        # (사용자 2026-09-10: 테스트 동안 자동 시작 안 함). 수신(피어 발견)은 그대로 돈다.
+        self.paused = not auto_send
         self._want_send_now = False
         self.last_signal: Signal | None = None
         self.last_sent_ok: bool | None = None
@@ -66,6 +68,8 @@ class FxReportService:
 
     async def run(self) -> None:
         await self._sink.start()
+        if self.paused:
+            self._note("자동 송신 꺼진 채 시작(KP_FX_AUTO_SEND=0) — 감시 화면 '재개'로 켠다")
         elapsed = 0.0
         try:
             while True:

@@ -361,13 +361,14 @@ class AutoMEngine:
                               leg.pre_filled, leg.pre_qty, leg.post_pending, self._ledger(s))
         else:
             fx = self._system.fx_entry_rate(order.intent.side) or 0.0
-            acts = on_post_fill(s, ref.block, qty, price, fx, mono, self.screen.settings)
-            acc = leg.acc
-            # Sprd 계산에 쓰는 시점 값도 남긴다(사용자 2026-09-09): 환진입가 = 이 체결 시점
-            # 원달러선물 호가(fx), S현재가·SF이론가 = 지금 시세. 누적은 전량 체결 확인된 판까지.
+            # Sprd 기준값(S현재가·SF이론가)은 **이 체결 시점** 값을 판 버퍼에 넣는다(사용자 확정
+            # 2026-09-10 — 실시간을 쓰면 매매결과가 시세 따라 계속 바뀜). 로그에도 같은 값.
             stock = self._system.stock_last(u)
             theory = self._system.stock_futures_theory(u, self._counterpart(self._book(u)))
-            sprd = acc.sprd(stock, theory)
+            acts = on_post_fill(s, ref.block, qty, price, fx, mono, self.screen.settings,
+                                stock_last=stock, sf_theory=theory)
+            acc = leg.acc
+            sprd = acc.sprd()
             self.ulog(u).info(
                 "체결 %s 후주문 #%s HL %g @ %g 환진입가 %g S현재가 %s SF이론가 %s → RT %d "
                 "HL대기 %g | %s | 누적 HL %g SF %g 환평균 %s HL평균 %s SF평균 %s Sprd %s",
@@ -522,8 +523,6 @@ class AutoMEngine:
 
     def _snapshot_for(self, u: Underlying, book: AutoMBook) -> dict[str, Any]:
         inst = self._counterpart(book)
-        stock = self._system.stock_last(u)
-        theory = self._system.stock_futures_theory(u, inst)
         # 상단 모니터 3칸(exec §11.9): 기준수량 est 괴리. 정방향 진입 = HL 매수호가창 est,
         # 청산 = 매도호가창; 역방향은 반대(진입 = 매도호가창, 청산 = 매수호가창).
         q = max(1, book.ref_qty)
@@ -545,7 +544,8 @@ class AutoMEngine:
                     "hl_qty": leg.acc.hl_qty, "sf_qty": leg.acc.sf_qty,
                     # 매매결과 표시는 짝이 맞은(적은 쪽) 체결량 기준(사용자 확정 2026-09-08)
                     "matched_hl": leg.acc.matched_hl(), "matched_sf": leg.acc.matched_sf(),
-                    "fx_avg": leg.acc.fx_avg(), "sprd": leg.acc.sprd(stock, theory),
+                    # Sprd는 체결 시점 값들의 가중평균이라 판이 끝나면 고정(2026-09-10)
+                    "fx_avg": leg.acc.fx_avg(), "sprd": leg.acc.sprd(),
                 }
             out.append(row)
         # HL 호가단위(틱) 옵션 — 일반주문창과 같은 표(가격 자릿수 기반, 코어 계산 §5.10)

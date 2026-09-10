@@ -41,6 +41,17 @@ class _MockSink:
         return [{"name": "감시", "ip": "10.0.0.5", "port": 5001}]
 
 
+def test_auto_send_off_starts_paused() -> None:
+    # 사용자 2026-09-10: 테스트 동안 FX 노출 보고를 자동 시작하지 않는다 — .env KP_FX_AUTO_SEND=0
+    # → 일시정지로 시작, 감시 화면 '재개'로 켠다. 기본은 자동 송신.
+    on = FxReportService(_StubSystem([], 1385.0))  # type: ignore[arg-type]
+    assert not on.paused
+    off = FxReportService(_StubSystem([], 1385.0), auto_send=False)  # type: ignore[arg-type]
+    assert off.paused and off.snapshot()["paused"] is True
+    off.resume()
+    assert not off.paused
+
+
 def test_control_and_snapshot() -> None:
     svc = FxReportService(_StubSystem([_hl(2, 52.0)], 1385.0))  # type: ignore[arg-type]
     svc.pause()

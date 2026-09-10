@@ -319,12 +319,48 @@ def test_halts_and_running_off() -> None:
 
 def test_accum_sprd_matches_excel_i25() -> None:
     # 엑셀 메인 I25: (환×HL − S현재가)/S현재가 − (SF − SF이론가)/SF이론가
+    # S현재가·SF이론가도 후주문 체결 시점 값의 HL 수량 가중평균(사용자 확정 2026-09-10) — 고정값.
     acc = Accum()
     acc.hl_qty, acc.hl_px_sum, acc.fx_sum = 40, 1083.5 * 40, 1413.0 * 40
     acc.sf_qty, acc.sf_px_sum = 4, 1_529_000 * 4
     stock, theory = 1_520_000.0, 1_525_000.0
+    acc.s_px_sum, acc.theory_sum, acc.ref_qty = stock * 40, theory * 40, 40
     want = (1413.0 * 1083.5 - stock) / stock - (1_529_000 - theory) / theory
-    assert acc.sprd(stock, theory) == pytest.approx(want)
-    assert Accum().sprd(stock, theory) is None
+    assert acc.sprd() == pytest.approx(want)
+    assert Accum().sprd() is None
+    no_ref = Accum(hl_qty=40, hl_px_sum=1083.5 * 40, fx_sum=1413.0 * 40,
+                   sf_qty=4, sf_px_sum=1_529_000 * 4)
+    assert no_ref.sprd() is None  # 체결 시점 시세가 없었으면 계산 불가(실시간으로 대체 안 함)
+    # 옛 누적(기준값 없음, ref_qty 0)에 새 판이 붙으면 분모는 기록된 수량(ref_qty)만 — 안 섞임
+    pend = Accum(hl_qty=10, hl_px_sum=1083.5 * 10, fx_sum=1413.0 * 10, sf_qty=1,
+                 sf_px_sum=1_529_000, s_px_sum=stock * 10, theory_sum=theory * 10, ref_qty=10)
+    no_ref.add_round(pend)
+    assert no_ref.hl_qty == 50 and no_ref.ref_qty == 10
+    assert no_ref.s_avg() == stock and no_ref.theory_avg() == theory
     acc.clear()
-    assert acc.hl_qty == 0 and acc.sf_qty == 0
+    assert acc.hl_qty == 0 and acc.sf_qty == 0 and acc.s_px_sum == 0 and acc.ref_qty == 0
+
+
+def test_sprd_is_fixed_at_post_fill_time_not_live() -> None:
+    # 사용자 2026-09-10: "매매결과 Sprd가 계속 바뀐다" → 체결 시점 S현재가·SF이론가로 고정.
+    # 두 판의 체결 시점 시세가 달라도 각 판 값의 HL 수량 가중평균으로 굳고, 뒤의 시세와 무관.
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
+    on_pre_ack(s, Block.ENTRY, "1")
+    on_pre_fill(s, Block.ENTRY, 10, 201_000.0, mono=101)
+    on_post_fill(s, Block.ENTRY, 100, 1184.0, 1356.0, mono=102, settings=SETTINGS,
+                 stock_last=199_000.0, sf_theory=200_000.0)
+    acc = s.entry.acc
+    assert acc.s_avg() == 199_000.0 and acc.theory_avg() == 200_000.0
+    first = acc.sprd()
+    assert first == pytest.approx((1356.0 * 1184.0 - 199_000) / 199_000
+                                  - (201_000 - 200_000) / 200_000)
+    # 다음 판(딜레이 뒤): 체결 시점 시세가 다름 → 가중평균으로 섞임
+    evaluate(s, Block.ENTRY, _sig(mono=104), SETTINGS, U)
+    on_pre_ack(s, Block.ENTRY, "2")
+    on_pre_fill(s, Block.ENTRY, 10, 201_000.0, mono=105)
+    on_post_fill(s, Block.ENTRY, 100, 1184.0, 1356.0, mono=106, settings=SETTINGS,
+                 stock_last=201_000.0, sf_theory=202_000.0)
+    assert acc.s_avg() == 200_000.0 and acc.theory_avg() == 201_000.0
+    assert acc.sprd() != first and acc.sprd() == acc.sprd()  # 이후 시세와 무관하게 같은 값
