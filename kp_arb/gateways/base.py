@@ -111,6 +111,14 @@ class HLGateway(ABC):
         """클라이언트 주문번호 생성 — 지원 안 하면 None(목 등). HLSdkGateway가 구현."""
         return None
 
+    async def lookup_by_cloid(self, cloid: str) -> str | None:
+        """cloid로 거래소에 주문이 들어갔는지 조회(orderStatus) → oid, 없으면 None. 기본 미지원."""
+        return None
+
+    def note_identified(self, oid: str, intent: OrderIntent) -> None:
+        """응답 전(또는 실패 뒤 늦게) 식별된 주문의 취소·정정 문맥을 미리 채운다. 기본 no-op."""
+        return None
+
     @abstractmethod
     async def cancel_order(self, order_id: str) -> None: ...
 

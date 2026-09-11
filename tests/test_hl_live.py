@@ -198,6 +198,21 @@ async def test_place_recovers_by_cloid_when_response_is_lost() -> None:
         await gw.place_order(_intent())
 
 
+async def test_lookup_by_cloid_and_note_identified() -> None:
+    # 발주 실패 유예 끝 재조회(lookup_by_cloid)와 응답 전 식별 주문의 취소 문맥 선등록
+    # (note_identified)
+    gw, ex, inf = _gw()
+    cloid = gw.new_cloid()
+    assert await gw.lookup_by_cloid(cloid) is None            # unknownOid
+    inf.order_status = {"status": "order", "order": {
+        "order": {"coin": "xyz:SMSN", "side": "A", "limitPx": "180.0", "sz": "0.1",
+                  "oid": 485478010353, "origSz": "0.1", "cloid": cloid}, "status": "open"}}
+    assert await gw.lookup_by_cloid(cloid) == "485478010353"
+    gw.note_identified("999", _intent(Side.SELL, price=180.0))
+    await gw.cancel_order("999")                              # 문맥이 있어 취소 가능
+    assert ex.cancels[-1] == ("xyz:SMSN", 999)
+
+
 async def test_place_immediate_fill_exposed_via_pop() -> None:
     # 발주 즉시체결(응답 filled)이면 (체결수량, 평균가)를 pop_place_fill로 1회 노출한다
     # — place()가 이걸 OrderBook에 반영해 미체결로 안 남게 한다.

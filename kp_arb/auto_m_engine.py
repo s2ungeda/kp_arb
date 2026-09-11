@@ -34,6 +34,7 @@ from .auto_m import (
     evaluate,
     on_post_fill,
     on_post_partial_reject,
+    on_post_recovered,
     on_post_reject,
     on_pre_ack,
     on_pre_cancel_failed,
@@ -108,6 +109,9 @@ class AutoMEngine:
         # 후주문 cloid → 세트(발주 응답 대기 중). 코어가 통보로 oid를 식별하면 그 oid로 등록
         # (결정 27)
         self._pending_refs: dict[str, _OrderRef] = {}
+        # 발주 실패로 처리한 후주문 cloid → (세트, 수량, 시각). 코어가 유예 안에 살아 있는 주문으로
+        # 식별하면 재연결(결정 30). 코어 유예(30초)보다 길게 두고 지나면 버린다.
+        self._failed_refs: dict[str, tuple[_OrderRef, float, float]] = {}
         self._seen_status: dict[str, str] = {}
         self._mono = 0.0  # 마지막 tick의 단조 시계(테스트 주입 가능)
         # 종목별 상세 로그(logs/autom_<종목>_날짜.log) — 판정 근거·상태 전이·체결 반영
@@ -336,15 +340,19 @@ class AutoMEngine:
         try:
             oid = await self._system.place(intent, cloid=cloid)
         except Exception as exc:  # noqa: BLE001 - 후주문 거부 → 체결차 누적, 한도 넘으면 중지(ㄹ2)
+            if cloid:
+                self._pending_refs.pop(cloid, None)
+                # 응답 유실이면 주문이 살아 있을 수 있다 — 코어 유예 안에 식별되면 재연결(결정 30)
+                self._prune_failed_refs()
+                self._failed_refs[cloid] = (ref, float(act.qty), time.monotonic())
             self._log.error("[자동M] %s 후주문 실패 %s — %s",
                             u.value, self._tag(u, index, block), exc)
             self._apply(u, index, block, on_post_reject(
                 s, block, str(exc)[:80], qty=act.qty, mono=time.monotonic(),
                 settings=self.screen.settings))
             return
-        finally:
-            if cloid:
-                self._pending_refs.pop(cloid, None)
+        if cloid:
+            self._pending_refs.pop(cloid, None)
         self._register(oid, ref)
         # 후주문은 취소하지 않는다(사용자 확정 2026-09-07) — 잔량이 걸려 있어도 후주문대기로 둔다.
         self._log.info("[자동M] %s 후주문 %s HL %s %d @ %g → #%s",
@@ -364,11 +372,35 @@ class AutoMEngine:
         # 끝남). 등록 직후 한 번 더 훑어 이미 끝난 상태를 반영한다.
         self._on_book_change()
 
+    FAILED_REF_TTL_S = 90.0  # 코어 유예(30초)+여유 — 이 뒤엔 코어도 식별하지 않으므로 버림
+
+    def _prune_failed_refs(self) -> None:
+        cutoff = time.monotonic() - self.FAILED_REF_TTL_S
+        for key in [k for k, (_r, _q, at) in self._failed_refs.items() if at < cutoff]:
+            del self._failed_refs[key]
+
     def _on_hl_identified(self, cloid: str, oid: str) -> None:
-        """코어가 응답 전 통보(cloid)로 후주문 oid를 식별 — 응답을 기다리지 않고 세트에 연결."""
+        """코어가 응답 전 통보(cloid)로 후주문 oid를 식별 — 응답을 기다리지 않고 세트에 연결.
+        발주 실패로 처리했던 후주문이 살아 있는 것으로 밝혀지면(결정 30) 세트에 재연결하고 그 수량을
+        후주문 대기에 도로 넣어, 뒤따르는 체결이 장부(HL 잔고·체결차)를 바로잡게 한다."""
         ref = self._pending_refs.pop(cloid, None)
         if ref is None:
-            return  # 우리 후주문이 아니거나 이미 응답으로 등록됨
+            failed = self._failed_refs.pop(cloid, None)
+            if failed is None:
+                return  # 우리 후주문이 아니거나 이미 응답으로 등록됨
+            ref, qty, _at = failed
+            u = ref.underlying
+            s = self._book(u).sets[ref.index]
+            self._log.warning("[자동M] %s %s 실패 처리했던 후주문 #%s(cloid %s) 살아 있음 → 세트 "
+                              "재연결, HL 대기 +%g (결정 30)", u.value,
+                              self._tag(u, ref.index, ref.block), oid, cloid, qty)
+            self.ulog(u).warning(
+                "통보 %s: 후주문 #%s 실패 처리 뒤 살아 있음 → 재연결, HL 대기 +%g | %s",
+                self._tag(u, ref.index, ref.block), oid, qty, self._ledger(s))
+            self._apply(u, ref.index, ref.block, on_post_recovered(s, ref.block, qty))
+            self._register(oid, ref)
+            self._persist()
+            return
         self._log.info("[자동M] %s 후주문 #%s 응답 전 식별(cloid %s) → 세트 연결",
                        ref.underlying.value, oid, cloid)
         self._register(oid, ref)

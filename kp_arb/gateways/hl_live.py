@@ -224,6 +224,20 @@ class HLSdkGateway(HLGateway):
                  cloid or "-")
         return oid
 
+    async def lookup_by_cloid(self, cloid: str) -> str | None:
+        """cloid로 orderStatus 조회 → 들어간 주문이면 oid(발주 실패 유예 끝 재확인, §HL cloid ③)."""
+        found = await self._recover_by_cloid(cloid)
+        return found[0] if found is not None else None
+
+    def note_identified(self, oid: str, intent: OrderIntent) -> None:
+        """응답 전 식별된 주문의 취소·정정 문맥 — place_order 반환 전엔 비어 있어 그 찰나의 취소가
+        'unknown order_id'로 거부됐다(검토 2026-09-11 §A 선택 항목). 응답이 오면 같은 값으로
+        덮인다."""
+        coin = self._symbol(intent.underlying)
+        self._order_coin.setdefault(oid, coin)
+        self._order_ctx.setdefault(
+            oid, (coin, intent.side is Side.BUY, float(intent.qty), float(intent.price or 0.0)))
+
     async def _recover_by_cloid(self, cloid: str) -> tuple[str, dict[str, Any]] | None:
         """응답을 못 받은 발주를 orderStatus(cloid)로 확인 — 들어갔으면 (oid, 응답), 아니면 None.
         공식 문서: orderStatus의 oid 자리에 16바이트 hex cloid를 넣을 수 있다."""

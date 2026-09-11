@@ -220,6 +220,67 @@ def test_judgement_waits_for_other_leg_post_order() -> None:
     assert s.fill_diff == -10 and "한도 10" in s.exit.halt_reason
 
 
+def test_post_recovered_restores_pending_and_fills_fix_ledger_even_when_halted() -> None:
+    # 결정 30: 거부로 처리한 후주문이 살아 있으면 대기에 도로 넣고, 체결이 장부를 바로잡는다.
+    # 1회주문 1이면 한도 10이라 통째 실패(10)가 곧바로 중지 — 그 뒤 체결도 장부에 들어가되 **중지는
+    # 유지**(실측 2026-09-11 14:41:19: 중지 뒤 후주문 체결이 판 종료로 이어져 halted →
+    # settle_delay 로 풀렸다). 장부가 0이 되면 사유에 "장부 보정"을 붙여 해제만 하면 되게 한다.
+    from kp_arb.auto_m import (
+        AutoMSettings,
+        LegStatus,
+        on_post_fill,
+        on_post_recovered,
+        on_post_reject,
+        release_halt,
+    )
+
+    st = AutoMSettings(windows=(("09:00:00", "15:20:00"),), pre_delay_ms=100)
+    s = _set()
+    s.per_qty = 1
+    set_running(s, Block.ENTRY, True)
+    s.entry.status, s.entry.pre_qty = LegStatus.PRE_RESTING, 1
+    on_pre_ack(s, Block.ENTRY, "1")
+    on_pre_fill(s, Block.ENTRY, 1, 255_500.0, mono=10.0)               # HL 대기 10
+    acts = on_post_reject(s, Block.ENTRY, "Connection reset", qty=10, mono=10.5, settings=st)
+    assert [a.kind for a in acts][:2] == ["halt", "notify"]
+    assert s.fill_diff == 10 and s.entry.post_pending == 0 and s.entry.status is LegStatus.HALTED
+    acts = on_post_recovered(s, Block.ENTRY, 10)
+    assert [a.kind for a in acts] == ["notify"] and s.entry.post_pending == 10
+    acts = on_post_fill(s, Block.ENTRY, 10.0, 192.9, 1345.5, 12.0, st)
+    assert s.hl_net == -10 and s.fill_diff == 0 and s.entry.post_pending == 0
+    assert s.entry.status is LegStatus.HALTED and acts == []        # 중지 유지 — 사람이 해제
+    assert "장부 보정" in s.entry.halt_reason
+    release_halt(s, Block.ENTRY)
+    assert s.entry.status is LegStatus.IDLE and s.fill_diff == 0     # 해제만으로 끝(Clear 불필요)
+
+
+def test_halted_leg_stays_halted_when_pending_post_order_fills() -> None:
+    # 실측 2026-09-11 14:41:18~19 삼성 2세트: 진입 체결차로 세트 중지 → 대기 중이던 청산 후주문 10이
+    # 체결 → 청산 판 종료 처리가 halted → settle_delay 로 넘겨 청산만 중지가 풀림(진입은 검정).
+    from kp_arb.auto_m import AutoMSettings, LegStatus, on_post_fill, on_post_reject
+
+    st = AutoMSettings(windows=(("09:00:00", "15:20:00"),), pre_delay_ms=100)
+    s = _set()
+    s.per_qty = 1
+    set_running(s, Block.ENTRY, True)
+    set_running(s, Block.EXIT, True)
+    s.rt = 2
+    s.entry.status, s.entry.pre_qty = LegStatus.PRE_RESTING, 1
+    s.exit.status, s.exit.pre_qty = LegStatus.PRE_RESTING, 1
+    on_pre_ack(s, Block.ENTRY, "1")
+    on_pre_ack(s, Block.EXIT, "2")
+    on_pre_fill(s, Block.EXIT, 1, 256_000.0, mono=10.0)                # 청산 후주문 10 대기
+    on_pre_fill(s, Block.ENTRY, 1, 255_500.0, mono=10.2)               # 진입 후주문 10 대기
+    on_post_reject(s, Block.EXIT, "rejected", qty=10, mono=10.5, settings=st)   # 청산 후주문 거부
+    on_post_fill(s, Block.ENTRY, 10.0, 192.9, 1345.5, 11.0, st)        # 진입 체결 → 세트 판정 −10
+    assert s.entry.status is LegStatus.HALTED and s.exit.status is LegStatus.HALTED
+    # (시나리오 변형) 중지된 청산에 후주문 대기가 남아 있다가 체결되는 경우 — 중지는 그대로
+    s.exit.post_pending = 10.0
+    acts = on_post_fill(s, Block.EXIT, 10.0, 192.985, 1345.6, 12.0, st)
+    assert acts == [] and s.exit.status is LegStatus.HALTED and not s.exit.running
+    assert s.entry.status is LegStatus.HALTED
+
+
 def test_halted_state_survives_restart() -> None:
     # 사용자 확정 2026-09-10: 중지는 재시동 뒤에도 유지(사람이 직접 풀어야 재개). 실측 10:42
     # 재시동이 중지를 대기로 되살려 정리·해제 없이 다음 판이 돌았다.

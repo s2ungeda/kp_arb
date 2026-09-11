@@ -681,6 +681,13 @@ def _finish_round(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
     leg.pending.clear()
     limit = diff_limit(s)
     acts: list[Action] = []
+    if leg.status is LegStatus.HALTED:
+        # 중지 뒤 들어온 후주문 체결로 판이 닫힘 — 장부·누적만 갱신하고 중지는 유지(사람이 해제).
+        # 실측 2026-09-11 14:41:19: 여기서 딜레이대기로 넘어가 청산이 halted → settle_delay 로 풀려
+        # 세트 반쪽만 중지로 남았다. 되살아난 후주문(결정 30)의 체결도 같은 경로.
+        if abs(diff) < _EPS and "장부 보정" not in leg.halt_reason:
+            leg.halt_reason += " → 이후 후주문 체결로 장부 보정(체결차 0), 해제하면 재개"
+        return acts
     if not set_post_done(s):
         # 다른 쪽(진입↔청산) 후주문이 아직 대기 중 — 세트 장부에 그 헤지가 빠져 있으니 지금 재면
         # 오판(실측 2026-09-11 14:41 −10 중지). 이 판은 끝내고 판정은 그쪽 판 끝에서.
@@ -699,8 +706,21 @@ def _finish_round(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
         leg.await_post_then_delay = False
         _start_delay(leg, mono, settings)
     else:
-        leg.status = LegStatus.PRE_PARTIAL
+        # 되살아난 후주문(결정 30)의 체결로 판이 끝나면 선주문이 아직 안 잡힌 채 걸려 있을 수 있다
+        leg.status = LegStatus.PRE_PARTIAL if leg.pre_filled > 0 else LegStatus.PRE_RESTING
     return acts
+
+
+def on_post_recovered(s: AutoMSet, block: Block, qty: float) -> list[Action]:
+    """발주 실패로 처리했던 후주문이 살아 있는 것으로 밝혀짐(결정 30, 사용자 확정 2026-09-11) —
+    그 수량을 후주문 대기에 도로 넣어 뒤따르는 체결이 세트 장부(HL 잔고·체결차)에 들어가게 한다.
+    그 판의 SF 몫은 이미 판 버퍼에서 빠졌으므로 이 체결은 지금 진행 중인 판에 섞인다(매매결과
+    평균가만 흐려짐 — 통신 장애 때만 나는 드문 경우라 감수)."""
+    leg = s.leg(block)
+    leg.post_pending += float(qty)
+    _refresh_fill_diff(s)
+    return [Action("notify", reason=f"실패 처리했던 후주문 살아 있음 — HL 대기 +{qty:g}, "
+                                    f"체결로 장부 보정")]
 
 
 def _halt_set(s: AutoMSet, block: Block, reason: str) -> list[Action]:

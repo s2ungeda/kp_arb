@@ -603,6 +603,101 @@ async def test_hl_order_identified_by_cloid_before_place_returns() -> None:
     assert system.order_book.position_qty(SAMSUNG, Instrument.HL_PERP) == -0.2
 
 
+def _failing_hl_system(grace_s: float) -> tuple[LiveSystem, object, str, list[str]]:
+    """발주 응답 유실(통신 오류) + cloid 조회 실패를 흉내 내는 HL 게이트웨이로 시스템 조립."""
+    from kp_arb.gateways.hl_ws import HLWebSocketClient
+    from kp_arb.gateways.mock_hl import MockHLGateway
+
+    CLOID = "0x" + "ef" * 16
+    noted: list[str] = []
+
+    class FailHL(MockHLGateway):
+        lookup_oid: str | None = None  # 유예 끝 orderStatus(cloid) 조회 결과
+
+        def new_cloid(self) -> str | None:
+            return CLOID
+
+        async def place_order(self, intent: OrderIntent, cloid: str | None = None) -> str:
+            raise ConnectionError("Connection reset by peer")
+
+        async def lookup_by_cloid(self, cloid: str) -> str | None:
+            return self.lookup_oid
+
+        def note_identified(self, oid: str, intent: OrderIntent) -> None:
+            noted.append(oid)
+
+    open_upd = json.dumps({"channel": "orderUpdates", "data": [
+        {"order": {"coin": "xyz:SMSN", "side": "A", "limitPx": "185.0", "sz": "0.0",
+                   "oid": 777, "timestamp": 1.0, "origSz": "0.2", "cloid": CLOID},
+         "status": "open", "statusTimestamp": 1.0}]})
+    hl_fill = json.dumps({"channel": "userFills", "data": {"fills": [
+        {"coin": "xyz:SMSN", "px": "185.0", "sz": "0.2", "side": "A",
+         "oid": 777, "tid": 1, "time": 1.0}]}})
+    hl_gw = FailHL()
+    system = LiveSystem(
+        gateway=MockLSGateway(),  # type: ignore[arg-type]
+        order_book=OrderBook(), session=SessionService(),
+        stock_ws=LSWebSocketClient(FakeConnector([])),
+        hl_gateway=hl_gw, hl_ws=HLWebSocketClient(FakeConnector([hl_fill, open_upd])),
+    )
+    system.hl_pending_grace_s = grace_s
+    return system, hl_gw, CLOID, noted
+
+
+_HL_INTENT = OrderIntent(venue=Venue.HYPERLIQUID, underlying=SAMSUNG,
+                         instrument=Instrument.HL_PERP, side=Side.SELL, qty=0.2,
+                         order_type=OrderType.LIMIT, price=185.0)
+
+
+async def test_failed_hl_place_adopts_late_cloid_notice_within_grace() -> None:
+    # 검토 2026-09-11 §A(예방): 발주가 통신 오류로 끝나고 cloid 조회도 실패했는데 주문은 들어가 있던
+    # 경우 — 유예 안에 그 cloid의 통보가 오면 살아 있는 주문으로 등록·체결 반영·알람·훅 통지.
+    import asyncio as _aio
+
+    import pytest
+
+    system, _, cloid, noted = _failing_hl_system(grace_s=5.0)
+    identified: list[tuple[str, str]] = []
+    system.on_hl_identified.append(lambda c, o: identified.append((c, o)))
+    with pytest.raises(ConnectionError):
+        await system.place(_HL_INTENT)
+    assert cloid in system._hl_failed and system._hl_pending == {}
+    await system.start()
+    await system.wait()  # 유예 안에 orderUpdates(cloid)·userFills 도착
+    order = system.order_book.order("777")
+    assert order is not None and order.filled_qty == 0.2
+    assert identified == [(cloid, "777")] and noted == ["777"] and system.error_seq == 1
+    assert cloid not in system._hl_failed
+    for t in list(system._bg):
+        t.cancel()  # 유예 끝 재조회 작업 정리
+    await _aio.sleep(0)
+
+
+async def test_failed_hl_place_rechecks_by_cloid_at_grace_end() -> None:
+    # 웹소켓까지 끊겼으면 통보가 안 온다 — 유예 끝에 orderStatus(cloid)로 마지막 확인해 등록.
+    import asyncio as _aio
+
+    import pytest
+
+    system, hl_gw, cloid, noted = _failing_hl_system(grace_s=0.02)
+    hl_gw.lookup_oid = "888"
+    with pytest.raises(ConnectionError):
+        await system.place(_HL_INTENT)
+    await _aio.sleep(0.1)  # 유예 지남 → 재조회
+    order = system.order_book.order("888")
+    assert order is not None and order.intent.qty == 0.2 and noted == ["888"]
+    assert system.error_seq == 1 and cloid not in system._hl_failed
+    # 조회에도 없으면 안 들어간 것으로 보고 조용히 끝(유예 뒤 통보는 무시)
+    system2, _, cloid2, _ = _failing_hl_system(grace_s=0.02)
+    with pytest.raises(ConnectionError):
+        await system2.place(_HL_INTENT)
+    await _aio.sleep(0.1)
+    assert cloid2 not in system2._hl_failed and system2.error_seq == 0
+    await system2.start()
+    await system2.wait()
+    assert system2.order_book.order("777") is None  # 유예 지난 통보 — 미아 보관(재동기가 안전망)
+
+
 async def test_place_routes_hl_to_hl_gateway() -> None:
     from kp_arb.gateways.hl_ws import HLWebSocketClient
     from kp_arb.gateways.mock_hl import MockHLGateway

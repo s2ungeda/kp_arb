@@ -68,6 +68,10 @@ from .theory import (
 from .ticks import ceil_to_tick, floor_to_tick, maker_cap, tick_for
 from .ws_status import WsStatus
 
+# HL 발주가 통신 오류로 끝난 뒤 cloid를 기억해 두는 유예(초) — 살아 있는 주문의 늦은 통보를 받아
+# 주고, 끝에 orderStatus(cloid)로 한 번 더 확인한다(DESIGN §HL cloid ③, 검토 2026-09-11 §A).
+HL_PENDING_GRACE_S = 30.0
+
 
 def select_near_month(
     rows: list[dict[str, object]],
@@ -230,6 +234,10 @@ class LiveSystem:
         # 즉시 장부에 등록한다(DESIGN §HL cloid ①). 식별 시 (cloid, oid)를 아래 훅에 알린다.
         self._hl_pending: dict[str, OrderIntent] = {}
         self.on_hl_identified: list[Callable[[str, str], None]] = []
+        # 발주가 통신 오류로 끝났지만 주문이 들어갔을 수 있는 cloid → (의도, 만료 monotonic).
+        # 유예 안에 그 cloid의 통보가 오면 살아 있는 주문으로 등록(§HL cloid ③, 검토 09-11 §A).
+        self._hl_failed: dict[str, tuple[OrderIntent, float]] = {}
+        self.hl_pending_grace_s = HL_PENDING_GRACE_S  # 테스트에서 줄인다
         self.order_book = order_book
         self.session = session
         self._stock_ws = stock_ws
@@ -552,18 +560,72 @@ class LiveSystem:
     def _identify_hl_order(self, upd: OrderUpdate) -> None:
         """응답 전 식별(DESIGN §HL cloid ①) — 통보의 cloid가 발주 응답을 기다리는 우리 주문이면
         oid를 즉시 장부에 등록하고, 훅(자동M 등)에 알린 뒤 먼저 온 체결(userFills)을 반영한다.
-        실측 2026-09-11 10:18:35: 잔량 버림 종료 통보가 응답보다 49ms 먼저 와 자동M이 놓쳤다."""
+        실측 2026-09-11 10:18:35: 잔량 버림 종료 통보가 응답보다 49ms 먼저 와 자동M이 놓쳤다.
+        발주 실패로 처리했던 cloid(유예 중)의 통보면 살아 있는 주문 — 경고·알람과 함께 등록(③)."""
+        import time as _t
+
         if not upd.cloid or self.order_book.order(upd.oid) is not None:
             return
         intent = self._hl_pending.get(upd.cloid)
-        if intent is None:
+        if intent is not None:
+            self._adopt_identified(upd.cloid, upd.oid, intent, late=False, how=upd.status)
             return
-        self.order_book.track(upd.oid, intent)
-        order_log.logger_for(Venue.HYPERLIQUID).info(
-            "HL 주문 식별(응답 전) #%s ← cloid %s (%s)", upd.oid, upd.cloid, upd.status)
+        failed = self._hl_failed.pop(upd.cloid, None)
+        if failed is None:
+            return
+        intent, expiry = failed
+        if _t.monotonic() > expiry:
+            return  # 유예 지남 — 재동기(재연결·'적'·재시동)가 일반 주문으로 잡는다
+        self._adopt_identified(upd.cloid, upd.oid, intent, late=True, how=upd.status)
+
+    def _adopt_identified(self, cloid: str, oid: str, intent: OrderIntent, *,
+                          late: bool, how: str) -> None:
+        """cloid로 식별된 주문을 장부에 등록 — 취소 문맥 선등록, 훅 통지, 보관된 체결 재생."""
+        assert self._hl is not None
+        self.order_book.track(oid, intent)
+        self._hl.note_identified(oid, intent)  # 응답 전 취소가 'unknown order_id'가 되지 않게
+        log = order_log.logger_for(Venue.HYPERLIQUID)
+        if late:
+            log.warning("HL 발주 실패로 처리했던 주문 #%s(cloid %s)가 살아 있음(%s) — 장부에 등록. "
+                        "자동M 장부(체결차)·체결 내역 확인 필요", oid, cloid, how)
+            self.error_seq += 1  # 메인창 알람
+        else:
+            log.info("HL 주문 식별(응답 전) #%s ← cloid %s (%s)", oid, cloid, how)
         for cb in self.on_hl_identified:
-            cb(upd.cloid, upd.oid)
-        self.order_book.replay_pending(upd.oid)
+            cb(cloid, oid)
+        self.order_book.replay_pending(oid)
+
+    def _hold_failed_hl(self, cloid: str, intent: OrderIntent) -> None:
+        """발주 실패(통신 오류·조회 실패)한 cloid를 유예 목록에 두고, 유예 끝에 다시 조회한다."""
+        import time as _t
+
+        self._hl_failed[cloid] = (intent, _t.monotonic() + self.hl_pending_grace_s)
+        order_log.logger_for(Venue.HYPERLIQUID).info(
+            "HL 발주 실패 cloid %s — %.0f초 유예(통보가 오면 살아 있는 주문으로 등록, 끝에 재조회)",
+            cloid, self.hl_pending_grace_s)
+        task = asyncio.create_task(self._late_hl_recheck(cloid))
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+
+    async def _late_hl_recheck(self, cloid: str) -> None:
+        """유예 끝 — 통보가 안 왔으면 orderStatus(cloid)로 마지막 확인(웹소켓까지 끊겼던 경우)."""
+        await asyncio.sleep(self.hl_pending_grace_s)
+        failed = self._hl_failed.pop(cloid, None)
+        if failed is None or self._hl is None:
+            return  # 이미 통보로 식별됨
+        intent, _ = failed
+        try:
+            oid = await self._hl.lookup_by_cloid(cloid)
+        except Exception as exc:  # noqa: BLE001 - 조회 실패면 안 들어간 것으로 본다(재동기가 안전망)
+            order_log.logger_for(Venue.HYPERLIQUID).warning(
+                "HL 유예 끝 재조회 실패 cloid %s — %s", cloid, exc)
+            return
+        if oid is None:
+            order_log.logger_for(Venue.HYPERLIQUID).info(
+                "HL 유예 끝 cloid %s — 통보·조회 모두 없음(주문 안 들어간 것으로 봄)", cloid)
+            return
+        if self.order_book.order(oid) is None:
+            self._adopt_identified(cloid, oid, intent, late=True, how="유예 끝 orderStatus 조회")
 
     def _on_ws_reconnect(self, label: str) -> None:
         """WS 재연결 후(동기 콜백) — 끊긴 동안 놓친 체결/외부거래를 반영하러 OrderBook을
@@ -633,9 +695,14 @@ class LiveSystem:
             self._hl_pending[cloid] = intent
         try:
             order_id = await self._hl.place_order(intent, cloid=cloid)
-        finally:
+        except Exception:
             if cloid:
                 self._hl_pending.pop(cloid, None)
+                # 거부가 확실한 경우도 섞여 있지만 구분이 어렵다 — 유예 안에 통보가 오면 그때 안다.
+                self._hold_failed_hl(cloid, intent)
+            raise
+        if cloid:
+            self._hl_pending.pop(cloid, None)
         order = self.order_book.order(order_id)
         if order is None:
             order = self.order_book.track(order_id, intent)

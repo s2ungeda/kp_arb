@@ -78,6 +78,9 @@ class FakeSystem:
         self._ids += 1
         oid = f"O{self._ids}"
         self.placed.append(intent)
+        if getattr(self, "fail_post", False) and intent.instrument is Instrument.HL_PERP:
+            self.last_cloid = cloid  # 응답 유실 흉내 — 주문은 들어갔을 수 있다
+            raise ConnectionError("Connection reset by peer")
         self.order_book.track(oid, intent)
         if cloid and intent.instrument is Instrument.HL_PERP:
             # 코어가 응답 전 통보(cloid)로 oid를 식별한 경우 흉내 — 체결·취소보다 먼저 알린다
@@ -184,6 +187,35 @@ async def test_post_order_linked_by_cloid_before_place_returns() -> None:
     assert abs(s.fill_diff - 4.037) < 1e-9 and s.entry.running
     assert s.entry.status is not LegStatus.POST_PENDING
     assert eng._pending_refs == {} and "O2" not in eng._orders and eng._orphan_fills == {}
+
+
+async def test_failed_post_order_relinked_when_identified_late() -> None:
+    # 결정 30(사용자 확정 2026-09-11): 후주문 발주가 통신 오류로 끝나 거부로 처리(체결차 +10)했는데
+    # 유예 안에 코어가 살아 있는 주문으로 식별하면 세트에 재연결 + HL 대기 도로 +10 → 뒤따르는
+    # 체결로 장부(HL 잔고·체결차)가 바로잡힌다.
+    eng, sys_, state = _engine()
+    sys_.cloid = "0x" + "ef" * 16
+    sys_.fail_post = True
+    s = state.autom.book(U).sets[0]
+    s.per_qty = 2  # 한도 20 — 후주문 10 통째 실패는 한도 미만이라 계속(중지 경우는 stop 테스트)
+    await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
+    await _settle()
+    assert s.fill_diff == 10 and s.entry.post_pending == 0          # 거부 처리 — 판 끝, 계속
+    assert s.entry.status is not LegStatus.HALTED and sys_.last_cloid == sys_.cloid
+    assert sys_.cloid in eng._failed_refs
+    # 코어가 유예 안에 통보로 식별(oid O9) — 장부 등록 뒤 훅
+    post_intent = sys_.placed[-1]
+    sys_.order_book.track("O9", post_intent)
+    for cb in sys_.on_hl_identified:
+        cb(sys_.cloid, "O9")
+    assert s.entry.post_pending == 10 and "O9" in eng._orders and eng._failed_refs == {}
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O9", qty=10, price=1184.0, ts=0))
+    await _settle()
+    assert s.hl_net == -10 and s.fill_diff == 0 and s.entry.post_pending == 0  # 장부 보정
+    assert s.entry.status is not LegStatus.HALTED and s.entry.running
 
 
 async def test_engine_saves_state_after_fills_and_halt() -> None:
