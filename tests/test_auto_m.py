@@ -166,6 +166,67 @@ def test_signal_gate_uses_only_s_for_entry_and_nothing_for_exit() -> None:
     assert evaluate(s3, Block.EXIT, _sig(), SETTINGS, U) == []  # 기준값 없으면 역산 불가 → 안 냄
 
 
+def test_three_consecutive_pre_rejects_turn_set_off_with_alarm() -> None:
+    # 결정 29(사용자 확정 2026-09-11): 선주문이 연속 3회 거부되면 원인이 남아 있는 것(증거금 부족
+    # 등) → 세트 진입·청산 둘 다 실행 끔 + 알람. 체결 전이라 중지(검정)는 아님. 접수 뒤 체결이나
+    # 취소가 한 번이라도 있으면 연속은 끊긴다.
+    from kp_arb.auto_m import PRE_REJECT_LIMIT
+
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    set_running(s, Block.EXIT, True)
+    s.rt = 10
+    for i in range(1, PRE_REJECT_LIMIT):
+        evaluate(s, Block.ENTRY, _sig(mono=100.0 + i), SETTINGS, U)
+        acts = on_pre_reject(s, Block.ENTRY, mono=100.5 + i, settings=SETTINGS,
+                             reason="증거금 부족")
+        assert [a.kind for a in acts] == ["notify"] and s.entry.running
+        assert f"({i}/{PRE_REJECT_LIMIT})" in acts[0].reason and "증거금 부족" in acts[0].reason
+        assert s.entry.status is LegStatus.SETTLE_DELAY
+    # 그 사이 청산 선주문이 걸려 있음 → 세트가 꺼질 때 같이 취소
+    evaluate(s, Block.EXIT, _sig(mono=105.0), SETTINGS, U)
+    on_pre_ack(s, Block.EXIT, "X1")
+    evaluate(s, Block.ENTRY, _sig(mono=106.0), SETTINGS, U)
+    acts = on_pre_reject(s, Block.ENTRY, mono=106.5, settings=SETTINGS, reason="증거금 부족")
+    kinds = [a.kind for a in acts]
+    assert "alarm" in kinds and "cancel_pre" in kinds          # 알람 + 청산 선주문 취소
+    assert not s.entry.running and not s.exit.running          # 세트 양쪽 실행 끔
+    assert s.entry.status is not LegStatus.HALTED               # 중지(검정) 아님
+    assert s.entry.reject_streak == 0 and s.exit.reject_streak == 0
+    assert "연속 3회" in next(a.reason for a in acts if a.kind == "alarm")
+    # 거부 2회 뒤 체결이 있으면 연속이 끊겨 다시 1부터
+    s2 = _set()
+    set_running(s2, Block.ENTRY, True)
+    for i in range(2):
+        evaluate(s2, Block.ENTRY, _sig(mono=200.0 + i), SETTINGS, U)
+        on_pre_reject(s2, Block.ENTRY, mono=200.5 + i, settings=SETTINGS)
+    evaluate(s2, Block.ENTRY, _sig(mono=203.0), SETTINGS, U)
+    on_pre_ack(s2, Block.ENTRY, "3")
+    on_pre_fill(s2, Block.ENTRY, 10, 201_000.0, mono=204.0)
+    assert s2.entry.reject_streak == 0
+
+
+def test_fill_before_cancel_confirmation_does_not_freeze_in_delay() -> None:
+    # 실측 2026-09-11 오후: 역산가 변경으로 취소를 보냈는데 취소보다 체결이 먼저(LS는 취소를 01433
+    # 거부) → 후주문까지 잡혀 판이 끝났는데 '취소 확인 대기' 표시가 남아 딜레이대기('쉼')에서 영영
+    # 못 나옴. 선주문이 끝나면(체결·취소·거부) 그 표시도 지워야 한다.
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    acts = evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"] and s.entry.pre_price == 201_000.0
+    on_pre_ack(s, Block.ENTRY, "1")
+    acts = evaluate(s, Block.ENTRY, _sig(hl_disp_bid=0.03), SETTINGS, U)  # 역산가 204,000
+    assert [a.kind for a in acts] == ["cancel_pre"] and s.entry.replace_pending
+    on_pre_fill(s, Block.ENTRY, 10, 201_000.0, mono=101.0)                # 취소 전에 전량 체결
+    assert s.entry.status is LegStatus.POST_PENDING
+    acts = on_post_fill(s, Block.ENTRY, 100.0, 1184.0, 1356.0, 102.0, SETTINGS)
+    assert acts == [] and s.entry.status is LegStatus.SETTLE_DELAY
+    assert not s.entry.replace_pending                                    # 판 끝 → 표시 정리
+    acts = evaluate(s, Block.ENTRY, _sig(mono=104.0), SETTINGS, U)        # 딜레이 지남
+    assert s.entry.block_reason != "후주문/취소 확인 대기"
+    assert [a.kind for a in acts] == ["place_pre"]                        # 다음 판 진행
+
+
 def test_limit_uses_market_tick_not_order_unit() -> None:
     # 사용자 확정 2026-09-08: 한계의 "상대1호가 − 1틱"에서 1틱은 시세 호가단위(20만 원대 500),
     # 선주문 주문단위(설정 3,000)는 역산가를 주문 단위로 맞출 때만. 매도1호가 201,500 →

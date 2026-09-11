@@ -277,7 +277,7 @@ class AutoMEngine:
             self._log.warning("[자동M] %s 선주문 실패 %s — %s",
                               u.value, self._tag(u, index, block), exc)
             self._apply(u, index, block, on_pre_reject(
-                s, block, time.monotonic(), self.screen.settings))
+                s, block, time.monotonic(), self.screen.settings, reason=str(exc)[:80]))
             return
         self._register(oid, _OrderRef(u, index, block, "pre"))
         late = on_pre_ack(s, block, oid, mono=self._mono)  # 발주 중 꺼졌/중지됐으면 취소 행동
@@ -457,7 +457,8 @@ class AutoMEngine:
                     self._forget(oid)
                 elif status == "rejected":
                     self._apply(u, ref.index, ref.block,
-                                on_pre_reject(s, ref.block, mono, self.screen.settings))
+                                on_pre_reject(s, ref.block, mono, self.screen.settings,
+                                              reason="LS 거부 통보"))
                     self._forget(oid)
                 elif status == "filled":
                     self._forget(oid)

@@ -228,6 +228,7 @@ class Leg:
     cancel_tries: int = 0           # 이번 선주문에 취소를 보낸 횟수(재전송 포함)
     cancel_alarmed: bool = False    # 취소 재전송 한도 초과 알람을 이미 냈음 → 상태줄 "취소실패"
     await_post_then_delay: bool = False  # 취소 확인됨, 병행 후주문 체결 확인 뒤 딜레이
+    reject_streak: int = 0          # 선주문 연속 거부 횟수 — 접수 뒤 체결·취소가 있으면 0으로
     halt_reason: str = ""
     # 마지막 판정 결과 한 줄(어느 게이트에서 막혔나·통과했나 + 숫자) — 로그는 바뀔 때만 남긴다
     block_reason: str = ""
@@ -249,6 +250,10 @@ class Leg:
         self.cancel_sent_mono = None
         self.cancel_tries = 0
         self.cancel_alarmed = False
+        # 선주문이 끝났으면(체결·취소·거부) 재발주 취소 대기도 끝 — 역산가 변경으로 취소를 보냈는데
+        # 취소보다 체결이 먼저 된 경우(LS 01433) 이 표시가 남아 판이 끝나도 '쉼'에서 못 나왔다
+        # (실측 2026-09-11 오후: 1·2세트 청산이 딜레이대기에 굳음).
+        self.replace_pending = False
 
 
 @dataclass
@@ -325,6 +330,13 @@ _EPS = 1e-9  # HL 소수 계약 비교용(0.588 같은 체결이 오므로 "== 0
 def post_done(leg: Leg) -> bool:
     """후주문 대기분이 없는가(소수 오차 허용)."""
     return leg.post_pending <= _EPS
+
+
+def set_post_done(s: AutoMSet) -> bool:
+    """세트의 진입·청산 **둘 다** 후주문 대기가 없는가 — 체결차 판정 시점(실측 2026-09-11 14:41:
+    진입·청산을 같이 돌릴 때 진입 후주문이 먼저 잡히자 청산 후주문 10이 아직 대기 중인데 세트 장부로
+    판정해 체결차 −10 → 중지. 판정 대상이 세트 장부이니 시점도 세트 전체 대기 0이어야 한다)."""
+    return post_done(s.entry) and post_done(s.exit)
 
 
 def fill_diff(sf_net_contracts: int, hl_net_contracts: float) -> float:
@@ -531,13 +543,29 @@ def on_pre_cancel_failed(s: AutoMSet, block: Block) -> None:
     leg.cancel_sent = False
 
 
-def on_pre_reject(s: AutoMSet, block: Block, mono: float, settings: AutoMSettings) -> list[Action]:
-    """선주문 거부 → 딜레이 뒤 다시 냄(멈추지 않음, exec ㄴ5)."""
+PRE_REJECT_LIMIT = 3  # 선주문 연속 거부 → 세트 양쪽 실행 끔 + 알람(사용자 확정 2026-09-11)
+
+
+def on_pre_reject(s: AutoMSet, block: Block, mono: float, settings: AutoMSettings,
+                  reason: str = "") -> list[Action]:
+    """선주문 거부 → 딜레이 뒤 다시 냄(exec ㄴ5). 단 **연속 PRE_REJECT_LIMIT회**면 원인이 남아 있는
+    것(증거금 부족·주문가능수량 초과 등)이라 세트 진입·청산 **둘 다 실행을 끄고** 알람(결정 29).
+    체결 전이라 헤지가 깨진 게 아니므로 중지(검정)가 아니라 실행 끔 — 사람이 정리 뒤 다시 켠다.
+    """
     leg = s.leg(block)
     leg.replace_pending = False
     leg._clear_pre()  # 거부된 주문은 취소할 것도 없음 — 번호·취소 표시 정리
+    leg.reject_streak += 1
+    why = f"선주문 거부{(': ' + reason) if reason else ''}"
+    if leg.reject_streak >= PRE_REJECT_LIMIT:
+        s.entry.reject_streak = s.exit.reject_streak = 0
+        acts = set_running(s, Block.ENTRY, False, mono) + set_running(s, Block.EXIT, False, mono)
+        acts.append(Action("alarm", reason=f"{why} — 연속 {PRE_REJECT_LIMIT}회, 세트 진입·청산 "
+                                           f"실행 끔(원인 정리 뒤 다시 켜세요)"))
+        return acts
     _start_delay(leg, mono, settings)
-    return [Action("notify", reason="선주문 거부 — 딜레이 뒤 재시도")]
+    return [Action("notify", reason=f"{why} — 딜레이 뒤 재시도({leg.reject_streak}/"
+                                    f"{PRE_REJECT_LIMIT})")]
 
 
 def on_pre_fill(
@@ -546,6 +574,7 @@ def on_pre_fill(
     """선주문 체결(일부/전부) → 체결분 × 10 후주문 즉시(exec ㄴ6·ㄴ7). 누적 SF 갱신."""
     leg = s.leg(block)
     leg.pre_filled += qty
+    leg.reject_streak = 0  # 체결됐으면 거부 연속은 끊김
     # 선주문 체결은 판 버퍼(pending)에 보관 — 매매결과(acc)는 후주문 전량 체결 확인 뒤 합친다
     leg.pending.sf_qty += qty
     leg.pending.sf_px_sum += price * qty
@@ -578,6 +607,7 @@ def _refresh_fill_diff(s: AutoMSet) -> None:
 def on_pre_cancelled(s: AutoMSet, block: Block, mono: float, settings: AutoMSettings) -> None:
     """선주문 취소 확인 — 재발주 취소면 병행 후주문 확인 뒤 딜레이, 아니면 감시로."""
     leg = s.leg(block)
+    leg.reject_streak = 0  # 걸렸다가 취소된 것 = 접수는 정상 → 거부 연속 끊김
     if leg.replace_pending:
         leg.replace_pending = False
         if not post_done(leg):
@@ -650,11 +680,18 @@ def _finish_round(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
     leg.acc.add_round(leg.pending, matched_only=not clean)
     leg.pending.clear()
     limit = diff_limit(s)
-    if _over_limit(s, diff):
+    acts: list[Action] = []
+    if not set_post_done(s):
+        # 다른 쪽(진입↔청산) 후주문이 아직 대기 중 — 세트 장부에 그 헤지가 빠져 있으니 지금 재면
+        # 오판(실측 2026-09-11 14:41 −10 중지). 이 판은 끝내고 판정은 그쪽 판 끝에서.
+        if abs(diff) >= _EPS or shortfall:
+            acts.append(Action("notify", reason=f"체결차 {diff:g} — 다른 쪽 후주문 대기 중, "
+                                                f"그 체결 뒤 판정"
+                                                + (f" — {shortfall}" if shortfall else "")))
+    elif _over_limit(s, diff):
         return _halt_set(s, block, f"체결차 {diff:g} ≥ 한도 {limit:g}(1회주문수량 {s.per_qty}×10)"
                          + (f" — {shortfall}" if shortfall else ""))
-    acts: list[Action] = []
-    if abs(diff) >= _EPS or shortfall:
+    elif abs(diff) >= _EPS or shortfall:
         acts.append(Action("notify", reason=f"체결차 {diff:g} (한도 {limit:g} 미만, 계속)"
                                             + (f" — {shortfall}" if shortfall else "")))
     # 이번 판 끝 — 남은 선주문 없으면 딜레이, 부분체결 잔량이 남아 있으면 계속 대기
@@ -714,7 +751,7 @@ def halt_if_unhedged(s: AutoMSet, block: Block, diff: float) -> list[Action]:
     그 미만은 그대로 진행(사용자 확정 2026-09-10). diff는 코어가 넣는다."""
     leg = s.leg(block)
     s.fill_diff = round(diff, 6)  # HL 소수 계약 그대로(0.412 등) — 정수로 깎으면 체결차가 사라진다
-    if not post_done(leg) or leg.status is LegStatus.HALTED or not _over_limit(s, diff):
+    if not set_post_done(s) or leg.status is LegStatus.HALTED or not _over_limit(s, diff):
         return []
     return _halt_set(s, block,
                      f"체결차 {diff:g} ≥ 한도 {diff_limit(s):g}(1회주문수량 {s.per_qty}×10)")

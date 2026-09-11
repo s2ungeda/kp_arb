@@ -176,6 +176,50 @@ def test_shortfall_accumulates_and_halts_only_at_per_qty_limit() -> None:
     assert acts == [] and s.entry.status is LegStatus.SETTLE_DELAY and s.fill_diff == 0
 
 
+def test_judgement_waits_for_other_leg_post_order() -> None:
+    # 실측 2026-09-11 14:41:18 삼성 2세트(진입·청산 동시 실행, 1회주문 1): 진입 선주문 체결(HL 대기
+    # 10) → 청산 선주문 체결(HL 대기 10) → 진입 후주문 10 체결 → 진입 판 끝에서 세트 장부로 판정
+    # 했는데 청산 후주문 10이 아직 대기라 체결차 −10 → 중지. 0.7초 뒤 청산 후주문이 잡혀 실제로는 0.
+    # 판정 대상이 세트 장부이니 판정 시점도 세트 전체(진입+청산) 후주문 대기 0이어야 한다.
+    from kp_arb.auto_m import AutoMSettings, LegStatus, on_post_fill, on_post_reject
+
+    st = AutoMSettings(windows=(("09:00:00", "15:20:00"),), pre_delay_ms=100)
+    s = _set()
+    s.per_qty = 1
+    s.sf_net, s.hl_net, s.rt = -2, 20.0, 2                       # 실측 장부(SF −2·HL 20, 체결차 0)
+    set_running(s, Block.ENTRY, True)
+    set_running(s, Block.EXIT, True)
+    s.entry.status, s.entry.pre_qty = LegStatus.PRE_RESTING, 1
+    s.exit.status, s.exit.pre_qty = LegStatus.PRE_RESTING, 1
+    on_pre_ack(s, Block.ENTRY, "17835")
+    on_pre_ack(s, Block.EXIT, "17834")
+    on_pre_fill(s, Block.ENTRY, 1, 255_500.0, mono=10.0)        # 진입 후주문 sell 10 대기
+    on_pre_fill(s, Block.EXIT, 1, 256_000.0, mono=10.2)         # 청산 후주문 buy 10 대기
+    assert s.fill_diff == 0
+    acts = on_post_fill(s, Block.ENTRY, 10.0, 192.99, 1345.5, 10.7, st)  # 진입 후주문 먼저 체결
+    assert s.fill_diff == -10 and s.exit.post_pending == 10
+    assert [a.kind for a in acts] == ["notify"]                  # 판정 보류 — 중지 아님
+    assert s.entry.status is LegStatus.SETTLE_DELAY and s.entry.running
+    assert s.exit.status is LegStatus.POST_PENDING and s.exit.running
+    acts = on_post_fill(s, Block.EXIT, 10.0, 192.985, 1345.6, 11.4, st)  # 청산 후주문 체결
+    assert s.fill_diff == 0 and acts == []                       # 세트 대기 0 → 판정 → 헤지 완성
+    assert s.exit.status is LegStatus.SETTLE_DELAY and s.exit.running
+    assert s.entry.status is not LegStatus.HALTED
+    # 반대로 청산 후주문이 거부되면 그때 세트 장부(−10)로 판정 → 한도 10 → 중지
+    s.entry.status, s.entry.pre_qty, s.entry.pre_filled = LegStatus.PRE_RESTING, 1, 0
+    s.exit.status, s.exit.pre_qty, s.exit.pre_filled = LegStatus.PRE_RESTING, 1, 0
+    on_pre_ack(s, Block.ENTRY, "17840")
+    on_pre_ack(s, Block.EXIT, "17841")
+    on_pre_fill(s, Block.ENTRY, 1, 255_500.0, mono=20.0)
+    on_pre_fill(s, Block.EXIT, 1, 256_000.0, mono=20.2)
+    acts = on_post_fill(s, Block.ENTRY, 10.0, 192.99, 1345.5, 20.7, st)
+    assert [a.kind for a in acts] == ["notify"] and s.fill_diff == -10
+    acts = on_post_reject(s, Block.EXIT, "HL order not accepted", qty=10, mono=21.0, settings=st)
+    assert [a.kind for a in acts][:2] == ["halt", "notify"]
+    assert s.exit.status is LegStatus.HALTED and s.entry.status is LegStatus.HALTED
+    assert s.fill_diff == -10 and "한도 10" in s.exit.halt_reason
+
+
 def test_halted_state_survives_restart() -> None:
     # 사용자 확정 2026-09-10: 중지는 재시동 뒤에도 유지(사람이 직접 풀어야 재개). 실측 10:42
     # 재시동이 중지를 대기로 되살려 정리·해제 없이 다음 판이 돌았다.
