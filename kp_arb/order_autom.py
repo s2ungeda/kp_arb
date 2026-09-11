@@ -241,12 +241,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # ===================== 상단 바 =====================
     top = tk.Frame(root)
     top.pack(fill="x", padx=4, pady=(2, 2))
-    tk.Label(top, text="종목").pack(side="left")
     # 종목 콤보 — 현대차 제외(사용자 2026-09-04, 시세 화면과 동일). 코어 취급 종목은 그대로.
+    # 앞의 '종목' 제목 라벨은 뺐다(사용자 2026-09-11, 상단 공간 확보).
     cb_under = ttk.Combobox(top, values=[u for u in UNDERLYINGS if u != "현대차"],
                             width=7, state="readonly")
     cb_under.set("하이닉스")
-    cb_under.pack(side="left", padx=(2, 4))
+    cb_under.pack(side="left", padx=(0, 4))
     cb_under.bind("<<ComboboxSelected>>", lambda e: on_under_change(e))  # 종목별 책 전환
     # HL 호가단위(틱) — 일반주문창처럼 코어가 계산한 실제 틱 숫자(autom_live.hl_merge_ticks)로
     # 채운다. 코어 가격 수신 전엔 "-" 하나.
