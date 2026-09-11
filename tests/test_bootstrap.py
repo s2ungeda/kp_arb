@@ -85,12 +85,15 @@ def test_record_cancel_captures_time_and_intent() -> None:
     order = ob.track("O9", OrderIntent(
         venue=Venue.HYPERLIQUID, underlying=Underlying.SK_HYNIX,
         instrument=Instrument.HL_PERP, side=Side.BUY, qty=0.05,
-        order_type=OrderType.LIMIT, price=1400.0))
-    sys = SimpleNamespace(cancels=deque(maxlen=200))
+        order_type=OrderType.LIMIT, price=1400.0, source="자동M"))
+    sys = SimpleNamespace(cancels=deque(maxlen=200), fills=deque(maxlen=200))
     LiveSystem._record_cancel(sys, order)
     assert len(sys.cancels) == 1
     c = sys.cancels[0]
     assert c["side"] == "buy" and c["qty"] == 0.05 and c["time"]  # 시각 채워짐
+    assert c["source"] == "자동M"  # 출처 — 주문 리스트 '출처' 칸·필터(2026-09-11)
+    LiveSystem._record_fill(sys, order, 0.05, 1400.0, "f1")
+    assert sys.fills[0]["source"] == "자동M" and sys.fills[0]["qty"] == 0.05
 
 
 async def test_guarded_ws_restarts_then_stops(monkeypatch) -> None:  # type: ignore[no-untyped-def]

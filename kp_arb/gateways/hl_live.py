@@ -26,7 +26,7 @@ from .. import order_log
 from ..config import ConfigError, SecretProvider, default_secrets
 from ..domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from ..domain.models import OrderIntent, Position
-from .base import HLGateway
+from .base import HLGateway, placed_at_from_ms, placed_epoch_from_ms
 from .hl import HLError
 from .ls import OrderGoneError
 
@@ -390,6 +390,8 @@ class HLSdkGateway(HLGateway):
                     intent=intent,
                     status=OrderStatus.PARTIAL if filled > 0 else OrderStatus.ACCEPTED,
                     filled_qty=filled,
+                    placed_at=placed_at_from_ms(row.get("timestamp")),  # 접수시각(거래소 값)
+                    placed_epoch=placed_epoch_from_ms(row.get("timestamp")),  # 정렬용
                 )
             )
         return orders

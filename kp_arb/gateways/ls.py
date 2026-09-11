@@ -23,7 +23,7 @@ from ..domain.models import OrderIntent, Position
 from ..etf_theory import EtfTheoryInputs
 from ..order_book import OrderStatus, TrackedOrder
 from ..routing import account_for
-from .base import LSGateway
+from .base import LSGateway, placed_at_from_hhmmss, placed_epoch_from_hhmmss
 from .ls_auth import TokenManager, TokenTransport
 from .ls_rest import (
     LS_PER_SECOND,
@@ -359,6 +359,9 @@ class LSApiGateway(LSGateway):
             status=OrderStatus.PARTIAL if exec_qty > 0 else OrderStatus.ACCEPTED,
             filled_qty=exec_qty,
             avg_fill_price=float(row.get("ExecPrc", 0) or 0),
+            # 접수시각 — OutBlock3 OrdTime(HHMMSSmmm, 공식 문서). 없으면 빈 칸(실측 확인 대기).
+            placed_at=placed_at_from_hhmmss(row.get("OrdTime")),
+            placed_epoch=placed_epoch_from_hhmmss(row.get("OrdTime")),  # 정렬용(오늘 날짜)
         )
 
     async def _deriv_open_orders(self) -> list[TrackedOrder]:
@@ -428,6 +431,8 @@ class LSApiGateway(LSGateway):
             order_id=order_id, intent=intent,
             status=OrderStatus.PARTIAL if exec_qty > 0 else OrderStatus.ACCEPTED,
             filled_qty=exec_qty, avg_fill_price=float(row.get("cheprice") or 0),
+            placed_at=placed_at_from_hhmmss(row.get("ordtime")),  # 접수시각(공식 문서 ordtime)
+            placed_epoch=placed_epoch_from_hhmmss(row.get("ordtime")),  # 정렬용(오늘 날짜)
         )
 
     STOCK_PRICE_TR = "t1102"    # 주식/ETF 현재가 (실측: OutBlock.price)

@@ -348,6 +348,7 @@ class LiveSystem:
             "side": it.side.value,
             "qty": qty, "price": price,                     # 체결량·체결가
             "order_qty": it.qty, "order_price": it.price,   # 원주문 수량·주문가
+            "source": it.source,                            # 출처(주문 리스트 '출처' 칸·필터)
         })
 
     def _record_cancel(self, order: TrackedOrder) -> None:
@@ -362,6 +363,7 @@ class LiveSystem:
             "accept_time": order.placed_at,         # 접수시각
             "underlying": it.underlying.value, "instrument": it.instrument.value,
             "side": it.side.value, "qty": it.qty, "price": it.price,  # 주문수량·주문가
+            "source": it.source,                    # 출처(주문 리스트 '출처' 칸·필터)
         })
 
     # --- 원달러선물 동시호가 대응주문 (§9.1, DESIGN-fx-auction) ---

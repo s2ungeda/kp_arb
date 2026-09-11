@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from .bootstrap import LiveSystem
     from .core_engine import RehearsalEngine
     from .fx_service import FxReportService
+    from .order_book import TrackedOrder
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
@@ -333,6 +334,23 @@ def _tick_size(
     return None
 
 
+def sorted_open_orders(orders: list[TrackedOrder]) -> list[TrackedOrder]:
+    """미체결을 **새 주문이 위**(접수시각 내림차순)로. 순수 로직.
+
+    장부 dict 순서는 출처에 따라 다르다 — 이 프로세스가 낸 주문은 낸 순서, 시동 조회분은 거래소
+    응답 순서(HL frontendOpenOrders는 최신 먼저; 실측 2026-09-11 화면이 거꾸로 보임). 접수시각
+    (placed_epoch)으로 정렬하면 어느 쪽이든 같다. 시각을 모르는 주문(0)은 맨 뒤, 같은 시각은
+    주문번호 큰 것(나중 주문)이 위."""
+    def _key(o: TrackedOrder) -> tuple[float, float]:
+        try:
+            oid = float(o.order_id)
+        except ValueError:
+            oid = 0.0
+        return (o.placed_epoch, oid)
+
+    return sorted(orders, key=_key, reverse=True)
+
+
 def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
     """수동 주문창용 스냅샷 — 취급 종목별 호가·포지션·매도가능·잔고 + 전체 미체결.
 
@@ -344,7 +362,7 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
     ob = system.order_book
     pending_sell: dict[tuple[Underlying, Instrument], float] = {}
     open_orders: list[dict[str, Any]] = []
-    for o in ob.open_orders():
+    for o in sorted_open_orders(ob.open_orders()):
         it = o.intent
         if it.side is Side.SELL:
             k = (it.underlying, it.instrument)
@@ -355,6 +373,7 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
             "qty": it.qty, "remaining": o.remaining_qty,
             "price": it.price, "status": o.status.value,
             "time": o.placed_at,  # 접수 시각(HH:MM:SS) — 주문 리스트 '시각' 칸
+            "source": it.source,  # 출처(자동M·일반주문창·따라가기) — 주문 리스트 '출처' 칸·필터
         })
     symbols: dict[str, Any] = {}
     for u in Underlying:

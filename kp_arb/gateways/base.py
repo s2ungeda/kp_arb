@@ -12,6 +12,51 @@ if TYPE_CHECKING:
     from ..order_book import TrackedOrder
 
 
+def placed_at_from_ms(ms: object) -> str:
+    """거래소 접수시각(epoch ms, HL frontendOpenOrders ``timestamp``) → 'HH:MM:SS'(현지 시각).
+    시동 조회로 알게 된 주문도 주문 리스트 '접수시각' 칸이 비지 않게. 값이 없거나 이상하면 ''."""
+    import time
+
+    try:
+        sec = float(str(ms)) / 1000.0
+    except (TypeError, ValueError):
+        return ""
+    if sec <= 0:
+        return ""
+    return time.strftime("%H:%M:%S", time.localtime(sec))
+
+
+def placed_epoch_from_ms(ms: object) -> float:
+    """epoch ms → epoch 초(정렬용). 없거나 이상하면 0.0."""
+    try:
+        sec = float(str(ms)) / 1000.0
+    except (TypeError, ValueError):
+        return 0.0
+    return sec if sec > 0 else 0.0
+
+
+def placed_at_from_hhmmss(raw: object) -> str:
+    """LS 시각 문자열(``HHMMSS`` 또는 ``HHMMSSmmm``, CSPAQ13700 OrdTime·t0434 ordtime) →
+    'HH:MM:SS'. 숫자 6자리 미만이면 ''."""
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if len(digits) < 6:
+        return ""
+    return f"{digits[0:2]}:{digits[2:4]}:{digits[4:6]}"
+
+
+def placed_epoch_from_hhmmss(raw: object, now: float | None = None) -> float:
+    """LS 시각 문자열 → 오늘 날짜의 epoch 초(정렬용). LS 미체결은 당일 주문뿐이라 날짜는 오늘.
+    시각이 없으면 0.0(맨 뒤로 정렬)."""
+    import time
+
+    hhmmss = placed_at_from_hhmmss(raw)
+    if not hhmmss:
+        return 0.0
+    base = time.localtime(time.time() if now is None else now)
+    h, m, s = (int(p) for p in hhmmss.split(":"))
+    return time.mktime((base.tm_year, base.tm_mon, base.tm_mday, h, m, s, 0, 0, -1))
+
+
 class LSGateway(ABC):
     """LS Open API 게이트웨이 (주식계좌 + 선물옵션계좌). REST+WS, OAuth2."""
 

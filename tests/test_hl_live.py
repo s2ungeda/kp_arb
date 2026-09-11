@@ -312,9 +312,13 @@ async def test_snapshot_orders_allow_amend() -> None:
     # "context required for modify" 거부가 안 난다(코어 재시작 후 정정, 특히 매도).
     info = StubInfo(open_orders=[
         {"coin": "xyz:SMSN", "side": "A", "origSz": "0.14", "sz": "0.14",
-         "limitPx": "185.0", "oid": 777}])
+         "limitPx": "185.0", "oid": 777, "timestamp": 1789084276518}])
     gw, ex, _ = _gw(info)
-    await gw.get_open_orders()  # place_order 없이 스냅샷만 로드
+    (snap,) = await gw.get_open_orders()  # place_order 없이 스냅샷만 로드
+    # 시동 조회 주문도 접수시각이 채워진다(거래소 timestamp → 현지 HH:MM:SS, 사용자 2026-09-11)
+    import time as _t
+
+    assert snap.placed_at == _t.strftime("%H:%M:%S", _t.localtime(1789084276.518))
     new_oid = await gw.amend_order("777", qty=0.14, price=184.0)
     assert new_oid == "778"  # 예외 없이 정정 — 새 oid
     assert ex.modifies[0][:3] == (777, "xyz:SMSN", False)  # 매도(is_buy=False) 보존

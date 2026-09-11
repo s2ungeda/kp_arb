@@ -399,6 +399,26 @@ def test_manual_snapshot_shape() -> None:
     assert any(o["order_id"] == "SELL1" for o in snap["open_orders"])
 
 
+def test_sorted_open_orders_newest_first_regardless_of_book_order() -> None:
+    # 시동 조회분(HL 응답 = 최신 먼저)과 이 프로세스가 낸 주문(낸 순서)이 섞여도 접수시각
+    # 내림차순 — 화면이 뒤집던 방식은 조회분을 거꾸로 보였다(실측 2026-09-11).
+    from kp_arb.core_server import sorted_open_orders
+    from kp_arb.order_book import TrackedOrder
+
+    def _o(oid: str, epoch: float) -> TrackedOrder:
+        return TrackedOrder(order_id=oid, intent=OrderIntent(
+            venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+            instrument=Instrument.HL_PERP, side=Side.BUY, qty=0.3, price=190.0),
+            placed_epoch=epoch)
+
+    book_order = [_o("30", 300.0), _o("20", 200.0), _o("10", 100.0),  # 조회분(최신 먼저)
+                  _o("40", 400.0), _o("50", 500.0),                    # 그 뒤 낸 주문(낸 순서)
+                  _o("5", 0.0), _o("7", 0.0)]                          # 시각 모름 → 맨 뒤
+    got = [o.order_id for o in sorted_open_orders(book_order)]
+    assert got == ["50", "40", "30", "20", "10", "7", "5"]
+    assert [o.order_id for o in sorted_open_orders([])] == []
+
+
 def test_manual_snapshot_hl_fields() -> None:
     # 잔고표 오른쪽(B) — 오라클·펀딩률(WS 저장), 마진·누적펀딩·청산가(clearinghouse detail)
     from kp_arb.gateways.hl import Mark

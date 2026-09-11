@@ -55,6 +55,7 @@ class TrackedOrder:
     avg_fill_price: float = 0.0
     placed_ts: float = 0.0  # 추적 시각(monotonic) — 스냅샷 재조정 유예용
     placed_at: str = ""     # 접수 시각(HH:MM:SS, 표시용) — 주문 리스트 '시각' 칸
+    placed_epoch: float = 0.0  # 접수 시각(epoch 초, 정렬용) — 시동 조회분은 거래소 값으로 채움
     provisional_filled: float = 0.0  # 발주 응답 선반영 수량 — userFills 재통보 흡수용(HL 즉시체결)
 
     @property
@@ -154,7 +155,7 @@ class OrderBook:
 
     def track(self, order_id: str, intent: OrderIntent) -> TrackedOrder:
         order = TrackedOrder(order_id=order_id, intent=intent, placed_ts=time.monotonic(),
-                             placed_at=time.strftime("%H:%M:%S"))
+                             placed_at=time.strftime("%H:%M:%S"), placed_epoch=time.time())
         self._orders[order_id] = order
         self._changed()
         return order

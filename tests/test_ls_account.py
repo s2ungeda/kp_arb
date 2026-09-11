@@ -32,7 +32,7 @@ FIXTURES: dict[str, dict[str, Any]] = {
         "CSPAQ13700OutBlock3": [
             {"OrdNo": 7267, "IsuNo": "A005930", "BnsTpCode": "2", "OrdQty": 1,
              "OrdPrc": "265000.00", "ExecQty": 0, "ExecPrc": "0.00",
-             "MrcAbleQty": 1, "OrdprcPtnCode": "00"},
+             "MrcAbleQty": 1, "OrdprcPtnCode": "00", "OrdTime": "090922123"},
             {"OrdNo": 7000, "IsuNo": "A005930", "BnsTpCode": "1", "OrdQty": 2,
              "OrdPrc": "0.00", "ExecQty": 2, "ExecPrc": "292000.00",
              "MrcAbleQty": 0, "OrdprcPtnCode": "03"},  # 전량 체결 → 제외 대상
@@ -47,7 +47,8 @@ FIXTURES: dict[str, dict[str, Any]] = {
              "medosu": "매수", "cheprice": "34225.00", "status": "완료"},
             {"orgordno": 0, "hogatype": "L", "ordrem": 4, "ordgb": "지정가", "cheqty": 1,
              "ordno": 69105, "price": "34225.00", "qty": 5, "expcode": "A1167000",
-             "medosu": "매도", "cheprice": "34225.00", "status": "접수"},
+             "medosu": "매도", "cheprice": "34225.00", "status": "접수",
+             "ordtime": "101530"},
             {"orgordno": 0, "hogatype": "L", "ordrem": 1, "ordgb": "지정가", "cheqty": 0,
              "ordno": 69106, "price": "1000.00", "qty": 1, "expcode": "ZZZ",
              "medosu": "매수", "cheprice": "0.00", "status": "접수"},  # 취급 외 종목
@@ -227,6 +228,7 @@ async def test_open_orders_parsed_and_filtered() -> None:
     assert o.intent.underlying is Underlying.SAMSUNG  # "A005930" → 005930
     assert o.intent.side is Side.BUY and o.intent.qty == 1
     assert o.intent.price == 265_000.0
+    assert o.placed_at == "09:09:22"  # 접수시각(OrdTime HHMMSSmmm) — 주문 리스트 칸
 
 
 async def test_deriv_open_orders_use_t0434_and_gate_reconcile() -> None:
@@ -251,7 +253,35 @@ async def test_deriv_open_orders_use_t0434_and_gate_reconcile() -> None:
     assert o.intent.instrument is Instrument.KR_STOCK_FUTURE and o.intent.side is Side.SELL
     assert o.intent.qty == 5 and o.intent.price == 34_225.0
     assert o.status is OrderStatus.PARTIAL and o.filled_qty == 1
+    assert o.placed_at == "10:15:30"  # 접수시각(ordtime)
     assert gw.open_orders_supported(Account.KR_DERIV)  # 성공 뒤 유령 정리 대상
+
+
+def test_placed_at_parsers() -> None:
+    from kp_arb.gateways.base import placed_at_from_hhmmss, placed_at_from_ms
+
+    assert placed_at_from_hhmmss("090922123") == "09:09:22"
+    assert placed_at_from_hhmmss("101530") == "10:15:30"
+    assert placed_at_from_hhmmss("") == "" and placed_at_from_hhmmss(None) == ""
+    assert placed_at_from_hhmmss("1015") == ""  # 자릿수 부족
+    assert placed_at_from_ms(None) == "" and placed_at_from_ms("x") == ""
+    assert placed_at_from_ms(0) == ""
+    assert len(placed_at_from_ms(1789084276518)) == 8  # 'HH:MM:SS'(현지 시각)
+
+
+def test_placed_epoch_parsers() -> None:
+    import time as _t
+
+    from kp_arb.gateways.base import placed_epoch_from_hhmmss, placed_epoch_from_ms
+
+    assert placed_epoch_from_ms(1789084276518) == 1789084276.518
+    assert placed_epoch_from_ms(None) == 0.0 and placed_epoch_from_ms("x") == 0.0
+    # LS 시각 → 오늘 날짜의 epoch(정렬용). 같은 날 안에서 순서가 맞으면 된다.
+    now = _t.mktime((2026, 9, 11, 12, 0, 0, 0, 0, -1))
+    a = placed_epoch_from_hhmmss("090922123", now)
+    b = placed_epoch_from_hhmmss("101530", now)
+    assert 0 < a < b and b - a == (1 * 3600 + 6 * 60 + 8)
+    assert placed_epoch_from_hhmmss("", now) == 0.0
 
 
 async def test_snapshot_orders_can_be_cancelled_after_restart() -> None:
