@@ -19,3 +19,6 @@ win_fields.json
 build/
 dist/
 real_log/
+
+# 세션 검토 메모(로컬 전용)
+docs/review-*.md
