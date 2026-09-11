@@ -103,7 +103,13 @@ class HLGateway(ABC):
     async def connect(self) -> None: ...
 
     @abstractmethod
-    async def place_order(self, intent: OrderIntent) -> str: ...
+    async def place_order(self, intent: OrderIntent, cloid: str | None = None) -> str:
+        """발주 → 거래소 주문번호(oid). cloid(클라이언트 주문번호, DESIGN §HL cloid)를 주면 주문에
+        실어 보낸다 — 응답 전 통보(orderUpdates)로 oid를 식별하고, 응답 유실 시 조회로 복구."""
+
+    def new_cloid(self) -> str | None:
+        """클라이언트 주문번호 생성 — 지원 안 하면 None(목 등). HLSdkGateway가 구현."""
+        return None
 
     @abstractmethod
     async def cancel_order(self, order_id: str) -> None: ...

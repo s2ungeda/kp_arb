@@ -24,7 +24,7 @@ class MockHLGateway(HLGateway):
     async def connect(self) -> None:
         self.connected = True
 
-    async def place_order(self, intent: OrderIntent) -> str:
+    async def place_order(self, intent: OrderIntent, cloid: str | None = None) -> str:
         if intent.venue is not Venue.HYPERLIQUID:
             raise ValueError("MockHLGateway only handles Hyperliquid orders")
         self.placed.append(intent)

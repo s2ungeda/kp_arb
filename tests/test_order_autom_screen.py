@@ -48,16 +48,32 @@ def test_settings_payload_shape() -> None:
     assert p["pre_delay_ms"] == 1000 and p["resume_delay_s"] == 10
 
 
+def test_fx_caption() -> None:
+    from kp_arb.order_autom import fx_caption
+
+    assert fx_caption(1349.6, "현물") == "환율 1,349.60 (현물)"
+    assert fx_caption(1352.25, "선물이론") == "환율 1,352.25 (선물이론)"
+    assert fx_caption(None, "현물") == "환율 -" and fx_caption(0, "") == "환율 -"
+    assert fx_caption(1349.6, "") == "환율 1,349.60"
+
+
 def test_sum_acc_weights_by_hl_qty() -> None:
     rows = [
-        {"entry": {"hl_qty": 40, "sf_qty": 4, "fx_avg": 1350.0, "sprd": 0.01}},
-        {"entry": {"hl_qty": 60, "sf_qty": 6, "fx_avg": 1360.0, "sprd": 0.02}},
+        {"entry": {"hl_qty": 40, "sf_qty": 4, "fx_avg": 1350.0, "sprd": 0.01,
+                   "hl_avg": 190.0, "sf_avg": 250_000.0}},
+        {"entry": {"hl_qty": 60, "sf_qty": 6, "fx_avg": 1360.0, "sprd": 0.02,
+                   "hl_avg": 200.0, "sf_avg": 260_000.0}},
         {"entry": {"hl_qty": 0, "sf_qty": 0, "fx_avg": None, "sprd": None}},
     ]
     agg = sum_acc(rows, "entry")
     assert agg["hl_qty"] == 100 and agg["sf_qty"] == 10
     assert agg["fx_avg"] == 1356.0 and abs(agg["sprd"] - 0.016) < 1e-12
-    assert sum_acc([], "exit")["fx_avg"] is None
+    # -HP/+SF 칸은 평균 체결가(수량 아님, 사용자 2026-09-11) — HL 수량 가중
+    assert agg["hl_avg"] == 196.0 and agg["sf_avg"] == 256_000.0
+    assert sum_acc([], "exit")["fx_avg"] is None and sum_acc([], "exit")["hl_avg"] is None
+    # 옛 스냅샷(평균가 키 없음)이면 평균가만 None, 나머지는 그대로
+    old = sum_acc([{"entry": {"hl_qty": 40, "sf_qty": 4, "fx_avg": 1350.0}}], "entry")
+    assert old["fx_avg"] == 1350.0 and old["hl_avg"] is None and old["sf_avg"] is None
 
 
 def test_sum_acc_uses_matched_smaller_side() -> None:

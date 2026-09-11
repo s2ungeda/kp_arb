@@ -82,7 +82,7 @@ class HLApiGateway(HLGateway):
 
     # --- 주문 ---
 
-    async def place_order(self, intent: OrderIntent) -> str:
+    async def place_order(self, intent: OrderIntent, cloid: str | None = None) -> str:
         if intent.venue is not Venue.HYPERLIQUID:
             raise ValueError("HLApiGateway only handles Hyperliquid orders")
         coin = self._symbol(intent.underlying)

@@ -226,6 +226,10 @@ class LiveSystem:
         self._fx_spot_window = (parse_hhmm(fx_spot_window[0]), parse_hhmm(fx_spot_window[1]))
         self._hl = hl_gateway
         self._hl_ws = hl_ws
+        # HL cloid → 발주 의도(응답 대기 중). 응답보다 먼저 온 orderUpdates의 cloid로 oid를 식별해
+        # 즉시 장부에 등록한다(DESIGN §HL cloid ①). 식별 시 (cloid, oid)를 아래 훅에 알린다.
+        self._hl_pending: dict[str, OrderIntent] = {}
+        self.on_hl_identified: list[Callable[[str, str], None]] = []
         self.order_book = order_book
         self.session = session
         self._stock_ws = stock_ws
@@ -527,6 +531,7 @@ class LiveSystem:
         외부(홈페이지) 취소·자동취소(post-only/reduce-only/마진부족 등)도 즉시 반영돼,
         조회(get_open_orders) 없이 호가창 유령 주문표시가 안 생긴다.
         """
+        self._identify_hl_order(upd)  # 응답 전 통보면 cloid로 먼저 등록(아래 취소 처리가 주인을 앎)
         if not upd.is_terminal_cancel:
             return  # open/triggered(살아있음)·filled(userFills 담당)은 여기서 처리 안 함
         order = (self.order_book.on_reject(upd.oid) if upd.is_rejected
@@ -543,6 +548,22 @@ class LiveSystem:
             # 아직 track 전(발주 응답보다 WS가 먼저) — OrderBook이 보관했다가 track 뒤 replay로 반영
             log.info("주문종료(%s, 잔량 %g) #%s — 추적 전 도착, 발주 처리 뒤 반영(또는 외부 주문)",
                      upd.status, upd.sz, upd.oid)
+
+    def _identify_hl_order(self, upd: OrderUpdate) -> None:
+        """응답 전 식별(DESIGN §HL cloid ①) — 통보의 cloid가 발주 응답을 기다리는 우리 주문이면
+        oid를 즉시 장부에 등록하고, 훅(자동M 등)에 알린 뒤 먼저 온 체결(userFills)을 반영한다.
+        실측 2026-09-11 10:18:35: 잔량 버림 종료 통보가 응답보다 49ms 먼저 와 자동M이 놓쳤다."""
+        if not upd.cloid or self.order_book.order(upd.oid) is not None:
+            return
+        intent = self._hl_pending.get(upd.cloid)
+        if intent is None:
+            return
+        self.order_book.track(upd.oid, intent)
+        order_log.logger_for(Venue.HYPERLIQUID).info(
+            "HL 주문 식별(응답 전) #%s ← cloid %s (%s)", upd.oid, upd.cloid, upd.status)
+        for cb in self.on_hl_identified:
+            cb(upd.cloid, upd.oid)
+        self.order_book.replay_pending(upd.oid)
 
     def _on_ws_reconnect(self, label: str) -> None:
         """WS 재연결 후(동기 콜백) — 끊긴 동안 놓친 체결/외부거래를 반영하러 OrderBook을
@@ -581,11 +602,16 @@ class LiveSystem:
 
     # --- 주문 (등록까지 한 번에 — 이후 상태는 이벤트로만) ---
 
-    async def place(self, intent: OrderIntent) -> str:
+    def new_hl_cloid(self) -> str | None:
+        """HL 클라이언트 주문번호 — 호출자가 발주 전에 만들어 두고 place(cloid=)로 넘긴다."""
+        return self._hl.new_cloid() if self._hl is not None else None
+
+    async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str:
         """venue 라우팅 주문 + OrderBook 등록. 이후 상태는 이벤트로만.
 
         HL은 발주 즉시체결(크로싱)이면 응답에 이미 체결이 실려온다 — userFills를 놓쳐도
         미체결로 남지 않게 그 체결을 바로 반영한다(중복은 OrderBook 초과체결 가드가 무시).
+        HL cloid(없으면 여기서 생성)는 응답 전 통보로 주문번호를 식별하는 데 쓴다(§HL cloid).
         """
         if intent.venue is Venue.LS:
             order_id = await self._gw.place_order(intent)
@@ -601,17 +627,33 @@ class LiveSystem:
             raise DailyLimitExceeded(
                 f"HL 일일 한도 초과 — 당일 {filled:,.0f} + 주문 {notional:,.0f} "
                 f"> 한도 {self.hl_daily_limit_usdc:,.0f} USDC")
-        order_id = await self._hl.place_order(intent)
-        self.order_book.track(order_id, intent)
+        if cloid is None:
+            cloid = self._hl.new_cloid()
+        if cloid:
+            self._hl_pending[cloid] = intent
+        try:
+            order_id = await self._hl.place_order(intent, cloid=cloid)
+        finally:
+            if cloid:
+                self._hl_pending.pop(cloid, None)
+        order = self.order_book.order(order_id)
+        if order is None:
+            order = self.order_book.track(order_id, intent)
+        else:  # 응답보다 먼저 온 통보(cloid)로 이미 등록·체결 반영됨 — 그대로 잇는다
+            order_log.logger_for(Venue.HYPERLIQUID).info(
+                "HL 발주 응답 #%s — 응답 전 식별로 이미 등록(체결 %g)", order_id, order.filled_qty)
         place_fill = self._hl.pop_place_fill()  # 발주 즉시체결 (수량, 평균가) | None
         if place_fill is not None:
             sz, px = place_fill
-            fill = Fill(fill_id=f"place-{order_id}", order_id=order_id,
-                        qty=sz, price=px, ts=0.0)
-            # 주문 체결처리 + 포지션만 반영(미체결 잔류 방지). apply_place_fill은 선반영
-            # 수량을 기록해 뒤이어 오는 userFills 재통보를 그 수량만큼 흡수한다(부분 즉시
-            # 체결도 이중 반영 안 됨). 체결내역 기록·엔진 통지는 userFills가 전담.
-            self.order_book.apply_place_fill(fill)
+            # 응답 전 식별로 이미 반영된 체결(userFills)은 뺀 차이만 선반영 — 이중 반영 방지
+            delta = sz - order.filled_qty
+            if delta > 1e-9:
+                fill = Fill(fill_id=f"place-{order_id}", order_id=order_id,
+                            qty=delta, price=px, ts=0.0)
+                # 주문 체결처리 + 포지션만 반영(미체결 잔류 방지). apply_place_fill은 선반영
+                # 수량을 기록해 뒤이어 오는 userFills 재통보를 그 수량만큼 흡수한다(부분 즉시
+                # 체결도 이중 반영 안 됨). 체결내역 기록·엔진 통지는 userFills가 전담.
+                self.order_book.apply_place_fill(fill)
             self._schedule_hl_refresh()
         # apply_place_fill **뒤**에 replay — track 전에 온 이벤트(체결·취소 등) 반영. 겹친
         # 체결은 provisional_filled가 흡수해 이중 반영 없음(주문 역전 대비, LS·HL 공용).

@@ -316,6 +316,22 @@ def test_replay_absorbs_duplicate_with_provisional() -> None:
     assert order is not None and order.filled_qty == 0.1   # 0.2 아님(이중 없음)
 
 
+def test_replay_float_residue_is_not_a_fill() -> None:
+    # 실측 2026-09-11: 선반영 5.963 vs WS 체결 0.521+5.208+0.234 — 부동소수점 찌꺼기 2.8e-17이
+    # '체결 2.77556e-17'로 반영돼 체결내역에 0짜리 행이 생겼다. 찌꺼기는 체결로 안 본다.
+    ob = OrderBook()
+    seen: list[float] = []
+    ob.on_fill_applied.append(lambda _o, q, _p, _f: seen.append(q))
+    for i, q in enumerate((0.521, 5.208, 0.234)):
+        ob.on_fill(fill("O5", q, 192.0, fill_id=f"ws{i}"))       # WS 체결이 먼저 → 버퍼
+    ob.track("O5", _hl_intent(Side.SELL, 10.0))
+    ob.apply_place_fill(fill("O5", 5.963, 192.03, fill_id="place-O5"))
+    ob.replay_pending("O5")
+    order = ob.order("O5")
+    assert order is not None and order.filled_qty == 5.963
+    assert seen == [5.963]  # 선반영 1회뿐 — 찌꺼기 체결 없음
+
+
 def test_pending_buffer_is_bounded() -> None:
     ob = OrderBook()
     for i in range(OrderBook._PENDING_CAP + 50):        # 외부 주문 이벤트 무한 누적 방지

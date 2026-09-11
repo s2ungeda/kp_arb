@@ -75,8 +75,10 @@ class _SystemLike(Protocol):
     def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]: ...
     def fx_entry_rate(self, side: Side) -> float | None: ...
     def futures_halted(self) -> bool: ...
-    async def place(self, intent: OrderIntent) -> str: ...
+    async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str: ...
     async def cancel(self, order_id: str) -> None: ...
+    def new_hl_cloid(self) -> str | None: ...
+    on_hl_identified: list[Callable[[str, str], None]]  # (cloid, oid) — 응답 전 식별 통지
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,9 @@ class AutoMEngine:
         self._orders: dict[str, _OrderRef] = {}
         # 등록 전에 온 우리 주문 체결(발주 응답 즉시체결) — oid → [(주문, 수량, 가격)], 등록 때 반영
         self._orphan_fills: dict[str, list[tuple[TrackedOrder, float, float]]] = {}
+        # 후주문 cloid → 세트(발주 응답 대기 중). 코어가 통보로 oid를 식별하면 그 oid로 등록
+        # (결정 27)
+        self._pending_refs: dict[str, _OrderRef] = {}
         self._seen_status: dict[str, str] = {}
         self._mono = 0.0  # 마지막 tick의 단조 시계(테스트 주입 가능)
         # 종목별 상세 로그(logs/autom_<종목>_날짜.log) — 판정 근거·상태 전이·체결 반영
@@ -114,6 +119,7 @@ class AutoMEngine:
         self._bg: set[asyncio.Task[None]] = set()
         system.order_book.on_fill_applied.append(self._on_fill_applied)
         system.order_book.on_change.append(self._on_book_change)
+        system.on_hl_identified.append(self._on_hl_identified)
         self._log_restored_halts()
 
     def _log_restored_halts(self) -> None:
@@ -225,7 +231,7 @@ class AutoMEngine:
             hl_disp_bid=hl_bid_d, hl_disp_ask=hl_ask_d,
             sf_theory=self._system.stock_futures_theory(u, inst), stock_last=stock,
             sf_asks=asks, sf_bids=bids, market_halted=halted,
-            resumed_mono=self._resumed_mono)
+            resumed_mono=self._resumed_mono, fx=fx)
 
     # ------------------------------------------------------------ 행동 실행 ---
     def _apply(self, u: Underlying, index: int, block: Block, actions: list[Action]) -> None:
@@ -321,8 +327,14 @@ class AutoMEngine:
         intent = OrderIntent(venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
                              side=act.side, qty=act.qty, order_type=OrderType.LIMIT,
                              price=price, source=SOURCE)
+        # cloid를 먼저 세트에 묶어 둔다 — 응답보다 먼저 온 통보로 코어가 oid를 식별하면
+        # _on_hl_identified가 그 oid로 등록한다(결정 27). 응답이 먼저면 아래 _register.
+        ref = _OrderRef(u, index, block, "post")
+        cloid = self._system.new_hl_cloid()
+        if cloid:
+            self._pending_refs[cloid] = ref
         try:
-            oid = await self._system.place(intent)
+            oid = await self._system.place(intent, cloid=cloid)
         except Exception as exc:  # noqa: BLE001 - 후주문 거부 → 체결차 누적, 한도 넘으면 중지(ㄹ2)
             self._log.error("[자동M] %s 후주문 실패 %s — %s",
                             u.value, self._tag(u, index, block), exc)
@@ -330,7 +342,10 @@ class AutoMEngine:
                 s, block, str(exc)[:80], qty=act.qty, mono=time.monotonic(),
                 settings=self.screen.settings))
             return
-        self._register(oid, _OrderRef(u, index, block, "post"))
+        finally:
+            if cloid:
+                self._pending_refs.pop(cloid, None)
+        self._register(oid, ref)
         # 후주문은 취소하지 않는다(사용자 확정 2026-09-07) — 잔량이 걸려 있어도 후주문대기로 둔다.
         self._log.info("[자동M] %s 후주문 %s HL %s %d @ %g → #%s",
                        u.value, self._tag(u, index, block), act.side.value, act.qty, price, oid)
@@ -343,6 +358,20 @@ class AutoMEngine:
         self._orders[oid] = ref
         for order, qty, price in self._orphan_fills.pop(oid, []):
             self._apply_fill(ref, order, qty, price)
+        # 상태 통보(취소·잔량 버림 종료)도 발주 응답보다 먼저 올 수 있다 — 장부는 replay로 이미
+        # 상태를 바꿨는데 그때는 주인을 몰라 _on_book_change가 지나쳤다(실측 2026-09-11 10:18:35:
+        # HL이 잔량 4.037을 버리고 끝낸 통보가 응답보다 49ms 먼저 → 판이 'HL 4.037 대기'에서 안
+        # 끝남). 등록 직후 한 번 더 훑어 이미 끝난 상태를 반영한다.
+        self._on_book_change()
+
+    def _on_hl_identified(self, cloid: str, oid: str) -> None:
+        """코어가 응답 전 통보(cloid)로 후주문 oid를 식별 — 응답을 기다리지 않고 세트에 연결."""
+        ref = self._pending_refs.pop(cloid, None)
+        if ref is None:
+            return  # 우리 후주문이 아니거나 이미 응답으로 등록됨
+        self._log.info("[자동M] %s 후주문 #%s 응답 전 식별(cloid %s) → 세트 연결",
+                       ref.underlying.value, oid, cloid)
+        self._register(oid, ref)
 
     def _on_fill_applied(self, order: TrackedOrder, qty: float, price: float,
                          _fill_id: str) -> None:
@@ -363,7 +392,7 @@ class AutoMEngine:
         # "체결 전에 판단했다"로 읽힌 실측(2026-09-10 10:45:47.536/537)을 막는다.
         if ref.leg == "pre":
             acts = on_pre_fill(s, ref.block, int(round(qty)), price, mono)
-            self.ulog(u).info("체결 %s 선주문 #%s %g @ %g → 누적 %d/%d, HL 대기 %g | %s",
+            self.ulog(u).info("체결 %s: 선주문 #%s %g @ %g → 누적 %d/%d, HL 대기 %g | %s",
                               self._tag(u, ref.index, ref.block), order.order_id, qty, price,
                               leg.pre_filled, leg.pre_qty, leg.post_pending, self._ledger(s))
         else:
@@ -377,7 +406,7 @@ class AutoMEngine:
             acc = leg.acc
             sprd = acc.sprd()
             self.ulog(u).info(
-                "체결 %s 후주문 #%s HL %g @ %g 환진입가 %g S현재가 %s SF이론가 %s → RT %d "
+                "체결 %s: 후주문 #%s HL %g @ %g 환진입가 %g S현재가 %s SF이론가 %s → RT %d "
                 "HL대기 %g | %s | 누적 HL %g SF %g 환평균 %s HL평균 %s SF평균 %s Sprd %s",
                 self._tag(u, ref.index, ref.block), order.order_id, qty, price, fx,
                 stock, f"{theory:,.0f}" if theory else None, s.rt, leg.post_pending,
@@ -418,7 +447,7 @@ class AutoMEngine:
             u = ref.underlying
             s = self._book(u).sets[ref.index]
             mono = time.monotonic()
-            self.ulog(u).info("통보 %s %s주문 #%s 상태 %s (체결 %g/%g)",
+            self.ulog(u).info("통보 %s: %s주문 #%s 상태 %s (체결 %g/%g)",
                               self._tag(u, ref.index, ref.block),
                               "선" if ref.leg == "pre" else "후", oid, status,
                               order.filled_qty, order.intent.qty)
@@ -456,7 +485,7 @@ class AutoMEngine:
         kind = "선" if ref.leg == "pre" else "후"
         self._log.warning("[자동M] %s %s %s주문 #%s 장부에서 사라짐(재동기 등) — 정리",
                           u.value, tag, kind, oid)
-        self.ulog(u).warning("통보 %s %s주문 #%s 장부에서 사라짐 — %s", tag, kind, oid,
+        self.ulog(u).warning("통보 %s: %s주문 #%s 장부에서 사라짐 — %s", tag, kind, oid,
                              "취소로 정리" if ref.leg == "pre" else "미체결분 체결차 → 중지")
         if ref.leg == "pre":
             if leg.pre_order_id == oid:
@@ -477,7 +506,7 @@ class AutoMEngine:
     def set_running(self, u: Underlying, index: int, block: Block, value: bool) -> None:
         s = self._book(u).sets[index]
         self.ulog(u).info(
-            "명령 %s 실행 %s | 목표 %d 1회 %d 전환 %ds 진입SF %s 진입S %s 청산 %s RT %d",
+            "명령 %s: 실행 %s | 목표 %d 1회 %d 전환 %ds 진입SF %s 진입S %s 청산 %s RT %d",
             self._tag(u, index, block), "켬" if value else "끔", s.target_qty,
             s.per_qty, s.switch_delay_s, s.en_sf, s.en_s, s.ex_sf, s.rt)
         self._apply(u, index, block, set_running(s, block, value, mono=self._mono))
@@ -488,7 +517,7 @@ class AutoMEngine:
         세트설정 "체결차 Clear"로 0을 만든다(사용자 확정 2026-09-10). 남아 있던 후주문 추적도 유지 —
         그 주문이 나중에 체결되면 장부에 반영된다."""
         s = self._book(u).sets[index]
-        self.ulog(u).info("명령 %s 중지 해제(세트 단위) — %s (장부는 유지, Clear는 세트설정에서)",
+        self.ulog(u).info("명령 %s: 중지 해제(세트 단위) — %s (장부는 유지, Clear는 세트설정에서)",
                           self._tag(u, index, block), self._ledger(s))
         release_halt(s, block)
         for b in (Block.ENTRY, Block.EXIT):
@@ -531,6 +560,7 @@ class AutoMEngine:
         s_en, s_ex = self._system.pair_signal(u, Instrument.KR_STOCK, q * HL_PER_SF, q * HL_PER_SF)
         monitor = {"fwd": {"en_sf": sf_en, "en_s": s_en, "ex_sf": sf_ex},
                    "rev": {"en_sf": sf_ex, "en_s": s_ex, "ex_sf": sf_en}}
+        fx_used, fx_src = self._system.usdkrw_effective()  # 지금 HL 환산에 쓰는 환율(화면 표시)
         out = []
         for s in book.sets:
             row: dict[str, Any] = {"rt": s.rt, "fill_diff": s.fill_diff}
@@ -545,6 +575,8 @@ class AutoMEngine:
                     "hl_qty": leg.acc.hl_qty, "sf_qty": leg.acc.sf_qty,
                     # 매매결과 표시는 짝이 맞은(적은 쪽) 체결량 기준(사용자 확정 2026-09-08)
                     "matched_hl": leg.acc.matched_hl(), "matched_sf": leg.acc.matched_sf(),
+                    # 매매결과 -HP/+SF 칸 = HL·SF 평균 체결가(수량이 아님, 사용자 2026-09-11)
+                    "hl_avg": leg.acc.hl_avg(), "sf_avg": leg.acc.sf_avg(),
                     # Sprd는 체결 시점 값들의 가중평균이라 판이 끝나면 고정(2026-09-10)
                     "fx_avg": leg.acc.fx_avg(), "sprd": leg.acc.sprd(),
                 }
@@ -557,6 +589,7 @@ class AutoMEngine:
         active_fn = getattr(self._system, "hl_merge_active", None)
         active = active_fn(u) if callable(active_fn) else None
         return {"sets": out, "any_running": book.any_running(), "monitor": monitor,
+                "fx": {"used": fx_used, "src": fx_src},  # 사용 환율(값, 출처 현물|선물이론)
                 "ref_qty": book.ref_qty, "future_month": book.future_month,
                 "hl_merge_ticks": merge_ticks,
                 "hl_merge_active": ({"n_sig_figs": active[0], "mantissa": active[1]}

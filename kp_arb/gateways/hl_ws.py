@@ -49,6 +49,7 @@ class OrderUpdate:
     sz: float                 # 남은 수량
     orig_sz: float            # 최초 수량
     limit_px: float | None
+    cloid: str | None = None  # 클라이언트 주문번호(우리가 붙인 경우만, 공식 WsBasicOrder.cloid)
 
     @property
     def is_rejected(self) -> bool:
@@ -532,12 +533,14 @@ class HLWebSocketClient:
             if str(order.get("coin", "")) not in self._by_symbol:
                 continue  # 대상 외 코인
             px = order.get("limitPx")
+            cloid = order.get("cloid")
             out.append(OrderUpdate(
                 oid=str(oid), coin=str(order.get("coin", "")), status=str(status),
                 side=str(order.get("side", "")),
                 sz=float(order.get("sz", 0) or 0),
                 orig_sz=float(order.get("origSz", 0) or 0),
-                limit_px=float(px) if px is not None and px != "" else None))
+                limit_px=float(px) if px is not None and px != "" else None,
+                cloid=str(cloid) if cloid else None))
         return out
 
 

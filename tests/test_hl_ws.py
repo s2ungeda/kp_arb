@@ -95,10 +95,11 @@ async def test_subscribes_marks_and_fills() -> None:
 
 
 def order_update_frame(status: str = "canceled", coin: str = "xyz:SMSN",
-                        oid: int = 485489797671) -> str:
+                        oid: int = 485489797671, cloid: str | None = None) -> str:
     return json.dumps({"channel": "orderUpdates", "data": [
         {"order": {"coin": coin, "side": "B", "limitPx": "183.87", "sz": "0.086",
-                   "oid": oid, "timestamp": 1751400000000, "origSz": "0.14"},
+                   "oid": oid, "timestamp": 1751400000000, "origSz": "0.14",
+                   "cloid": cloid},  # 공식 WsBasicOrder: cloid: string | undefined
          "status": status, "statusTimestamp": 1751400000001},
         {"order": {"coin": "xyz:NVDA", "side": "B", "limitPx": "1.0", "sz": "1",
                    "oid": 999, "timestamp": 1751400000000, "origSz": "1"},
@@ -125,6 +126,17 @@ async def test_order_update_parsed_and_filtered() -> None:
     assert u.oid == "485489797671" and u.coin == "xyz:SMSN"
     assert u.status == "canceled" and u.sz == 0.086 and u.orig_sz == 0.14
     assert u.is_terminal_cancel is True and u.is_rejected is False
+    assert u.cloid is None  # 우리가 안 붙인 주문(홈페이지 등) — null
+
+
+async def test_order_update_carries_cloid() -> None:
+    # DESIGN §HL cloid: 통보의 cloid로 발주 응답 전에 주문번호를 식별한다
+    cloid = "0x" + "ab" * 16
+    client = HLWebSocketClient(FakeConnector([order_update_frame("open", cloid=cloid)]))
+    got: list[OrderUpdate] = []
+    client.on_order_update.append(got.append)
+    await client.run()
+    assert got[0].cloid == cloid and got[0].oid == "485489797671"
 
 
 def test_terminal_cancel_covers_status_families() -> None:

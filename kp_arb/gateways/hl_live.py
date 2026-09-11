@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -166,9 +167,16 @@ class HLSdkGateway(HLGateway):
                             attempt + 1, NONCE_RETRIES, what, resp.get("response"))
         return resp  # type: ignore[no-any-return]  # (도달 안 함 — mypy용)
 
-    async def place_order(self, intent: OrderIntent) -> str:
+    def new_cloid(self) -> str | None:
+        """클라이언트 주문번호 — 공식 "128 bit hex string"(0x + 32자리). 앞 6바이트는 시각(ms),
+        뒤 10바이트는 난수라 재시동·다중 창에서도 겹치지 않는다(DESIGN §HL cloid)."""
+        return f"0x{int(time.time() * 1000):012x}{secrets.token_hex(10)}"
+
+    async def place_order(self, intent: OrderIntent, cloid: str | None = None) -> str:
         if intent.venue is not Venue.HYPERLIQUID:
             raise ValueError("HLSdkGateway only handles Hyperliquid orders")
+        from hyperliquid.utils.types import Cloid
+
         coin = self._symbol(intent.underlying)
         is_buy = intent.side is Side.BUY
         if intent.order_type is OrderType.LIMIT:
@@ -183,24 +191,60 @@ class HLSdkGateway(HLGateway):
             price = await self._market_px(coin, is_buy)
             order_type = {"limit": {"tif": "Ioc"}}
         order_log.order_requested(intent, price=price)  # 보내기 직전(응답 전) — 단계 추적
-        self._log_wire(coin, is_buy, float(intent.qty), price, order_type, intent.reduce_only)
+        self._log_wire(coin, is_buy, float(intent.qty), price, order_type, intent.reduce_only,
+                       cloid)
+        log = order_log.logger_for(Venue.HYPERLIQUID)
+        sent_ms = int(time.time() * 1000)
         try:
             resp = await self._exchange_action(
                 "order", self._ex.order, coin, is_buy, float(intent.qty), price, order_type,
                 reduce_only=intent.reduce_only,
+                cloid=Cloid.from_str(cloid) if cloid else None,
             )
             oid = self._parse_oid(resp)
-        except Exception as exc:  # 거부·오류도 거래소별 파일에 남긴다(발주거부)
+        except HLError as exc:  # 거래소 거부 — 주문이 안 들어간 것. 거래소별 파일에 남긴다
             order_log.order_rejected(intent, exc)
             raise
+        except Exception as exc:
+            # 통신 오류·타임아웃 — 들어갔는지 모름. cloid로 orderStatus를 물어 들어간 주문이면
+            # 정상 발주로 잇는다(재발주 중복 방지, DESIGN §HL cloid ②). 못 찾으면 거부로.
+            recovered = await self._recover_by_cloid(cloid) if cloid else None
+            if recovered is None:
+                order_log.order_rejected(intent, exc)
+                raise
+            oid, resp = recovered
+            log.warning("HL 발주 응답 유실(%s: %s) — orderStatus(cloid %s)로 복구 #%s",
+                        type(exc).__name__, exc, cloid, oid)
         self._order_coin[oid] = coin
         self._order_ctx[oid] = (coin, is_buy, float(intent.qty), price)
         self._last_place_fill = self._parse_place_fill(resp)  # 즉시체결이면 (수량, 평균가)
         order_log.order_placed(intent, oid, resp)  # 원응답(filled/resting·수량) 포함
+        # 왕복 시간(요청 직전→응답) — 한국에서 0.7~1.0초 실측(DESIGN v6.17), 지연 위치 진단용
+        log.info("HL 발주 왕복 %d ms #%s cloid=%s", int(time.time() * 1000) - sent_ms, oid,
+                 cloid or "-")
         return oid
 
+    async def _recover_by_cloid(self, cloid: str) -> tuple[str, dict[str, Any]] | None:
+        """응답을 못 받은 발주를 orderStatus(cloid)로 확인 — 들어갔으면 (oid, 응답), 아니면 None.
+        공식 문서: orderStatus의 oid 자리에 16바이트 hex cloid를 넣을 수 있다."""
+        try:
+            resp = await self._post_info(
+                {"type": "orderStatus", "user": self._address, "oid": cloid})
+        except Exception as exc:  # noqa: BLE001 - 조회도 실패 → 복구 불가(원래 예외로)
+            order_log.logger_for(Venue.HYPERLIQUID).warning(
+                "HL orderStatus(cloid %s) 조회 실패 — %s", cloid, exc)
+            return None
+        if not isinstance(resp, dict) or resp.get("status") != "order":
+            return None
+        try:
+            oid = str(resp["order"]["order"]["oid"])
+        except (KeyError, TypeError):
+            return None
+        return oid, resp
+
     def _log_wire(self, coin: str, is_buy: bool, sz: float, price: float,
-                  order_type: dict[str, Any], reduce_only: bool) -> None:
+                  order_type: dict[str, Any], reduce_only: bool,
+                  cloid: str | None = None) -> None:
         """HL로 나가는 주문 패킷(action)을 그대로 hl_order 로그에 남긴다(사용자 요청 2026-09-07).
 
         SDK가 서명 직전에 만드는 wire 형식({a,b,p,s,r,t}, grouping)을 같은 함수로 재구성 —
@@ -211,9 +255,12 @@ class HLSdkGateway(HLGateway):
                 order_request_to_order_wire,
                 order_wires_to_order_action,
             )
+            from hyperliquid.utils.types import Cloid
 
             req: dict[str, Any] = {"coin": coin, "is_buy": is_buy, "sz": sz, "limit_px": price,
                                    "order_type": order_type, "reduce_only": reduce_only}
+            if cloid:
+                req["cloid"] = Cloid.from_str(cloid)  # wire의 "c" 칸
             wire = order_request_to_order_wire(req, self._ex.info.name_to_asset(coin))
             action = order_wires_to_order_action([wire])
             order_log.logger_for(Venue.HYPERLIQUID).info(

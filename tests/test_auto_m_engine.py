@@ -26,6 +26,8 @@ class FakeSystem:
         self.cancelled: list[str] = []
         self.halted = False
         self._ids = 0
+        self.on_hl_identified: list[Any] = []  # (cloid, oid) — 응답 전 식별 훅(결정 27)
+        self.cloid: str | None = None          # new_hl_cloid()가 돌려줄 값(None=cloid 없음)
         from kp_arb.domain.models import InstrumentInfo
 
         # HL szDecimals=1 → 가격 소수 최대 5자리, 유효숫자 5자리(1184.5 → 소수 1자리)
@@ -66,7 +68,10 @@ class FakeSystem:
     def futures_halted(self) -> bool:
         return self.halted
 
-    async def place(self, intent: OrderIntent) -> str:
+    def new_hl_cloid(self) -> str | None:
+        return self.cloid
+
+    async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str:
         delay = getattr(self, "place_delay", 0.0)  # LS 접수 응답 지연 흉내(실측 0.9초)
         if delay > 0:
             await asyncio.sleep(delay)
@@ -74,6 +79,10 @@ class FakeSystem:
         oid = f"O{self._ids}"
         self.placed.append(intent)
         self.order_book.track(oid, intent)
+        if cloid and intent.instrument is Instrument.HL_PERP:
+            # 코어가 응답 전 통보(cloid)로 oid를 식별한 경우 흉내 — 체결·취소보다 먼저 알린다
+            for cb in self.on_hl_identified:
+                cb(cloid, oid)
         # HL 발주 응답에 즉시 체결분이 실려 오는 경우 흉내 — place()가 끝나기 전에 체결 훅이 돈다
         imm = getattr(self, "immediate_fill", 0.0)
         if imm > 0 and intent.instrument is Instrument.HL_PERP:
@@ -81,6 +90,10 @@ class FakeSystem:
 
             self.order_book.on_fill(Fill(fill_id=f"imm-{oid}", order_id=oid,
                                          qty=imm, price=intent.price or 0.0, ts=0))
+            # 거래소가 잔량을 버리고 끝낸 통보(orderUpdates filled, sz>0)가 발주 응답보다 먼저
+            # 와서 replay로 장부 상태가 place() 안에서 이미 취소로 바뀌는 경우 흉내(실측 09-11)
+            if getattr(self, "drop_remainder_before_return", False):
+                self.order_book.on_cancel(oid)
         return oid
 
     async def cancel(self, order_id: str) -> None:
@@ -130,6 +143,47 @@ async def test_immediate_partial_fill_is_applied_and_remainder_is_fractional() -
     await _settle()
     assert s.entry.status is LegStatus.PRE_PARTIAL and s.entry.running  # 결정 25: 멈추지 않음
     assert abs(s.fill_diff - 9.412) < 1e-9 and s.entry.post_pending == 0
+
+
+async def test_remainder_dropped_before_place_returns_finishes_round() -> None:
+    # 실측 2026-09-11 10:18:35: HL이 후주문 10 중 5.963만 잡고 잔량 4.037을 버린 통보가 발주
+    # 응답보다 49ms 먼저 와 replay로 장부는 취소가 됐는데, 그때 엔진은 주문번호를 몰라 지나쳤다
+    # → 판이 'HL 4.037 대기'에서 영영 안 끝남. 등록 직후 상태를 한 번 더 훑어 판을 끝내야 한다.
+    eng, sys_, state = _engine()
+    sys_.immediate_fill = 5.963
+    sys_.drop_remainder_before_return = True
+    s = state.autom.book(U).sets[0]
+    s.per_qty = 1  # 1회주문 1계약 → 후주문 10, 한도 10
+    await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
+    await _settle()
+    assert abs(s.hl_net + 5.963) < 1e-9 and s.entry.post_pending == 0  # 대기 안 남음
+    assert abs(s.fill_diff - 4.037) < 1e-9                              # 체결차 누적
+    assert s.entry.status is not LegStatus.POST_PENDING                 # 판 종료
+    assert s.entry.status is not LegStatus.HALTED and s.entry.running   # 4.037 < 한도 10 → 계속
+    assert "O2" not in eng._orders                                      # 후주문 추적 정리
+
+
+async def test_post_order_linked_by_cloid_before_place_returns() -> None:
+    # 결정 27: 후주문 cloid를 발주 전에 세트에 묶어 두고, 코어가 통보로 oid를 식별하면 그 oid로
+    # 등록 — 응답 전에 온 체결·잔량 버림 종료가 고아 보관 없이 바로 세트에 반영된다.
+    eng, sys_, state = _engine()
+    sys_.cloid = "0x" + "cd" * 16
+    sys_.immediate_fill = 5.963
+    sys_.drop_remainder_before_return = True
+    s = state.autom.book(U).sets[0]
+    s.per_qty = 1
+    await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
+    await _settle()
+    assert abs(s.hl_net + 5.963) < 1e-9 and s.entry.post_pending == 0
+    assert abs(s.fill_diff - 4.037) < 1e-9 and s.entry.running
+    assert s.entry.status is not LegStatus.POST_PENDING
+    assert eng._pending_refs == {} and "O2" not in eng._orders and eng._orphan_fills == {}
 
 
 async def test_engine_saves_state_after_fills_and_halt() -> None:
@@ -301,7 +355,7 @@ async def test_release_keeps_ledger_and_logs_fill_before_action(tmp_path: Any) -
     for h in logging.getLogger("kp_arb.autom.sk_hynix").handlers:
         h.flush()
     text = "\n".join(p.read_text(encoding="utf-8") for p in tmp_path.glob("autom_*.log"))
-    fill_at = text.index("체결 정방향 1세트 진입 후주문 #O2")
+    fill_at = text.index("체결 정방향 1세트 진입: 후주문 #O2")
     assert "장부 SF 10 HL -40 체결차 60" in text
     assert text.index("행동 정방향 1세트 진입: halt") > fill_at
     assert "중지 해제(세트 단위) — 장부 SF 10 HL -40 체결차 60 (장부는 유지" in text
@@ -407,12 +461,12 @@ async def test_engine_writes_per_underlying_log(tmp_path: Any) -> None:
     text = files[0].read_text(encoding="utf-8")
     assert "G5 미달" not in text
     # 세트 표기 = "정방향 N세트 진입/청산" — 정/역 구분이 로그에 보이게(사용자 2026-09-08)
-    assert "명령 정방향 1세트 진입 실행 켬" in text
+    assert "명령 정방향 1세트 진입: 실행 켬" in text  # 종류 뒤 대상, ':' 뒤 내용 — 전 줄 통일
     assert text.count("판정 정방향 1세트 진입: 통과") == 1  # 바뀔 때만
     assert ("상태 정방향 1세트 진입: - → armed" in text
             and "armed → pre_resting" in text)  # 전이 순서
     assert "행동 정방향 1세트 진입: place_pre buy 10 1602000" in text
-    assert "체결 정방향 1세트 진입 선주문 #O1" in text and "누적 4/10, HL 대기 40" in text
+    assert "체결 정방향 1세트 진입: 선주문 #O1" in text and "누적 4/10, HL 대기 40" in text
     assert "행동 정방향 1세트 진입: place_post sell 40" in text
 
 

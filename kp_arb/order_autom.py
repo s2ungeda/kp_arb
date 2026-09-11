@@ -81,13 +81,21 @@ def settings_payload(common: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def fx_caption(used: object, src: object) -> str:
+    """정방향 모니터 옆 환율 표시 — '환율 1,349.60 (현물)'. 값이 없으면 '환율 -'. 순수 로직."""
+    if not isinstance(used, int | float) or used <= 0:
+        return "환율 -"
+    tail = f" ({src})" if src else ""
+    return f"환율 {float(used):,.2f}{tail}"
+
+
 def sum_acc(rows: list[dict[str, Any]], leg: str) -> dict[str, float | None]:
     """세트별 누적(autom_live)을 방향 하나로 합산 — 수량은 **짝이 맞은(적은 쪽)** 체결량 합
-    (사용자 확정 2026-09-08: LS·HL 누적 체결량이 다르면 적은 쪽 기준, SF 1 = HL 10), 환·Sprd는
-    그 HL 수량 가중."""
+    (사용자 확정 2026-09-08: LS·HL 누적 체결량이 다르면 적은 쪽 기준, SF 1 = HL 10), 환·HL평균가·
+    SF평균가·Sprd는 그 HL 수량 가중(값이 없는 세트는 그 항목의 가중에서 뺀다)."""
     hl = sf = 0.0
-    fx_w = sprd_w = 0.0
-    sprd_q = 0.0
+    weighted: dict[str, list[float]] = {k: [0.0, 0.0] for k in ("fx_avg", "hl_avg", "sf_avg",
+                                                                 "sprd")}  # [가중합, 수량]
     for row in rows:
         acc = row.get(leg) or {}
         raw_hl = float(acc.get("hl_qty") or 0)
@@ -95,14 +103,16 @@ def sum_acc(rows: list[dict[str, Any]], leg: str) -> dict[str, float | None]:
         q = float(acc.get("matched_hl", min(raw_hl, raw_sf * 10)) or 0)
         hl += q
         sf += float(acc.get("matched_sf", q / 10) or 0)
-        if q > 0 and acc.get("fx_avg") is not None:
-            fx_w += float(acc["fx_avg"]) * q
-        if q > 0 and acc.get("sprd") is not None:
-            sprd_w += float(acc["sprd"]) * q
-            sprd_q += q
-    return {"hl_qty": hl, "sf_qty": sf,
-            "fx_avg": fx_w / hl if hl > 0 else None,
-            "sprd": sprd_w / sprd_q if sprd_q > 0 else None}
+        if q <= 0:
+            continue
+        for key, slot in weighted.items():
+            if acc.get(key) is not None:
+                slot[0] += float(acc[key]) * q
+                slot[1] += q
+    out: dict[str, float | None] = {"hl_qty": hl, "sf_qty": sf}
+    for key, (w, wq) in weighted.items():
+        out[key] = w / wq if wq > 0 else None
+    return out
 
 # 진입/청산 진행 상태(exec §2)의 짧은 표시 — 상태줄 상세용(버튼 캡션은 항상 '진입'/'청산')
 # 상태줄 진행 상태 표기 — pre_resting은 '접수'(옛 '걸림', 사용자 2026-09-08)
@@ -374,7 +384,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                       en_s: str, ex_sf: str, acc_rows: tuple[Any, ...]) -> None:
         # 두 방향을 공유 그리드에 rbase 오프셋으로 → 컬럼 공유 = 완벽 정렬.
         heads = ("목표수량", "1회주문", en_sf, en_s, "실행", ex_sf, "실행",
-                 "설정", "RT선진입", "체결차", "초")
+                 "설정", "RT선진입", "체결차(HP)", "초")  # 체결차 단위 = HL 계약(사용자 09-11)
         nset = len(heads)  # 11 (자동T 10 + 진입 S 한 칸)
 
         # 제목 "정방향 (주식선물)" — 상품명은 작은 글씨로 붙여 목표수량·1회주문 두 칸 안에 들어가게
@@ -391,6 +401,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                             font=T.FONT_NUM_LG)
             mlbl.grid(row=rbase, column=mcol, padx=1, pady=(0, 2), sticky="nsew")
             mon[f"{dtag}_{skey}"] = mlbl
+        if dtag == "fwd":
+            # 지금 HL 환산에 쓰는 환율(값·출처) — 정방향 모니터 수치 옆 빈 자리(RT선진입~초 칸 위,
+            # 사용자 2026-09-11). 코어 스냅샷 fx.used/src, 출처는 현물|선물이론.
+            mon["fx"] = tk.Label(grid, text="환율 -", font=T.FONT_LABEL, fg="gray25", anchor="e")
+            mon["fx"].grid(row=rbase, column=8, columnspan=3, sticky="e", padx=(0, 2))
         ttk.Separator(grid, orient="vertical").grid(
             row=rbase, column=nset, rowspan=5, sticky="ns", padx=3)
         acc_cols: dict[str, tuple[int, int, tuple[str, ...]]] = {}
@@ -706,11 +721,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             e.insert(0, str(common["pre_tick"][pcode]))
             e.grid(row=r, column=1, padx=4, pady=2)
             pt_ents[pcode] = e
-        # 줄2 왼쪽 — 상대호가 콤보(매수/매도)
+        # 줄2 왼쪽 — 상대호가 콤보. 라벨은 진입/청산(사용자 2026-09-11) — 정방향 기준 진입=SF 매수
+        # (rel_buy), 청산=SF 매도(rel_sell). 코어는 주문 방향(매수/매도)으로 고른다(§6.3).
         rel = tk.LabelFrame(win, text="상대호가")
         rel.grid(row=2, column=0, columnspan=2, sticky="new", padx=6, pady=4)
         rel_cbs: dict[str, ttk.Combobox] = {}
-        for r, (rk, rlabel) in enumerate((("rel_buy", "매수"), ("rel_sell", "매도"))):
+        for r, (rk, rlabel) in enumerate((("rel_buy", "진입"), ("rel_sell", "청산"))):
             choices = _REL_CHOICES_BUY if rk == "rel_buy" else _REL_CHOICES_SELL
             tk.Label(rel, text=rlabel, anchor="w", width=7).grid(
                 row=r, column=0, sticky="w", padx=4, pady=2)
@@ -741,7 +757,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                            validatecommand=vcmd_int)
         e_delay.insert(0, str(common["pre_delay"]))
         e_delay.grid(row=0, column=1, padx=4, pady=2, sticky="e")  # 오른쪽 끝을 콤보와 맞춤
-        tk.Label(pr, text="재개 딜레이(초)").grid(row=1, column=0, sticky="e", pady=2)
+        tk.Label(pr, text="시장멈춤 재개 딜레이(초)").grid(row=1, column=0, sticky="e", pady=2)
         e_resume = tk.Entry(pr, width=7, justify="right", validate="key",
                             validatecommand=vcmd_int)
         e_resume.insert(0, str(common["resume_delay"]))
@@ -951,7 +967,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # 목업 대조용 모니터 샘플 (정 -0.82/-0.82/-0.52, 역 0.12/0.12/0.23)
     preview_mon = {"fwd_en_sf": "-0.82", "fwd_en_s": "-0.82", "fwd_ex_sf": "-0.52",
-                   "rev_en_sf": "0.12", "rev_en_s": "0.12", "rev_ex_sf": "0.23"}
+                   "rev_en_sf": "0.12", "rev_en_s": "0.12", "rev_ex_sf": "0.23",
+                   "fx": fx_caption(1349.6, "현물")}
 
     def _fmt_num(v: Any, d: int = 0) -> str:
         return f"{float(v):,.{d}f}" if isinstance(v, int | float) else "-"
@@ -1145,6 +1162,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         # 상단 모니터 3칸 — 코어가 기준수량으로 계산한 est 괴리(%), 정/역 각각.
         # '적'을 누른 뒤부터 표시(종목·호가단위·기준수량이 코어에 적용된 값이라야 뜻이 있음).
         monitor = _live_book().get("monitor") or {}
+        fx = _live_book().get("fx") or {}
+        mon["fx"].config(text=fx_caption(fx.get("used"), fx.get("src")))
         # 표시 여부는 화면 입력칸이 아니라 **코어가 실제로 쓰는 기준수량**으로 판단 —
         # 입력칸을 지우는 중에도 수치가 사라지지 않게(사용자 2026-09-07).
         core_ref = int(_live_book().get("ref_qty") or 0)
@@ -1165,13 +1184,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             agg = sum_acc(rows, leg)
             hp_key, s_key, fx_key = (("-HP", "+SF", "-환") if leg == "entry"
                                      else ("+HP", "-SF", "+환"))
-            # 짝이 맞은 체결량 — HL 부분 체결이면 SF도 소수(0.0588 등)라 소수면 자릿수를 붙인다
-            sf_q, hl_q = float(agg["sf_qty"] or 0), float(agg["hl_qty"] or 0)
-            sf_txt = _fmt_num(sf_q, 2 if sf_q % 1 else 0)
-            hl_txt = _fmt_num(hl_q, 3 if hl_q % 1 else 0)
-            labels["누적"].config(text=hl_txt)  # 위 누적체결량 칸은 HL 기준(사용자 2026-09-09)
-            labels[hp_key].config(text=hl_txt)
-            labels[s_key].config(text=sf_txt)
+            # 누적체결량 칸 = 짝이 맞은 HL 체결량(사용자 2026-09-09) — 소수면 자릿수를 붙인다
+            hl_q = float(agg["hl_qty"] or 0)
+            labels["누적"].config(text=_fmt_num(hl_q, 3 if hl_q % 1 else 0))
+            # -HP/+SF/-환 = Sprd 식의 세 입력값(HL 평균 체결가·SF 평균 체결가·환진입가, 엑셀 메인
+            # I28/I29/I27). 수량을 보여주던 것을 바로잡음(사용자 2026-09-11 — 로그의 평균가가 맞음).
+            labels[hp_key].config(text=_fmt_num(agg["hl_avg"], 2))
+            labels[s_key].config(text=_fmt_num(agg["sf_avg"], 0))
             labels[fx_key].config(text=_fmt_num(agg["fx_avg"], 1))
             sprd = agg["sprd"]
             labels["Sprd"].config(text=f"{sprd * 100:.3f}" if sprd is not None else "-")

@@ -51,7 +51,12 @@ class StubExchange:
         self.in_flight -= 1
 
     def order(self, coin: str, is_buy: bool, sz: float, px: float,
-              order_type: dict[str, Any], reduce_only: bool = False) -> dict[str, Any]:
+              order_type: dict[str, Any], reduce_only: bool = False,
+              cloid: Any = None) -> dict[str, Any]:
+        self.cloids: list[Any] = getattr(self, "cloids", [])
+        self.cloids.append(cloid)  # SDK Cloid 객체(없으면 None)
+        if getattr(self, "raise_transport", False):  # 응답 유실(통신 오류) 흉내
+            raise ConnectionError("Connection reset by peer")
         self._enter()
         try:
             return self._order(coin, is_buy, sz, px, order_type, reduce_only)
@@ -128,6 +133,8 @@ class StubInfo:
         if body["type"] == "frontendOpenOrders":
             assert body["dex"] == "xyz"
             return self._open_orders
+        if body["type"] == "orderStatus":  # 공식: oid 자리에 cloid(16바이트 hex) 가능
+            return getattr(self, "order_status", {"status": "unknownOid"})
         raise AssertionError(f"unexpected info type {body['type']}")
 
 
@@ -151,6 +158,44 @@ async def test_limit_order_uses_dex_symbol_and_parses_oid() -> None:
     assert coin == "xyz:SMSN"  # 실측 심볼(SAMSUNG 아님)
     assert is_buy is False and sz == 0.1 and px == 180.0
     assert otype == {"limit": {"tif": "Gtc"}}
+
+
+async def test_place_sends_cloid_when_given() -> None:
+    # DESIGN §HL cloid: 우리가 만든 16바이트 hex를 주문에 실어 보낸다(SDK Cloid). 없으면 안 실음.
+    gw, ex, _ = _gw()
+    cloid = gw.new_cloid()
+    assert cloid is not None and cloid.startswith("0x") and len(cloid) == 34
+    assert gw.new_cloid() != cloid  # 난수부 — 같은 ms에도 겹치지 않음
+    oid = await gw.place_order(_intent(), cloid=cloid)
+    assert oid == "485478010353" and ex.cloids[-1].to_raw() == cloid
+    await gw.place_order(_intent())
+    assert ex.cloids[-1] is None
+
+
+async def test_place_recovers_by_cloid_when_response_is_lost() -> None:
+    # 통신 오류로 응답을 못 받으면 orderStatus(cloid)로 들어간 주문인지 확인 — 들어갔으면 oid를
+    # 돌려 정상 발주로 잇는다(재발주 중복 방지). 거래소 거부(HLError)는 조회 없이 그대로 거부.
+    gw, ex, inf = _gw()
+    ex.raise_transport = True
+    cloid = gw.new_cloid()
+    inf.order_status = {"status": "order", "order": {
+        "order": {"coin": "xyz:SMSN", "side": "A", "limitPx": "180.0", "sz": "0.1",
+                  "oid": 485478010353, "timestamp": 1789084276518, "origSz": "0.1",
+                  "cloid": cloid},
+        "status": "open", "statusTimestamp": 1789084276518}}
+    oid = await gw.place_order(_intent(), cloid=cloid)
+    assert oid == "485478010353"
+    assert inf.posts[-1] == {"type": "orderStatus", "user": ADDR, "oid": cloid}
+    assert gw.pop_place_fill() is None      # 체결은 userFills가 전담
+    await gw.cancel_order(oid)              # 취소 문맥(coin)도 채워짐
+    assert ex.cancels[-1] == ("xyz:SMSN", 485478010353)
+    # 조회에도 없으면(unknownOid) 원래 통신 오류를 그대로 올린다
+    inf.order_status = {"status": "unknownOid"}
+    with pytest.raises(ConnectionError):
+        await gw.place_order(_intent(), cloid=gw.new_cloid())
+    # cloid 없이 낸 주문은 조회할 수 없어 바로 오류
+    with pytest.raises(ConnectionError):
+        await gw.place_order(_intent())
 
 
 async def test_place_immediate_fill_exposed_via_pop() -> None:

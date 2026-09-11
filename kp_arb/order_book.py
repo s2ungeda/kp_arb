@@ -192,8 +192,8 @@ class OrderBook:
             absorbed = min(qty, order.provisional_filled)
             order.provisional_filled -= absorbed
             qty -= absorbed
-        if qty <= 0:  # 전량 흡수(선반영과 중복) — 무시
-            return order
+        if qty <= _FILL_EPS:  # 전량 흡수(선반영과 중복) — 무시. 부동소수점 찌꺼기(2.8e-17,
+            return order      # 실측 2026-09-11: 0.521+5.208+0.234 vs 5.963)도 체결로 안 본다
         if order.remaining_qty <= 0:  # 이미 전량 체결 뒤 중복 통보 — 무시
             return order
         self._apply_fill_core(order, qty, fill.price, fill.fee, fill.fill_id)

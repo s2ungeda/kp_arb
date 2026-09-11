@@ -537,6 +537,72 @@ async def test_hl_slot_snapshot_marks_and_fills() -> None:
     assert system.order_book.order("777").filled_qty == 0.2  # HL 체결 반영
 
 
+async def test_hl_order_identified_by_cloid_before_place_returns() -> None:
+    # DESIGN §HL cloid ①(실측 2026-09-11 10:18:35): 발주 응답(0.7~1.0초)보다 웹소켓 통보가 먼저
+    # 오면 orderUpdates의 cloid로 oid를 식별해 즉시 장부에 등록·체결 반영·훅 통지. 응답이 뒤에
+    # 오면 즉시체결 선반영은 이미 반영된 체결을 뺀 차이만(이중 반영 없음).
+    import asyncio as _aio
+    import json as _json
+
+    from kp_arb.gateways.hl_ws import HLWebSocketClient
+    from kp_arb.gateways.mock_hl import MockHLGateway
+
+    CLOID = "0x" + "ab" * 16
+
+    class SlowHL(MockHLGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gate = _aio.Event()
+            self.sent_cloid: str | None = None
+            self._fill: tuple[float, float] | None = (0.2, 185.0)  # 응답에 실린 즉시체결
+
+        def new_cloid(self) -> str | None:
+            return CLOID
+
+        async def place_order(self, intent: OrderIntent, cloid: str | None = None) -> str:
+            self.sent_cloid = cloid
+            await self.gate.wait()  # 응답 지연 — 그 사이 웹소켓 통보가 먼저 온다
+            return "777"
+
+        def pop_place_fill(self) -> tuple[float, float] | None:
+            f, self._fill = self._fill, None
+            return f
+
+    hl_gw = SlowHL()
+    open_upd = _json.dumps({"channel": "orderUpdates", "data": [
+        {"order": {"coin": "xyz:SMSN", "side": "A", "limitPx": "185.0", "sz": "0.0",
+                   "oid": 777, "timestamp": 1.0, "origSz": "0.2", "cloid": CLOID},
+         "status": "open", "statusTimestamp": 1.0}]})
+    hl_fill = _json.dumps({"channel": "userFills", "data": {"fills": [
+        {"coin": "xyz:SMSN", "px": "185.0", "sz": "0.2", "side": "A",
+         "oid": 777, "tid": 1, "time": 1.0}]}})
+    # 실측 순서: 체결(userFills)이 orderUpdates보다 먼저 찍힘 — 체결은 보관됐다가 식별 때 반영
+    system = LiveSystem(
+        gateway=MockLSGateway(),  # type: ignore[arg-type]
+        order_book=OrderBook(), session=SessionService(),
+        stock_ws=LSWebSocketClient(FakeConnector([])),
+        hl_gateway=hl_gw, hl_ws=HLWebSocketClient(FakeConnector([hl_fill, open_upd])),
+    )
+    identified: list[tuple[str, str]] = []
+    system.on_hl_identified.append(lambda c, o: identified.append((c, o)))
+    intent = OrderIntent(venue=Venue.HYPERLIQUID, underlying=SAMSUNG,
+                         instrument=Instrument.HL_PERP, side=Side.SELL, qty=0.2,
+                         order_type=OrderType.LIMIT, price=185.0)
+    task = _aio.create_task(system.place(intent))
+    for _ in range(3):
+        await _aio.sleep(0)  # place가 cloid를 대기 목록에 넣고 응답을 기다리는 상태
+    assert hl_gw.sent_cloid == CLOID
+    await system.start()
+    await system.wait()  # 웹소켓 프레임 소진 — 응답 전 식별
+    order = system.order_book.order("777")
+    assert order is not None and order.filled_qty == 0.2 and identified == [(CLOID, "777")]
+    hl_gw.gate.set()
+    assert await task == "777"
+    # 응답의 즉시체결 0.2는 이미 반영분과 차이 0 → 이중 반영 없음
+    assert system.order_book.order("777").filled_qty == 0.2
+    assert system.order_book.position_qty(SAMSUNG, Instrument.HL_PERP) == -0.2
+
+
 async def test_place_routes_hl_to_hl_gateway() -> None:
     from kp_arb.gateways.hl_ws import HLWebSocketClient
     from kp_arb.gateways.mock_hl import MockHLGateway

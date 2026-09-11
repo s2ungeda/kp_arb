@@ -98,6 +98,7 @@ class Signals:
     sf_bids: Levels = ()              # SF 매수호가창 — 매도 한계용
     market_halted: bool = False       # 선물시장 정지 오버레이(exec §8)
     resumed_mono: float | None = None  # 정지가 풀린 시각(재개 딜레이)
+    fx: float | None = None           # HL 환산 환율(역산가의 HL괴리에 쓰인 값) — 로그용
 
 
 # --------------------------------------------------------------- 행동(출력) ---
@@ -290,14 +291,19 @@ def rel_quote(levels: Levels, n: int) -> float | None:
     return prices[n - 1] if 0 < n <= len(prices) else None
 
 
+def range_start(side: Side, rel_px: float, tick: int) -> float:
+    """발주 허용범위의 시작호가(§6.3) — 매수 = 상대매도N호가 − 1틱 / 매도 = 상대매수N호가 + 1틱.
+    한계는 여기서 범위(%)만큼 더 물러난 값. 로그에 한계와 함께 남긴다(사용자 2026-09-11)."""
+    return rel_px - tick if side is Side.BUY else rel_px + tick
+
+
 def limit_price(side: Side, rel_px: float, tick: int, rng: float) -> float:
     """발주 허용 한계(§6.3).
 
     매수 = (상대매도N호가 − 1틱) × (1 − 범위) / 매도 = (상대매수N호가 + 1틱) × (1 + 범위).
     """
-    if side is Side.BUY:
-        return (rel_px - tick) * (1.0 - rng)
-    return (rel_px + tick) * (1.0 + rng)
+    start = range_start(side, rel_px, tick)
+    return start * (1.0 - rng) if side is Side.BUY else start * (1.0 + rng)
 
 
 def pre_order_price(
@@ -401,6 +407,9 @@ def evaluate(
     def pct(v: float | None) -> str:
         return f"{v * 100:.3f}%" if v is not None else "-"
 
+    def won(v: float | None) -> str:
+        return f"{v:,.0f}" if v is not None else "-"
+
     if leg.status is LegStatus.HALTED:
         # 중지 뒤에도 걸린 선주문의 취소 확인은 지켜본다(안 오면 재전송, exec ㅂ3)
         return hold("중지", _cancel_if_resting(leg, mono=sig.mono))
@@ -459,13 +468,19 @@ def evaluate(
     # 한계의 "상대N호가 ∓ 1틱"에서 1틱은 **시세(호가창)의 호가단위** = 한 호가 옆(사용자 확정
     # 2026-09-08). 선주문 주문단위(settings.pre_tick)는 역산가를 주문 단위로 맞추는 데만 쓴다.
     mkt_tick = tick_for(Instrument.KR_STOCK_FUTURE, rel)
+    start = range_start(side, rel, mkt_tick)
     limit = limit_price(side, rel, mkt_tick, settings.pre_range)
+    # 범위 = 시작호가(상대N호가 ∓ 1틱)부터 한계까지 — 둘 다 로그에(사용자 2026-09-11)
+    rng_txt = f"범위 {start:,.0f}~{limit:,.0f}(호가단위 {mkt_tick})"
     if not within_limit(side, price, limit):
-        return hold(f"G6 한계 밖 역산가 {price:,.0f} 한계 {limit:,.0f} "
-                    f"(상대호가 {rel:,.0f} 호가단위 {mkt_tick})",
+        return hold(f"G6 범위 밖 역산가 {price:,.0f} {rng_txt} 상대호가 {rel:,.0f}",
                     _cancel_if_resting(leg, mono=sig.mono))
+    # 발주 근거엔 그때의 SF 1호가·환율도 남긴다(사용자 2026-09-11) — 나중에 역산을 되짚을 수 있게
+    bid1 = sig.sf_bids[0][0] if sig.sf_bids else None
+    ask1 = sig.sf_asks[0][0] if sig.sf_asks else None
+    fx_txt = f"{sig.fx:,.2f}" if sig.fx else "-"
     basis = (f"역산가 {price:,.0f} = 이론가 {sig.sf_theory:,.0f}×(1+{pct(hl_disp)}−{pct(thr)}) "
-             f"주문단위 {tick} 한계 {limit:,.0f}(호가단위 {mkt_tick})")
+             f"주문단위 {tick} {rng_txt} 매수1 {won(bid1)} 매도1 {won(ask1)} 환율 {fx_txt}")
     # 통과 — 없으면 발주, 있고 역산가가 바뀌었으면 재발주 규칙(취소→후주문 확인→딜레이→신규)
     if leg.pre_order_id is None and leg.status is LegStatus.ARMED:
         if qty < 1:
@@ -482,7 +497,7 @@ def evaluate(
                             reason=f"역산가 변경 {leg.pre_price:g}→{price:g}")])
     # '유지'는 역산가·한계가 바뀔 때만 새 근거가 되게 짧게 — 이론가·괴리까지 넣으면 매 틱 바뀌어
     # 분당 170줄이 쌓였다(실측 2026-09-08). 상세 근거는 '통과'·'역산가 변경' 줄에 남는다.
-    return hold(f"유지 역산가 {price:,.0f} 한계 {limit:,.0f}")
+    return hold(f"유지 역산가 {price:,.0f} 범위 {start:,.0f}~{limit:,.0f}")
 
 
 # ------------------------------------------------------------ 주문 사건 처리 ---

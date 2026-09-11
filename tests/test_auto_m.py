@@ -39,7 +39,8 @@ def _sig(mono: float = 100.0, **kw: object) -> Signals:
     base = dict(now=NOW, mono=mono, sf_spread_entry=0.01, s_spread_entry=0.01,
                 sf_spread_exit=-0.01, hl_disp_bid=0.01, hl_disp_ask=0.01,
                 sf_theory=200_000.0, stock_last=199_000.0,
-                sf_asks=[(201_500.0, 5), (204_500.0, 3)], sf_bids=[(198_500.0, 4)])
+                sf_asks=[(201_500.0, 5), (204_500.0, 3)], sf_bids=[(198_500.0, 4)],
+                fx=1349.6)
     base.update(kw)
     return Signals(**base)  # type: ignore[arg-type]
 
@@ -173,7 +174,11 @@ def test_limit_uses_market_tick_not_order_unit() -> None:
     set_running(s, Block.ENTRY, True)
     acts = evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
     assert [a.kind for a in acts] == ["place_pre"]
-    assert "한계 200,196" in s.entry.block_reason and "호가단위 500" in s.entry.block_reason
+    # 로그엔 범위의 시작호가(상대1호가 − 1틱 = 201,000)와 한계를 함께(사용자 2026-09-11)
+    assert "범위 201,000~200,196" in s.entry.block_reason
+    assert "호가단위 500" in s.entry.block_reason
+    # 발주 근거에 그때의 SF 1호가·환율(사용자 2026-09-11)
+    assert "매수1 198,500 매도1 201,500 환율 1,349.60" in s.entry.block_reason
     assert "주문단위 3000" in s.entry.block_reason  # 역산가 반올림 단위는 그대로 설정값
 
 
@@ -262,7 +267,7 @@ def test_block_reason_records_gate_and_basis() -> None:
     assert "G5 미달" in s.entry.block_reason and "0.500%" in s.entry.block_reason
     assert "0.100%" not in s.entry.block_reason
     evaluate(s, Block.ENTRY, _sig(hl_disp_bid=-0.01), SETTINGS, U)
-    assert "G6 한계 밖" in s.entry.block_reason
+    assert "G6 범위 밖" in s.entry.block_reason and "범위 201,000~200,196" in s.entry.block_reason
     evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
     assert s.entry.block_reason.startswith("통과") and "201,000" in s.entry.block_reason
     on_pre_ack(s, Block.ENTRY, "1")
