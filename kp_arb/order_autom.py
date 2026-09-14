@@ -721,12 +721,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             e.insert(0, str(common["pre_tick"][pcode]))
             e.grid(row=r, column=1, padx=4, pady=2)
             pt_ents[pcode] = e
-        # 줄2 왼쪽 — 상대호가 콤보. 라벨은 진입/청산(사용자 2026-09-11) — 정방향 기준 진입=SF 매수
-        # (rel_buy), 청산=SF 매도(rel_sell). 코어는 주문 방향(매수/매도)으로 고른다(§6.3).
+        # 줄2 왼쪽 — 상대호가 콤보. 라벨은 매수/매도(SF 주문 방향) — 09-11에 '진입/청산'으로
+        # 바꿨다가 역방향(진입=SF 매도)에선 헷갈려 09-14 사용자가 되돌림. 코어도 주문 방향으로
+        # 고른다(§6.3).
         rel = tk.LabelFrame(win, text="상대호가")
         rel.grid(row=2, column=0, columnspan=2, sticky="new", padx=6, pady=4)
         rel_cbs: dict[str, ttk.Combobox] = {}
-        for r, (rk, rlabel) in enumerate((("rel_buy", "진입"), ("rel_sell", "청산"))):
+        for r, (rk, rlabel) in enumerate((("rel_buy", "매수"), ("rel_sell", "매도"))):
             choices = _REL_CHOICES_BUY if rk == "rel_buy" else _REL_CHOICES_SELL
             tk.Label(rel, text=rlabel, anchor="w", width=7).grid(
                 row=r, column=0, sticky="w", padx=4, pady=2)

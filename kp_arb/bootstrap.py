@@ -420,14 +420,15 @@ class LiveSystem:
 
     def fx_entry_rate(self, side: Side) -> float | None:
         """자동M 환진입가(§9a) — 최근월물 원달러선물의 매수1호가(HL 매도, −환) / 매도1호가(HL 매수).
-        호가가 없으면 직전 체결가, 그것도 없으면 None."""
-        if self._fx_futures is None:
-            return None
-        code = self._fx_futures[0]
-        quote = self.fx_futures_quote.get(code)
+        호가가 없으면 현물환율(LS CUR, 없으면 하나고시 백업값), 그것도 없으면 선물 직전 체결가,
+        그것도 없으면 None(사용자 확정 2026-09-14 — 옛 순서는 호가 → 직전 체결가)."""
+        code = self._fx_futures[0] if self._fx_futures is not None else None
+        quote = self.fx_futures_quote.get(code) if code is not None else None
         if quote is not None:
             return quote[0] if side is Side.SELL else quote[1]
-        return self.fx_futures_price.get(code)
+        if self.usdkrw_spot is not None:
+            return self.usdkrw_spot
+        return self.fx_futures_price.get(code) if code is not None else None
 
     def set_fx_spot_window(self, start: str, end: str) -> None:
         """현물환율(CUR) 사용 시간대 반영("HH:MM") — 코어가 공통설정에서 주입(사용자 입력,

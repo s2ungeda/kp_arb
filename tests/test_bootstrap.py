@@ -225,6 +225,21 @@ def _system(
     return system, stock_connector, deriv_connector
 
 
+def test_fx_entry_rate_fallback_order() -> None:
+    # 자동M 환진입가(§10 -환/+환): 원달러선물 1호가(HL 매도=매수1호가, HL 매수=매도1호가) → 없으면
+    # 현물환율(LS CUR/백업) → 없으면 선물 직전 체결가 → 없으면 None(사용자 확정 2026-09-14).
+    system, _, _ = _system([], deriv_frames=[])
+    assert system.fx_entry_rate(Side.SELL) is None            # 월물도 값도 없음
+    system._fx_futures = ("A7569000", 202610)
+    system.fx_futures_price["A7569000"] = 1_350.0             # 직전 체결가만
+    assert system.fx_entry_rate(Side.SELL) == 1_350.0
+    system.usdkrw_spot = 1_349.6                              # 현물이 생기면 체결가보다 우선
+    assert system.fx_entry_rate(Side.SELL) == 1_349.6 and system.fx_entry_rate(Side.BUY) == 1_349.6
+    system.fx_futures_quote["A7569000"] = (1_349.4, 1_349.5)  # 호가가 있으면 방향별 1호가
+    assert system.fx_entry_rate(Side.SELL) == 1_349.4         # HL 매도 → 매수1호가
+    assert system.fx_entry_rate(Side.BUY) == 1_349.5          # HL 매수 → 매도1호가
+
+
 def test_ws_statuses_collects_present_clients() -> None:
     # WS 세션 현황(Phase 8-3c) — 살아있는 채널만 모으고 없는 채널(HL)은 건너뛴다.
     system, _, _ = _system([], deriv_frames=[])
