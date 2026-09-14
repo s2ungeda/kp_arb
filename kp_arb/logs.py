@@ -28,9 +28,10 @@ class QueuedHandler(QueueHandler):
     """
 
     def __init__(self, target: logging.Handler) -> None:
-        super().__init__(queue.SimpleQueue())
+        self._q: queue.SimpleQueue[logging.LogRecord] = queue.SimpleQueue()
+        super().__init__(self._q)
         self.target = target
-        self._listener = QueueListener(self.queue, target, respect_handler_level=True)
+        self._listener = QueueListener(self._q, target, respect_handler_level=True)
         self._listener.start()
         _LISTENERS.append(self._listener)
 
@@ -39,6 +40,16 @@ class QueuedHandler(QueueHandler):
         prepared.msg = record.getMessage()
         prepared.args = None
         return prepared
+
+    def flush(self) -> None:
+        """큐가 비고 target이 다 쓸 때까지(최대 1초) 기다린다 — 테스트·종료 직전 확인용."""
+        import time as _t
+
+        deadline = _t.monotonic() + 1.0
+        while not self._q.empty() and _t.monotonic() < deadline:
+            _t.sleep(0.005)
+        _t.sleep(0.01)  # 방금 꺼낸 레코드가 target.emit을 지나는 시간
+        self.target.flush()
 
     def close(self) -> None:
         _stop_listener(self._listener)

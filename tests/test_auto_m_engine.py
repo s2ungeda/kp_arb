@@ -276,6 +276,33 @@ async def test_engine_saves_state_after_fills_and_halt() -> None:
     assert len(saves) > before and s.fill_diff == 20 and s.entry.status is LegStatus.PRE_PARTIAL
 
 
+async def test_state_save_runs_after_post_order_is_sent() -> None:
+    # 2026-09-14: 체결마다 하는 상태 저장(파일 읽기·비교·세대 회전·교체, 수 ms)이 체결 처리 안에서
+    # 돌아 방금 예약한 후주문 태스크를 늦췄다 → 저장은 후주문 전송 뒤로(call_soon).
+    state = CoreState()
+    state.screens[ScreenKind.AUTO_M].underlying = U
+    sys_ = FakeSystem()
+    order: list[str] = []
+    real_place = sys_.place
+
+    async def place(intent: OrderIntent, *, cloid: str | None = None) -> str:
+        order.append(f"place:{intent.instrument.value}")
+        return await real_place(intent, cloid=cloid)
+
+    sys_.place = place  # type: ignore[method-assign]
+    eng = AutoMEngine(state, sys_, save=lambda: order.append("save"))  # type: ignore[arg-type]
+    s = state.autom.book(U).sets[0]
+    s.target_qty, s.per_qty, s.en_sf, s.en_s, s.ex_sf = 100, 10, 0.005, 0.005, -0.001
+    state.autom.settings.windows = (("09:00:00", "15:20:00"),)
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    order.clear()
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    await _settle()
+    assert order[:2] == ["place:hl_perp", "save"]  # 후주문 전송이 저장보다 먼저
+
+
 async def test_books_run_independently_per_underlying() -> None:
     # 사용자 확정 2026-09-08: 삼성이 도는 중에도 다른 창에서 하이닉스를 따로 돌린다.
     # 종목별 책 — 한 종목 실행/정지가 다른 종목에 영향 없음, 스냅샷은 종목 키로.
@@ -544,6 +571,8 @@ async def test_engine_writes_per_underlying_log(tmp_path: Any) -> None:
     await _settle()
     sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=1_602_000.0, ts=0))
     await _settle()
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1183.5, ts=0))
+    await _settle()
     for h in logging.getLogger("kp_arb.autom.sk_hynix").handlers:
         h.flush()
     files = list(tmp_path.glob("autom_sk_hynix_*.log"))
@@ -558,6 +587,10 @@ async def test_engine_writes_per_underlying_log(tmp_path: Any) -> None:
     assert "행동 정방향 1세트 진입: place_pre buy 10 1602000" in text
     assert "체결 정방향 1세트 진입: 선주문 #O1" in text and "누적 4/10, HL 대기 40" in text
     assert "행동 정방향 1세트 진입: place_post sell 40" in text
+    # 발주 때 보관한 est와 체결 순간 다시 계산한 est를 나란히(사용자 2026-09-15) — 호가창이
+    # 그대로면 둘이 같다(매수호가 1184 × 500 → 40계약 est 1184). 후주문 체결가 대비 차이는 유리 +.
+    assert "선주문 #O1 4 @ 1.602e+06 기준est 1184 현est 1184 → 누적" in text
+    assert "후주문 #O2 HL 40 @ 1183.5 기준est 1184 차이 -0.5(-0.042%) 현est 1184 " in text
 
 
 async def test_engine_cancel_on_signal_loss_and_halt_on_post_reject() -> None:

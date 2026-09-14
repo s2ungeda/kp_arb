@@ -120,6 +120,10 @@ class AutoMEngine:
         # (사용자 2026-09-04). 판정·상태는 바뀔 때만 한 줄.
         self._logged_reason: dict[tuple[Underlying, int, Block, bool], str] = {}
         self._logged_status: dict[tuple[Underlying, int, Block, bool], str] = {}
+        # 지연 계측(2026-09-14): 선주문 체결 반영 시각(perf_counter) → 후주문 준비 줄에 경과 ms
+        self._fill_perf: dict[tuple[Underlying, int, Block, bool], float] = {}
+        self._persist_ms = 0.0  # 마지막 상태 저장에 걸린 ms(후주문 준비 줄에 함께)
+        self._persist_pending = False  # 저장 예약됨(루프 다음 차례에 한 번)
         self._halt_since: float | None = None
         self._resumed_mono: float | None = None
         self._bg: set[asyncio.Task[None]] = set()
@@ -342,6 +346,8 @@ class AutoMEngine:
                           reverse: bool = False) -> None:
         s = self._set(u, index, reverse)
         assert act.side is not None
+        t_task = time.perf_counter()
+        t_fill = self._fill_perf.pop((u, index, block, reverse), None)
         # 후주문도 지정가(Gtc)만(사용자 확정 2026-09-04) — 상대 1호가 ± HP 여유로 taker처럼 잡는다.
         hl = self._system.quotes.get((u, Instrument.HL_PERP, "hl"))
         if hl is None or not hl.bid or not hl.ask:
@@ -364,6 +370,15 @@ class AutoMEngine:
         cloid = self._system.new_hl_cloid()
         if cloid:
             self._pending_refs[cloid] = ref
+        if t_fill is not None:
+            # 지연 계측(2026-09-14, 운영 ①→② 5~42ms의 내역): 체결 반영 → 이 태스크 시작(루프 대기)
+            # → 전송 직전(호가·가격·의도·cloid 준비). 직전 상태 저장 시간도 참고로.
+            now = time.perf_counter()
+            self.ulog(u).info(
+                "후주문 준비 %s: 선체결 후 %.1fms 태스크 시작 → %.1fms 전송 직전 "
+                "(직전 저장 %.1fms)",
+                self._tag(u, index, block, reverse), (t_task - t_fill) * 1000,
+                (now - t_fill) * 1000, self._persist_ms)
         try:
             oid = await self._system.place(intent, cloid=cloid)
         except Exception as exc:  # noqa: BLE001 - 후주문 거부 → 체결차 누적, 한도 넘으면 중지(ㄹ2)
@@ -449,18 +464,25 @@ class AutoMEngine:
         s = self._set(u, ref.index, ref.reverse)
         mono = time.monotonic()
         leg = s.leg(ref.block)
+        if ref.leg == "pre":
+            self._fill_perf[(u, ref.index, ref.block, ref.reverse)] = time.perf_counter()
         # 체결 줄을 먼저 찍고 행동(후주문 발주·중지)을 적용한다 — 행동 줄이 체결 줄보다 앞에 찍혀
         # "체결 전에 판단했다"로 읽힌 실측(2026-09-10 10:45:47.536/537)을 막는다.
         tag = self._tag(u, ref.index, ref.block, ref.reverse)
+        # 발주 때 보관한 est와 **지금 호가창으로 다시 계산한 est**를 나란히(사용자 2026-09-15) —
+        # 선체결 순간·후체결 순간에 호가창이 발주 때와 얼마나 달라졌는지 바로 보이게.
+        est_now = self._current_est(u, leg)
+        est_pair = f"기준est {leg.pre_est:g} 현est {self._fmt_est(est_now)}" if leg.pre_est \
+            else f"기준est - 현est {self._fmt_est(est_now)}"
         if ref.leg == "pre":
             acts = on_pre_fill(s, ref.block, int(round(qty)), price, mono)
-            self.ulog(u).info("체결 %s: 선주문 #%s %g @ %g → 누적 %d/%d, HL 대기 %g | %s",
-                              tag, order.order_id, qty, price, leg.pre_filled, leg.pre_qty,
-                              leg.post_pending, self._ledger(s))
+            self.ulog(u).info("체결 %s: 선주문 #%s %g @ %g %s → 누적 %d/%d, HL 대기 %g | %s",
+                              tag, order.order_id, qty, price, est_pair, leg.pre_filled,
+                              leg.pre_qty, leg.post_pending, self._ledger(s))
             # 코어 로그에도 체결가·체결수량(사용자 2026-09-14: 코어 로그엔 발주가만 있고 체결 없음)
-            self._log.info("[자동M] %s 선주문 체결 %s #%s %s %g @ %s (누적 %d/%d)",
+            self._log.info("[자동M] %s 선주문 체결 %s #%s %s %g @ %s %s (누적 %d/%d)",
                            u.value, tag, order.order_id, order.intent.side.value, qty,
-                           f"{price:,.0f}", leg.pre_filled, leg.pre_qty)
+                           f"{price:,.0f}", est_pair, leg.pre_filled, leg.pre_qty)
         else:
             fx = self._system.fx_entry_rate(order.intent.side) or 0.0
             # Sprd 기준값(S현재가·SF이론가)은 **이 체결 시점** 값을 판 버퍼에 넣는다(사용자 확정
@@ -471,21 +493,49 @@ class AutoMEngine:
                                 stock_last=stock, sf_theory=theory)
             acc = leg.acc
             sprd = acc.sprd()
+            # 선주문 발주 시점 est(후주문 방향) 대비 체결가 — 판정 때 본 값대로 잡혔나
+            # (사용자 2026-09-14). 차이는 우리에게 유리하면 +: 매도는 체결가−est, 매수는 est−체결가.
+            est_txt = (self._est_vs_fill(leg.pre_est, order.intent.side, price)
+                       + f" 현est {self._fmt_est(est_now)}")
             self.ulog(u).info(
-                "체결 %s: 후주문 #%s HL %g @ %g 환진입가 %g S현재가 %s SF이론가 %s → RT %d "
+                "체결 %s: 후주문 #%s HL %g @ %g %s 환진입가 %g S현재가 %s SF이론가 %s → RT %d "
                 "HL대기 %g | %s | 누적 HL %g SF %g 환평균 %s HL평균 %s SF평균 %s Sprd %s",
-                tag, order.order_id, qty, price, fx,
+                tag, order.order_id, qty, price, est_txt, fx,
                 stock, f"{theory:,.0f}" if theory else None, s.rt, leg.post_pending,
                 self._ledger(s), acc.hl_qty, acc.sf_qty, acc.fx_avg(), acc.hl_avg(),
                 acc.sf_avg(), f"{sprd * 100:.3f}%" if sprd is not None else "-(판 미완)")
             # 코어 로그에도 체결가·체결수량·누적·남은 대기(사용자 2026-09-14) — 발주가(@ 주문가)와
             # 구분되게 '체결'을 앞에.
-            self._log.info("[자동M] %s 후주문 체결 %s #%s %s %g @ %g (누적 %g/%g, HL 대기 %g)",
+            self._log.info("[자동M] %s 후주문 체결 %s #%s %s %g @ %g %s (누적 %g/%g, HL 대기 %g)",
                            u.value, tag, order.order_id, order.intent.side.value, qty, price,
-                           order.filled_qty, order.intent.qty, leg.post_pending)
+                           est_txt, order.filled_qty, order.intent.qty, leg.post_pending)
         self._apply(u, ref.index, ref.block, acts, ref.reverse)
         self._trace(u, ref.index, ref.block, leg, ref.reverse)
-        self._persist()  # RT·체결차·순잔고 바뀜 → core_state.json
+        self._persist()  # RT·체결차·순잔고 바뀜 → core_state.json (실제 저장은 루프 다음 차례)
+
+    def _current_est(self, u: Underlying, leg: Leg) -> float | None:
+        """지금 HL 호가창으로 다시 계산한 est(후주문 방향, 이번 선주문 계약수 × 10) — 판정 때와
+        같은 식(build_signals). 호가창이 없으면 None."""
+        hl = self._system.quotes.get((u, Instrument.HL_PERP, "hl"))
+        if hl is None or not hl.bid or not hl.ask:
+            return None
+        qty = (leg.pre_qty or 1) * HL_PER_SF
+        if leg.post_side is Side.SELL:
+            return est_price(hl.bids or [(hl.bid, hl.bid_qty or 1.0)], qty)
+        return est_price(hl.asks or [(hl.ask, hl.ask_qty or 1.0)], qty)
+
+    @staticmethod
+    def _fmt_est(est: float | None) -> str:
+        return f"{est:g}" if est else "-"
+
+    @staticmethod
+    def _est_vs_fill(est: float | None, side: Side, price: float) -> str:
+        """'기준est X 차이 ±d(±p%)' — 선주문 발주 시점 est 대비 후주문 체결가. 유리하면 +
+        (HL 매도는 더 높게, 매수는 더 낮게 잡힌 것). est가 없던 판(호가창 없음)은 '기준est -'."""
+        if not est:
+            return "기준est -"
+        diff = price - est if side is Side.SELL else est - price
+        return f"기준est {est:g} 차이 {diff:+g}({diff / est * 100:+.3f}%)"
 
     @staticmethod
     def _ledger(s: AutoMSet) -> str:
@@ -493,13 +543,35 @@ class AutoMEngine:
         return f"장부 SF {s.sf_net} HL {s.hl_net:g} 체결차 {s.fill_diff:g}"
 
     def _persist(self) -> None:
+        """코어 상태 저장 예약 — 실제 저장은 **이벤트 루프의 다음 차례**에 한 번(같은 이벤트 안의
+        여러 요청은 하나로).
+
+        2026-09-14: 저장(파일 읽기·비교·임시파일·세대 회전·교체)은 수 ms인데 체결 처리·통보 처리
+        안에서 그 자리에서 하면 방금 예약한 후주문 발주 태스크가 그만큼 늦게 시작했다(①→② 지연).
+        call_soon은 예약 순서대로 돌므로 먼저 예약된 후주문 태스크의 첫 스텝(전송까지)이 앞선다.
+        루프 밖(동기 테스트)이면 그 자리에서 저장.
+        """
+        if self._save is None or self._persist_pending:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._persist_now()
+            return
+        self._persist_pending = True
+        loop.call_soon(self._persist_now)
+
+    def _persist_now(self) -> None:
         """코어 상태 저장(세대 백업 포함) — 실패해도 판정을 멈추지 않는다."""
+        self._persist_pending = False
         if self._save is None:
             return
+        t0 = time.perf_counter()
         try:
             self._save()
         except Exception as exc:  # noqa: BLE001 - 저장 실패는 로그만
             self._log.warning("[자동M] 상태 저장 실패 — %s", exc)
+        self._persist_ms = (time.perf_counter() - t0) * 1000
 
     def _on_book_change(self) -> None:
         """취소·거부는 상태 변화로 온다 — 추적 주문의 상태 전이를 한 번씩 처리."""
@@ -619,6 +691,8 @@ class AutoMEngine:
         left = [oid for oid, ref in self._orders.items() if ref.leg == "pre"]
         if left:
             self._log.warning("[자동M] 종료 — 취소 확인 못 한 선주문 %s (LS에서 확인 필요)", left)
+        if self._persist_pending:  # 예약만 된 저장이 루프 종료로 사라지지 않게 지금 쓴다
+            self._persist_now()
 
     # ------------------------------------------------------------- 스냅샷 ---
     def live_snapshot(self) -> dict[str, Any]:

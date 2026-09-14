@@ -211,6 +211,21 @@ def test_three_consecutive_pre_rejects_turn_set_off_with_alarm() -> None:
     assert s2.entry.reject_streak == 0
 
 
+def test_place_pre_keeps_hl_est_of_post_side_for_fill_comparison() -> None:
+    # 사용자 2026-09-14: 선주문 발주 시점 HL est(후주문 방향)를 들고 있다가 후주문 체결가와
+    # 비교한다. 정방향 진입 = 후주문 HL 매도 → 매수호가창 est(hl_est_bid). 재발주면 새 값으로.
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    acts = evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"] and s.entry.pre_est == 191.88
+    on_pre_ack(s, Block.ENTRY, "1")
+    evaluate(s, Block.ENTRY, _sig(hl_disp_bid=0.03), SETTINGS, U)  # 역산가 변경 → 취소
+    on_pre_cancelled(s, Block.ENTRY, mono=101.0, settings=SETTINGS)
+    acts = evaluate(s, Block.ENTRY, _sig(mono=102.0, hl_disp_bid=0.03, hl_est_bid=195.5),
+                    SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"] and s.entry.pre_est == 195.5
+
+
 def test_fill_before_cancel_confirmation_does_not_freeze_in_delay() -> None:
     # 실측 2026-09-11 오후: 역산가 변경으로 취소를 보냈는데 취소보다 체결이 먼저(LS는 취소를 01433
     # 거부) → 후주문까지 잡혀 판이 끝났는데 '취소 확인 대기' 표시가 남아 딜레이대기('쉼')에서 영영

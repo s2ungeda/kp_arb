@@ -226,6 +226,9 @@ class Leg:
     status: LegStatus = LegStatus.IDLE
     pre_order_id: str | None = None
     pre_price: float | None = None
+    # 선주문 발주 시점의 HL est(후주문 방향, 후주문 수량만큼 쓸어담은 평균 예상가) — 후주문 체결가와
+    # 비교해 "판정 때 본 값대로 잡혔나"를 본다(사용자 2026-09-14). 재발주 때 새 값으로 덮인다.
+    pre_est: float | None = None
     pre_qty: int = 0            # 이번 선주문 계약수
     pre_filled: int = 0         # 이번 선주문 체결 계약수
     post_pending: float = 0.0   # 후주문(HL) 체결 대기 계약수 — HL은 소수 체결(0.588 등, 실측 09-07)
@@ -535,6 +538,7 @@ def evaluate(
         if qty < 1:
             return hold(f"G4 여유 없음 (목표 {s.target_qty} RT {s.rt})")
         leg.pre_price, leg.pre_qty, leg.pre_filled = price, qty, 0
+        leg.pre_est = hl_est  # 후주문 체결가 비교 기준(발주 시점 est)
         leg.cancel_sent = False
         leg.status = LegStatus.PRE_RESTING
         return hold(f"통과 → 선주문 {qty}계약 {basis}",
