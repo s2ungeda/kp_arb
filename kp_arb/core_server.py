@@ -495,13 +495,18 @@ async def _autom_command(
 
     cmd = body.get("cmd")
     am = state.autom
+    # 방향(exec §7A·§7B, 2026-09-14): "fwd"(기본) = 정방향 sets, "rev" = 역방향 rev_sets
+    reverse = str(body.get("direction", "fwd")) == "rev"
 
     def _book() -> Any:
         return am.book(Underlying(str(body["underlying"])))
 
+    def _sets() -> Any:
+        return _book().sets_of(reverse)
+
     try:
         if cmd == "autom_set":
-            _autom_set_from_body(_book().sets[int(body["set"])], body)
+            _autom_set_from_body(_sets()[int(body["set"])], body)
             return _ok()
         if cmd == "autom_month":  # 선물 월물(근/차근) — 종목별(exec §11.9)
             month = str(body["month"]).strip()
@@ -527,21 +532,24 @@ async def _autom_command(
             for key in ("hl_margin_buy", "hl_margin_sell"):  # 후주문 지정가 여유(소수)
                 if key in body:
                     setattr(st, key, float(body[key]))
-            for key in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap"):
+            for key in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap",
+                        "risk_rev_en", "risk_rev_ex", "risk_rev_gap"):
                 if key in body:
                     setattr(am, key, float(body[key]))
             # 설정 변경은 코어 로그에 남긴다 — "왜 그때 주문이 나갔/막혔나"를 따질 근거
             # (실측 2026-09-08: 주문가능시간을 줄인 순간 걸린 선주문이 취소됐는데 기록이 없었음).
             logging.getLogger("kp_arb.autom").info(
                 "[자동M] 체결쏴 설정 변경: 주문가능시간 %s 선주문딜레이 %dms 재개 %ds 범위 %.3f%% "
-                "상대호가 매수%d/매도%d 후주문HP 매수%.2f%%/매도%.2f%% 주문단위 %s 리스크 %s/%s/%s",
+                "상대호가 매수%d/매도%d 후주문HP 매수%.2f%%/매도%.2f%% 주문단위 %s "
+                "리스크 정 %s/%s/%s 역 %s/%s/%s",
                 st.windows, st.pre_delay_ms, st.resume_delay_s, st.pre_range * 100,
                 st.rel_buy, st.rel_sell, st.hl_margin_buy * 100, st.hl_margin_sell * 100,
                 {u.value: t for u, t in st.pre_tick.items()},
-                am.risk_fwd_en, am.risk_fwd_ex, am.risk_fwd_gap)
+                am.risk_fwd_en, am.risk_fwd_ex, am.risk_fwd_gap,
+                am.risk_rev_en, am.risk_rev_ex, am.risk_rev_gap)
             return _ok()
         if cmd == "autom_clear_acc":
-            _book().sets[int(body["set"])].leg(Block(str(body["block"]))).acc.clear()
+            _sets()[int(body["set"])].leg(Block(str(body["block"]))).acc.clear()
             return _ok()
         if cmd == "autom_ref_qty":  # 상단 기준수량 — 모니터 3칸 est 계산 수량(종목별)
             _book().ref_qty = max(0, int(body["qty"]))
@@ -552,7 +560,7 @@ async def _autom_command(
             u = Underlying(str(body["underlying"]))
             index, block = int(body["set"]), Block(str(body["block"]))
             value = bool(body["value"])
-            target = am.book(u).sets[index]
+            target = am.book(u).sets_of(reverse)[index]
             if value:
                 errors: list[str] = []
                 if target.per_qty <= 0:
@@ -567,11 +575,11 @@ async def _autom_command(
                     errors.append("중지 상태 — 먼저 해제하세요")
                 if errors:
                     return _fail(errors)
-            engine.set_running(u, index, block, value)
+            engine.set_running(u, index, block, value, reverse)
             return _ok()
         if cmd == "autom_release":
             engine.release(Underlying(str(body["underlying"])), int(body["set"]),
-                           Block(str(body["block"])))
+                           Block(str(body["block"])), reverse)
             return _ok()
         if cmd == "autom_stop_all":  # 창 닫기 = 그 창의 종목만 정지, 안전종료 = 전 종목
             raw_u = body.get("underlying")
@@ -1093,10 +1101,17 @@ def _setup_logging() -> logging.Logger:
     """콘솔 + logs/core_날짜.log 파일 로그 (7-3a — 판정·발주 추적용). 자정 롤오버(Phase 8)."""
     import sys
 
+    from .logs import QueuedHandler, has_file_handler
+
+    # 파일 핸들러는 전부 큐 뒤에 둔다(logs.QueuedHandler) — 파일 쓰기가 이벤트 루프를 잡지 않게.
+    # 포맷터는 큐가 아니라 파일 핸들러에 단다(큐 핸들러의 포맷터는 무시됨).
     log_dir = _base_dir() / "logs"
+    core_fmt = "%(asctime)s %(levelname)s %(name)s %(message)s"
     try:
         log_dir.mkdir(exist_ok=True)
-        file_handler: logging.Handler = _DailyFileHandler(log_dir)
+        core_file = _DailyFileHandler(log_dir)
+        core_file.setFormatter(logging.Formatter(core_fmt))
+        file_handler: logging.Handler = QueuedHandler(core_file)
     except OSError:
         file_handler = logging.NullHandler()
     handlers: list[logging.Handler] = [file_handler]
@@ -1104,23 +1119,19 @@ def _setup_logging() -> logging.Logger:
     # 터진다 — 콘솔이 있을 때만 콘솔 출력, 없으면 파일 로그만.
     if sys.stderr is not None:
         handlers.insert(0, logging.StreamHandler())
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        handlers=handlers,
-    )
+    logging.basicConfig(level=logging.INFO, format=core_fmt, handlers=handlers)
     # 거래소별 주문 로그 — HL/LS 각각 별도 파일(hl_order_날짜.log / ls_order_날짜.log),
     # 자정 롤오버. root로 전파 안 함(propagate=False) → core.log·콘솔과 분리(중복 없음).
     for name, prefix in (("kp_arb.order.hl", "hl_order"), ("kp_arb.order.ls", "ls_order")):
         olg = logging.getLogger(name)
         olg.setLevel(logging.INFO)
         olg.propagate = False
-        if not any(isinstance(h, _DailyFileHandler) for h in olg.handlers):
+        if not has_file_handler(olg, _DailyFileHandler):
             try:
                 oh = _DailyFileHandler(log_dir, prefix=prefix)
                 # 시각 필수 — 발주요청→응답→체결 순서·간격 추적(없으면 순서 재구성 불가).
                 oh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-                olg.addHandler(oh)
+                olg.addHandler(QueuedHandler(oh))
             except OSError:
                 pass
     # WS 주문 원본 로그 — 거래소별(ws_hl/ws_ls), 수신 시각 필요 → 타임스탬프 포매터.
@@ -1128,11 +1139,11 @@ def _setup_logging() -> logging.Logger:
         wlg = logging.getLogger(name)
         wlg.setLevel(logging.INFO)
         wlg.propagate = False
-        if not any(isinstance(h, _DailyFileHandler) for h in wlg.handlers):
+        if not has_file_handler(wlg, _DailyFileHandler):
             try:
                 wh = _DailyFileHandler(log_dir, prefix=prefix)
                 wh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-                wlg.addHandler(wh)
+                wlg.addHandler(QueuedHandler(wh))
             except OSError:
                 pass
     return logging.getLogger("kp_arb.core")
@@ -1142,6 +1153,10 @@ async def _serve() -> None:
     import aiohttp
 
     log = _setup_logging()
+    from . import since_start
+
+    # 시동 계측(2026-09-14): 프로세스 시작(패키지 첫 임포트) 기준 — exe 기동·임포트에 쓴 시간.
+    log.info("코어 프로세스 시작 — 임포트·로그 준비까지 %.1fs", since_start())
     try:
         from dotenv import load_dotenv
 
@@ -1214,6 +1229,9 @@ async def _serve() -> None:
             task.cancel()
         await runner.cleanup()
         log.info("코어 안전종료 완료")  # 미체결 전량 취소는 7-3b에서 이 앞에
+        from .logs import stop_queued_logging
+
+        stop_queued_logging()  # 큐에 남은 로그를 파일에 다 쓰고 종료(atexit도 있으나 명시)
 
 
 def main() -> None:

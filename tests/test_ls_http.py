@@ -33,12 +33,16 @@ class FakeSession:
         self._resp = resp
         self.calls: list[dict[str, Any]] = []
 
-    def post(self, url: str, *, data: Any = None, headers: Any = None) -> FakeResp:
-        self.calls.append({"method": "POST", "url": url, "data": data, "headers": headers})
+    def post(self, url: str, *, data: Any = None, headers: Any = None,
+             timeout: Any = None) -> FakeResp:
+        self.calls.append({"method": "POST", "url": url, "data": data, "headers": headers,
+                           "timeout": timeout})
         return self._resp
 
-    def request(self, method: str, url: str, *, headers: Any = None, data: Any = None) -> FakeResp:
-        self.calls.append({"method": method, "url": url, "data": data, "headers": headers})
+    def request(self, method: str, url: str, *, headers: Any = None, data: Any = None,
+                timeout: Any = None) -> FakeResp:
+        self.calls.append({"method": method, "url": url, "data": data, "headers": headers,
+                           "timeout": timeout})
         return self._resp
 
 
@@ -84,6 +88,19 @@ async def test_rest_transport_sends_json_and_parses() -> None:
     assert call["url"] == "https://x/stock/accno"
     assert call["headers"]["tr_cd"] == "CSPAQ22200"
     assert json.loads(call["data"]) == {"a": 1}  # body가 JSON 직렬화됨
+
+
+async def test_requests_carry_10s_timeout() -> None:
+    # 사용자 확정 2026-09-14: LS REST 요청 1건 최대 10초
+    # (전엔 aiohttp 기본 5분 — 운영 실측 잔고 조회 72초가 시동을 붙잡음).
+    from kp_arb.gateways.ls_http import REQUEST_TIMEOUT_S
+
+    assert REQUEST_TIMEOUT_S == 10.0
+    session = FakeSession(FakeResp(200, json_body={"access_token": "tok", "rsp_cd": "00000"}))
+    await AiohttpTokenTransport(session, "https://x").fetch_token("k", "s")
+    await AiohttpRestTransport(session).request("POST", "https://x", {}, None)
+    for call in session.calls:
+        assert call["timeout"] is not None and call["timeout"].total == 10.0
 
 
 async def test_rest_transport_non_json_falls_back_to_raw() -> None:

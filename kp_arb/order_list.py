@@ -118,6 +118,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
+    from .core_client import log_screen_timing
+    log_screen_timing(root, __name__)  # 시동 계측: 화면 시작·표시 시각(screen 로그)
     root.title(_TITLE)
     root.resizable(True, True)  # 크기 조절 — 표 행만 확장(root.rowconfigure weight)
     # 기본 크기 — 컬럼 전부 + 여유가 보이는 폭(사용자 2026-09-11). 최소폭 고정을 없애면서 자연

@@ -49,7 +49,7 @@ class FakeSystem:
     def pair_signal(self, u: Underlying, instrument: Instrument, entry_qty: int,
                     exit_qty: int) -> tuple[float | None, float | None]:
         if instrument is Instrument.KR_STOCK:
-            return self.s_entry, None
+            return self.s_entry, getattr(self, "s_exit", None)  # 매도 쪽 S괴리(역방향 진입 G5)
         return self.sf_entry, self.sf_exit
 
     def stock_futures_theory(self, underlying: Underlying,
@@ -100,6 +100,11 @@ class FakeSystem:
         return oid
 
     async def cancel(self, order_id: str) -> None:
+        self.cancel_calls = getattr(self, "cancel_calls", 0) + 1
+        if getattr(self, "cancel_gone", False):  # 체결과 교차 — LS 03416/01433(OrderGoneError)
+            from kp_arb.gateways.ls import OrderGoneError
+
+            raise OrderGoneError("CFOAT00300 rejected (03416): 정정취소가능수량이 없습니다.")
         fails = getattr(self, "cancel_fail_times", 0)  # LS 초당 한도 흉내 — 처음 n번 실패
         if fails > 0:
             self.cancel_fail_times = fails - 1
@@ -218,6 +223,36 @@ async def test_failed_post_order_relinked_when_identified_late() -> None:
     assert s.entry.status is not LegStatus.HALTED and s.entry.running
 
 
+async def test_engine_reverse_round_sells_sf_then_buys_hl() -> None:
+    # exec §7A(2026-09-14): 역방향 세트는 rev_sets에 있고 명령·주문 참조에 reverse가 붙는다.
+    # 진입 = SF 매도 선주문(올림·매수호가 기준 한계) → 체결 → HL 매수 후주문 → RT −10, 체결차 0.
+    eng, sys_, state = _engine()
+    sys_.s_exit = -0.01  # 매도 쪽 S괴리 < 진입S 0.5% → 역방향 G5 통과
+    book = state.autom.book(U)
+    r = book.rev_sets[0]
+    r.target_qty, r.per_qty, r.en_sf, r.en_s, r.ex_sf = 100, 10, 0.005, 0.005, -0.001
+    await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True,
+                                      "direction": "rev"})
+    assert r.entry.running and not book.sets[0].entry.running  # 정방향 세트는 그대로
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert len(sys_.placed) == 1 and sys_.placed[0].side is Side.SELL   # 선주문 SF 매도
+    # HL 매도호가 1184.5×1356 = 1,606,182 → 괴리 +0.386% → P = 1,605,000×(1+0.00386−0.005)
+    # = 1,603,170 → 3,000 올림 1,605,000 ≤ 한계 (1,598,000+1,000)×1.004 = 1,605,396
+    assert sys_.placed[0].price == 1_605_000
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_605_000.0, ts=0))
+    await _settle()
+    assert len(sys_.placed) == 2 and sys_.placed[1].side is Side.BUY    # 후주문 HL 매수 100
+    assert sys_.placed[1].qty == 100 and r.rt == -10 and r.sf_net == -10
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=100, price=1184.5, ts=0))
+    await _settle()
+    assert r.hl_net == 100 and r.fill_diff == 0 and r.entry.status is LegStatus.SETTLE_DELAY
+    snap = eng.live_snapshot()[U.value]
+    assert snap["rev_sets"][0]["rt"] == -10 and snap["rev_sets"][0]["reverse"] is True
+    assert snap["sets"][0]["rt"] == 0
+    assert eng._tag(U, 0, Block.ENTRY, True) == "역방향 1세트 진입"
+
+
 async def test_engine_saves_state_after_fills_and_halt() -> None:
     # RT·체결차·순잔고는 체결로 바뀐다 → 명령 때만 저장하면 재시동 때 잃는다(사용자 2026-09-07).
     state = CoreState()
@@ -334,6 +369,29 @@ async def test_late_pre_fill_after_stop_still_hedges() -> None:
     assert sys_.placed[1].qty == 100 and s.entry.post_pending == 100  # 10계약 × 10
     assert s.entry.status is LegStatus.POST_PENDING and not s.entry.running
     for task in list(eng._bg):                    # 남은 취소 재시도 정리
+        task.cancel()
+    await _settle()
+
+
+async def test_cancel_crossed_by_fill_is_not_retried() -> None:
+    # 운영 실측 2026-09-14 #6548: 발주 55ms 뒤 체결, 그 사이 낸 취소는 LS 03416(잔량 없음).
+    # 옛 코드는 3회 재시도(2·3회째는 잔량 0으로 보내 02897)로 경고 20줄. 잔량 없음은 경합이지
+    # 실패가 아니다 — 한 번으로 끝내고 재시도·취소실패 표시 없이 체결 통보에 맡긴다.
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    sys_.cancel_gone = True
+    eng.set_running(U, 0, Block.ENTRY, False)     # 실행 끔 → 취소 → 03416
+    await asyncio.sleep(1.5)                      # 재시도 간격(0.6초×2)보다 길게 기다려도
+    assert sys_.cancel_calls == 1                 # 한 번만 보냈고 재시도 없음
+    assert s.entry.cancel_tries == 1 and not s.entry.cancel_alarmed
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    await _settle()                               # 체결 통보가 정리 → 후주문(헤지)
+    assert [p.instrument for p in sys_.placed] == [SF, Instrument.HL_PERP]
+    for task in list(eng._bg):
         task.cancel()
     await _settle()
 

@@ -51,10 +51,11 @@ def pct_to_frac(value: float | None) -> float | None:
     return None if value is None else value / 100.0
 
 
-def set_payload(index: int, w: dict[str, Any], underlying: str) -> dict[str, Any]:
-    """세트 화면 상태 → 코어 autom_set 명령(정방향, 종목별 책). 기준값은 %→소수."""
+def set_payload(index: int, w: dict[str, Any], underlying: str,
+                direction: str = "fwd") -> dict[str, Any]:
+    """세트 화면 상태 → 코어 autom_set 명령(종목별 책, direction fwd|rev). 기준값은 %→소수."""
     return {
-        "cmd": "autom_set", "underlying": underlying, "set": index,
+        "cmd": "autom_set", "underlying": underlying, "set": index, "direction": direction,
         "target_qty": int(w.get("target") or 0), "per_qty": int(w.get("per") or 0),
         "switch_delay_s": int(w.get("delay") or 0),
         "en_sf": pct_to_frac(w.get("en_sf")), "en_s": pct_to_frac(w.get("en_s")),
@@ -78,6 +79,10 @@ def settings_payload(common: dict[str, Any]) -> dict[str, Any]:
         "risk_fwd_en": float(common["risk"]["fwd_en"]) / 100.0,
         "risk_fwd_ex": float(common["risk"]["fwd_ex"]) / 100.0,
         "risk_fwd_gap": float(common["risk"]["fwd_gap"]) / 100.0,
+        # 역방향 리스크방지도 코어 저장(2026-09-14) — 옛 화면 상태에 키가 없으면 기본값
+        "risk_rev_en": float(common["risk"].get("rev_en", 0.5)) / 100.0,
+        "risk_rev_ex": float(common["risk"].get("rev_ex", 0.0)) / 100.0,
+        "risk_rev_gap": float(common["risk"].get("rev_gap", 0.1)) / 100.0,
     }
 
 
@@ -139,7 +144,9 @@ def set_inputs_sig(book: dict[str, Any]) -> str:
     rows = book.get("sets")
     if not isinstance(rows, list):
         return ""
-    return json.dumps([[r.get(k) for k in _SET_INPUT_KEYS] for r in rows[:3]
+    rev = book.get("rev_sets")  # 역방향 3세트(2026-09-14) — 옛 코어 스냅샷엔 없을 수 있음
+    both = rows[:3] + (rev[:3] if isinstance(rev, list) else [])
+    return json.dumps([[r.get(k) for k in _SET_INPUT_KEYS] for r in both
                        if isinstance(r, dict)], sort_keys=True)
 
 
@@ -198,6 +205,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     if not preview:
         watch_parent_exit()
     root = tk.Tk()
+    from .core_client import log_screen_timing
+    log_screen_timing(root, __name__)  # 시동 계측: 화면 시작·표시 시각(screen 로그)
     root.title("체결쏴(자동M)-주식선물")  # 캡션에 상품명(사용자 2026-09-10)
     root.resizable(True, True)
     win_state.attach(root, "autoM")
@@ -492,9 +501,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         key = f"run_{side}"
         turning_on = not w[key]
         release = False
-        if turning_on and dtag == "fwd":
+        if turning_on:
             # 중지(HALTED)는 사람이 직접 풀어야 재개(exec §2) — 확인 뒤 해제 + 실행(2026-09-07)
-            live_sets = _live_sets()
+            live_sets = _live_sets(dtag)
             leg_live = ((live_sets[i] if i < len(live_sets) else {})
                         .get("entry" if side == "en" else "exit") or {})
             if leg_live.get("status") == "halted":
@@ -551,28 +560,26 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         st = "disabled" if on else "normal"
         for ent in (("e_en_sf", "e_en_s") if side == "en" else ("e_ex_sf",)):
             w[ent].config(state=st)
-        if dtag == "fwd":  # 코어 실행(정방향) — 켤 때 세트 입력값을 먼저 보내고 실행 명령
-            block = "entry" if side == "en" else "exit"
-            if on:
-                send(set_payload(i, w, cur_under()), "세트 설정")
-                if release:  # 중지 해제 먼저(같은 큐라 순서 보장) → 실행
-                    send({"cmd": "autom_release", "underlying": cur_under(), "set": i,
-                          "block": block}, "중지 해제")
-            send({"cmd": "autom_run", "underlying": cur_under(), "set": i, "block": block,
-                  "value": on},
-                 "실행" if on else "정지")
-        else:
-            status.config(text="역방향은 아직 미구현 — 화면 표시만(정방향 실측 후)")
+        # 코어 실행(정·역 공통, 역방향 2026-09-14) — 켤 때 세트 입력값을 먼저 보내고 실행 명령
+        block = "entry" if side == "en" else "exit"
+        if on:
+            send(set_payload(i, w, cur_under(), dtag), "세트 설정")
+            if release:  # 중지 해제 먼저(같은 큐라 순서 보장) → 실행
+                send({"cmd": "autom_release", "underlying": cur_under(), "set": i,
+                      "block": block, "direction": dtag}, "중지 해제")
+        send({"cmd": "autom_run", "underlying": cur_under(), "set": i, "block": block,
+              "value": on, "direction": dtag},
+             "실행" if on else "정지")
 
     def clear_acc(dtag: str, group: str) -> None:
         accs = sets[(dtag, 0)].get("_acc", {}).get(group, {})
         for lbl in accs.values():
             lbl.config(text="-")
-        if dtag == "fwd":  # 누적은 세트별로 코어가 들고 있다 → 3세트 모두 clear
-            block = "entry" if group == "진입" else "exit"
-            for idx in range(3):
-                send({"cmd": "autom_clear_acc", "underlying": cur_under(), "set": idx,
-                      "block": block}, "누적 clear")
+        # 누적은 세트별로 코어가 들고 있다 → 그 방향 3세트 모두 clear
+        block = "entry" if group == "진입" else "exit"
+        for idx in range(3):
+            send({"cmd": "autom_clear_acc", "underlying": cur_under(), "set": idx,
+                  "block": block, "direction": dtag}, "누적 clear")
 
     def _risk_of(dtag: str) -> tuple[float, float, float]:
         r = common["risk"]
@@ -656,8 +663,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             w["clear_diff"] = diff_var.get()
             apply_set_display(dtag, i)
             win.destroy()
-            if dtag == "fwd":  # 코어에 세트 설정 전송(실행 중에도 가능 — 코어가 다음 판정부터 반영)
-                send(set_payload(i, w, cur_under()), "세트 설정")
+            # 코어에 세트 설정 전송(실행 중에도 가능 — 코어가 다음 판정부터 반영)
+            send(set_payload(i, w, cur_under(), dtag), "세트 설정")
             # 1회성 항목은 보낸 즉시 비운다 — 뒤의 실행 켬(set_payload 재전송)·저장에 안 실리게
             w["rt_manual"] = None
             w["clear_diff"] = False
@@ -863,13 +870,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         live = (data.get("autom_live") or {}).get(cur_under())
         return live if isinstance(live, dict) else {}
 
-    def _live_sets() -> list[dict[str, Any]]:
-        rows = _live_book().get("sets")
+    def _live_sets(dtag: str = "fwd") -> list[dict[str, Any]]:
+        rows = _live_book().get("sets" if dtag == "fwd" else "rev_sets")
         return rows if isinstance(rows, list) else []
 
     def _any_running() -> bool:
         return any(bool((r.get("entry") or {}).get("running"))
-                   or bool((r.get("exit") or {}).get("running")) for r in _live_sets())
+                   or bool((r.get("exit") or {}).get("running"))
+                   for d in ("fwd", "rev") for r in _live_sets(d))
 
     def _set_status(text: str) -> None:
         status.config(text=text)
@@ -999,13 +1007,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         for ent in (("e_en_sf", "e_en_s") if side == "en" else ("e_ex_sf",)):
             w[ent].config(state=st)
 
-    def _leg_detail(i: int, side: str, leg: dict[str, Any]) -> str | None:
-        """상태줄용 진행 상세 — 감시/대기 외 상태만 한 줄."""
+    def _leg_detail(i: int, side: str, leg: dict[str, Any], dtag: str = "fwd") -> str | None:
+        """상태줄용 진행 상세 — 감시/대기 외 상태만 한 줄. 역방향은 '역' 표시."""
         st = str(leg.get("status") or "idle")
         if st in ("idle", "armed"):
             return None
         name = "진입" if side == "en" else "청산"
-        parts = [f"{i + 1}세트 {name}: {_STATUS_TEXT.get(st, st)}"]
+        head = f"{'역 ' if dtag == 'rev' else ''}{i + 1}세트 {name}"
+        parts = [f"{head}: {_STATUS_TEXT.get(st, st)}"]
         if leg.get("pre_order_id"):
             price = leg.get("pre_price")
             px = f"{float(price):,.0f}" if isinstance(price, int | float) else "-"
@@ -1043,16 +1052,17 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             ent_refqty.insert(0, str(ref))
             ref_sent["qty"] = ref
         state_box["_sets_sig"] = set_inputs_sig(book)
-        _load_set_inputs(rows)
+        _load_set_inputs(rows, "fwd")
+        _load_set_inputs(book.get("rev_sets") or [], "rev")
 
-    def _load_set_inputs(rows: list[Any], skip_focused: bool = False) -> None:
-        """코어 책의 세트 입력값(목표·1회·전환초·진입SF·진입S·청산)을 3세트 칸에 채운다.
+    def _load_set_inputs(rows: list[Any], dtag: str, skip_focused: bool = False) -> None:
+        """코어 책의 세트 입력값(목표·1회·전환초·진입SF·진입S·청산)을 그 방향 3세트 칸에 채운다.
         skip_focused: 지금 인라인 칸을 편집 중인 세트는 건너뛴다(입력 중 값이 튀지 않게)."""
         focused = root.focus_get() if skip_focused else None
         for i, raw in enumerate(rows[:3]):
             if not isinstance(raw, dict):
                 continue
-            w = sets[("fwd", i)]
+            w = sets[(dtag, i)]
             if focused is not None and focused in (w["e_en_sf"], w["e_en_s"], w["e_ex_sf"]):
                 continue
             w["target"] = int(raw.get("target_qty") or 0)
@@ -1061,7 +1071,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             for key in ("en_sf", "en_s", "ex_sf"):
                 v = raw.get(key)
                 w[key] = float(v) * 100.0 if isinstance(v, int | float) else None
-            apply_set_display("fwd", i)
+            apply_set_display(dtag, i)
 
     def _sync_set_inputs_from_core(data: dict[str, Any]) -> None:
         """다른 창에서 같은 종목의 세트설정을 바꿨으면(코어 값 변경) 이 창도 따라간다.
@@ -1075,7 +1085,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if not sig or sig == state_box.get("_sets_sig"):
             return
         state_box["_sets_sig"] = sig
-        _load_set_inputs(book.get("sets") or [], skip_focused=True)
+        _load_set_inputs(book.get("sets") or [], "fwd", skip_focused=True)
+        _load_set_inputs(book.get("rev_sets") or [], "rev", skip_focused=True)
 
     def _load_common_from_core(data: dict[str, Any]) -> None:
         """체결쏴 설정(공통)을 코어 값으로 맞춘다 — 코어가 원본(단일 진실).
@@ -1088,7 +1099,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if not isinstance(st, dict):
             return
         sig = json.dumps(st, sort_keys=True) + json.dumps(
-            [am.get("risk_fwd_en"), am.get("risk_fwd_ex"), am.get("risk_fwd_gap")])
+            [am.get(k) for k in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap",
+                                 "risk_rev_en", "risk_rev_ex", "risk_rev_gap")])
         if state_box.get("_common_sig") == sig:
             return
         state_box["_common_sig"] = sig
@@ -1109,7 +1121,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             if isinstance(st.get(src), int | float):
                 common[dst] = float(st[src]) * 100.0  # 코어는 소수, 화면은 %
         for src, dst in (("risk_fwd_en", "fwd_en"), ("risk_fwd_ex", "fwd_ex"),
-                         ("risk_fwd_gap", "fwd_gap")):
+                         ("risk_fwd_gap", "fwd_gap"), ("risk_rev_en", "rev_en"),
+                         ("risk_rev_ex", "rev_ex"), ("risk_rev_gap", "rev_gap")):
             if isinstance(am.get(src), int | float):
                 common["risk"][dst] = float(am[src]) * 100.0
         refresh_windows_bar()
@@ -1146,20 +1159,21 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             _load_inputs_from_core(data)
         else:
             _sync_set_inputs_from_core(data)  # 다른 창이 바꾼 세트설정 반영(같은 종목)
-        rows = _live_sets()
         details: list[str] = []
-        for i, row in enumerate(rows[:3]):
-            w = sets[("fwd", i)]
-            en, ex = row.get("entry") or {}, row.get("exit") or {}
-            _paint_leg(w, "en", en)
-            _paint_leg(w, "ex", ex)
-            _paint_halt(w, en.get("status") == "halted" or ex.get("status") == "halted")
-            for side, leg in (("en", en), ("ex", ex)):
-                detail = _leg_detail(i, side, leg)
-                if detail:
-                    details.append(detail)
-            w["rt"].config(text=_fmt_num(row.get("rt")))
-            w["diff"].config(text=_fmt_num(row.get("fill_diff")))
+        for dtag in ("fwd", "rev"):  # 정·역 각 3세트(역방향 2026-09-14)
+            for i, row in enumerate(_live_sets(dtag)[:3]):
+                w = sets[(dtag, i)]
+                en, ex = row.get("entry") or {}, row.get("exit") or {}
+                _paint_leg(w, "en", en)
+                _paint_leg(w, "ex", ex)
+                _paint_halt(w, en.get("status") == "halted" or ex.get("status") == "halted")
+                for side, leg in (("en", en), ("ex", ex)):
+                    detail = _leg_detail(i, side, leg, dtag)
+                    if detail:
+                        details.append(detail)
+                # RT는 부호 그대로 — 역방향은 0 또는 음수(사용자 확정 2026-09-14)
+                w["rt"].config(text=_fmt_num(row.get("rt")))
+                w["diff"].config(text=_fmt_num(row.get("fill_diff")))
         # 상단 모니터 3칸 — 코어가 기준수량으로 계산한 est 괴리(%), 정/역 각각.
         # '적'을 누른 뒤부터 표시(종목·호가단위·기준수량이 코어에 적용된 값이라야 뜻이 있음).
         monitor = _live_book().get("monitor") or {}
@@ -1176,25 +1190,27 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 text = (f"{float(v) * 100:.2f}"
                         if applied and isinstance(v, int | float) else "-")
                 mon[f"{dtag}_{skey}"].config(text=text)
-        # 매매결과 누적(정방향) — 진입 = entry 누적, 청산 = exit 누적(세트 합산)
-        accs = sets[("fwd", 0)].get("_acc", {})
-        for glabel, leg in (("진입", "entry"), ("청산", "exit")):
-            labels = accs.get(glabel, {})
-            if not labels or not rows:
-                continue
-            agg = sum_acc(rows, leg)
-            hp_key, s_key, fx_key = (("-HP", "+SF", "-환") if leg == "entry"
-                                     else ("+HP", "-SF", "+환"))
-            # 누적체결량 칸 = 짝이 맞은 HL 체결량(사용자 2026-09-09) — 소수면 자릿수를 붙인다
-            hl_q = float(agg["hl_qty"] or 0)
-            labels["누적"].config(text=_fmt_num(hl_q, 3 if hl_q % 1 else 0))
-            # -HP/+SF/-환 = Sprd 식의 세 입력값(HL 평균 체결가·SF 평균 체결가·환진입가, 엑셀 메인
-            # I28/I29/I27). 수량을 보여주던 것을 바로잡음(사용자 2026-09-11 — 로그의 평균가가 맞음).
-            labels[hp_key].config(text=_fmt_num(agg["hl_avg"], 2))
-            labels[s_key].config(text=_fmt_num(agg["sf_avg"], 0))
-            labels[fx_key].config(text=_fmt_num(agg["fx_avg"], 1))
-            sprd = agg["sprd"]
-            labels["Sprd"].config(text=f"{sprd * 100:.3f}" if sprd is not None else "-")
+        # 매매결과 누적(정·역 각각) — 진입 = entry 누적, 청산 = exit 누적(세트 합산). 칸 이름은
+        # 방향별 배치표(_ACC_ROWS_*)에서: 정방향 진입 -HP/+SF/-환, 역방향 진입 +HP/-SF/+환 …
+        for dtag, acc_rows in (("fwd", _ACC_ROWS_FWD), ("rev", _ACC_ROWS_REV)):
+            accs = sets[(dtag, 0)].get("_acc", {})
+            rows = _live_sets(dtag)
+            for glabel, leg in (("진입", "entry"), ("청산", "exit")):
+                labels = accs.get(glabel, {})
+                if not labels or not rows:
+                    continue
+                agg = sum_acc(rows, leg)
+                hp_key, s_key, fx_key = dict(acc_rows)[glabel]
+                # 누적체결량 칸 = 짝이 맞은 HL 체결량(사용자 2026-09-09) — 소수면 자릿수를 붙인다
+                hl_q = float(agg["hl_qty"] or 0)
+                labels["누적"].config(text=_fmt_num(hl_q, 3 if hl_q % 1 else 0))
+                # HP/SF/환 = Sprd 식의 세 입력값(HL 평균 체결가·SF 평균 체결가·환진입가, 엑셀 메인
+                # I28/I29/I27). 수량을 보여주던 것을 바로잡음(사용자 2026-09-11).
+                labels[hp_key].config(text=_fmt_num(agg["hl_avg"], 2))
+                labels[s_key].config(text=_fmt_num(agg["sf_avg"], 0))
+                labels[fx_key].config(text=_fmt_num(agg["fx_avg"], 1))
+                sprd = agg["sprd"]
+                labels["Sprd"].config(text=f"{sprd * 100:.3f}" if sprd is not None else "-")
         _refresh_merge_combo(data)
         # 이 종목이 실행 중이면 호가단위·월물 콤보와 '적'만 잠금(실행 중 상대 상품·호가단위가
         # 바뀌면 판정 기준이 통째로 바뀜). **종목 콤보는 항상 열어 둔다** — 다른 창에서 다른

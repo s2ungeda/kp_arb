@@ -3,8 +3,9 @@
 I/O 없음. 코어(결선 단계)가 시세마다 ``Signals``를 넣고 ``evaluate``를 부르고, 주문 사건이 오면
 ``on_*`` 를 부른다. 여기서 나온 ``Action`` 목록을 코어가 실제 발주/취소로 옮긴다.
 
-범위: **정방향 진입·청산**(선주문 = 국내 SF maker, 후주문 = HL taker, 후주문 수량 = SF 체결 × 10).
-역방향은 대칭이라 같은 뼈대로 뒤에 붙인다(exec §11). 다른 전략도 이 뼈대를 공유한다(exec §0).
+범위: **정방향·역방향 진입·청산**(선주문 = 국내 SF maker, 후주문 = HL taker, 후주문 수량 = SF 체결
+× 10). 역방향(exec §7A·§7B, 2026-09-14)은 세트의 ``reverse`` 값 하나로 뒤집힌다 — 선·후주문 방향,
+판정 부등호, 역산 호가창·반올림·한계, RT·SF·HL 부호. 다른 전략도 이 뼈대를 공유한다(exec §0).
 
 상태(exec §2): IDLE 대기 · ARMED 감시 · PRE_RESTING 선주문대기 · PRE_PARTIAL 부분체결 ·
 POST_PENDING 후주문대기 · SETTLE_DELAY 딜레이대기 · HALTED 중지(사람이 풀어야 재개).
@@ -96,6 +97,12 @@ class Signals:
     stock_last: float | None          # 주식 현재가(Sprd 기준)
     sf_asks: Levels = ()              # SF 매도호가창(1호가부터) — 매수 한계용
     sf_bids: Levels = ()              # SF 매수호가창 — 매도 한계용
+    s_spread_exit: float | None = None  # 청산 쪽 S괴리(HL 매도호가창 est) — 역방향 진입 G5(§7A)
+    # HL 호가 원값(USD) — 발주 근거 로그용(사용자 2026-09-14): 1호가와 후주문 수량 est 평균가
+    hl_bid1: float | None = None
+    hl_ask1: float | None = None
+    hl_est_bid: float | None = None   # 매수호가창을 후주문 수량만큼 쓸어담은 평균가(HL 매도 쪽)
+    hl_est_ask: float | None = None   # 매도호가창 est(HL 매수 쪽)
     market_halted: bool = False       # 선물시장 정지 오버레이(exec §8)
     resumed_mono: float | None = None  # 정지가 풀린 시각(재개 딜레이)
     fx: float | None = None           # HL 환산 환율(역산가의 HL괴리에 쓰인 값) — 로그용
@@ -214,6 +221,7 @@ class Leg:
     """진입 또는 청산 한 줄의 실행 상태(세트마다 진입·청산 각 1개)."""
 
     block: Block
+    reverse: bool = False       # 역방향 세트의 줄(AutoMSet.__post_init__가 맞춤) — 선·후주문 방향
     running: bool = False
     status: LegStatus = LegStatus.IDLE
     pre_order_id: str | None = None
@@ -237,11 +245,14 @@ class Leg:
 
     @property
     def pre_side(self) -> Side:
-        return Side.BUY if self.block is Block.ENTRY else Side.SELL
+        """선주문(SF) 방향 — 정방향 진입·역방향 청산 = 매수, 정방향 청산·역방향 진입 = 매도."""
+        buy = (self.block is Block.ENTRY) != self.reverse
+        return Side.BUY if buy else Side.SELL
 
     @property
     def post_side(self) -> Side:
-        return Side.SELL if self.block is Block.ENTRY else Side.BUY
+        """후주문(HL) 방향 — 선주문의 반대."""
+        return Side.SELL if self.pre_side is Side.BUY else Side.BUY
 
     def _clear_pre(self) -> None:
         self.pre_order_id = self.pre_price = None
@@ -258,7 +269,7 @@ class Leg:
 
 @dataclass
 class AutoMSet:
-    """세트 1개(정방향) — 세트 설정 + RT·체결차 + 진입/청산 실행 상태."""
+    """세트 1개 — 세트 설정 + RT·체결차 + 진입/청산 실행 상태. ``reverse``면 역방향(§7A·§7B)."""
 
     target_qty: int = 0
     per_qty: int = 0
@@ -266,14 +277,25 @@ class AutoMSet:
     en_sf: float | None = None              # 진입 SF 기준값(소수, 0.005 = 0.5%)
     en_s: float | None = None               # 진입 S 기준값
     ex_sf: float | None = None              # 청산 SF 기준값
-    rt: int = 0                             # RT선진입(계약) — 후주문 전부 체결 때 증감
+    # RT선진입(계약) — 선주문(SF) 체결 계약수. 정방향 = SF 매수 체결로 +, 역방향 = SF 매도 체결로
+    # −(0 또는 음수, 화면도 −값 그대로 — 사용자 확정 2026-09-14)
+    rt: int = 0
     fill_diff: float = 0.0                  # 체결차 = SF잔고×10 + HL잔고 (이 세트 체결 기준, 소수)
     sf_net: int = 0                         # 이 세트가 잡은 SF 순잔고(계약, 매수 +)
     hl_net: float = 0.0                     # 이 세트가 잡은 HL 순잔고(계약, 매도 −)
+    reverse: bool = False                   # 역방향 세트(진입 = SF 매도 + HL 매수)
     entry: Leg = field(default_factory=lambda: Leg(Block.ENTRY))
     exit: Leg = field(default_factory=lambda: Leg(Block.EXIT))
     last_entry_fill_mono: float | None = None
     last_exit_fill_mono: float | None = None
+
+    def __post_init__(self) -> None:
+        self.entry.reverse = self.exit.reverse = self.reverse
+
+    @property
+    def held(self) -> int:
+        """들고 있는 선주문 포지션 계약수(항상 0 이상) — 정방향 RT, 역방향 RT×−1(§7A G4)."""
+        return -self.rt if self.reverse else self.rt
 
     def leg(self, block: Block) -> Leg:
         return self.entry if block is Block.ENTRY else self.exit
@@ -284,9 +306,12 @@ class AutoMSet:
 
 # ---------------------------------------------------------------- 순수 계산 ---
 
-def order_qty(block: Block, per_qty: int, target_qty: int, rt: int) -> int:
-    """이번에 낼 계약수(§5) — 진입 Min(1회주문, 목표−RT) / 청산 Min(1회주문, RT). 0 이하면 0."""
-    room = target_qty - rt if block is Block.ENTRY else rt
+def order_qty(block: Block, per_qty: int, target_qty: int, rt: int,
+              reverse: bool = False) -> int:
+    """이번에 낼 계약수(§5) — 진입 Min(1회주문, 목표−들고 있는 양) / 청산 Min(1회주문, 들고 있는
+    양). 들고 있는 양 = 정방향 RT, 역방향 RT×−1(§7A·§7B, 사용자 확정 2026-09-14). 0 이하면 0."""
+    held = -rt if reverse else rt
+    room = target_qty - held if block is Block.ENTRY else held
     return max(0, min(per_qty, room))
 
 
@@ -312,11 +337,12 @@ def limit_price(side: Side, rel_px: float, tick: int, rng: float) -> float:
 
 
 def pre_order_price(
-    block: Block, sf_theory: float, hl_disp: float, threshold: float, tick: int,
+    side: Side, sf_theory: float, hl_disp: float, threshold: float, tick: int,
 ) -> float:
-    """역산가(§6.1) P = 이론가 × (1 + HL_est괴리 − 기준값) → 호가단위(§6.2: 매수 내림/매도 올림)."""
+    """역산가(§6.1) P = 이론가 × (1 + HL_est괴리 − 기준값) → 주문단위(§6.2: 매수 내림/매도 올림).
+    side = 선주문(SF) 방향(정방향 진입·역방향 청산 = 매수, 정방향 청산·역방향 진입 = 매도)."""
     raw = maker_price_for_spread(sf_theory, hl_disp, threshold)
-    return floor_to_tick(raw, tick) if block is Block.ENTRY else ceil_to_tick(raw, tick)
+    return floor_to_tick(raw, tick) if side is Side.BUY else ceil_to_tick(raw, tick)
 
 
 def within_limit(side: Side, price: float, limit: float) -> bool:
@@ -396,6 +422,8 @@ def _passes_signal(s: AutoMSet, leg: Leg, sig: Signals) -> bool:
     if leg.block is Block.ENTRY:
         if s.en_sf is None or s.en_s is None:
             return False
+        if s.reverse:  # 역방향 진입(§7A G5): 매도호가창 est 기준 S괴리 < +HP/-S
+            return sig.s_spread_exit is not None and sig.s_spread_exit < s.en_s
         return sig.s_spread_entry is not None and sig.s_spread_entry > s.en_s
     return s.ex_sf is not None
 
@@ -453,7 +481,7 @@ def evaluate(
     # G3 전환대기 · G4 여유 계약수 — 새로 내지 않음(걸어둔 것은 유지)
     if _switch_wait(s, leg, sig.mono):
         return hold(f"G3 전환대기 {s.switch_delay_s}초")
-    qty = order_qty(block, s.per_qty, s.target_qty, s.rt)
+    qty = order_qty(block, s.per_qty, s.target_qty, s.rt, s.reverse)
     if qty < 1 and leg.pre_order_id is None:
         return hold(f"G4 여유 없음 (목표 {s.target_qty} RT {s.rt} 1회 {s.per_qty})")
     # G5 판정
@@ -467,12 +495,14 @@ def evaluate(
         return hold(why, _cancel_if_resting(leg, mono=sig.mono))
     # G6 역산가 → 허용범위
     thr = s.threshold(block)
-    hl_disp = sig.hl_disp_bid if block is Block.ENTRY else sig.hl_disp_ask
+    # HL est 호가창은 후주문 방향으로: HL 매도(정방향 진입·역방향 청산) = 매수호가창, HL 매수 =
+    # 매도호가창
+    side = leg.pre_side
+    hl_disp = sig.hl_disp_bid if leg.post_side is Side.SELL else sig.hl_disp_ask
     tick = settings.pre_tick.get(underlying)
     if sig.sf_theory is None or hl_disp is None or thr is None or not tick:
         return hold(f"G6 입력 없음 (이론가 {sig.sf_theory} HL괴리 {pct(hl_disp)} 틱 {tick})")
-    price = pre_order_price(block, sig.sf_theory, hl_disp, thr, tick)
-    side = leg.pre_side
+    price = pre_order_price(side, sig.sf_theory, hl_disp, thr, tick)
     rel = (rel_quote(sig.sf_asks, settings.rel_buy) if side is Side.BUY
            else rel_quote(sig.sf_bids, settings.rel_sell))
     if rel is None:
@@ -491,8 +521,15 @@ def evaluate(
     bid1 = sig.sf_bids[0][0] if sig.sf_bids else None
     ask1 = sig.sf_asks[0][0] if sig.sf_asks else None
     fx_txt = f"{sig.fx:,.2f}" if sig.fx else "-"
+
+    def usd(v: float | None) -> str:
+        return f"{v:g}" if v is not None else "-"
+
+    # HL 쪽도 남긴다(사용자 2026-09-14): 1호가와 후주문 수량만큼 쓸어담은 est 평균가(후주문 방향)
+    hl_est = sig.hl_est_bid if leg.post_side is Side.SELL else sig.hl_est_ask
     basis = (f"역산가 {price:,.0f} = 이론가 {sig.sf_theory:,.0f}×(1+{pct(hl_disp)}−{pct(thr)}) "
-             f"주문단위 {tick} {rng_txt} 매수1 {won(bid1)} 매도1 {won(ask1)} 환율 {fx_txt}")
+             f"주문단위 {tick} {rng_txt} 매수1 {won(bid1)} 매도1 {won(ask1)} 환율 {fx_txt} "
+             f"HL 매수1 {usd(sig.hl_bid1)} 매도1 {usd(sig.hl_ask1)} est {usd(hl_est)}")
     # 통과 — 없으면 발주, 있고 역산가가 바뀌었으면 재발주 규칙(취소→후주문 확인→딜레이→신규)
     if leg.pre_order_id is None and leg.status is LegStatus.ARMED:
         if qty < 1:
@@ -506,7 +543,7 @@ def evaluate(
         leg.replace_pending = True
         return hold(f"역산가 변경 {leg.pre_price:,.0f}→{price:,.0f} → 취소 후 재발주 ({basis})",
                     [Action("cancel_pre", order_id=leg.pre_order_id,
-                            reason=f"역산가 변경 {leg.pre_price:g}→{price:g}")])
+                            reason=f"역산가 변경 {leg.pre_price:,.0f}→{price:,.0f}")])
     # '유지'는 역산가·한계가 바뀔 때만 새 근거가 되게 짧게 — 이론가·괴리까지 넣으면 매 틱 바뀌어
     # 분당 170줄이 쌓였다(실측 2026-09-08). 상세 근거는 '통과'·'역산가 변경' 줄에 남는다.
     return hold(f"유지 역산가 {price:,.0f} 범위 {start:,.0f}~{limit:,.0f}")
@@ -579,13 +616,14 @@ def on_pre_fill(
     leg.pending.sf_qty += qty
     leg.pending.sf_px_sum += price * qty
     leg.post_pending += float(qty * HL_PER_SF)
-    s.sf_net += qty if block is Block.ENTRY else -qty
+    s.sf_net += qty if leg.pre_side is Side.BUY else -qty
     # RT선진입은 **선주문(SF) 체결 계약수** 기준(사용자 확정 2026-09-08) — HL 체결(소수·부분)로
-    # 환산하지 않는다. 진입 체결 +, 청산 체결 −.
+    # 환산하지 않는다. 정방향: 진입 +, 청산 −(0 아래로는 안 감). 역방향: 진입 −, 청산 +(0 위로는
+    # 안 감) — RT는 항상 0 또는 음수(사용자 확정 2026-09-14, §7A).
     if block is Block.ENTRY:
-        s.rt += qty
+        s.rt += -qty if s.reverse else qty
     else:
-        s.rt = max(0, s.rt - qty)
+        s.rt = min(0, s.rt + qty) if s.reverse else max(0, s.rt - qty)
     if leg.pre_filled >= leg.pre_qty and leg.pre_qty > 0:
         leg.status = LegStatus.POST_PENDING
     else:
@@ -641,12 +679,12 @@ def on_post_fill(
         leg.pending.theory_sum += sf_theory * hl_qty
         leg.pending.ref_qty += hl_qty
     leg.post_pending = max(0.0, leg.post_pending - hl_qty)
-    # RT는 선주문(SF) 체결에서 갱신(on_pre_fill) — 여기서는 HL 순잔고·전환딜레이 기준 시각만
+    # RT는 선주문(SF) 체결에서 갱신(on_pre_fill) — 여기서는 HL 순잔고·전환딜레이 기준 시각만.
+    # HL 순잔고는 후주문 방향으로(매도 −, 매수 +): 정방향 진입·역방향 청산 −, 그 반대는 +
+    s.hl_net += -hl_qty if leg.post_side is Side.SELL else hl_qty
     if block is Block.ENTRY:
-        s.hl_net -= hl_qty
         s.last_entry_fill_mono = mono
     else:
-        s.hl_net += hl_qty
         s.last_exit_fill_mono = mono
     _refresh_fill_diff(s)  # 중지 상태에서 들어온 체결도 칸에 반영(실측 09-10: −20 → −10)
     if not post_done(leg):
@@ -836,11 +874,22 @@ class AutoMBook:
     같은 종목을 두 창에서 열면 같은 책을 함께 보여준다(중복 실행 아님)."""
 
     sets: list[AutoMSet] = field(default_factory=lambda: [AutoMSet() for _ in range(SET_COUNT)])
+    # 역방향 3세트(§7A·§7B, 2026-09-14) — 정방향과 같은 뼈대, reverse=True
+    rev_sets: list[AutoMSet] = field(
+        default_factory=lambda: [AutoMSet(reverse=True) for _ in range(SET_COUNT)])
     ref_qty: int = 1  # 상단 기준수량(계약) — 모니터 3칸(진입SF·진입S·청산SF) est 계산용
     future_month: str = "near"  # 선물 월물 "near"|"next" (exec §11.9, DESIGN §5.11)
 
+    def sets_of(self, reverse: bool) -> list[AutoMSet]:
+        return self.rev_sets if reverse else self.sets
+
+    def all_sets(self) -> list[tuple[bool, int, AutoMSet]]:
+        """(역방향 여부, 세트 번호, 세트) 전부 — 엔진 순회용."""
+        return ([(False, i, s) for i, s in enumerate(self.sets)]
+                + [(True, i, s) for i, s in enumerate(self.rev_sets)])
+
     def any_running(self) -> bool:
-        return any(s.entry.running or s.exit.running for s in self.sets)
+        return any(s.entry.running or s.exit.running for _r, _i, s in self.all_sets())
 
     @property
     def counterpart(self) -> Instrument:
@@ -862,6 +911,10 @@ class AutoMScreen:
     risk_fwd_en: float = 0.0
     risk_fwd_ex: float = 0.005
     risk_fwd_gap: float = 0.001
+    # 역방향(§11.9): 진입 < en, 청산 > ex, 청산−진입 > gap (코어 저장 2026-09-14)
+    risk_rev_en: float = 0.005
+    risk_rev_ex: float = 0.0
+    risk_rev_gap: float = 0.001
 
     def book(self, u: Underlying) -> AutoMBook:
         return self.books.setdefault(u.value, AutoMBook())
@@ -889,9 +942,14 @@ def _book_from_dict(book: AutoMBook, raw: object) -> None:
         pass
     month = str(raw.get("future_month", book.future_month))
     book.future_month = month if month in ("near", "next") else "near"
-    sets = raw.get("sets")
+    for key, targets in (("sets", book.sets), ("rev_sets", book.rev_sets)):
+        _sets_from_dict(targets, raw.get(key))
+
+
+def _sets_from_dict(targets: list[AutoMSet], sets: object) -> None:
+    """세트 목록(정방향 sets 또는 역방향 rev_sets) 복원 — 값 오류는 그 필드만 기본값."""
     if isinstance(sets, list):
-        for target, rs in zip(book.sets, sets, strict=False):
+        for target, rs in zip(targets, sets, strict=False):
             if not isinstance(rs, dict):
                 continue
             try:
@@ -983,9 +1041,9 @@ def autom_from_dict(screen: AutoMScreen, raw: object, legacy_underlying: str = "
             s.hl_margin_sell = float(st.get("hl_margin_sell", s.hl_margin_sell))
         except (TypeError, ValueError):
             pass
-    try:
-        screen.risk_fwd_en = float(raw.get("risk_fwd_en", screen.risk_fwd_en))
-        screen.risk_fwd_ex = float(raw.get("risk_fwd_ex", screen.risk_fwd_ex))
-        screen.risk_fwd_gap = float(raw.get("risk_fwd_gap", screen.risk_fwd_gap))
-    except (TypeError, ValueError):
-        pass
+    for key in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap",
+                "risk_rev_en", "risk_rev_ex", "risk_rev_gap"):
+        try:
+            setattr(screen, key, float(raw.get(key, getattr(screen, key))))
+        except (TypeError, ValueError):
+            pass

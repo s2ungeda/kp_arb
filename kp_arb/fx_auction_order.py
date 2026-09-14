@@ -25,6 +25,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
+    from .core_client import log_screen_timing
+    log_screen_timing(root, __name__)  # 시동 계측: 화면 시작·표시 시각(screen 로그)
     root.title("원달러선물 동시호가 주문")
     root.resizable(True, True)  # 크기 조절 — 발주내역 리스트만 확장(폼·상태바 고정)
     win_state.attach(root, "fx_auction_order")

@@ -44,8 +44,11 @@ class OrderGoneError(RestError):
     체결과의 경합에서 종종 발생하므로 호출부는 체결 확인으로 이어가면 된다."""
 
 
-# "잔량 없음" 거부 코드 (모의 실측 01433. 운영 코드는 라이브 시 확인해 추가).
-_ORDER_GONE_RSP_CDS = frozenset({"01433"})
+# "잔량 없음" 거부 코드 — 취소·정정 대상이 이미 체결/취소된 경우(정상 흐름의 경합).
+#   01433 "모의투자 정정/취소할 수량이 없습니다" (모의 실측 v6.15)
+#   03416 "정정취소가능수량이 없습니다" (운영 실측 2026-09-14: 발주 55ms 뒤 체결과 취소가 교차,
+#         실행 끔의 강제 취소가 앞선 취소와 겹침 — 하루 4건, 매번 3회 재시도로 경고 20줄)
+_ORDER_GONE_RSP_CDS = frozenset({"01433", "03416"})
 
 # 모의 미제공 TR 거부 코드 (실측 01900: CFOAQ50600 선물잔고) — 조회는 빈 결과로 대체.
 _PAPER_UNSUPPORTED_RSP_CDS = frozenset({"01900"})
@@ -265,13 +268,15 @@ class LSApiGateway(LSGateway):
             rows = self._rows(resp, self.STOCK_POSITIONS_TR)
             return [p for r in rows if (p := self._stock_position(r)) is not None]
         # 운영 실측: CFOAQ50600은 형식을 맞춰도 거부(09604/08001) → t0441 사용.
+        # 공식 초당 1회(재대조 2026-09-14) — 재동기가 겹치면 한 박자 쉬고 재시도(_request_paced).
         fields = self._account_fields(account)
-        resp = await self._rest_for(account).request(
+        resp = await self._request_paced(
+            account,
             self.DERIV_POSITIONS_TR,
             {f"{self.DERIV_POSITIONS_TR}InBlock": {
                 "accno": fields.get("AcntNo", ""), "passwd": fields.get("Pwd", ""),
             }},
-            path=self.DERIV_ACC_PATH,
+            self.DERIV_ACC_PATH,
         )
         if str(resp.body.get("rsp_cd", "")) in _PAPER_UNSUPPORTED_RSP_CDS:
             return []  # 모의 미제공이면 빈 결과
@@ -475,11 +480,13 @@ class LSApiGateway(LSGateway):
             return None
 
     async def get_price_snapshots(
-        self, *, pause_s: float = 0.6
+        self, *, pause_s: float = 0.0
     ) -> dict[tuple[Underlying, Instrument], float]:
-        """취급 전 종목(주식/ETF/선물)의 현재가 일괄 조회 — 창 오픈 시 최초 1회용.
+        """취급 전 종목(주식/ETF/선물)의 현재가 일괄 조회 — 시동 초기값·창 오픈 시 1회용.
 
-        조회 사이 pause로 TR별 초당 한도(2회)를 지킨다.
+        순차 호출이되 사이에 쉬지 않는다(정정 2026-09-14). 옛 0.6초 쉼은 근거 없던 기본 한도
+        "초당 2회" 시절 것 — 공식 한도는 t1102/t8402 모두 초당 10회라 9건이 한 초에 들어가고,
+        넘치면 _request_paced가 0.6초 쉬고 재시도한다. 0.6초×9 = 시동 초기값 5초가 그냥 대기였다.
         """
         import asyncio as _asyncio
 

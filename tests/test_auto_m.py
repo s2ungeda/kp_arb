@@ -40,7 +40,7 @@ def _sig(mono: float = 100.0, **kw: object) -> Signals:
                 sf_spread_exit=-0.01, hl_disp_bid=0.01, hl_disp_ask=0.01,
                 sf_theory=200_000.0, stock_last=199_000.0,
                 sf_asks=[(201_500.0, 5), (204_500.0, 3)], sf_bids=[(198_500.0, 4)],
-                fx=1349.6)
+                fx=1349.6, hl_bid1=191.9, hl_ask1=191.95, hl_est_bid=191.88, hl_est_ask=191.97)
     base.update(kw)
     return Signals(**base)  # type: ignore[arg-type]
 
@@ -55,13 +55,18 @@ def _set(**kw: object) -> AutoMSet:
 
 def test_pure_pieces_match_exec_example() -> None:
     # exec §4 실예: 역산가 201,000(틱 3,000 내림), 한계 (201,500−3,000)×0.996 ≈ 197,706 → 발주
-    assert pre_order_price(Block.ENTRY, 200_000, 0.01, 0.005, 3000) == 201_000
+    assert pre_order_price(Side.BUY, 200_000, 0.01, 0.005, 3000) == 201_000
     assert round(limit_price(Side.BUY, 201_500, 3000, 0.004)) == 197_706
-    assert pre_order_price(Block.EXIT, 200_000, 0.01, 0.005, 3000) == 201_000  # 매도는 올림
-    assert pre_order_price(Block.EXIT, 200_000, 0.011, 0.005, 3000) == 204_000
+    assert pre_order_price(Side.SELL, 200_000, 0.01, 0.005, 3000) == 201_000  # 매도는 올림
+    assert pre_order_price(Side.SELL, 200_000, 0.011, 0.005, 3000) == 204_000
     assert rel_quote([(100.0, 1), (102.0, 1), (105.0, 1)], 2) == 102 and rel_quote([], 1) is None
     assert order_qty(Block.ENTRY, 10, 100, 95) == 5 and order_qty(Block.ENTRY, 10, 100, 100) == 0
     assert order_qty(Block.EXIT, 10, 100, 3) == 3
+    # 역방향(§7A·§7B): RT는 0 또는 음수, 진입 Min(1회, 목표−(RT×−1)) / 청산 Min(1회, RT×−1)
+    assert order_qty(Block.ENTRY, 10, 100, -95, reverse=True) == 5
+    assert order_qty(Block.ENTRY, 10, 100, -100, reverse=True) == 0
+    assert order_qty(Block.EXIT, 10, 100, -3, reverse=True) == 3
+    assert order_qty(Block.EXIT, 10, 100, 0, reverse=True) == 0
     assert fill_diff(4, -40) == 0 and fill_diff(4, -30) == 10
     assert parse_hms("08:30:10").second == 10 and parse_hms("09:00").hour == 9
     with pytest.raises(ValueError):
@@ -227,6 +232,72 @@ def test_fill_before_cancel_confirmation_does_not_freeze_in_delay() -> None:
     assert [a.kind for a in acts] == ["place_pre"]                        # 다음 판 진행
 
 
+def test_reverse_entry_is_sf_sell_hl_buy_with_flipped_gates() -> None:
+    # exec §7A(2026-09-14): 역방향 진입 = SF 매도 → HL 매수. G5는 매도호가창 S괴리 < +HP/-S,
+    # G6는 HL 매도호가창 est·주문단위 올림·한계 (상대매수N호가+1틱)(1+범위) 이하. RT는 −쪽으로,
+    # SF 순잔고 −, HL 순잔고 +. 화면 RT는 −값 그대로.
+    s = AutoMSet(target_qty=100, per_qty=10, switch_delay_s=30, en_sf=0.005, en_s=0.005,
+                 ex_sf=-0.001, reverse=True)
+    assert s.entry.pre_side is Side.SELL and s.entry.post_side is Side.BUY
+    assert s.exit.pre_side is Side.BUY and s.exit.post_side is Side.SELL
+    set_running(s, Block.ENTRY, True)
+    # G5: 매도호가창 S괴리(s_spread_exit)를 본다 — 기준(0.5%) 이상이면 미달
+    acts = evaluate(s, Block.ENTRY, _sig(s_spread_exit=0.02, hl_disp_ask=-0.02), SETTINGS, U)
+    assert acts == [] and "G5 미달" in s.entry.block_reason
+    # 통과: 역산가 = 200,000×(1 − 2.0% − 0.5%) = 195,000 → 3,000 올림 195,000; 한계(매도) =
+    # (매수1호가 198,500 + 500) × 1.004 = 199,796 → 195,000 ≤ 한계 → SF 매도 선주문
+    acts = evaluate(s, Block.ENTRY, _sig(s_spread_exit=-0.01, hl_disp_ask=-0.02), SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"]
+    assert acts[0].side is Side.SELL and acts[0].qty == 10 and acts[0].price == 195_000
+    assert "범위 199,000~199,796" in s.entry.block_reason
+    # 역산가가 한계보다 높으면(너무 비싸게 팔려고 물러남) 범위 밖
+    on_pre_ack(s, Block.ENTRY, "R1")
+    evaluate(s, Block.ENTRY, _sig(s_spread_exit=-0.01, hl_disp_ask=0.03), SETTINGS, U)
+    assert "G6 범위 밖" in s.entry.block_reason
+    # 체결: SF 매도 4계약 → 후주문 HL 매수 40, RT −4, SF 순잔고 −4
+    evaluate(s, Block.ENTRY, _sig(s_spread_exit=-0.01, hl_disp_ask=-0.02), SETTINGS, U)
+    acts = on_pre_fill(s, Block.ENTRY, 4, 195_000.0, mono=101.0)
+    assert [a.kind for a in acts] == ["place_post"] and acts[0].side is Side.BUY
+    assert acts[0].qty == 40 and s.rt == -4 and s.sf_net == -4 and s.held == 4
+    assert s.fill_diff == -40  # 후주문 대기 중 — SF −4×10 + HL 0
+    acts = on_post_fill(s, Block.ENTRY, 40.0, 1190.0, 1356.1, 102.0, SETTINGS)
+    assert s.hl_net == 40 and s.fill_diff == 0 and s.entry.post_pending == 0
+    assert acts == [] and s.entry.status is LegStatus.PRE_PARTIAL  # 선주문 6계약 아직 걸림
+    # 역방향 청산 = SF 매수 → HL 매도, 수량 Min(1회, RT×−1) = 4, RT는 0 쪽으로
+    set_running(s, Block.EXIT, True)
+    acts = evaluate(s, Block.EXIT, _sig(mono=140.0), SETTINGS, U)  # 전환대기 30초 지난 뒤
+    assert [a.kind for a in acts] == ["place_pre"] and acts[0].side is Side.BUY
+    assert acts[0].qty == 4 and acts[0].price == 201_000  # 정방향 진입과 같은 계산(내림·하한)
+    on_pre_ack(s, Block.EXIT, "R2")
+    on_pre_fill(s, Block.EXIT, 4, 201_000.0, mono=141.0)
+    assert s.rt == 0 and s.sf_net == 0
+    on_post_fill(s, Block.EXIT, 40.0, 1184.0, 1355.9, 142.0, SETTINGS)
+    assert s.hl_net == 0 and s.fill_diff == 0
+
+
+def test_reverse_sets_and_risk_round_trip_through_dict() -> None:
+    # 책의 역방향 3세트(rev_sets)·리스크방지 역방향 값이 저장·복원되고, 복원된 세트는 reverse 유지
+    from dataclasses import asdict
+
+    from kp_arb.auto_m import AutoMScreen, autom_from_dict
+
+    screen = AutoMScreen()
+    book = screen.book(U)
+    assert len(book.rev_sets) == 3 and all(s.reverse and s.entry.reverse for s in book.rev_sets)
+    assert len(book.all_sets()) == 6 and book.sets_of(True) is book.rev_sets
+    book.rev_sets[1].target_qty, book.rev_sets[1].rt, book.rev_sets[1].sf_net = 7, -3, -3
+    book.rev_sets[1].en_sf = -0.015
+    screen.risk_rev_en, screen.risk_rev_gap = 0.004, 0.002
+    raw = asdict(screen)
+    restored = AutoMScreen()
+    autom_from_dict(restored, raw)
+    r = restored.book(U).rev_sets[1]
+    assert (r.target_qty, r.rt, r.sf_net, r.en_sf) == (7, -3, -3, -0.015) and r.reverse
+    assert r.held == 3 and restored.book(U).sets[1].target_qty == 0
+    assert (restored.risk_rev_en, restored.risk_rev_ex, restored.risk_rev_gap) == (
+        0.004, 0.0, 0.002)
+
+
 def test_limit_uses_market_tick_not_order_unit() -> None:
     # 사용자 확정 2026-09-08: 한계의 "상대1호가 − 1틱"에서 1틱은 시세 호가단위(20만 원대 500),
     # 선주문 주문단위(설정 3,000)는 역산가를 주문 단위로 맞출 때만. 매도1호가 201,500 →
@@ -238,8 +309,17 @@ def test_limit_uses_market_tick_not_order_unit() -> None:
     # 로그엔 범위의 시작호가(상대1호가 − 1틱 = 201,000)와 한계를 함께(사용자 2026-09-11)
     assert "범위 201,000~200,196" in s.entry.block_reason
     assert "호가단위 500" in s.entry.block_reason
-    # 발주 근거에 그때의 SF 1호가·환율(사용자 2026-09-11)
+    # 발주 근거에 그때의 SF 1호가·환율(사용자 2026-09-11) + HL 1호가·est(후주문 방향, 2026-09-14)
     assert "매수1 198,500 매도1 201,500 환율 1,349.60" in s.entry.block_reason
+    # 진입 후주문 = HL 매도 → 매수호가창 est(191.88)
+    assert "HL 매수1 191.9 매도1 191.95 est 191.88" in s.entry.block_reason
+    # 청산 후주문 = HL 매수 → 매도호가창 est(191.97) — 같은 근거 줄 형식
+    s2 = _set()
+    s2.rt = 10
+    set_running(s2, Block.EXIT, True)
+    evaluate(s2, Block.EXIT, _sig(hl_disp_ask=-0.02), SETTINGS, U)  # 역산가 198,000 ≤ 한계
+    assert s2.exit.block_reason.startswith("통과")
+    assert "HL 매수1 191.9 매도1 191.95 est 191.97" in s2.exit.block_reason
     assert "주문단위 3000" in s.entry.block_reason  # 역산가 반올림 단위는 그대로 설정값
 
 

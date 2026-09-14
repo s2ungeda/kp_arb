@@ -179,17 +179,14 @@ class HLSdkGateway(HLGateway):
 
         coin = self._symbol(intent.underlying)
         is_buy = intent.side is Side.BUY
-        if intent.order_type is OrderType.LIMIT:
-            if intent.price is None:
-                raise HLError("limit order requires price")
-            # post_only는 HL의 Alo(Add-Liquidity-Only=메이커 전용) tif.
-            tif = "Alo" if intent.post_only else "Gtc"
-            order_type: dict[str, Any] = {"limit": {"tif": tif}}
-            price = float(intent.price)
-        else:
-            # HL은 순수 시장가가 없음 — IOC 지정가(마크 대비 슬리피지 허용)로 대응.
-            price = await self._market_px(coin, is_buy)
-            order_type = {"limit": {"tif": "Ioc"}}
+        # HL 주문은 **지정가만**(사용자 확정 2026-09-04, 재확인 2026-09-14: "무조건 지정가"). 옛
+        # 시장가→IOC(마크 ±1%) 대용 경로는 Claude가 임의로 둔 것이라 삭제 — 지정가가 아니면 거부.
+        if intent.order_type is not OrderType.LIMIT or intent.price is None:
+            raise HLError("HL 주문은 지정가(가격 필수)만 — 시장가·IOC 없음")
+        # post_only는 HL의 Alo(Add-Liquidity-Only=메이커 전용) tif.
+        tif = "Alo" if intent.post_only else "Gtc"
+        order_type: dict[str, Any] = {"limit": {"tif": tif}}
+        price = float(intent.price)
         order_log.order_requested(intent, price=price)  # 보내기 직전(응답 전) — 단계 추적
         self._log_wire(coin, is_buy, float(intent.qty), price, order_type, intent.reduce_only,
                        cloid)
@@ -538,12 +535,6 @@ class HLSdkGateway(HLGateway):
 
     async def _post_info(self, body: dict[str, Any]) -> Any:
         return await asyncio.to_thread(self._info.post, "/info", body)
-
-    async def _market_px(self, coin: str, is_buy: bool, *, slippage: float = 0.01) -> float:
-        underlying = self._by_symbol[coin]
-        mark = await self.get_mark(underlying)
-        raw = mark * (1 + slippage) if is_buy else mark * (1 - slippage)
-        return float(f"{raw:.5g}")  # HL 유효숫자 5자리 제한
 
     def _symbol(self, underlying: Underlying) -> str:
         try:

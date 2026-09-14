@@ -157,20 +157,30 @@ async def test_per_second_limit_is_per_tr() -> None:
     assert transport.calls == 2
 
 
-async def test_daily_cap_blocks_and_resets_next_day() -> None:
+async def test_daily_cap_warns_only_and_resets_next_day(caplog) -> None:  # type: ignore[no-untyped-def]
+    # 정정 2026-09-14: 일 한도는 참고값 — 넘어도 막지 않고 경고만(자체 가드가 취소를 막은 실측).
+    import logging
+
     clock = FakeClock()
     transport = RecordingTransport()
-    limiter = RateLimiter(now=clock, daily_cap=2, default_per_second=100)
+    today = ["2026-09-14"]  # 날짜 경계는 달력 날짜(주입) — 단조시계 t가 아니라(정정 2026-09-14)
+    limiter = RateLimiter(now=clock, daily_cap=2, default_per_second=100, today=lambda: today[0])
     client = _client(transport, clock, limiter=limiter)
 
     await client.request("Q")
     await client.request("Q")
-    with pytest.raises(RateLimitError):
-        await client.request("Q")  # 일 한도 2 초과
-
-    clock.advance(86_400.0)  # 다음 날 → 일 카운트 리셋
-    await client.request("Q")
+    with caplog.at_level(logging.WARNING, logger="kp_arb.gateways.ls_rest"):
+        await client.request("Q")  # 일 한도 2 초과 — 경고만, 전송은 됨
     assert transport.calls == 3
+    assert any("일 호출수" in r.getMessage() for r in caplog.records)
+
+    clock.advance(86_400.0)  # 단조시계만 하루 지나도 달력 날짜가 같으면 일 카운트 리셋 없음
+    await client.request("Q")
+    assert transport.calls == 4 and limiter._daily_count == 4
+
+    today[0] = "2026-09-15"  # 달력 날짜가 바뀌면 → 일 카운트 리셋(이 호출이 오늘 1건째)
+    await client.request("Q")
+    assert transport.calls == 5 and limiter._daily_count == 1
 
 
 # --- 재시도 ---

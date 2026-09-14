@@ -271,6 +271,79 @@ async def test_refresh_snapshot_keeps_futures_orders_without_open_order_query() 
     assert ob.order("S1") is None       # 주식: 실제 조회 결과에 없음 → 유령 정리
 
 
+async def test_refresh_snapshot_open_orders_500_keeps_balance_and_positions(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 실측 2026-09-14 10:47:22: '적' 재조회 중 선물 미체결(t0434)만 LS 500 ×3. 잔고·포지션은
+    # 받았고 미체결만 못 받았는데 옛 문구 "이 계좌 없이 계속"은 계좌 전체를 뺀 듯 읽혔다
+    # → 실패 단계·유지 내용을 문구에 명시.
+    import logging
+    import time as _t
+
+    from kp_arb.gateways.ls_rest import RestError
+
+    system, _, _ = _system([])
+    gw = system._gw
+    assert isinstance(gw, MockLSGateway)
+    gw.seed_position(Position(venue=Venue.LS, instrument=Instrument.KR_STOCK_FUTURE,
+                              underlying=SAMSUNG, side=Side.BUY, qty=2, avg_price=1.0,
+                              account=Account.KR_DERIV))
+    gw._balances[Account.KR_DERIV] = 777.0
+
+    async def boom(account: Account) -> list[object]:
+        if account is Account.KR_DERIV:
+            raise RestError("REST t0434 failed after 3 attempts")
+        return []
+
+    gw.get_open_orders = boom  # type: ignore[method-assign]
+    ob = system.order_book
+    fut = ob.track("D1", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE, side=Side.BUY,
+        qty=1, order_type=OrderType.LIMIT, price=1.0, account=Account.KR_DERIV))
+    fut.placed_ts = _t.monotonic() - 60
+    with caplog.at_level(logging.WARNING, logger="kp_arb.bootstrap"):
+        await system.refresh_snapshot()
+    assert ob.balance(Account.KR_DERIV) == 777.0  # 잔고 갱신
+    fut_qty = ob.position_qty(SAMSUNG, Instrument.KR_STOCK_FUTURE, Account.KR_DERIV)
+    assert fut_qty == 2  # 포지션 갱신
+    assert ob.order("D1") is not None  # 미체결 보존
+    msg = next(r.getMessage() for r in caplog.records if "계좌 스냅샷" in r.getMessage())
+    assert "kr_deriv 계좌 스냅샷: 미체결 조회 실패" in msg and "잔고·포지션은 갱신" in msg
+    assert "t0434" in msg
+
+
+async def test_cancel_with_no_remaining_qty_is_order_gone_without_sending() -> None:
+    # 운영 실측 2026-09-14 #6548: 체결 통보가 먼저 반영돼 잔량 0인데 취소를 보내면 LS 02897
+    # "취소수량을 잘못 입력". 잔량 0이면 보내지 않고 OrderGoneError(정정 amend와 같은 규칙).
+    from kp_arb.gateways.ls import OrderGoneError
+    from kp_arb.gateways.ls_ws import Fill
+
+    system, _, _ = _system([])
+    gw = system._gw
+    sent: list[str] = []
+
+    async def spy(order_id: str, qty: float | None = None) -> None:
+        sent.append(order_id)
+
+    gw.cancel_order = spy  # type: ignore[method-assign]
+    ob = system.order_book
+    ob.track("D1", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE, side=Side.BUY,
+        qty=1, order_type=OrderType.LIMIT, price=1.0, account=Account.KR_DERIV))
+    ob.on_fill(Fill(fill_id="f1", order_id="D1", qty=1, price=1.0, ts=0))  # 전량 체결
+    with pytest.raises(OrderGoneError):
+        await system.cancel("D1")
+    assert sent == []  # 거래소로 안 나감
+
+
+def test_snapshot_failure_note_by_stage() -> None:
+    from kp_arb.bootstrap import snapshot_failure_note
+
+    assert snapshot_failure_note("잔고").startswith("잔고 0으로 표시")
+    assert snapshot_failure_note("포지션").startswith("잔고는 갱신")
+    assert "유령 정리 안 함" in snapshot_failure_note("미체결")
+
+
 async def test_hl_reconnect_resync_leaves_ls_book_alone() -> None:
     # 사용자 확정 2026-09-09: 재연결 재동기는 끊긴 시장만. HL 재연결이 LS 주식 주문·포지션을
     # 건드리면 안 된다(옛: 전체 재동기 → 주식 미체결이 빈 결과라 유령 정리 대상).

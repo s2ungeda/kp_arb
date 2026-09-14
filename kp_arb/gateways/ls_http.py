@@ -11,8 +11,16 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import aiohttp
+
 from .ls_auth import TokenResponse
 from .ls_rest import RestResponse
+
+# 요청 1건의 최대 대기(초) — 사용자 확정 2026-09-14: 10초. 전에는 aiohttp 기본(5분)이라 걸린 요청
+# 하나가 시동을 붙잡았다(운영 실측 10:33 잔고 조회 72초). 넘기면 전송 예외 → LSRestClient가
+# 0.3·0.6초 뒤 재시도(3회), 끝내 실패하면 RestError(시동은 그 계좌 없이 계속).
+REQUEST_TIMEOUT_S = 10.0
+_TIMEOUT = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S)
 
 
 class AiohttpTokenTransport:
@@ -33,7 +41,7 @@ class AiohttpTokenTransport:
             data["scope"] = self._scope
         headers = {"content-type": "application/x-www-form-urlencoded"}
         async with self._session.post(
-            f"{self._base}/oauth2/token", data=data, headers=headers
+            f"{self._base}/oauth2/token", data=data, headers=headers, timeout=_TIMEOUT
         ) as resp:
             body = await resp.json(content_type=None)
         if "access_token" not in body:
@@ -60,7 +68,9 @@ class AiohttpRestTransport:
         body: dict[str, Any] | None,
     ) -> RestResponse:
         payload = json.dumps(body) if body is not None else None
-        async with self._session.request(method, url, headers=headers, data=payload) as resp:
+        async with self._session.request(
+            method, url, headers=headers, data=payload, timeout=_TIMEOUT
+        ) as resp:
             status = int(resp.status)
             try:
                 parsed = await resp.json(content_type=None)

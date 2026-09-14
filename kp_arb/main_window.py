@@ -206,6 +206,15 @@ def main() -> None:
     import time
     import tkinter as tk
 
+    from . import since_start
+    from .core_client import screen_log as _slog
+
+    # 시동 계측(2026-09-14): "메인 창 뒤 저장 화면까지 2분+"의 구간을 잡는다 — 메인 시작·창 표시·
+    # 코어 실행·코어 첫 연결·화면 복원 시작을 screen 로그에 프로세스 시작 기준 초로 남긴다.
+    t_main0 = time.perf_counter()
+    _slog().info("메인 시작 — 프로세스 시작 후 %.1fs", since_start())
+    timing = {"core_seen": False}
+
     # 마지막 상태는 **스레드 시작 전에** 읽는다 — 감시 스레드가 ui_state.json을
     # 빈 화면 목록으로 먼저 덮어써 복원이 안 되던 문제 방지.
     try:
@@ -295,6 +304,10 @@ def main() -> None:
             data = core_request("/state")  # 코어 생존 + WS 세션 현황 한 번에
             alive = data is not None
             alive_box["alive"] = alive
+            if alive and not timing["core_seen"]:
+                timing["core_seen"] = True
+                _slog().info("코어 첫 연결 확인 — 메인 시작 후 %.1fs (프로세스 시작 후 %.1fs)",
+                             time.perf_counter() - t_main0, since_start())
             alive_box["ws"] = (data or {}).get("ws") or []
             alive_box["load_errors"] = (data or {}).get("load_errors") or []
             check_sounds(data)  # 알람(체결·에러·WS끊김)
@@ -572,6 +585,10 @@ def main() -> None:
     if not core_alive():
         launch_module("kp_arb.core_server", console=False, watch_parent=False)
         status.config(text="코어 시작 중 ...")
+        _slog().info("코어 실행 — 메인 시작 후 %.1fs", time.perf_counter() - t_main0)
+    root.after_idle(lambda: _slog().info(
+        "메인 창 표시 — 메인 시작 후 %.1fs (프로세스 시작 후 %.1fs)",
+        time.perf_counter() - t_main0, since_start()))
     screens = list(restore_box["saved"])
     if screens:
         # 저장된 화면은 **코어 연결된 뒤** 연다 — 코어 미접속 상태에서 화면 조작을 막기 위함
@@ -580,6 +597,8 @@ def main() -> None:
         # "저장된 화면이 안 뜬다"가 됐다(실측 2026-09-07).
         def reopen_when_ready(waited_ms: int = 0) -> None:
             if alive_box["alive"]:
+                _slog().info("저장 화면 복원 시작 %d개 — 메인 시작 후 %.1fs: %s",
+                             len(screens), time.perf_counter() - t_main0, ", ".join(screens))
                 for token in screens:
                     module, *args = token.split()
                     open_screen(module, *args)

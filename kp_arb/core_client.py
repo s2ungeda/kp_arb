@@ -249,3 +249,26 @@ def screen_log() -> Any:
         logger.addHandler(handler)
     _screen_logger = logger
     return logger
+
+
+def log_screen_timing(root: Any, module: str) -> None:
+    """시동 계측 — 화면 프로세스가 언제 시작해 언제 창을 그렸는지 screen 로그에 남긴다.
+
+    "메인 창이 뜬 뒤 저장된 화면들이 열리기까지 2분+"(사용자 실측 2026-09-14)의 어느 구간이
+    느린지 로그로 잡기 위한 것. 시작 = 이 함수 호출 시점(프로세스 시작 후 초), 표시 = tk가 처음
+    한가해지는 시점(after_idle ≈ 창이 그려진 직후).
+    """
+    import time as _t
+
+    from . import since_start
+
+    name = module.rsplit(".", 1)[-1]
+    t_call = _t.perf_counter()
+    screen_log().info("화면 %s 시작 — 프로세스 시작 후 %.1fs", name, since_start())
+
+    def shown() -> None:
+        screen_log().info("화면 %s 표시 — 시작 후 %.1fs (프로세스 시작 후 %.1fs) 제목=%s",
+                          name, _t.perf_counter() - t_call, since_start(), root.title())
+
+    root.after_idle(shown)
+

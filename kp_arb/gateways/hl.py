@@ -86,16 +86,14 @@ class HLApiGateway(HLGateway):
         if intent.venue is not Venue.HYPERLIQUID:
             raise ValueError("HLApiGateway only handles Hyperliquid orders")
         coin = self._symbol(intent.underlying)
+        if intent.order_type is not OrderType.LIMIT or intent.price is None:  # 지정가만(09-04)
+            raise HLError("HL 주문은 지정가(가격 필수)만 — 시장가·IOC 없음")
         order = {
             "coin": coin,
             "is_buy": intent.side is Side.BUY,
             "sz": intent.qty,
             "limit_px": intent.price,
-            "order_type": (
-                {"limit": {"tif": "Gtc"}}
-                if intent.order_type is OrderType.LIMIT
-                else {"market": {}}
-            ),
+            "order_type": {"limit": {"tif": "Gtc"}},
             "reduce_only": False,
         }
         resp = await self._exchange({"type": "order", "orders": [order]})

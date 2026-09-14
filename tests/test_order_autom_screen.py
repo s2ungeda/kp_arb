@@ -33,6 +33,8 @@ def test_set_payload_converts_percent_to_fraction() -> None:
     assert (p["target_qty"], p["per_qty"], p["switch_delay_s"]) == (100, 10, 30)
     assert (p["en_sf"], p["en_s"], p["ex_sf"]) == (0.005, 0.005, -0.001)
     assert p["rt_manual"] is None and p["clear_diff"] is True
+    assert p["direction"] == "fwd"                                # 기본 정방향
+    assert set_payload(0, w, "samsung", "rev")["direction"] == "rev"  # 역방향 세트(2026-09-14)
     assert pct_to_frac(None) is None
 
 
@@ -46,6 +48,21 @@ def test_settings_payload_shape() -> None:
     assert p["windows"] == [["08:30:10", "08:46:20"], ["15:35:30", "15:46:55"]]
     assert p["pre_range"] == 0.004 and p["risk_fwd_ex"] == 0.005 and p["rel_buy"] == 2
     assert p["pre_delay_ms"] == 1000 and p["resume_delay_s"] == 10
+    # 역방향 리스크방지(2026-09-14) — 화면 상태에 키가 없으면 기본값(0.5/0/0.1%)
+    assert (p["risk_rev_en"], p["risk_rev_ex"], p["risk_rev_gap"]) == (0.005, 0.0, 0.001)
+    common["risk"].update({"rev_en": 0.4, "rev_ex": 0.05, "rev_gap": 0.2})
+    p2 = settings_payload(common)
+    assert (p2["risk_rev_en"], p2["risk_rev_ex"], p2["risk_rev_gap"]) == (0.004, 0.0005, 0.002)
+
+
+def test_set_inputs_sig_includes_reverse_sets() -> None:
+    book = {"sets": [{"target_qty": 1, "per_qty": 1, "switch_delay_s": 0,
+                      "en_sf": 0.005, "en_s": 0.005, "ex_sf": -0.001}],
+            "rev_sets": [{"target_qty": 0, "per_qty": 0, "switch_delay_s": 0,
+                          "en_sf": None, "en_s": None, "ex_sf": None}]}
+    base = set_inputs_sig(book)
+    book["rev_sets"][0]["target_qty"] = 5           # 역방향 세트설정 변경 → 서명 달라짐
+    assert set_inputs_sig(book) != base
 
 
 def test_fx_caption() -> None:

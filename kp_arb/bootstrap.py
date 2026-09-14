@@ -135,6 +135,17 @@ def select_months(
 FX_SPOT_SILENT_S = 600.0  # 현물환율(CUR) 무수신 → 하나고시 대체 기준(사용자 확정 2026-09-04: 10분)
 
 
+def snapshot_failure_note(stage: str) -> str:
+    """계좌 스냅샷(잔고→포지션→미체결 순차 조회)이 ``stage``에서 실패했을 때 장부에 무엇이
+    남고 무엇이 안 바뀌는지 한 줄로. 로그 문구용 순수 함수 — "이 계좌 없이 계속"처럼
+    계좌 전체를 뺀 듯 읽히지 않게, 실패 단계 앞까지는 받았음을 명시한다."""
+    if stage == "잔고":
+        return "잔고 0으로 표시, 포지션·미체결은 이전 장부 유지"
+    if stage == "포지션":
+        return "잔고는 갱신, 포지션·미체결은 이전 장부 유지"
+    return "잔고·포지션은 갱신, 미체결은 이전 장부 유지(유령 정리 안 함)"
+
+
 def fx_spot_backup_due(last_rx: float, now: float, silent_s: float = FX_SPOT_SILENT_S) -> bool:
     """하나은행 고시환율로 대체할 때인가 — CUR을 한 번도 못 받았거나(last_rx=0) silent_s 넘게
     조용할 때만. 마지막 CUR 체결가는 실제 거래가라 잠시 뜸해도 고시환율보다 낫다. 순수 로직."""
@@ -308,20 +319,26 @@ class LiveSystem:
         ls_accounts = [a for a in (Account.KR_STOCK, Account.KR_DERIV)
                        if scope is None or a in scope]
         for account in ls_accounts:
-            # 실계좌 환경 편차(선물 계좌 없음, 형식 거부 등)로 한 계좌 조회가
-            # 실패해도 시동을 멈추지 않는다 — 해당 계좌만 빼고 계속.
+            # 실계좌 환경 편차(선물 계좌 없음, 형식 거부 등)·LS 간헐 500으로 한 계좌 조회가
+            # 실패해도 시동을 멈추지 않는다 — 실패한 단계부터 빼고 계속. 어느 단계에서
+            # 실패했고 무엇을 유지하는지 로그에 남긴다(실측 2026-09-14: 선물 미체결(t0434)만
+            # 500인데 "이 계좌 없이 계속"이라 적혀 계좌 전체를 뺀 것처럼 읽혔다).
+            stage = "잔고"
             try:
                 balances[account] = await self._gw.get_balance(account)
+                stage = "포지션"
                 positions.extend(await self._gw.get_positions(account))
+                stage = "미체결"
                 open_orders.extend(await self._gw.get_open_orders(account))
                 # 실제 조회가 되는 계좌만 유령 정리 대상. 선물 미체결 TR은 미확인이라 빈 결과가
                 # 오는데, 이를 "조회 성공"으로 보고 걸린 선주문(#20851)을 지웠다(실측 2026-09-09) —
                 # 그 뒤 체결 통보가 미아가 되고 자동M은 없는 주문 취소를 되풀이했다.
                 if self._gw.open_orders_supported(account):
                     reconciled.add(account)
-            except RestError:
+            except RestError as exc:
                 logging.getLogger("kp_arb.bootstrap").warning(
-                    "%s 계좌 스냅샷 실패 — 이 계좌 없이 계속", account.value, exc_info=True
+                    "%s 계좌 스냅샷: %s 조회 실패 — %s (%s)",
+                    account.value, stage, snapshot_failure_note(stage), exc,
                 )
                 balances.setdefault(account, 0.0)
         if self._hl is not None and (scope is None or None in scope):
@@ -770,7 +787,11 @@ class LiveSystem:
         if order is None:
             raise ValueError(f"unknown order {order_id}")
         if order.intent.venue is Venue.LS:
-            # 취소수량은 장부의 남은 수량 — 원주문 수량이면 부분체결 뒤 01443 거부(실측 09-09)
+            # 취소수량은 장부의 남은 수량 — 원주문 수량이면 부분체결 뒤 01443 거부(실측 09-09).
+            # 남은 수량이 0(체결 통보가 먼저 반영됨)이면 보내지 않는다 — 0으로 보내면 LS가
+            # 02897 "취소수량을 잘못 입력"으로 거부(운영 실측 2026-09-14 #6548 재시도 2·3회째).
+            if order.remaining_qty <= 0:
+                raise OrderGoneError(f"order {order_id} has no remaining qty")
             await self._gw.cancel_order(order_id, qty=order.remaining_qty)  # 상태는 통보로 전이
         else:
             assert self._hl is not None
@@ -968,8 +989,18 @@ class LiveSystem:
         온디맨드 재조회는 ``refresh_snapshot``(재연결 경로) — 이쪽은 시동 1회 전용.
         """
         import logging
+        import time as _t
 
         log = logging.getLogger("kp_arb.bootstrap")
+        t_stage = _t.perf_counter()  # 시동 계측: 단계마다 걸린 초를 로그에(2026-09-14)
+
+        def took() -> str:
+            nonlocal t_stage
+            now = _t.perf_counter()
+            s = f"{now - t_stage:.1f}s"
+            t_stage = now
+            return s
+
         # 1) 종목 — 근월물 누락은 bootstrap_live가 미리 판정(startup_load_error 설정).
         if self.startup_load_error is not None:
             log.error("시동 로드 실패: %s", self.startup_load_error)
@@ -979,8 +1010,8 @@ class LiveSystem:
         # 1-2) 종목정보 — HL 소수자릿수·최대레버리지(없으면 HL 주문 수량 반올림이 어긋남).
         try:
             await self.load_instruments()
-            log.info("시동 로드 OK: 종목정보 (HL %s)",
-                     "조회됨" if self._hl is not None else "미사용")
+            log.info("시동 로드 OK: 종목정보 (HL %s) %s",
+                     "조회됨" if self._hl is not None else "미사용", took())
         except Exception:  # noqa: BLE001 - 실패는 기록만 하고 중단(팝업 유도)
             self.startup_load_error = "종목정보(HL 소수자릿수·레버리지)"
             log.error("시동 로드 실패: 종목정보", exc_info=True)
@@ -996,7 +1027,7 @@ class LiveSystem:
         try:
             for account in accounts:
                 balances[account] = await self._gw.get_balance(account)
-            log.info("시동 로드 OK: 잔고 (%d계좌)", len(balances))
+            log.info("시동 로드 OK: 잔고 (%d계좌) %s", len(balances), took())
         except Exception:  # noqa: BLE001 - 실패는 기록만 하고 중단(팝업 유도)
             self.startup_load_error = "잔고"
             log.error("시동 로드 실패: 잔고", exc_info=True)
@@ -1013,7 +1044,7 @@ class LiveSystem:
                     d = self.hl_detail.setdefault(u, {})
                     d.setdefault("leverage", lev["leverage"])
                     d.setdefault("leverage_cross", lev["leverage_cross"])
-            log.info("시동 로드 OK: 포지션 (%d건)", len(positions))
+            log.info("시동 로드 OK: 포지션 (%d건) %s", len(positions), took())
         except Exception:  # noqa: BLE001
             self.startup_load_error = "포지션"
             log.error("시동 로드 실패: 포지션", exc_info=True)
@@ -1026,7 +1057,7 @@ class LiveSystem:
                     reconciled.add(account)
             if self._hl is not None:
                 open_orders.extend(await self._hl.get_open_orders())
-            log.info("시동 로드 OK: 주문 (미체결 %d건)", len(open_orders))
+            log.info("시동 로드 OK: 주문 (미체결 %d건) %s", len(open_orders), took())
         except Exception:  # noqa: BLE001
             self.startup_load_error = "주문"
             log.error("시동 로드 실패: 주문", exc_info=True)
@@ -1040,12 +1071,23 @@ class LiveSystem:
 
     async def start(self) -> None:
         """최초 스냅샷 → 세션 초기값(옵션) → WS 결선 → 실시간 수신 시작(재연결 포함)."""
+        import logging
+        import time as _t
+
+        from . import since_start
+
+        t0 = _t.perf_counter()
         await self._startup_init()  # 종목→종목정보→잔고→포지션→주문 순차(실패 시 load_error)
         if self.startup_load_error is not None:
             # 로드 실패 — WS 결선·상시 조회 생략(사용자가 곧 재접속). 서버는 /state로 실패 알림.
             return
+        t_load = _t.perf_counter() - t0
         self._seed_session_from_env()
         await self._seed_initial_prices()  # 구독 **전** 현재가 초기값 — 실시간이 안 와도 빈칸 방지
+        # 시동 계측(2026-09-14): 어느 구간이 느린지 한 줄로 — 로드(LS·HL REST)/초기값/프로세스 기준
+        logging.getLogger("kp_arb.bootstrap").info(
+            "시동 소요 — 로드 %.1fs + 초기값 %.1fs = %.1fs (프로세스 시작 후 %.1fs)",
+            t_load, _t.perf_counter() - t0 - t_load, _t.perf_counter() - t0, since_start())
         self._wire()
         # 시동 REST 조회들은 **순차 실행** — 동시에 나가면 서버 계정당 초당 한도에
         # 걸려 일부(t1901 등)가 실패한다(운영 실측). 환율 폴링은 그 뒤에 시작.
@@ -1110,7 +1152,8 @@ class LiveSystem:
         """환율 예비 갱신 — 시동 직후 초기값 + 30초 간격 확인 조회(t2111).
 
         본선은 WS(주간 FC9 / 야간 DC0 — FC0는 2026-06 폐지) 실시간이고, 이 루프는
-        WS가 조용할 때(체결 없음·미실측 필드 불일치)의 안전망이다. 주간(08~16시)만.
+        WS가 조용할 때(체결 없음·미실측 필드 불일치)의 안전망이다. 주간(08~16시)만 —
+        통화선물 주간장 08:45~15:45를 넉넉히 감싼 조회 창(사용자 확인 2026-09-14).
         """
         import logging
         from datetime import datetime
@@ -1120,9 +1163,8 @@ class LiveSystem:
         code, _ = self._fx_futures
         log = logging.getLogger("kp_arb.bootstrap")
         failures = 0
-        # 시동 초기값 조회(_seed_initial_prices)가 방금 t2111을 월물 수만큼 써서 초당 한도(2회)가
-        # 찬 상태 — 바로 조회하면 RateLimitError 경고만 남긴다(2026-09-04 실측). 한 박자 쉬고 시작.
-        await asyncio.sleep(2.0)
+        # (옛 2초 대기 삭제 2026-09-14: t2111이 한도 표에 없어 근거 없는 기본 2회에 막혔던 것.
+        #  공식 한도 10회를 표에 넣어 시동 초기값(월물 2건) 직후 바로 조회해도 안 걸린다.)
         while True:
             now = datetime.now()
             in_spot = in_time_window(now.time(), *self._fx_spot_window)
@@ -1383,9 +1425,12 @@ class LiveSystem:
         실패는 로그만 남기고 계속(실시간이 오면 채워진다). 순차 호출 — 초당 한도 보호.
         """
         import logging
+        import time as _t
 
         log = logging.getLogger("kp_arb.bootstrap")
+        t0 = _t.perf_counter()
         await self._seed_prices()  # 주식·주식선물·ETF 현재가 → self.trades (실패 시 자체 경고)
+        t_prices = _t.perf_counter() - t0
         fx_filled = 0
         for code, _ym in self._fx_months:
             try:
@@ -1407,9 +1452,10 @@ class LiveSystem:
             if spot is not None:
                 self.usdkrw_spot = spot
                 self.usdkrw_spot_src = "하나고시"
-        log.info("시동 초기값 채움 — 현재가 %d종, 원달러선물 %d/%d월물, 현물환율 %s",
+        log.info("시동 초기값 채움 — 현재가 %d종, 원달러선물 %d/%d월물, 현물환율 %s "
+                 "(현재가 %.1fs, 전체 %.1fs)",
                  len(self.trades), fx_filled, len(self._fx_months),
-                 self.usdkrw_spot_src or "없음")
+                 self.usdkrw_spot_src or "없음", t_prices, _t.perf_counter() - t0)
 
     async def _seed_prices(self) -> None:
         """장중 체결이 오기 전(개장 전·애프터·한산 종목) 현재가 초기값 — 스냅샷 1회.
@@ -1689,8 +1735,15 @@ async def bootstrap_live(
     # 주식선물 근·차근 월물 자동 조회(만기 롤오버 대응, §5.11) 후 게이트웨이 재조립.
     # 조회 실패·월물 누락은 아래 startup_symbol_error가 "종목" 로드 실패로 판정한다.
     try:
+        import time as _time
+
+        from . import since_start as _since
+
+        _t_master = _time.perf_counter()
         _fut_rows = await gateway.fetch_futures_master()
-        _blog.info("t8401 주식선물 마스터 %d행 수신", len(_fut_rows))  # 조회 원본(진단)
+        # 조회 원본(진단) + 시동 계측: 토큰 발급 + 마스터 수신에 걸린 초, 프로세스 기준 초
+        _blog.info("t8401 주식선물 마스터 %d행 수신 (%.1fs, 프로세스 시작 후 %.1fs)",
+                   len(_fut_rows), _time.perf_counter() - _t_master, _since())
         months = select_months(_fut_rows, count=2)
     except Exception:  # noqa: BLE001 - 조회 실패는 종목 로드 실패(팝업)로 이어진다
         _blog.warning("주식선물 월물(t8401) 조회 실패", exc_info=True)

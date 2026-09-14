@@ -362,6 +362,30 @@ async def test_rejected_01xxx_raises() -> None:
         await gw.place_order(_intent(Instrument.KR_STOCK))
 
 
+class Reject03416Transport:
+    """운영 거부 코드 03416 픽스처 (실측 2026-09-14: 체결과 교차한 취소·중복 취소)."""
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any] | None,
+    ) -> RestResponse:
+        return RestResponse(
+            status_code=200,
+            body={"rsp_cd": "03416", "rsp_msg": "정정취소가능수량이 없습니다."},
+        )
+
+
+async def test_live_cancel_reject_03416_is_order_gone() -> None:
+    # 운영 실측 2026-09-14: 모의 01433에 해당하는 운영 코드는 03416. 취소 실패가 아니라 "이미 없음".
+    # (거부 판정 _check_ok는 발주·취소 공통 — 발주 경로로 확인)
+    gw = _gateway(Reject03416Transport())
+    with pytest.raises(OrderGoneError, match="03416"):
+        await gw.place_order(_intent(Instrument.KR_STOCK))
+
+
 # --- 정정/취소: 원주문 컨텍스트 보존 ---
 
 

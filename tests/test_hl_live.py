@@ -229,12 +229,13 @@ async def test_place_resting_has_no_place_fill() -> None:
     assert gw.pop_place_fill() is None
 
 
-async def test_market_order_becomes_ioc_with_slippage() -> None:
+async def test_market_or_priceless_order_is_rejected() -> None:
+    # 사용자 확정 2026-09-04·재확인 09-14: HL 주문은 지정가만. 옛 시장가→IOC(마크±1%) 경로 삭제.
     gw, ex, _ = _gw()
-    await gw.place_order(_intent(Side.BUY, order_type=OrderType.MARKET, price=None))
-    _, is_buy, _, px, otype = ex.orders[0]
-    assert otype == {"limit": {"tif": "Ioc"}}
-    assert is_buy is True and px == pytest.approx(184.1 * 1.01, rel=1e-3)
+    # (지정가인데 가격 없음은 OrderIntent 모델 검증에서 먼저 막힌다 — 게이트웨이까지 못 온다.)
+    with pytest.raises(HLError):
+        await gw.place_order(_intent(Side.BUY, order_type=OrderType.MARKET, price=None))
+    assert ex.orders == []  # 거래소로 나간 주문 없음
 
 
 async def test_cancel_requires_tracked_coin() -> None:

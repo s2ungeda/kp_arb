@@ -33,7 +33,8 @@ _NAMES = {"samsung": "삼성전자", "sk_hynix": "SK하이닉스", "hyundai": "�
 _KIND = {"kr_stock": "주식", "kr_stock_future": "선물", "kr_stock_future_next": "선물(차)",
          "kr_etf": "ETF"}
 
-FUNDING_INTERVAL_S = 3600  # HL 펀딩은 매시 정각
+# HL 펀딩은 매시 정각 — HL 문서: 1시간 주기, UTC 정각(= 로컬 정각). 사용자 확인 2026-09-14.
+FUNDING_INTERVAL_S = 3600
 # 시세 화면에서 숨기는 종목(사용자 2026-09-04: 현대차 제외) — 코어 구독·계산은 그대로, 표시만 뺀다.
 HIDDEN_UNDERLYINGS: frozenset[str] = frozenset({"hyundai"})
 
@@ -153,6 +154,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     threading.Thread(target=sender, daemon=True).start()
 
     root = tk.Tk()
+    from .core_client import log_screen_timing
+    log_screen_timing(root, __name__)  # 시동 계측: 화면 시작·표시 시각(screen 로그)
     root.title("시세")
     root.geometry("760x600")
     win_state.attach(root, "monitor", keep_size=True)  # 마지막 창 위치·크기 복원·저장

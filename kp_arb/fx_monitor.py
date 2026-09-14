@@ -24,6 +24,8 @@ def main() -> None:
 
     watch_parent_exit()  # 메인이 죽으면 이 창도 종료 (고아 방지)
     root = tk.Tk()
+    from .core_client import log_screen_timing
+    log_screen_timing(root, __name__)  # 시동 계측: 화면 시작·표시 시각(screen 로그)
     root.title("FX 노출 감시 [v2]")  # [v2]=뒷단 스레드 수정본 (옛 창 구분용)
     root.geometry("560x460")
     win_state.attach(root, "fx_monitor")  # 마지막 창 위치 복원·저장

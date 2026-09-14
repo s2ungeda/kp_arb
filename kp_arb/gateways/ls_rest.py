@@ -3,10 +3,11 @@
 라이브 네트워크 없음: 실제 HTTP는 주입된 ``RestTransport``(Protocol) 뒤로 격리한다.
 공통 책임:
 - ``base_url`` + Bearer 토큰 주입(``TokenManager``) + ``tr_cd`` 헤더 구성.
-- 레이트리밋 가드: 일 5,000회 + TR별 초당 한도(예: 조회 초당 2회). 초과 시 ``RateLimitError``.
+- 레이트리밋 가드: TR별 초당 한도(LS 공식 표 ``LS_PER_SECOND``) 초과 시 ``RateLimitError``.
+  일 호출수는 참고값(5,000)을 넘어도 막지 않고 경고만(2026-09-14 정정).
 - 지수 백오프 재시도(전송 예외/5xx). 소진 시 ``RestError``.
 
-실제 전송(aiohttp) 구현과 TR별 path/한도 표는 이후 블록·config에서 채운다.
+실제 전송(aiohttp)은 ``ls_http``, TR별 path는 ``ls.LSApiGateway``.
 """
 from __future__ import annotations
 
@@ -14,22 +15,26 @@ import asyncio
 import logging
 from collections import defaultdict, deque
 from collections.abc import Callable
+from datetime import date
 from typing import Any, Protocol
 
 from pydantic import BaseModel
 
 from .ls_auth import TokenManager
 
-DEFAULT_DAILY_CAP = 5_000
-DEFAULT_PER_SECOND = 2  # 표에 없는 TR의 기본 초당 한도(보수적)
-# TR별 초당 한도 — LS OpenAPI 공식 TR 목록(transaction_per_sec, 2026-09-03 수집) 그대로.
+DEFAULT_DAILY_CAP = 5_000  # 참고값(출처 없음) — 막지 않고 경고만(RateLimiter 참고)
+DEFAULT_PER_SECOND = 2  # 표에 없는 TR의 기본 초당 한도(보수적). 쓰는 TR은 전부 표에 넣는다.
+# TR별 초당 한도 — LS OpenAPI 공식 값 그대로. 출처: openapi.ls-sec.co.kr 서비스 목록
+# (`/api/apis/public/api-list/<그룹id>` 응답의 extraParam.ThroughputQuotaRule[].requestLimit,
+# 주식 그룹 73142d9f…, 선물/옵션 그룹 2f1eea77…; 2026-09-03 수집 → 2026-09-14 전 TR 재대조).
 # 실측 2026-09-08: 기본값 2를 전 TR에 적용해 선물 취소(공식 10)를 우리 쪽에서 막았고,
-# 그 사이 종료 취소가 실패해 선주문이 LS에 남았다. 조회 TR 중 1회짜리도 2로 느슨했음.
+# 그 사이 종료 취소가 실패해 선주문이 LS에 남았다. 재대조 2026-09-14: t0441·t0434는 공식 1인데
+# 2로 적혀 있었음(정정), t2111(원달러선물 현재가)은 표에 없어 기본 2로 막히고 있었음(공식 10).
 LS_PER_SECOND: dict[str, int] = {
     "CFOAT00100": 10, "CFOAT00200": 10, "CFOAT00300": 10,  # 선물옵션 주문·정정·취소
     "CSPAT00601": 10, "CSPAT00701": 3, "CSPAT00801": 3,    # 현물 주문·정정·취소
-    "t1102": 10, "t8402": 10,                              # 주식·주식선물 현재가
-    "t8401": 2, "t0441": 2, "t0434": 2,                    # 주식선물 마스터·선물 잔고·선물 미체결
+    "t1102": 10, "t8402": 10, "t2111": 10,                 # 주식·주식선물·선물옵션(원달러) 현재가
+    "t8401": 2, "t0441": 1, "t0434": 1,                    # 주식선물 마스터·선물 잔고·선물 미체결
     "CFOBQ10500": 1, "CSPAQ12300": 1, "CSPAQ13700": 1, "CSPAQ22200": 1,  # 증거금·예수금·체결
     "t1901": 1, "t8426": 1,                                # ETF 현재가·상품선물 마스터
 }
@@ -102,9 +107,14 @@ def build_headers(tr_cd: str, token: str, *, tr_cont: str = "N") -> dict[str, st
 
 
 class RateLimiter:
-    """일 한도 + TR별 초당 한도 가드. 주입형 시계(epoch 초)로 판정.
+    """TR별 초당 한도 가드 + 일 호출수 감시. 주입형 시계(epoch 초)로 판정.
 
-    초과 시 대기하지 않고 ``RateLimitError``를 던진다(호출자가 페이싱).
+    초당 한도 초과 시 대기하지 않고 ``RateLimitError``를 던진다(호출자가 페이싱).
+    **일 한도(daily_cap)는 막지 않고 경고만** — 운영 실측 2026-09-14 13:11: 초기 골격의 가정값
+    5,000(LS 공식 안내엔 초당 한도뿐)에 하이닉스 자동M의 재발주 왕복이 닿자 그날 남은 시간 동안
+    선물 계좌의 **취소까지 전부 차단**돼 걸린 선주문(#8903)을 못 지웠다. 자체 가드가 취소를 막는
+    쪽이 더 위험하므로 넘어가면 로그로만 알린다(넘긴 뒤 1,000건마다 한 번 더). 진짜 한도는 LS가
+    rsp_cd로 거부하고, 그 거부는 request()가 남긴다.
     """
 
     def __init__(
@@ -114,12 +124,16 @@ class RateLimiter:
         daily_cap: int = DEFAULT_DAILY_CAP,
         default_per_second: int = DEFAULT_PER_SECOND,
         per_tr_per_second: dict[str, int] | None = None,
+        today: Callable[[], str] | None = None,
     ) -> None:
         self._now = now
         self._daily_cap = daily_cap
         self._default_per_second = default_per_second
         self._per_tr = dict(per_tr_per_second or {})
-        self._day = -1
+        # 일 카운트의 날짜 경계는 **실제 달력 날짜**(로컬) — ``now``는 초당 판정용 단조시계라
+        # (운영은 time.monotonic) 거기서 나눈 "날"은 자정과 무관한 임의 경계였다(정정 2026-09-14).
+        self._today: Callable[[], str] = today or (lambda: date.today().isoformat())
+        self._day = ""
         self._daily_count = 0
         self._recent: dict[str, deque[float]] = defaultdict(deque)
 
@@ -127,12 +141,14 @@ class RateLimiter:
         """tr_cd 호출 1건을 허용 가능한지 판정하고, 가능하면 카운트에 반영."""
         t = self._now()
 
-        day = int(t // 86_400)
+        day = self._today()
         if day != self._day:
             self._day = day
             self._daily_count = 0
-        if self._daily_count >= self._daily_cap:
-            raise RateLimitError(f"daily cap {self._daily_cap} exceeded")
+        if self._daily_count >= self._daily_cap and (
+                self._daily_count - self._daily_cap) % 1_000 == 0:
+            _log.warning("LS REST 일 호출수 %d — 참고 한도 %d 초과(차단 안 함, %s)",
+                         self._daily_count, self._daily_cap, tr_cd)
 
         recent = self._recent[tr_cd]
         cutoff = t - 1.0

@@ -92,6 +92,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     if not preview:
         watch_parent_exit()  # 메인이 죽으면 이 창도 종료(고아 방지)
     root = tk.Tk()
+    from .core_client import log_screen_timing
+    log_screen_timing(root, __name__)  # 시동 계측: 화면 시작·표시 시각(screen 로그)
     root.title("바로쏴 (자동T)")
     root.resizable(True, True)  # 창 크기 조절 가능 — 컨트롤은 좌상단 고정(안 늘어남)
     win_state.attach(root, "autoT")

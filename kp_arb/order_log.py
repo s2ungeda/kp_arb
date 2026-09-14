@@ -54,7 +54,8 @@ def order_requested(intent: OrderIntent, *, price: float | None = None) -> None:
     """발주요청 — 거래소로 **보내기 직전**(응답 전). 네트워크가 막혀 응답이 안 와도 '무엇을
     보냈는지'가 남아, 뒤따르는 발주응답·체결과 짝을 이뤄 한 주문의 단계를 추적할 수 있다.
 
-    시장가(HL)는 intent.price가 없어 실제 실어보낸 가격을 price로 받아 함께 남긴다.
+    price는 게이트웨이가 실제 실어보낸 가격(HL 지정가 float 변환값 등) — intent.price가 없을 때만
+    덧붙인다. (HL 시장가→IOC 대용 경로는 2026-09-14 삭제, HL은 지정가만.)
     """
     extra = f" @ {price}" if price is not None and intent.price is None else ""
     logger_for(intent.venue).info("발주요청 %s%s%s", _src(intent), _fmt(intent), extra)
