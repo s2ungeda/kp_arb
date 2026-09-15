@@ -78,6 +78,7 @@ class _SystemLike(Protocol):
 
     order_book: OrderBook
     quotes: dict[tuple[Underlying, Instrument, str], Quote]
+    trades: dict[tuple[Underlying, Instrument, str], float]  # 현재가(장 밖엔 호가 없고 이것만)
     instruments: dict[tuple[Underlying, Instrument], InstrumentInfo]  # HL szDecimals(가격 격자)
     error_seq: int
 
@@ -743,9 +744,15 @@ class AutoMEngine:
         # SF 시세 호가단위(지금 가격대) — 세트설정 기준배수 검사용(사용자 2026-09-15).
         # 시세 없으면 None(화면은 그 검사를 건너뛴다)
         quotes = self._system.quotes
-        sf_q = next((quotes.get((u, inst, m)) for m in ("uni", "krx", "nxt")
+        markets = ("uni", "krx", "nxt")
+        sf_q = next((quotes.get((u, inst, m)) for m in markets
                      if quotes.get((u, inst, m)) is not None), None)
         sf_ref = (sf_q.ask or sf_q.bid) if sf_q is not None else None
+        if not sf_ref:  # 장 밖(호가 없음)엔 현재가(시동 초기값·마지막 체결)로 — 실측 09-15 저녁:
+            # 호가만 보니 sf_tick이 비어 세트설정 기준배수 경고가 안 떴다
+            trades = getattr(self._system, "trades", {})
+            sf_ref = next((trades.get((u, inst, m)) for m in markets
+                           if trades.get((u, inst, m))), None)
         sf_tick = tick_for(Instrument.KR_STOCK_FUTURE, float(sf_ref)) if sf_ref else None
         return {"sets": out, "rev_sets": rev_out, "any_running": book.any_running(),
                 "monitor": monitor, "sf_tick": sf_tick,

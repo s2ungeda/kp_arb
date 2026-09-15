@@ -34,6 +34,7 @@ class FakeSystem:
         self.instruments = {(U, Instrument.HL_PERP): InstrumentInfo(
             underlying=U, instrument=Instrument.HL_PERP, code="xyz:SKHX",
             multiplier=1.0, sz_decimals=1)}
+        self.trades: dict[tuple[Underlying, Instrument, str], float] = {}  # 현재가(장 밖 대비)
         self.quotes = {
             (U, Instrument.HL_PERP, "hl"): Quote(
                 underlying=U, instrument=Instrument.HL_PERP, bid=1184.0, ask=1184.5, ts=0,
@@ -748,3 +749,14 @@ def test_autom_state_persists_inputs_not_runtime() -> None:
     assert (r.target_qty, r.per_qty, r.en_sf, r.rt) == (30, 3, 0.007, 5)
     assert r.entry.acc.fx_avg() == 1356 and restored.autom.settings.rel_buy == 3
     assert not r.entry.running and r.entry.status is LegStatus.IDLE and r.entry.pre_order_id is None
+
+
+async def test_snapshot_sf_tick_falls_back_to_last_price_after_hours() -> None:
+    # 실측 2026-09-15 저녁: 장 밖엔 SF 호가가 없어 sf_tick이 비고 세트설정 기준배수 경고가 안 떴다.
+    # 호가가 없으면 현재가(시동 초기값·마지막 체결)로 호가단위를 구한다.
+    eng, sys_, _state = _engine()
+    for key in [k for k in sys_.quotes if k[1] is SF]:
+        del sys_.quotes[key]
+    assert eng.live_snapshot()[U.value]["sf_tick"] is None  # 호가도 현재가도 없음
+    sys_.trades[(U, SF, "krx")] = 243_000.0  # 삼성 24만 원대 → 500
+    assert eng.live_snapshot()[U.value]["sf_tick"] == 500
