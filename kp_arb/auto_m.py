@@ -240,6 +240,10 @@ class Leg:
     cancel_alarmed: bool = False    # 취소 재전송 한도 초과 알람을 이미 냈음 → 상태줄 "취소실패"
     await_post_then_delay: bool = False  # 취소 확인됨, 병행 후주문 체결 확인 뒤 딜레이
     reject_streak: int = 0          # 선주문 연속 거부 횟수 — 접수 뒤 체결·취소가 있으면 0으로
+    # 마지막 선주문 거부 — 화면 상태줄에 "거부(n/3): 사유"로(사용자 2026-09-15: 거부났는지·사유를
+    # 화면에서 알 수 없었음). 다음 선주문이 접수되면 지운다. 시각은 엔진이 넣는다.
+    last_reject: str = ""
+    last_reject_at: str = ""
     halt_reason: str = ""
     # 마지막 판정 결과 한 줄(어느 게이트에서 막혔나·통과했나 + 숫자) — 로그는 바뀔 때만 남긴다
     block_reason: str = ""
@@ -571,6 +575,7 @@ def on_pre_ack(s: AutoMSet, block: Block, order_id: str,
     """
     leg = s.leg(block)
     leg.pre_order_id = order_id
+    leg.last_reject = leg.last_reject_at = ""  # 접수됐으면 앞선 거부 표시는 끝
     if not leg.running or leg.status in (LegStatus.IDLE, LegStatus.HALTED):
         return _cancel_if_resting(leg, force=True, mono=mono)
     return []
@@ -602,10 +607,12 @@ def on_pre_reject(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
     why = f"선주문 거부{(': ' + reason) if reason else ''}"
     if leg.reject_streak >= PRE_REJECT_LIMIT:
         s.entry.reject_streak = s.exit.reject_streak = 0
+        leg.last_reject = f"선주문 거부 연속 {PRE_REJECT_LIMIT}회 → 실행 끔: {reason or '-'}"
         acts = set_running(s, Block.ENTRY, False, mono) + set_running(s, Block.EXIT, False, mono)
         acts.append(Action("alarm", reason=f"{why} — 연속 {PRE_REJECT_LIMIT}회, 세트 진입·청산 "
                                            f"실행 끔(원인 정리 뒤 다시 켜세요)"))
         return acts
+    leg.last_reject = f"선주문 거부({leg.reject_streak}/{PRE_REJECT_LIMIT}): {reason or '-'}"
     _start_delay(leg, mono, settings)
     return [Action("notify", reason=f"{why} — 딜레이 뒤 재시도({leg.reject_streak}/"
                                     f"{PRE_REJECT_LIMIT})")]

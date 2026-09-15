@@ -211,6 +211,24 @@ def test_three_consecutive_pre_rejects_turn_set_off_with_alarm() -> None:
     assert s2.entry.reject_streak == 0
 
 
+def test_pre_reject_is_shown_with_reason_until_next_ack() -> None:
+    # 사용자 2026-09-15: 선주문이 거부됐는지·사유가 뭔지 화면에서 알 수 없었다 → 마지막 거부를
+    # 다리에 들고 있다가 상태줄에("거부(n/3): 사유"), 다음 접수가 오면 지운다. 3회째는
+    # "실행 끔" 문구.
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
+    on_pre_reject(s, Block.ENTRY, mono=100.5, settings=SETTINGS, reason="LS 02752 증거금부족")
+    assert s.entry.last_reject == "선주문 거부(1/3): LS 02752 증거금부족"
+    evaluate(s, Block.ENTRY, _sig(mono=200.0), SETTINGS, U)
+    on_pre_ack(s, Block.ENTRY, "9")
+    assert s.entry.last_reject == ""  # 접수됐으면 거부 표시 끝
+    s.entry.reject_streak = 2
+    on_pre_reject(s, Block.ENTRY, mono=201.0, settings=SETTINGS, reason="LS 02752 증거금부족")
+    assert s.entry.last_reject.startswith("선주문 거부 연속 3회 → 실행 끔: LS 02752")
+    assert not s.entry.running and not s.exit.running
+
+
 def test_place_pre_keeps_hl_est_of_post_side_for_fill_comparison() -> None:
     # 사용자 2026-09-14: 선주문 발주 시점 HL est(후주문 방향)를 들고 있다가 후주문 체결가와
     # 비교한다. 정방향 진입 = 후주문 HL 매도 → 매수호가창 est(hl_est_bid). 재발주면 새 값으로.

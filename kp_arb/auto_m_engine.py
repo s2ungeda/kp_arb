@@ -57,6 +57,17 @@ if TYPE_CHECKING:
     from .order_book import OrderBook, TrackedOrder
     from .strategy_core import CoreState
 
+
+def reject_reason_text(exc_text: str, limit: int = 90) -> str:
+    """거부 예외 문구를 상태줄용으로 — LS 거부 "CFOAT00100 rejected (02752): 증거금부족…"은
+    "LS 02752 증거금부족…"으로, 그 외는 그대로. 너무 길면 자른다. (순수 함수)"""
+    import re
+
+    m = re.match(r"^\w+ rejected \((\w+)\): (.*)$", exc_text.strip())
+    text = f"LS {m.group(1)} {m.group(2)}" if m else exc_text.strip()
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 TICK_S = 0.1
 SOURCE = "자동M"
 
@@ -304,7 +315,9 @@ class AutoMEngine:
             self._log.warning("[자동M] %s 선주문 실패 %s — %s",
                               u.value, self._tag(u, index, block, reverse), exc)
             self._apply(u, index, block, on_pre_reject(
-                s, block, time.monotonic(), self.screen.settings, reason=str(exc)[:80]), reverse)
+                s, block, time.monotonic(), self.screen.settings,
+                reason=reject_reason_text(str(exc))), reverse)
+            s.leg(block).last_reject_at = time.strftime("%H:%M:%S")  # 상태줄 표시용 시각
             return
         self._register(oid, _OrderRef(u, index, block, "pre", reverse))
         late = on_pre_ack(s, block, oid, mono=self._mono)  # 발주 중 꺼졌/중지됐으면 취소 행동
@@ -601,7 +614,8 @@ class AutoMEngine:
                 elif status == "rejected":
                     self._apply(u, ref.index, ref.block,
                                 on_pre_reject(s, ref.block, mono, self.screen.settings,
-                                              reason="LS 거부 통보"), ref.reverse)
+                                              reason="LS 거부 통보(접수 뒤 거부)"), ref.reverse)
+                    s.leg(ref.block).last_reject_at = time.strftime("%H:%M:%S")
                     self._forget(oid)
                 elif status == "filled":
                     self._forget(oid)
@@ -739,6 +753,8 @@ class AutoMEngine:
                 "pre_filled": leg.pre_filled, "post_pending": leg.post_pending,
                 # 취소 재전송 한도 초과 → 상태줄 "취소실패 #번호 n회"(exec ㅂ3)
                 "cancel_failed": leg.cancel_alarmed, "cancel_tries": leg.cancel_tries,
+                # 마지막 선주문 거부(시각·사유·횟수) → 상태줄(사용자 2026-09-15)
+                "reject": leg.last_reject, "reject_at": leg.last_reject_at,
                 "hl_qty": leg.acc.hl_qty, "sf_qty": leg.acc.sf_qty,
                 # 매매결과 표시는 짝이 맞은(적은 쪽) 체결량 기준(사용자 확정 2026-09-08)
                 "matched_hl": leg.acc.matched_hl(), "matched_sf": leg.acc.matched_sf(),

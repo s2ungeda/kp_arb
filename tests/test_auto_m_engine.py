@@ -75,6 +75,11 @@ class FakeSystem:
         delay = getattr(self, "place_delay", 0.0)  # LS 접수 응답 지연 흉내(실측 0.9초)
         if delay > 0:
             await asyncio.sleep(delay)
+        fail_pre = getattr(self, "fail_pre", None)  # LS 선주문 거부 흉내(RestError 문구)
+        if fail_pre and intent.instrument is SF:
+            from kp_arb.gateways.ls_rest import RestError
+
+            raise RestError(fail_pre)
         self._ids += 1
         oid = f"O{self._ids}"
         self.placed.append(intent)
@@ -398,6 +403,34 @@ async def test_late_pre_fill_after_stop_still_hedges() -> None:
     for task in list(eng._bg):                    # 남은 취소 재시도 정리
         task.cancel()
     await _settle()
+
+
+def test_reject_reason_text_shortens_ls_rejection() -> None:
+    from kp_arb.auto_m_engine import reject_reason_text
+
+    assert reject_reason_text("CFOAT00100 rejected (02752): 증거금부족으로 주문이 불가합니다.") == \
+        "LS 02752 증거금부족으로 주문이 불가합니다."
+    assert reject_reason_text("daily cap 5000 exceeded") == "daily cap 5000 exceeded"
+    assert reject_reason_text("x" * 200).endswith("…") and len(reject_reason_text("x" * 200)) == 90
+
+
+async def test_pre_reject_reason_reaches_snapshot() -> None:
+    # 거부 → 스냅샷 entry.reject/reject_at(상태줄 표시) — 재접수되면 비워진다.
+    eng, sys_, state = _engine()
+    sys_.fail_pre = "CFOAT00100 rejected (02752): 증거금부족으로 주문이 불가합니다."
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    row = eng.live_snapshot()[U.value]["sets"][0]["entry"]
+    assert row["reject"] == "선주문 거부(1/3): LS 02752 증거금부족으로 주문이 불가합니다."
+    assert len(row["reject_at"]) == 8  # HH:MM:SS
+    sys_.fail_pre = None
+    # 거부 뒤 딜레이는 실제 단조시계 기준(엔진의 time.monotonic) — 테스트 시계로는 안 지나가서 지움
+    state.autom.book(U).sets[0].entry.delay_until = None
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 200.0)  # 딜레이 뒤 재발주 → 접수
+    await _settle()
+    row = eng.live_snapshot()[U.value]["sets"][0]["entry"]
+    assert row["reject"] == "" and row["pre_order_id"] is not None
 
 
 async def test_cancel_crossed_by_fill_is_not_retried() -> None:

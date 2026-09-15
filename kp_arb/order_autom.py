@@ -1034,11 +1034,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def _leg_detail(i: int, side: str, leg: dict[str, Any], dtag: str = "fwd") -> str | None:
         """상태줄용 진행 상세 — 감시/대기 외 상태만 한 줄. 역방향은 '역' 표시."""
         st = str(leg.get("status") or "idle")
-        if st in ("idle", "armed"):
+        reject = str(leg.get("reject") or "")
+        if st in ("idle", "armed") and not reject:
             return None
         name = "진입" if side == "en" else "청산"
         head = f"{'역 ' if dtag == 'rev' else ''}{i + 1}세트 {name}"
         parts = [f"{head}: {_STATUS_TEXT.get(st, st)}"]
+        if reject:  # 마지막 선주문 거부 — 시각·횟수·LS 사유(사용자 2026-09-15). 다음 접수 때 사라짐
+            parts.append(f"{leg.get('reject_at') or ''} {reject}".strip())
         if leg.get("pre_order_id"):
             price = leg.get("pre_price")
             px = f"{float(price):,.0f}" if isinstance(price, int | float) else "-"
