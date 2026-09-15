@@ -196,6 +196,8 @@ async def test_public_trades_parsed_as_ticks() -> None:
     assert len(ticks) == 1
     assert ticks[0].underlying is Underlying.SK_HYNIX
     assert ticks[0].price == 1434.5 and ticks[0].market == "hl"
+    # HL 체결 창용(2026-09-15): side는 HL 표기 그대로 B=매수/A=매도, sz=체결수량, time=epoch ms
+    assert ticks[0].side == "buy" and ticks[0].qty == 0.2 and ticks[0].ts == 1751500000000
 
 
 async def test_snapshot_fills_skipped() -> None:

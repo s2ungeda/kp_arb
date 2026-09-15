@@ -1,6 +1,7 @@
 """코어 API 테스트 — 명령 적용(순수) + HTTP 왕복 + 저장/복원 (DESIGN §12, §6.2)."""
 from pathlib import Path
 
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from kp_arb.core_server import (
@@ -167,6 +168,100 @@ def test_load_state_missing_or_corrupt(tmp_path: Path) -> None:
     bad = tmp_path / "bad.json"
     bad.write_text("{broken", encoding="utf-8")
     assert load_state(bad).fx_month == "near"
+
+
+async def test_hl_trades_endpoint_returns_newest_first_or_empty() -> None:
+    # HL 체결 창(2026-09-15): /hl_trades?underlying= — 코어 보관 30건을 최신 순으로. 시스템 없음·
+    # 종목 오류면 빈 목록(창은 "체결 대기 중").
+    from collections import deque
+
+    from kp_arb.domain.enums import Underlying
+
+    class _Sys:
+        hl_trades = {Underlying.SK_HYNIX: deque([
+            {"time": "10:00:00.000", "ts": 1.0, "side": "buy", "price": 1.0, "qty": 1.0},
+            {"time": "10:00:01.000", "ts": 2.0, "side": "sell", "price": 2.0, "qty": 0.5},
+        ], maxlen=30)}
+
+        # make_app이 시동 때 주입하는 공통설정 훅 — 여기선 아무것도 안 함
+        def set_hl_daily_limit(self, usdc: float) -> None: ...
+        def set_carry_rates(self, fx: float, eq: float) -> None: ...
+        def set_fx_spot_window(self, start: str, end: str) -> None: ...
+
+    client = TestClient(TestServer(make_app(CoreState(), system=_Sys())))  # type: ignore[arg-type]
+    await client.start_server()
+    try:
+        resp = await client.get("/hl_trades?underlying=sk_hynix")
+        body = await resp.json()
+        assert body["underlying"] == "sk_hynix"
+        assert [r["price"] for r in body["rows"]] == [2.0, 1.0]  # 최신이 위
+        resp = await client.get("/hl_trades?underlying=nope")
+        assert (await resp.json()) == {"underlying": None, "rows": []}
+        resp = await client.get("/hl_trades")  # 종목 없음 = trades 채널과 같은 모양(창 폴백)
+        body = await resp.json()
+        assert [r["price"] for r in body["trades"]["sk_hynix"]] == [2.0, 1.0]
+    finally:
+        await client.close()
+
+
+async def test_ws_hub_trades_channel_pushes_only_on_hl_trade() -> None:
+    # trades 채널(§12.1 3차, 2026-09-15): 구독 즉시 스냅샷, HL 체결이 올 때만 푸시(다른 이벤트·
+    # LS 체결은 안 보냄). HTTP 폴링보다 0.5초쯤 늦던 HL 체결 창을 실시간으로.
+    import asyncio
+    import json
+    from collections import deque
+
+    from kp_arb.core_server import WsHub
+    from kp_arb.domain.enums import Instrument, Underlying
+    from kp_arb.gateways.ls_ws import TradeTick
+    from kp_arb.order_book import OrderBook
+
+    class _Sys:
+        on_quote: list = []  # noqa: RUF012 - 테스트 스텁
+        on_mark: list = []  # noqa: RUF012
+        on_trade: list = []  # noqa: RUF012
+        order_book = OrderBook()
+        hl_trades = {Underlying.SK_HYNIX: deque(
+            [{"time": "t", "ts": 1.0, "side": "buy", "price": 1.0, "qty": 1.0}], maxlen=30)}
+
+    sys_ = _Sys()
+    hub = WsHub(sys_, coalesce_s=0.01, heartbeat_s=5.0)  # type: ignore[arg-type]
+    # 접속 직후의 manual 스냅샷은 LiveSystem 전체가 필요 — 이 테스트는 trades 채널만 본다
+    hub._manual_text = lambda: '{"channel":"manual","ts":0,"data":{}}'  # type: ignore[method-assign]
+    runner = asyncio.create_task(hub.run())
+    client = TestClient(TestServer(make_app(CoreState(), hub=hub)))
+    await client.start_server()
+    try:
+        ws = await client.ws_connect("/ws")
+        await ws.receive()  # manual 스냅샷
+        await ws.send_str('{"subscribe":["trades"]}')
+        snap = json.loads((await asyncio.wait_for(ws.receive(), 1.0)).data)
+        assert snap["channel"] == "trades" and snap["data"]["trades"]["sk_hynix"][0]["price"] == 1.0
+
+        ls_tick = TradeTick(underlying=Underlying.SK_HYNIX, instrument=Instrument.KR_STOCK,
+                            price=1.0, market="krx")
+        for h in sys_.on_trade:
+            h(ls_tick)  # LS 체결 — manual은 밀어도 trades 채널엔 안 보냄
+        got = json.loads((await asyncio.wait_for(ws.receive(), 1.0)).data)
+        assert got["channel"] == "manual"
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(ws.receive(), 0.1)  # trades 푸시 없음
+
+        hl_tick = TradeTick(underlying=Underlying.SK_HYNIX, instrument=Instrument.HL_PERP,
+                            price=2.0, market="hl", side="sell", qty=0.5, ts=2.0)
+        sys_.hl_trades[Underlying.SK_HYNIX].append(
+            {"time": "t2", "ts": 2.0, "side": "sell", "price": 2.0, "qty": 0.5})
+        for h in sys_.on_trade:
+            h(hl_tick)
+        pushed = json.loads((await asyncio.wait_for(ws.receive(), 1.0)).data)
+        if pushed["channel"] == "manual":  # 같은 묶음에서 manual이 먼저 나갈 수 있다
+            pushed = json.loads((await asyncio.wait_for(ws.receive(), 1.0)).data)
+        assert pushed["channel"] == "trades"
+        assert [r["price"] for r in pushed["data"]["trades"]["sk_hynix"]] == [2.0, 1.0]
+        await ws.close()
+    finally:
+        runner.cancel()
+        await client.close()
 
 
 async def test_ws_hub_snapshot_push_and_heartbeat() -> None:

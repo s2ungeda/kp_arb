@@ -495,12 +495,18 @@ class HLWebSocketClient:
             underlying = self._by_symbol.get(str(t.get("coin", "")))
             if underlying is None or "px" not in t:
                 continue
+            # side: HL 표기 그대로 "B"=매수(taker 매수), "A"=매도
+            # (사용자 확정 2026-09-15: HL 앱과 같게)
+            raw_side = str(t.get("side", "")).upper()
+            side = "buy" if raw_side == "B" else "sell" if raw_side == "A" else None
             ticks.append(TradeTick(
                 underlying=underlying,
                 instrument=Instrument.HL_PERP,
                 price=float(t["px"]),
                 ts=float(t.get("time", 0.0)),
                 market="hl",
+                side=side,
+                qty=float(t["sz"]) if "sz" in t else None,
             ))
         return ticks
 

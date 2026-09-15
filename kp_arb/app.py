@@ -39,6 +39,9 @@ def main() -> None:
     elif arg == "fx_monitor":
         from kp_arb.fx_monitor import main as run
         run()
+    elif arg == "hl_trades":
+        from kp_arb.hl_trades import main as run
+        run()
     elif arg == "order_hl":
         from kp_arb.order_hl import main as run
         run()

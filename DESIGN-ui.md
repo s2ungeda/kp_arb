@@ -89,5 +89,6 @@
 
 - ✅ 토큰 정의: `kp_arb/ui_theme.py` (+ `tests/test_ui_theme.py`)
 - ✅ `order_list` — ui_theme 적용 + Label 그리드 표(매매 칸 매수=빨강/매도=파랑)
+- ✅ `hl_trades`(2026-09-15) — ui_theme 토큰으로 처음부터(Treeview 행 태그 매수=빨강/매도=파랑)
 - ⬜ order_hl 이전(값 동일 → 무변화) · monitor · fx_monitor · main_window
 - ⬜ [OPEN] 숫자 표시 포맷(`_fmt`/`_fmt_qty`/`_fmt_px`) 공용화 — 현재 창별 중복

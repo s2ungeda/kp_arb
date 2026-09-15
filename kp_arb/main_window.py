@@ -30,6 +30,7 @@ _SCREEN_NAMES = {
     "kp_arb.monitor": "시세 모니터", "kp_arb.fx_monitor": "FX 노출 감시",
     "kp_arb.order_hl": "HL 일반주문", "kp_arb.order_list": "주문 리스트",
     "kp_arb.fx_auction_order": "원달러선물 동시호가", "kp_arb.settings_window": "공통설정",
+    "kp_arb.hl_trades": "HL 체결",
 }
 
 _MUTEX_HANDLES: list[int] = []  # 단일 인스턴스 뮤텍스 핸들 유지(프로세스 수명 동안)
@@ -160,6 +161,8 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "meme.exe"), "monitor"]
     if module == "kp_arb.fx_monitor":
         return [str(exe_dir / "meme.exe"), "fx_monitor"]
+    if module == "kp_arb.hl_trades":
+        return [str(exe_dir / "meme.exe"), "hl_trades"]
     if module == "kp_arb.order_hl":
         return [str(exe_dir / "meme.exe"), "order_hl"]
     if module == "kp_arb.order_list":
@@ -346,13 +349,13 @@ def main() -> None:
 
         # 채널별 공유 파일 — manual(일반주문·주문리스트) / state(자동T·자동M·설정·동시호가)
         writers = {ch: ShareWriter(share_path_for(share_path, ch))
-                   for ch in ("manual", "state")}
+                   for ch in ("manual", "state", "trades")}
         fails = 0
         mw = alive_box["main_ws"]  # 현황판 표시용(연결·수신·끊김) — 화면은 읽기만
         while not closing["flag"]:
             try:
                 with connect(CORE_WS_URL, open_timeout=3.0, close_timeout=1.0) as ws:
-                    ws.send('{"subscribe":["manual","state"]}')
+                    ws.send('{"subscribe":["manual","state","trades"]}')
                     mw["connected"] = True
                     if fails:
                         screen_log().warning("메인 WS 복구 — 연속 실패 %d회 뒤 정상", fails)
@@ -529,6 +532,8 @@ def main() -> None:
                          command=lambda: open_screen("kp_arb.fx_monitor"))
     m_screen.add_command(label="HL 일반주문 (수동)",
                          command=lambda: open_screen("kp_arb.order_hl"))
+    m_screen.add_command(label="HL 체결 (실시간 30건)",
+                         command=lambda: open_screen("kp_arb.hl_trades"))
     m_screen.add_command(label="주문 리스트 (미체결·취소·정정)",
                          command=lambda: open_screen("kp_arb.order_list"))
     m_screen.add_command(label="원달러선물 동시호가 주문",

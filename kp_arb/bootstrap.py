@@ -133,6 +133,51 @@ def select_months(
 
 
 FX_SPOT_SILENT_S = 600.0  # 현물환율(CUR) 무수신 → 하나고시 대체 기준(사용자 확정 2026-09-04: 10분)
+HL_TRADES_KEEP = 30  # HL 체결 창에 보여 줄 최근 공개 체결 건수(사용자 2026-09-15: 30줄)
+
+
+def hl_trade_row(tick: TradeTick) -> dict[str, Any]:
+    """HL 공개 체결 1건 → 체결 창 행(체결시각·매도/매수·체결가·체결수량). 시각은 HL epoch ms를
+    로컬 시각 HH:MM:SS.mmm 으로. (순수 함수)"""
+    stamp = datetime.fromtimestamp(tick.ts / 1000.0) if tick.ts else None
+    return {
+        "time": stamp.strftime("%H:%M:%S.%f")[:-3] if stamp else "-",
+        "ts": tick.ts,
+        "side": tick.side or "",         # "buy" | "sell" | ""
+        "price": tick.price,
+        "qty": tick.qty or 0.0,
+    }
+
+
+def hl_trade_rows(trades: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """보관 순서(오래된 것부터) → 화면 순서(최신이 위). (순수 함수)"""
+    return list(reversed(list(trades)))
+
+
+class LagMeter:
+    """수신 지연 집계 — 거래소 체결 시각(HL epoch ms) 대비 코어 수신 시각. 창(window_s)마다
+    건수·평균·최대를 돌려주고 비운다. HL 체결 창이 홈페이지보다 늦어 보인 원인이 코어 수신
+    자체의 지연인지 그 뒤(채널·화면)인지 가르기 위한 계측(사용자 2026-09-15). 순수 로직."""
+
+    def __init__(self, window_s: float = 10.0) -> None:
+        self.window_s = window_s
+        self._start: float | None = None
+        self.count = 0
+        self.total_ms = 0.0
+        self.max_ms = 0.0
+
+    def add(self, lag_ms: float, now: float) -> tuple[int, float, float] | None:
+        """지연 1건 반영. 창이 찼으면 (건수, 평균 ms, 최대 ms)를 돌려주고 새 창을 연다."""
+        if self._start is None:
+            self._start = now
+        self.count += 1
+        self.total_ms += lag_ms
+        self.max_ms = max(self.max_ms, lag_ms)
+        if now - self._start < self.window_s:
+            return None
+        out = (self.count, self.total_ms / self.count, self.max_ms)
+        self._start, self.count, self.total_ms, self.max_ms = now, 0, 0.0, 0.0
+        return out
 
 
 def snapshot_failure_note(stage: str) -> str:
@@ -262,6 +307,9 @@ class LiveSystem:
         self.hl_mark: dict[Underlying, Mark] = {}
         self.hl_funding_rate: dict[Underlying, float] = {}  # 예정(다음) 펀딩률
         self.hl_funding_prev: dict[Underlying, float] = {}  # 직전 확정 펀딩률(REST 조회)
+        # HL 공개 체결 최근 30건(종목별, 오래된 것부터) — HL 체결 창(사용자 2026-09-15)
+        self.hl_trades: dict[Underlying, deque[dict[str, Any]]] = {}
+        self._hl_lag = LagMeter()  # HL 체결 수신 지연 집계(10초 창)
         # 배경 상시 태스크(괴리 CSV 등) — wait()가 기다리는 스트리밍 태스크와 분리, stop()이 취소.
         self._aux_tasks: list[asyncio.Task[None]] = []
         # HL 포지션 상세(마진·누적펀딩·청산가·레버리지) — clearinghouseState에서 refresh 때 채움.
@@ -851,6 +899,21 @@ class LiveSystem:
             self.trades[(tick.underlying, tick.instrument, tick.market)] = tick.price
             if tick.instrument is Instrument.KR_STOCK and tick.change_pct is not None:
                 self.stock_change_pct[(tick.underlying, tick.market)] = tick.change_pct
+            if tick.market == "hl":
+                self.hl_trades.setdefault(tick.underlying, deque(maxlen=HL_TRADES_KEEP)).append(
+                    hl_trade_row(tick))
+                if tick.ts:  # 수신 지연 계측(2026-09-15) — 10초마다 한 줄, 최대 0.3초 넘으면 경고
+                    import logging as _lg
+                    import time as _t
+
+                    now = _t.time()
+                    summary = self._hl_lag.add(now * 1000.0 - tick.ts, now)
+                    if summary is not None:
+                        n, avg, mx = summary
+                        lvl = _lg.WARNING if mx > 300 else _lg.INFO
+                        _lg.getLogger("kp_arb.bootstrap").log(
+                            lvl, "HL 체결 수신 지연 — 10초 %d건 평균 %.0fms 최대 %.0fms "
+                            "(거래소 체결시각 대비, PC 시계 오차 포함)", n, avg, mx)
             for handler in self.on_trade:
                 handler(tick)
 

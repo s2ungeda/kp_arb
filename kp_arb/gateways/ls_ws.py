@@ -137,7 +137,9 @@ class TradeTick(BaseModel):
     price: float
     change_pct: float | None = None  # 등락률(%, drate — ETF 이론가의 핵심 입력, 문서 §2)
     ts: float = 0.0
-    market: str = "krx"  # "krx" | "nxt"
+    market: str = "krx"  # "krx" | "nxt" | "hl"
+    side: str | None = None   # "buy" | "sell" — 체결 방향(HL trades B/A; HL 체결 창 표시용)
+    qty: float | None = None  # 체결 수량(HL sz) — 체결 창 표시용
 
 
 class ExpectedPrice(BaseModel):

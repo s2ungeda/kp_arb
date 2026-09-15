@@ -13,6 +13,7 @@
 - GET  /state        : CoreState 스냅샷 + live + autom_live(종목별) — 자동T/자동M·설정 화면
 - GET  /manual_state : 잔고·호가·미체결(일반주문·주문리스트)
 - GET  /monitor      : 시세 화면(괴리보드·est·환율·HL 호가단위)
+- GET  /hl_trades    : HL 체결 창(종목의 최근 공개 체결 30건, ?underlying=)
 - POST /command      : {"cmd": ...} — autoT는 apply_command, 자동M은 autom_*(underlying 필수),
                        수동 주문은 manual_*, 동시호가는 fx_auction_*, 환율 월물은 fx_*
 """
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
     from .bootstrap import LiveSystem
     from .core_engine import RehearsalEngine
     from .fx_service import FxReportService
+    from .gateways.ls_ws import TradeTick
     from .order_book import TrackedOrder
 
 HOST = "127.0.0.1"
@@ -349,6 +351,15 @@ def sorted_open_orders(orders: list[TrackedOrder]) -> list[TrackedOrder]:
         return (o.placed_epoch, oid)
 
     return sorted(orders, key=_key, reverse=True)
+
+
+def hl_trades_snapshot(system: LiveSystem | None) -> dict[str, Any]:
+    """trades 채널·/hl_trades 본문 — {"trades": {종목: [최신 체결 …]}} (HL 체결 창, 2026-09-15)."""
+    from .bootstrap import hl_trade_rows
+
+    if system is None:
+        return {"trades": {}}
+    return {"trades": {u.value: hl_trade_rows(rows) for u, rows in system.hl_trades.items()}}
 
 
 def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
@@ -852,7 +863,7 @@ class WsHub:
     하트비트 — 화면이 "데이터 없음"과 "연결 끊김"을 구분한다. 페이로드는 /manual_state와 동일.
     """
 
-    CHANNELS = ("manual", "state")
+    CHANNELS = ("manual", "state", "trades")
 
     def __init__(self, system: LiveSystem | None, *, coalesce_s: float = 0.1,
                  heartbeat_s: float = 1.0,
@@ -863,6 +874,12 @@ class WsHub:
         # 접속 → 구독 채널 집합. 접속 직후 기본 manual(구버전 메인 호환), 구독 메시지로 추가.
         self._subs: dict[web.WebSocketResponse, set[str]] = {}
         self._dirty = asyncio.Event()
+        # trades 채널(3차, 2026-09-15) — HL 공개 체결이 왔을 때만 밀어준다(HL 체결 창).
+        # HTTP 0.3초 폴링으로는 홈페이지 체결 탭보다 0.5초쯤 늦어 보였다(사용자 실측 09-15).
+        # manual/state의 100ms 묶음과 따로 20ms 묶음으로 보낸다(본문이 작아 자주 보내도 됨) —
+        # 100ms 묶음으로도 "살짝 느리다"(사용자 09-15).
+        self._trades_event = asyncio.Event()
+        self.trades_coalesce_s = 0.02
         # state 채널(/state와 동일 페이로드) — 자동T·자동M·설정창·동시호가창용. make_app이 넣는다.
         # 시세 틱마다 보내면 낭비라 **내용이 바뀌었을 때만** 보낸다(마지막 본문과 비교).
         self.state_provider = state_provider
@@ -872,12 +889,33 @@ class WsHub:
         if system is not None:  # 모든 훅은 코어 이벤트 루프 안에서 불린다 → Event.set 안전
             system.on_quote.append(lambda _q: self.mark())
             system.on_mark.append(lambda _m: self.mark())
-            system.on_trade.append(lambda _t: self.mark())
+            system.on_trade.append(self._on_trade)
             system.order_book.on_change.append(self.mark)
 
     def mark(self) -> None:
         """밀어줄 게 생겼다 — 전송 루프가 묶어서 보낸다."""
         self._dirty.set()
+
+    def _on_trade(self, tick: TradeTick) -> None:
+        if tick.market == "hl":
+            self._trades_event.set()
+        self.mark()
+
+    async def _trades_loop(self) -> None:
+        """trades 채널 전송 루프 — HL 체결이 오면 20ms 묶어 구독자에게(하트비트는 run()이)."""
+        while True:
+            await self._trades_event.wait()
+            await asyncio.sleep(self.trades_coalesce_s)
+            self._trades_event.clear()
+            subs = self._subs_of("trades")
+            if subs:
+                await self._broadcast(self._trades_text(), subs)
+                self.pushes += 1
+
+    def _trades_text(self) -> str:
+        """trades 채널 본문 — 종목별 HL 최근 체결(최신이 위). /hl_trades(종목 없음)와 같은 모양."""
+        return _dumps({"channel": "trades", "ts": int(time.time() * 1000),
+                       "data": hl_trades_snapshot(self._system)})
 
     @property
     def subscribers(self) -> int:
@@ -910,7 +948,15 @@ class WsHub:
         self.pushes += 1
 
     async def run(self) -> None:
-        """전송 루프 — dirty면 100ms 묶어 스냅샷, 조용하면 1초 하트비트(채널별)."""
+        """전송 루프 — dirty면 100ms 묶어 스냅샷, 조용하면 1초 하트비트(채널별).
+        trades 채널은 별도 루프(20ms 묶음)."""
+        trades_task = asyncio.create_task(self._trades_loop())
+        try:
+            await self._run_main()
+        finally:
+            trades_task.cancel()
+
+    async def _run_main(self) -> None:
         while True:
             try:
                 await asyncio.wait_for(self._dirty.wait(), timeout=self._heartbeat_s)
@@ -948,6 +994,8 @@ class WsHub:
             body = self._state_body()
             self._last_state_body = body
             await ws.send_str(self._state_text(body))
+        elif channel == "trades":
+            await ws.send_str(self._trades_text())
 
     async def handle(self, request: web.Request) -> web.WebSocketResponse:
         """GET /ws — 접속 즉시 manual 스냅샷 1회, 이후 푸시. `{"subscribe":["state"]}`로 채널 추가
@@ -1083,12 +1131,32 @@ def make_app(
             qty, en, ex = 1, 0.0, 0.0
         return web.json_response(monitor_snapshot(system, qty, en, ex), dumps=_dumps)
 
+    async def get_hl_trades(request: web.Request) -> web.Response:
+        # HL 체결 창(hl_trades) — 코어가 HL WS trades로 받아 종목별 30건 보관(LiveSystem.hl_trades).
+        # 종목 없이 부르면 전 종목(trades 채널과 같은 모양 — 창의 HTTP 폴백용), 종목을 주면 그
+        # 종목 행만. 시스템 없음/종목 오류면 빈 목록.
+        from .bootstrap import hl_trade_rows
+
+        raw = str(request.query.get("underlying", ""))
+        if not raw:
+            return web.json_response(hl_trades_snapshot(system), dumps=_dumps)
+        rows: list[dict[str, Any]] = []
+        try:
+            u = Underlying(raw)
+        except ValueError:
+            u = None
+        if system is not None and u is not None:
+            rows = hl_trade_rows(system.hl_trades.get(u, ()))
+        return web.json_response({"underlying": u.value if u else None, "rows": rows},
+                                 dumps=_dumps)
+
     app = web.Application()
     app.router.add_get("/state", get_state)
     app.router.add_get("/manual_state", get_manual_state)
     if hub is not None:  # 실시간 채널(DESIGN §12.1) — 메인창이 붙는 WebSocket
         app.router.add_get("/ws", hub.handle)
     app.router.add_get("/monitor", get_monitor)
+    app.router.add_get("/hl_trades", get_hl_trades)
     app.router.add_post("/command", post_command)
     return app
 
