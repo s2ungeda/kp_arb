@@ -618,12 +618,17 @@ def main() -> None:
     def on_close() -> None:
         """메인 종료 = 화면들 + 코어까지 함께 종료 (사용자 확정 2026-07-24).
 
-        단, 자동 매매(실행 중 세트)가 있으면 확인창 — 실수로 매매를 끊지 않게.
+        항상 확인창을 띄운다(사용자 2026-09-15) — X를 잘못 눌러 코어·화면이 통째로 내려가지
+        않게. 자동 매매(실행 중 세트)가 있으면 그 사실을 문구에 밝힌다.
         """
         from .ui_dialog import ask_yes_no
 
-        if _auto_running() and not ask_yes_no(
-                root, "종료 확인", "자동 매매가 실행 중입니다.\n코어까지 종료하시겠습니까?"):
+        if _auto_running():
+            msg = ("자동 매매가 실행 중입니다.\n"
+                   "자동 매매를 멈추고 코어·모든 화면을 종료하시겠습니까?")
+        else:
+            msg = "메인을 종료하면 코어와 열린 화면이 모두 함께 종료됩니다.\n종료하시겠습니까?"
+        if not ask_yes_no(root, "종료 확인", msg):
             return
         save_ui_state()  # 닫기 직전 화면 목록 저장 — 다음 실행 때 다시 열림
         closing["flag"] = True
