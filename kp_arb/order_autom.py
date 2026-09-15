@@ -718,7 +718,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 errs.append("청산을 입력하세요")
             errs += check_risk(dtag, en_sf, ex_sf, *_risk_of(dtag))
             offset = parse_qty(ents["offset"].get())
-            errs += price_offset_errors(offset, int(common["pre_tick"].get(cur_under(), 0)))
+            sf_tick = _live_book().get("sf_tick")  # 코어가 실은 지금 가격대의 SF 호가단위
+            errs += price_offset_errors(offset, int(common["pre_tick"].get(cur_under(), 0)),
+                                        int(sf_tick) if isinstance(sf_tick, int) else None)
             if rt_var.get() and not rt_ent.get().strip():  # 체크만 하고 값 없음 → 확인창
                 errs.append("RT 진입수량 수동 입력이 켜져 있는데 값이 없습니다")
             elif rt_var.get():

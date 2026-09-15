@@ -658,3 +658,17 @@ def test_missing_judgment_fx_halts_the_set() -> None:
     idle = _set()
     assert evaluate(idle, Block.EXIT, _sig(fx=None), SETTINGS, U) == []
     assert idle.exit.status is not LegStatus.HALTED
+
+
+def test_price_offset_must_be_multiple_of_market_tick() -> None:
+    # 사용자 2026-09-15: 잘못 넣으면(삼성 호가단위 500에 기준배수 100) 저장 때 바로 경고창.
+    # 코어 스냅샷 sf_tick(지금 가격대 호가단위)이 있을 때만 검사, 없으면 G6이 잡는다.
+    from kp_arb.auto_m import price_offset_errors
+
+    samsung = price_offset_errors(100, 500, 500)[0]  # 실측 15:17 — 삼성 500 호가에 100
+    assert "호가단위(500)의 배수" in samsung and "가능한 값: 0" in samsung
+    msg = price_offset_errors(500, 3000, 1000)[0]
+    assert "호가단위(1,000)의 배수" in msg and "가능한 값: 0, 1,000, 2,000" in msg
+    assert price_offset_errors(1000, 3000, 1000) == []
+    assert price_offset_errors(500, 1000, 500) == []
+    assert price_offset_errors(500, 3000, None) == []  # 시세 없음 → 건너뜀

@@ -52,6 +52,7 @@ from .gateways.ls import OrderGoneError
 from .hl_merge import merge_tick_options
 from .hl_price import hl_round_price
 from .logs import attach_daily_file
+from .ticks import tick_for
 
 if TYPE_CHECKING:
     from .order_book import OrderBook, TrackedOrder
@@ -739,8 +740,15 @@ class AutoMEngine:
                         for s, nsf, mant in merge_tick_options(float(ref))] if ref else [])
         active_fn = getattr(self._system, "hl_merge_active", None)
         active = active_fn(u) if callable(active_fn) else None
+        # SF 시세 호가단위(지금 가격대) — 세트설정 기준배수 검사용(사용자 2026-09-15).
+        # 시세 없으면 None(화면은 그 검사를 건너뛴다)
+        quotes = self._system.quotes
+        sf_q = next((quotes.get((u, inst, m)) for m in ("uni", "krx", "nxt")
+                     if quotes.get((u, inst, m)) is not None), None)
+        sf_ref = (sf_q.ask or sf_q.bid) if sf_q is not None else None
+        sf_tick = tick_for(Instrument.KR_STOCK_FUTURE, float(sf_ref)) if sf_ref else None
         return {"sets": out, "rev_sets": rev_out, "any_running": book.any_running(),
-                "monitor": monitor,
+                "monitor": monitor, "sf_tick": sf_tick,
                 "fx": {"used": fx_used, "src": fx_src},  # 사용 환율(값, 출처 현물|선물이론)
                 "ref_qty": book.ref_qty, "future_month": book.future_month,
                 "hl_merge_ticks": merge_ticks,

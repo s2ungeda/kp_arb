@@ -377,15 +377,20 @@ def pre_order_price(
     return snap_to_unit(side, raw, tick, offset)
 
 
-def price_offset_errors(offset: int, unit: int) -> list[str]:
+def price_offset_errors(offset: int, unit: int, mkt_tick: int | None = None) -> list[str]:
     """세트설정 기준배수 검사(순수) — 0 이상, 선주문 주문단위 미만(같거나 크면 뜻이 없다: 3,000
-    단위에 4,000은 1,000과 같음). 시세 호가단위와의 배수 관계는 그 시점 가격대에 달려 있어
-    판정(G6)에서 검사한다."""
+    단위에 4,000은 1,000과 같음), 그리고 시세 호가단위(mkt_tick, 코어 스냅샷 sf_tick — 지금
+    가격대 기준)의 배수. 호가단위를 모르면(시세 없음) 그 검사는 건너뛰고 판정(G6)이 잡는다
+    (사용자 2026-09-15: 잘못 넣으면 저장 때 바로 경고창)."""
     errs: list[str] = []
     if offset < 0:
         errs.append("기준배수는 0 이상으로 입력하세요")
     elif unit > 0 and offset >= unit:
         errs.append(f"기준배수는 선주문 주문단위({unit:,}) 미만이어야 합니다")
+    elif mkt_tick and offset % mkt_tick != 0:
+        usable = ", ".join(f"{v:,}" for v in range(0, unit, mkt_tick)) if unit > 0 else "0"
+        errs.append(f"기준배수는 시세 호가단위({mkt_tick:,})의 배수여야 합니다 — "
+                    f"주문단위 {unit:,}에서 가능한 값: {usable}")
     return errs
 
 

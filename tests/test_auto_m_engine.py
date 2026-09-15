@@ -254,6 +254,7 @@ async def test_engine_reverse_round_sells_sf_then_buys_hl() -> None:
     assert r.hl_net == 100 and r.fill_diff == 0 and r.entry.status is LegStatus.SETTLE_DELAY
     snap = eng.live_snapshot()[U.value]
     assert snap["rev_sets"][0]["rt"] == -10 and snap["rev_sets"][0]["reverse"] is True
+    assert snap["sf_tick"] == 1000  # 세트설정 기준배수 검사용 SF 호가단위(2026-09-15, 160만 원대)
     assert snap["sets"][0]["rt"] == 0
     assert eng._tag(U, 0, Block.ENTRY, True) == "역방향 1세트 진입"
 
