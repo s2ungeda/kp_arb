@@ -60,6 +60,7 @@ from .strategy.base import Strategy
 from .theory import (
     carry_theory,
     days_to_expiry,
+    fx_theory_base_and_carry,
     in_time_window,
     is_rolled,
     parse_hhmm,
@@ -470,30 +471,45 @@ class LiveSystem:
         # 환율이론가는 선물가 수신 때 계산해 둔 값이라, 금리만 바뀌면 다음 선물 틱까지 옛 금리로
         # 남는다(2026-09-03 실측: 설정 0.4%로 바꿔도 16시 이후 1.0% 값 유지, 엑셀과 0.40원 차이).
         # 저장된 최근월물 가격으로 즉시 다시 계산한다. (주식선물 이론가는 호출 때 계산하므로 무관)
-        if self._fx_futures is not None:
-            code = self._fx_futures[0]
-            price = self.fx_futures_price.get(code)
-            if price is not None:
-                self._apply_fx_price(code, price)
+        self._recompute_fx_theory()
 
     def _apply_fx_quote(self, code: str, bid: float, ask: float) -> None:
+        """원달러선물 1호가 수신 → 저장(환진입가용) + 최근월물이면 환율이론가 재계산(2026-09-15)."""
         self.fx_futures_quote[code] = (bid, ask)
+        if self._fx_futures is not None and code == self._fx_futures[0]:
+            self._recompute_fx_theory()
+
+    def _recompute_fx_theory(self) -> None:
+        """환율이론가(판정용 야간·현물 없음 대체) = 최근월물 (현재가 + 매도1호가 + 매수1호가)/3
+        × (1 + 연이자율 × 잔존일/365) — 사용자 확정 2026-09-15(옛 식은 현재가만). 셋 중 하나라도
+        없으면 **계산불가(None)** — 자동M은 판정 환율이 없으면 세트를 중지한다(exec §4 G0)."""
+        from datetime import date
+
+        if self._fx_futures is None:
+            self.usdkrw_theory = None
+            return
+        code, ym = self._fx_futures
+        price = self.fx_futures_price.get(code)
+        quote = self.fx_futures_quote.get(code)
+        self.usdkrw_theory = fx_theory_base_and_carry(
+            price, quote, days_to_expiry(ym, "USD", date.today()), self._carry.fx)
 
     def futures_halted(self) -> bool:
         """선물시장(5) 정지 오버레이(사이드카·서킷) 여부 — 자동M 판정용(exec §8)."""
         return self.session.halt_for(FUTURES_MARKET) is not None
 
     def fx_entry_rate(self, side: Side) -> float | None:
-        """자동M 환진입가(§9a) — 최근월물 원달러선물의 매수1호가(HL 매도, −환) / 매도1호가(HL 매수).
-        호가가 없으면 현물환율(LS CUR, 없으면 하나고시 백업값), 그것도 없으면 선물 직전 체결가,
-        그것도 없으면 None(사용자 확정 2026-09-14 — 옛 순서는 호가 → 직전 체결가)."""
+        """자동M 환진입가(§10) — 최근월물 원달러선물의 매수1호가(HL 매도, −환) / 매도1호가(HL 매수).
+        호가가 없으면 **LS 현물환(CUR)만**(하나고시 백업값은 쓰지 않음), 그것도 없으면 None
+        (사용자 확정 2026-09-15 — 09-14 순서의 "하나고시 백업 → 선물 직전 체결가"를 뺐다:
+        정산값에 고시환율·체결가 같은 다른 성격의 값을 섞지 않는다)."""
         code = self._fx_futures[0] if self._fx_futures is not None else None
         quote = self.fx_futures_quote.get(code) if code is not None else None
         if quote is not None:
             return quote[0] if side is Side.SELL else quote[1]
-        if self.usdkrw_spot is not None:
+        if self.usdkrw_spot is not None and self.usdkrw_spot_src == "LS":
             return self.usdkrw_spot
-        return self.fx_futures_price.get(code) if code is not None else None
+        return None
 
     def set_fx_spot_window(self, start: str, end: str) -> None:
         """현물환율(CUR) 사용 시간대 반영("HH:MM") — 코어가 공통설정에서 주입(사용자 입력,
@@ -1171,29 +1187,32 @@ class LiveSystem:
                 self._guarded_ws("HL", self._hl_ws.run, self._mark_ws_dead)))
 
     def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]:
-        """HL 환산에 실제 쓰는 환율과 출처: 주간 창(fx_spot_window) 안이고 외환현물이
-        있으면 ("현물"), 아니면 환율이론가("선물이론"). (값, 출처) 반환."""
+        """판정용 환율(HL 환산)과 출처 — 사용자 확정 2026-09-15.
+        ① 현물환 사용 시간대(공통설정, 기본 07:00~18:10) 안이고 현물환이 있으면 현물환("현물").
+           본선은 LS CUR, 못 받으면 하나고시 백업값(usdkrw_spot_src로 구분, LS가 다시 오면 LS).
+        ② 그 밖(시간대 밖·현물 없음)은 환율이론가("선물이론") = 원달러선물 최근월물
+           (현재가+매수1호가+매도1호가)/3 × 캐리.
+        ③ 이론가도 못 구하면 (None, "계산불가") — 자동M은 실행 중인 세트를 중지한다(exec §4 G0)."""
         moment = now if now is not None else datetime.now()
         if self.usdkrw_spot is not None and in_time_window(
             moment.time(), *self._fx_spot_window
         ):
             return self.usdkrw_spot, "현물"
+        if self.usdkrw_theory is None:
+            return None, "계산불가"
         return self.usdkrw_theory, "선물이론"
 
     def _apply_fx_price(self, code: str, price: float) -> None:
         """원달러선물 현재가 수신 → 월물별 저장 + **최근월물만** 환율이론가(현물환산) 갱신.
-        차근월물은 저장만 한다(§9.1 — 헤지 월물 선택용). WS(FC9/DC0)·예비 조회 공용."""
-        from datetime import date
-
+        차근월물은 저장만 한다(§9.1 — 헤지 월물 선택용). WS(FC9/DC0)·예비 조회 공용.
+        이론가는 현재가·1호가 셋의 평균이 바탕(2026-09-15) — 호가가 아직 없으면 계산불가."""
         if price <= 0:
             return
         self.fx_futures_price[code] = price  # 근·차근 모두 최신가 보관
         if self._fx_futures is None or code != self._fx_futures[0]:
             return  # 차근월물 등은 환율이론가에 안 먹인다(최근월물 기준 유지)
-        _, ym = self._fx_futures
-        days = days_to_expiry(ym, "USD", date.today())
         self.usdkrw_futures = price
-        self.usdkrw_theory = carry_theory(price, days, self._carry.fx)
+        self._recompute_fx_theory()
 
     def _apply_fx_spot(self, rate: float) -> None:
         """원달러 현물환율(CUR) 실시간 수신 → HL 환산 본선 환율. Naver 백업은 이걸로 억제."""

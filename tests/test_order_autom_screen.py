@@ -112,3 +112,29 @@ def test_sum_acc_uses_matched_smaller_side() -> None:
     assert abs(agg["hl_qty"] - 0.588) < 1e-9 and abs(agg["sf_qty"] - 0.0588) < 1e-9
     old = sum_acc([{"entry": {"hl_qty": 25, "sf_qty": 4}}], "entry")  # matched 키 없는 옛 스냅샷
     assert old["hl_qty"] == 25 and old["sf_qty"] == 2.5
+
+
+def test_set_payload_carries_price_offset() -> None:
+    # 세트설정 기준배수(2026-09-15) — 없으면 0
+    w = {"target": 1, "per": 1, "delay": 0, "offset": 1000, "en_sf": 0.5, "en_s": 0.5,
+         "ex_sf": -0.1}
+    assert set_payload(0, w, "sk_hynix")["price_offset"] == 1000
+    assert set_payload(0, {**w, "offset": None}, "sk_hynix")["price_offset"] == 0
+    sig_a = set_inputs_sig({"sets": [{"target_qty": 1, "price_offset": 0}]})
+    sig_b = set_inputs_sig({"sets": [{"target_qty": 1, "price_offset": 1000}]})
+    assert sig_a != sig_b  # 다른 창이 기준배수를 바꾸면 이 창도 다시 읽는다
+
+
+def test_acc_clear_keeps_dash_until_core_snapshot_is_cleared() -> None:
+    # 사용자 2026-09-15: 매매결과 clear를 누르면 한 번 깜빡였다 — 옛 합계를 실은 스냅샷이 clear
+    # 직후 도착해 되살아났다가 지워짐. clear 뒤엔 합계 0이 올 때까지(상한 3초) 그리지 않는다.
+    from kp_arb.order_autom import ACC_CLEAR_WAIT_S, acc_clear_pending
+
+    pending = {("fwd", "진입"): 100.0}
+    assert acc_clear_pending(pending, ("fwd", "진입"), 25.0, 100.5) is True   # 옛 값 → 안 그림
+    assert acc_clear_pending(pending, ("fwd", "청산"), 25.0, 100.5) is False  # 다른 그룹은 그대로
+    assert acc_clear_pending(pending, ("fwd", "진입"), 0.0, 101.0) is False   # 지워진 값 → 그림
+    assert ("fwd", "진입") not in pending
+    pending = {("rev", "진입"): 100.0}
+    assert acc_clear_pending(pending, ("rev", "진입"), 25.0, 100.0 + ACC_CLEAR_WAIT_S) is False
+    assert not pending  # 상한 지나면 굳지 않게 그린다

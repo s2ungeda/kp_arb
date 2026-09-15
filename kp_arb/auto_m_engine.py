@@ -497,7 +497,13 @@ class AutoMEngine:
                            u.value, tag, order.order_id, order.intent.side.value, qty,
                            f"{price:,.0f}", est_pair, leg.pre_filled, leg.pre_qty)
         else:
-            fx = self._system.fx_entry_rate(order.intent.side) or 0.0
+            # 환진입가: 원달러선물 1호가 → LS 현물환 → 없음(사용자 확정 2026-09-15). 없으면 그
+            # 체결은 환 없이 쌓이고 경고 한 줄.
+            fx = self._system.fx_entry_rate(order.intent.side)
+            if fx is None:
+                self._log.warning("[자동M] %s 후주문 체결 %s #%s — 환진입가 없음(원달러선물 호가·"
+                                  "LS 현물환 모두 없음) → 이 체결은 환평균·Sprd에서 제외",
+                                  u.value, tag, order.order_id)
             # Sprd 기준값(S현재가·SF이론가)은 **이 체결 시점** 값을 판 버퍼에 넣는다(사용자 확정
             # 2026-09-10 — 실시간을 쓰면 매매결과가 시세 따라 계속 바뀜). 로그에도 같은 값.
             stock = self._system.stock_last(u)
@@ -511,9 +517,9 @@ class AutoMEngine:
             est_txt = (self._est_vs_fill(leg.pre_est, order.intent.side, price)
                        + f" 현est {self._fmt_est(est_now)}")
             self.ulog(u).info(
-                "체결 %s: 후주문 #%s HL %g @ %g %s 환진입가 %g S현재가 %s SF이론가 %s → RT %d "
+                "체결 %s: 후주문 #%s HL %g @ %g %s 환진입가 %s S현재가 %s SF이론가 %s → RT %d "
                 "HL대기 %g | %s | 누적 HL %g SF %g 환평균 %s HL평균 %s SF평균 %s Sprd %s",
-                tag, order.order_id, qty, price, est_txt, fx,
+                tag, order.order_id, qty, price, est_txt, f"{fx:g}" if fx else "없음",
                 stock, f"{theory:,.0f}" if theory else None, s.rt, leg.post_pending,
                 self._ledger(s), acc.hl_qty, acc.sf_qty, acc.fx_avg(), acc.hl_avg(),
                 acc.sf_avg(), f"{sprd * 100:.3f}%" if sprd is not None else "-(판 미완)")

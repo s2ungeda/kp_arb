@@ -1,5 +1,15 @@
 """공통 팝업 — 부모 창 중앙 배치 계산(순수 함수)."""
-from kp_arb.ui_dialog import centered_geometry
+from kp_arb.ui_dialog import centered_geometry, hint_position
+
+
+def test_hint_position_prefers_above_then_below_and_clamps() -> None:
+    # 상태줄 전문 힌트(2026-09-15): 기본은 상태줄 바로 위, 위가 모니터 밖이면 아래, 좌우는 작업
+    # 영역 안.
+    bounds = (0, 0, 1000, 800)
+    assert hint_position(100, 700, 20, 300, 60, bounds) == (100, 636)  # 위
+    assert hint_position(100, 30, 20, 300, 60, bounds) == (100, 54)  # 위 자리 없음 → 아래
+    assert hint_position(900, 700, 20, 300, 60, bounds) == (700, 636)  # 오른쪽 넘침 → 안으로
+    assert hint_position(100, 30, 20, 300, 60, None) == (100, 54)  # 영역 정보 없음
 
 
 def test_centered_geometry_on_parent() -> None:

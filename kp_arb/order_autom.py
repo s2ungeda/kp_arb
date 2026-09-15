@@ -16,6 +16,7 @@ import json
 from functools import partial
 from typing import Any
 
+from .auto_m import SET_COUNT_FWD, SET_COUNT_REV, price_offset_errors
 from .order_autot import (
     UNDER_MAP,
     UNDERLYINGS,
@@ -37,11 +38,19 @@ _DIRECTIONS = (
 # 국내 체결은 SF라 목업의 'S'를 'SF'로 표기(사용자 2026-09-09).
 _ACC_ROWS_FWD = (("진입", ("-HP", "+SF", "-환")), ("청산", ("+HP", "-SF", "+환")))
 _ACC_ROWS_REV = (("진입", ("+HP", "-SF", "+환")), ("청산", ("-HP", "+SF", "-환")))
+# 방향별 세트 줄 수 = 코어 세트 수(정 4·역 2, 사용자 확정 2026-09-15). 배치 검토는 값을 바꿔 띄운다.
+SET_ROWS: dict[str, int] = {"fwd": SET_COUNT_FWD, "rev": SET_COUNT_REV}
+
+
+def section_height(rows: int) -> int:
+    """방향 섹션이 차지하는 그리드 줄 수 = 제목 1 + 컬럼헤더 1 + 세트 줄. 매매결과 블록(Sprd+3칸)이
+    헤더 줄부터 4줄을 쓰므로 세트가 3줄 미만이어도 높이는 5 이상."""
+    return 2 + max(rows, 3)
 
 # 바탕색 선택(상단 콤보, 사용자 2026-09-10) — 채도 낮은 옅은 색만(흰 칸·노란 칸·빨강/파랑
 # 모니터 칸이 묻히지 않게). "기본"은 시스템 기본(회색).
-_BG_CHOICES: dict[str, str | None] = {"기본": None, "하늘": "#e8f0f8", "민트": "#eaf4ee",
-                                      "베이지": "#f5f0e6"}
+_BG_CHOICES: dict[str, str | None] = {"기본": None, "흰색": "#ffffff", "하늘": "#e8f0f8",
+                                      "민트": "#eaf4ee", "베이지": "#f5f0e6"}  # 흰색 추가 09-15
 
 # 선물 월물 콤보(상단) — 표시 → 코어 settings.future_month 값 (DESIGN §5.11)
 MONTH_MAP = {"최근": "near", "차근": "next"}  # 표시는 '최근/차근'(사용자 2026-09-03)
@@ -59,6 +68,7 @@ def set_payload(index: int, w: dict[str, Any], underlying: str,
         "cmd": "autom_set", "underlying": underlying, "set": index, "direction": direction,
         "target_qty": int(w.get("target") or 0), "per_qty": int(w.get("per") or 0),
         "switch_delay_s": int(w.get("delay") or 0),
+        "price_offset": int(w.get("offset") or 0),  # 주문가 기준배수(원, 2026-09-15)
         "en_sf": pct_to_frac(w.get("en_sf")), "en_s": pct_to_frac(w.get("en_s")),
         "ex_sf": pct_to_frac(w.get("ex_sf")),
         "rt_manual": w.get("rt_manual"), "clear_diff": bool(w.get("clear_diff")),
@@ -93,6 +103,26 @@ def fx_caption(used: object, src: object) -> str:
         return "환율 -"
     tail = f" ({src})" if src else ""
     return f"환율 {float(used):,.2f}{tail}"
+
+
+ACC_CLEAR_WAIT_S = 3.0  # 누적 clear 뒤 코어 스냅샷이 지워진 값을 실어 올 때까지 "-" 유지 상한
+
+
+def acc_clear_pending(pending: dict[tuple[str, str], float], key: tuple[str, str],
+                      hl_qty: float, now: float) -> bool:
+    """매매결과 clear 직후 옛 합계를 다시 그리지 않기 위한 판정(순수, 2026-09-15).
+
+    clear를 누르면 화면은 "-"를 쓰고 코어에 명령을 보내는데, 그 사이 도착하는 스냅샷은 아직
+    옛 값이라 한 번 되살아났다가 지워지며 깜빡였다. pending에 (방향, 그룹)이 있는 동안 스냅샷
+    합계가 0이 아니면 그리지 않는다(True). 합계가 0으로 오거나 상한 시간을 넘기면 pending에서
+    지우고 그린다(False) — 코어가 명령을 못 받았어도 화면이 영원히 굳지 않게."""
+    started = pending.get(key)
+    if started is None:
+        return False
+    if hl_qty <= 0 or now - started >= ACC_CLEAR_WAIT_S:
+        del pending[key]
+        return False
+    return True
 
 
 def sum_acc(rows: list[dict[str, Any]], leg: str) -> dict[str, float | None]:
@@ -132,7 +162,8 @@ _REL_CHOICES_BUY = [f"상대{n}호가 - 1틱" for n in range(1, 6)]
 _REL_CHOICES_SELL = [f"상대{n}호가 + 1틱" for n in range(1, 6)]
 
 
-_SET_INPUT_KEYS = ("target_qty", "per_qty", "switch_delay_s", "en_sf", "en_s", "ex_sf")
+_SET_INPUT_KEYS = ("target_qty", "per_qty", "switch_delay_s", "price_offset",
+                   "en_sf", "en_s", "ex_sf")
 
 
 def set_inputs_sig(book: dict[str, Any]) -> str:
@@ -145,8 +176,8 @@ def set_inputs_sig(book: dict[str, Any]) -> str:
     rows = book.get("sets")
     if not isinstance(rows, list):
         return ""
-    rev = book.get("rev_sets")  # 역방향 3세트(2026-09-14) — 옛 코어 스냅샷엔 없을 수 있음
-    both = rows[:3] + (rev[:3] if isinstance(rev, list) else [])
+    rev = book.get("rev_sets")  # 역방향 세트(2026-09-14) — 옛 코어 스냅샷엔 없을 수 있음
+    both = rows[:SET_ROWS["fwd"]] + (rev[:SET_ROWS["rev"]] if isinstance(rev, list) else [])
     return json.dumps([[r.get(k) for k in _SET_INPUT_KEYS] for r in both
                        if isinstance(r, dict)], sort_keys=True)
 
@@ -269,8 +300,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 세트: 진입 SF·S 2개 + 청산 SF 1개 (자동T는 진입/청산 1개씩)
     sets: dict[tuple[str, int], dict[str, Any]] = {}
     for d, *_ in _DIRECTIONS:
-        for i in range(3):
-            sets[(d, i)] = {"target": 0, "per": 0, "delay": 0, "en_sf": None,
+        for i in range(SET_ROWS[d]):
+            sets[(d, i)] = {"target": 0, "per": 0, "delay": 0, "offset": 0, "en_sf": None,
                             "en_s": None, "ex_sf": None, "rt_manual": None,
                             "clear_diff": False}
 
@@ -433,7 +464,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             mon["fx"] = tk.Label(grid, text="환율 -", font=T.FONT_LABEL, fg="gray25", anchor="e")
             mon["fx"].grid(row=rbase, column=8, columnspan=3, sticky="e", padx=(0, 2))
         ttk.Separator(grid, orient="vertical").grid(
-            row=rbase, column=nset, rowspan=5, sticky="ns", padx=3)
+            row=rbase, column=nset, rowspan=section_height(SET_ROWS[dtag]), sticky="ns", padx=3)
         acc_cols: dict[str, tuple[int, int, tuple[str, ...]]] = {}
         cum_labels: dict[str, tk.Label] = {}
         for gi, (glabel, comps) in enumerate(acc_rows):
@@ -451,7 +482,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             tk.Label(grid, text=h, fg="gray25", font=T.FONT_LABEL).grid(
                 row=rbase + 1, column=c, padx=1, sticky="nsew")
 
-        for i in range(3):  # 세트 3줄
+        for i in range(SET_ROWS[dtag]):  # 세트 줄(기본 3)
             r = rbase + i + 2
             w = sets[(dtag, i)]
             lbl_tg = tk.Label(grid, text="-", width=6, anchor="e", bg="#fffbcc",
@@ -500,15 +531,23 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             btn_ex.config(command=partial(toggle_run, dtag, i, "ex"))
 
         # 매매결과 값 — Sprd=컬럼헤더 줄, -HP/+SF/-환=세트1~3 줄. 탑·끝 라인 정렬.
+        # 세트가 3줄을 넘으면 블록을 그만큼 내려 **끝 줄을 마지막 세트에 맞추고 위를 비운다**
+        # (사용자 2026-09-15, 4세트 배치 검토).
+        shift = max(0, SET_ROWS[dtag] - 3)
+        if shift:
+            for lcol, vcol, _comps in acc_cols.values():
+                for col in (lcol, vcol):
+                    for child in grid.grid_slaves(row=rbase, column=col):
+                        child.grid_configure(row=rbase + shift)
         for glabel, (lcol, vcol, comps) in acc_cols.items():
             labels: dict[str, tk.Label] = {"누적": cum_labels[glabel]}
             for ri, comp in enumerate(("Sprd", *comps)):
                 tk.Label(grid, text=comp, fg="gray30", font=T.FONT_LABEL).grid(
-                    row=rbase + ri + 1, column=lcol, padx=(2, 0), sticky="e")
+                    row=rbase + shift + ri + 1, column=lcol, padx=(2, 0), sticky="e")
                 v = tk.Label(grid, text="-", width=7, anchor="e", relief="solid",
                              bd=1, font=T.FONT_BASE_LG,
                              bg="#fffbcc" if comp == "Sprd" else "white")
-                v.grid(row=rbase + ri + 1, column=vcol, padx=1, pady=1, sticky="nsew")
+                v.grid(row=rbase + shift + ri + 1, column=vcol, padx=1, pady=1, sticky="nsew")
                 labels[comp] = v
             sets[(dtag, 0)].setdefault("_acc", {})[glabel] = labels
 
@@ -595,11 +634,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         accs = sets[(dtag, 0)].get("_acc", {}).get(group, {})
         for lbl in accs.values():
             lbl.config(text="-")
-        # 누적은 세트별로 코어가 들고 있다 → 그 방향 3세트 모두 clear
+        # 누적은 세트별로 코어가 들고 있다 → 그 방향 전 세트를 **한 명령**으로 clear. 세트마다
+        # 따로 보내면 그 사이 스냅샷이 반쯤 지워진 합계를 싣고, 화면은 그 옛 값을 한 번 그렸다가
+        # 다시 지워 깜빡였다(사용자 2026-09-15). 코어 스냅샷에 지워진 값이 올 때까지는 "-" 유지.
         block = "entry" if group == "진입" else "exit"
-        for idx in range(3):
-            send({"cmd": "autom_clear_acc", "underlying": cur_under(), "set": idx,
-                  "block": block, "direction": dtag}, "누적 clear")
+        state_box.setdefault("_acc_clear", {})[(dtag, group)] = time.monotonic()
+        send({"cmd": "autom_clear_acc", "underlying": cur_under(), "set": "all",
+              "block": block, "direction": dtag}, "누적 clear")
 
     def _risk_of(dtag: str) -> tuple[float, float, float]:
         r = common["risk"]
@@ -623,9 +664,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         win.resizable(False, False)
         win.transient(root)
         # 진입은 SF·S 두 칸, 청산은 SF 한 칸 (자동T 대비 한 줄 늘어남)
+        # 기준배수(원, 2026-09-15) = 역산가를 주문단위로 맞출 때의 기준점(0이면 0원 기준 배수).
+        # 목업(STG_2/세트설정.png) 6칸 뒤에 한 줄 추가.
         rows = [("목표수량", "target", vcmd_int), ("1회주문수량", "per", vcmd_int),
                 ("전환딜레이(초)", "delay", vcmd_int), ("진입SF", "en_sf", vcmd_dec),
-                ("진입S", "en_s", vcmd_dec), ("청산", "ex_sf", vcmd_dec)]
+                ("진입S", "en_s", vcmd_dec), ("청산", "ex_sf", vcmd_dec),
+                ("주문가 기준배수(원)", "offset", vcmd_int)]
         ents: dict[str, tk.Entry] = {}
         inline_map = {"en_sf": "e_en_sf", "en_s": "e_en_s", "ex_sf": "e_ex_sf"}
         for r, (label, key, vc) in enumerate(rows):
@@ -635,9 +679,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                          validatecommand=vc)
             if key in inline_map:  # 진입SF·진입S·청산 = 화면 인라인 현재값
                 e.insert(0, w[inline_map[key]].get())
-            else:  # 목표수량·1회주문·전환딜레이 = 세트 상태값 (전환딜레이는 0도 유효한 값)
+            else:  # 목표수량·1회주문·전환딜레이·기준배수 = 세트 상태값 (딜레이·기준배수는 0도 값)
                 val = w.get(key)
-                blank = val is None or (val == 0 and key != "delay")
+                blank = val is None or (val == 0 and key not in ("delay", "offset"))
                 e.insert(0, "" if blank else str(val))
             e.grid(row=r, column=1, padx=6, pady=3)
             ents[key] = e
@@ -673,6 +717,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             if ex_sf is None:
                 errs.append("청산을 입력하세요")
             errs += check_risk(dtag, en_sf, ex_sf, *_risk_of(dtag))
+            offset = parse_qty(ents["offset"].get())
+            errs += price_offset_errors(offset, int(common["pre_tick"].get(cur_under(), 0)))
             if rt_var.get() and not rt_ent.get().strip():  # 체크만 하고 값 없음 → 확인창
                 errs.append("RT 진입수량 수동 입력이 켜져 있는데 값이 없습니다")
             elif rt_var.get():
@@ -682,6 +728,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 return
             w["target"], w["per"] = target, per
             w["delay"] = parse_qty(ents["delay"].get())
+            w["offset"] = offset
             w["en_sf"], w["en_s"], w["ex_sf"] = en_sf, en_s, ex_sf
             w["rt_manual"] = parse_qty(rt_ent.get()) if rt_var.get() else None
             w["clear_diff"] = diff_var.get()
@@ -852,9 +899,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     board = tk.Frame(root)  # 두 방향 공유 그리드
     board.pack(fill="x", padx=4, pady=(1, 2), anchor="w")
+    rbase = 0
     for di, (dtag, name, en_sf, en_s, ex_sf) in enumerate(_DIRECTIONS):
-        rbase = di * 6  # 정방향 0~4, (5=구분선), 역방향 6~10
+        # 정방향 0~(높이−1), 구분선 1줄, 역방향 그 다음 — 기본 3·3세트면 0~4 / 5 / 6~10
         if di > 0:
+            rbase += section_height(SET_ROWS[_DIRECTIONS[di - 1][0]]) + 1
             ttk.Separator(board, orient="horizontal").grid(
                 row=rbase - 1, column=0, columnspan=16, sticky="ew", pady=3)
         acc_rows = _ACC_ROWS_FWD if dtag == "fwd" else _ACC_ROWS_REV
@@ -883,9 +932,21 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # width=1: 상태줄 글이 길어도(중지 사유 등) 창 폭을 밀어 키우지 않게 — 라벨이 요구하는 폭을
     # 1글자로 두고 pack(fill="x")로 창 폭만큼만 보인다(넘치는 글은 잘림, 전문은 로그에). 09-08.
-    status = tk.Label(root, anchor="w", relief="groove", width=1,
-                      text="UI 미리보기 — 코어 미연결" if preview else "코어 확인 중 ...")
-    status.pack(fill="x", padx=4, pady=(2, 4))
+    status_text = "UI 미리보기 — 코어 미연결" if preview else "코어 확인 중 ..."
+    last_tag, last_rows = _DIRECTIONS[-1][0], SET_ROWS[_DIRECTIONS[-1][0]]
+    if last_rows < 3:
+        # 마지막 방향의 세트가 3줄 미만이면 매매결과 블록 옆 빈 줄에 상태줄을 넣어 창 높이를 아낀다
+        # (사용자 2026-09-15, 역방향 2세트 배치). 세트 컬럼(0~10) 폭만 차지.
+        status = tk.Label(board, anchor="w", relief="groove", width=1, text=status_text)
+        status.grid(row=rbase + 2 + last_rows, column=0, columnspan=11, sticky="ew",
+                    padx=1, pady=(3, 1))
+    else:
+        status = tk.Label(root, anchor="w", relief="groove", width=1, text=status_text)
+        status.pack(fill="x", padx=4, pady=(2, 4))
+    del last_tag
+    from .ui_dialog import attach_full_text_popup
+
+    attach_full_text_popup(status, root)  # 더블클릭 → 잘린 상태줄 전문을 힌트 창으로(2026-09-15)
     refresh_windows_bar()  # 상단 주문가능시간 표시 초기화
 
     def _live_book() -> dict[str, Any]:
@@ -1086,7 +1147,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         """코어 책의 세트 입력값(목표·1회·전환초·진입SF·진입S·청산)을 그 방향 3세트 칸에 채운다.
         skip_focused: 지금 인라인 칸을 편집 중인 세트는 건너뛴다(입력 중 값이 튀지 않게)."""
         focused = root.focus_get() if skip_focused else None
-        for i, raw in enumerate(rows[:3]):
+        for i, raw in enumerate(rows[:SET_ROWS[dtag]]):
             if not isinstance(raw, dict):
                 continue
             w = sets[(dtag, i)]
@@ -1095,6 +1156,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             w["target"] = int(raw.get("target_qty") or 0)
             w["per"] = int(raw.get("per_qty") or 0)
             w["delay"] = int(raw.get("switch_delay_s") or 0)
+            w["offset"] = int(raw.get("price_offset") or 0)
             for key in ("en_sf", "en_s", "ex_sf"):
                 v = raw.get(key)
                 w[key] = float(v) * 100.0 if isinstance(v, int | float) else None
@@ -1227,6 +1289,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 if not labels or not rows:
                     continue
                 agg = sum_acc(rows, leg)
+                if acc_clear_pending(state_box.get("_acc_clear") or {}, (dtag, glabel),
+                                     float(agg["hl_qty"] or 0), time.monotonic()):
+                    continue  # clear 눌렀는데 아직 옛 합계 — "-" 그대로 둔다
                 hp_key, s_key, fx_key = dict(acc_rows)[glabel]
                 # 누적체결량 칸 = 짝이 맞은 HL 체결량(사용자 2026-09-09) — 소수면 자릿수를 붙인다
                 hl_q = float(agg["hl_qty"] or 0)

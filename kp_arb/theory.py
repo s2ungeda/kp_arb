@@ -62,6 +62,20 @@ def carry_theory(base_price: float, days: int, annual_rate: float) -> float:
     return base_price * (1.0 + annual_rate * days / 365.0)
 
 
+def fx_theory_base_and_carry(
+    last: float | None, quote: tuple[float, float] | None, days: int, annual_rate: float,
+) -> float | None:
+    """환율이론가(판정용) = 원달러선물 최근월물 (현재가 + 매수1호가 + 매도1호가)/3 × (1 + 연이자율 ×
+    잔존일/365) — 사용자 확정 2026-09-15(옛 식은 현재가만). 현재가·호가 중 하나라도 없거나 0이면
+    **계산불가(None)**."""
+    if not last or quote is None:
+        return None
+    bid, ask = quote
+    if not bid or not ask:
+        return None
+    return carry_theory((last + bid + ask) / 3.0, days, annual_rate)
+
+
 def parse_ym(hname: str) -> int | None:
     """선물 hname에서 만기 YYYYMM 추출 (t8401/t8426 = 6자리, 지수 t9943 = YYMM 4자리)."""
     m6 = re.findall(r"\d{6}", hname or "")

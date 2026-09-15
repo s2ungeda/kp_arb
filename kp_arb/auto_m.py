@@ -134,6 +134,9 @@ class Accum:
     hl_qty: float = 0.0
     hl_px_sum: float = 0.0   # HL 체결가 × 수량 합
     fx_sum: float = 0.0      # 환진입가(원달러선물 호가) × HL 수량 합
+    # 환진입가가 기록된 HL 수량(분모, 2026-09-15) — 호가·LS 현물환이 다 없으면 그 체결은 환 없이
+    # 쌓인다(값 없음). 옛 저장본엔 이 칸이 없어 0이면 hl_qty로 나눈다.
+    fx_qty: float = 0.0
     sf_qty: float = 0.0      # SF 체결 계약수(중지 때 짝 맞은 몫만 넣으면 소수 가능)
     sf_px_sum: float = 0.0
     # Sprd 기준값도 **후주문 체결 시점** 값(사용자 확정 2026-09-10 — 실시간을 쓰면 판이 끝나도
@@ -149,6 +152,7 @@ class Accum:
             self.hl_qty += pending.hl_qty
             self.hl_px_sum += pending.hl_px_sum
             self.fx_sum += pending.fx_sum
+            self.fx_qty += pending.fx_qty
             self.s_px_sum += pending.s_px_sum
             self.theory_sum += pending.theory_sum
             self.ref_qty += pending.ref_qty
@@ -162,7 +166,9 @@ class Accum:
         hl_avg, fx_avg, sf_avg = pending.hl_avg(), pending.fx_avg(), pending.sf_avg()
         self.hl_qty += hl_take
         self.hl_px_sum += (hl_avg or 0.0) * hl_take
-        self.fx_sum += (fx_avg or 0.0) * hl_take
+        if fx_avg is not None:  # 환진입가가 있던 판만(분모도 같이)
+            self.fx_sum += fx_avg * hl_take
+            self.fx_qty += hl_take
         if pending.ref_qty > 0:  # 기준값이 있던 판만 — 짝 맞은 몫만큼
             self.s_px_sum += (pending.s_avg() or 0.0) * hl_take
             self.theory_sum += (pending.theory_avg() or 0.0) * hl_take
@@ -174,7 +180,13 @@ class Accum:
         return self.hl_px_sum / self.hl_qty if self.hl_qty > 0 else None
 
     def fx_avg(self) -> float | None:
-        return self.fx_sum / self.hl_qty if self.hl_qty > 0 else None
+        """환진입가의 HL 수량 가중평균 — 환이 기록된 체결(fx_qty)만 분모. 옛 저장본(fx_qty 없음)은
+        hl_qty로. 환이 한 번도 없었으면 None(값 없음)."""
+        if self.fx_qty > 0:
+            return self.fx_sum / self.fx_qty
+        if self.fx_sum > 0 and self.hl_qty > 0:
+            return self.fx_sum / self.hl_qty
+        return None
 
     def s_avg(self) -> float | None:
         """후주문 체결 시점 S현재가의 HL 수량 가중평균(기록된 체결이 없으면 None)."""
@@ -211,7 +223,7 @@ class Accum:
         return (fx * hl - stock) / stock - (sf - theory) / theory
 
     def clear(self) -> None:
-        self.hl_qty = self.hl_px_sum = self.fx_sum = self.sf_px_sum = 0.0
+        self.hl_qty = self.hl_px_sum = self.fx_sum = self.fx_qty = self.sf_px_sum = 0.0
         self.s_px_sum = self.theory_sum = self.ref_qty = 0.0
         self.sf_qty = 0.0
 
@@ -281,6 +293,9 @@ class AutoMSet:
     target_qty: int = 0
     per_qty: int = 0
     switch_delay_s: int = 0                 # 전환딜레이(초)
+    # 주문가 기준배수(원, 사용자 2026-09-15) — 역산가를 주문단위로 맞출 때의 기준점. 0이면
+    # 0·3,000·6,000…(0원 기준 배수), 1,000이면 1,000·4,000·7,000…. 0 이상 주문단위 미만.
+    price_offset: int = 0
     en_sf: float | None = None              # 진입 SF 기준값(소수, 0.005 = 0.5%)
     en_s: float | None = None               # 진입 S 기준값
     ex_sf: float | None = None              # 청산 SF 기준값
@@ -343,13 +358,35 @@ def limit_price(side: Side, rel_px: float, tick: int, rng: float) -> float:
     return start * (1.0 - rng) if side is Side.BUY else start * (1.0 + rng)
 
 
+def snap_to_unit(side: Side, raw: float, unit: int, offset: int = 0) -> float:
+    """역산가 원값을 주문단위 격자(offset + k×unit)에 맞춘다 — 매수 내림 / 매도 올림(§11.6).
+    기준배수 offset(세트설정, 2026-09-15): 0이면 0·unit·2unit…, 1,000이면 1,000·1,000+unit…."""
+    base = raw - offset
+    snapped = floor_to_tick(base, unit) if side is Side.BUY else ceil_to_tick(base, unit)
+    return snapped + offset
+
+
 def pre_order_price(
     side: Side, sf_theory: float, hl_disp: float, threshold: float, tick: int,
+    offset: int = 0,
 ) -> float:
-    """역산가(§6.1) P = 이론가 × (1 + HL_est괴리 − 기준값) → 주문단위(§6.2: 매수 내림/매도 올림).
-    side = 선주문(SF) 방향(정방향 진입·역방향 청산 = 매수, 정방향 청산·역방향 진입 = 매도)."""
+    """역산가(§6.1) P = 이론가 × (1 + HL_est괴리 − 기준값) → 주문단위(§6.2: 매수 내림/매도 올림,
+    세트의 기준배수 offset 반영). side = 선주문(SF) 방향(정방향 진입·역방향 청산 = 매수,
+    정방향 청산·역방향 진입 = 매도)."""
     raw = maker_price_for_spread(sf_theory, hl_disp, threshold)
-    return floor_to_tick(raw, tick) if side is Side.BUY else ceil_to_tick(raw, tick)
+    return snap_to_unit(side, raw, tick, offset)
+
+
+def price_offset_errors(offset: int, unit: int) -> list[str]:
+    """세트설정 기준배수 검사(순수) — 0 이상, 선주문 주문단위 미만(같거나 크면 뜻이 없다: 3,000
+    단위에 4,000은 1,000과 같음). 시세 호가단위와의 배수 관계는 그 시점 가격대에 달려 있어
+    판정(G6)에서 검사한다."""
+    errs: list[str] = []
+    if offset < 0:
+        errs.append("기준배수는 0 이상으로 입력하세요")
+    elif unit > 0 and offset >= unit:
+        errs.append(f"기준배수는 선주문 주문단위({unit:,}) 미만이어야 합니다")
+    return errs
 
 
 def within_limit(side: Side, price: float, limit: float) -> bool:
@@ -468,6 +505,11 @@ def evaluate(
         return hold("G1 실행 꺼짐", acts)
     if leg.status is LegStatus.IDLE:
         leg.status = LegStatus.ARMED
+    # G0 판정 환율 계산불가(사용자 확정 2026-09-15) — 현물환(LS·하나고시)도 없고 원달러선물
+    # 현재가·1호가로 만드는 이론가도 없으면 **세트 중지**(사람이 해제). 값 없이 판정할 수 없다.
+    if sig.fx is None:
+        reason = "판정 환율 계산불가 — 현물환 없음 + 원달러선물 현재가·매수/매도 1호가 미수신"
+        return hold(reason, _halt_set(s, block, reason))
     # 시장 정지(exec §8) — 신규·정정 중단 + 미체결 취소, HL은 손대지 않음
     if sig.market_halted:
         return hold("시장 정지 — 신규·정정 중단", _cancel_if_resting(leg, mono=sig.mono))
@@ -509,7 +551,7 @@ def evaluate(
     tick = settings.pre_tick.get(underlying)
     if sig.sf_theory is None or hl_disp is None or thr is None or not tick:
         return hold(f"G6 입력 없음 (이론가 {sig.sf_theory} HL괴리 {pct(hl_disp)} 틱 {tick})")
-    price = pre_order_price(side, sig.sf_theory, hl_disp, thr, tick)
+    price = pre_order_price(side, sig.sf_theory, hl_disp, thr, tick, s.price_offset)
     rel = (rel_quote(sig.sf_asks, settings.rel_buy) if side is Side.BUY
            else rel_quote(sig.sf_bids, settings.rel_sell))
     if rel is None:
@@ -517,6 +559,12 @@ def evaluate(
     # 한계의 "상대N호가 ∓ 1틱"에서 1틱은 **시세(호가창)의 호가단위** = 한 호가 옆(사용자 확정
     # 2026-09-08). 선주문 주문단위(settings.pre_tick)는 역산가를 주문 단위로 맞추는 데만 쓴다.
     mkt_tick = tick_for(Instrument.KR_STOCK_FUTURE, rel)
+    # 주문단위·기준배수가 시세 호가단위에 안 맞으면(예: 하이닉스 1,000 호가에 기준배수 500)
+    # LS가 거부하므로 내지 않는다(2026-09-15). 상태줄에 사유가 보인다.
+    if round(price) % mkt_tick != 0:
+        return hold(f"G6 주문가 {price:,.0f}이 시세 호가단위 {mkt_tick}에 안 맞음 "
+                    f"(주문단위 {tick} 기준배수 {s.price_offset:,})",
+                    _cancel_if_resting(leg, mono=sig.mono))
     start = range_start(side, rel, mkt_tick)
     limit = limit_price(side, rel, mkt_tick, settings.pre_range)
     # 범위 = 시작호가(상대N호가 ∓ 1틱)부터 한계까지 — 둘 다 로그에(사용자 2026-09-11)
@@ -535,7 +583,8 @@ def evaluate(
     # HL 쪽도 남긴다(사용자 2026-09-14): 1호가와 후주문 수량만큼 쓸어담은 est 평균가(후주문 방향)
     hl_est = sig.hl_est_bid if leg.post_side is Side.SELL else sig.hl_est_ask
     basis = (f"역산가 {price:,.0f} = 이론가 {sig.sf_theory:,.0f}×(1+{pct(hl_disp)}−{pct(thr)}) "
-             f"주문단위 {tick} {rng_txt} 매수1 {won(bid1)} 매도1 {won(ask1)} 환율 {fx_txt} "
+             f"주문단위 {tick} 기준배수 {s.price_offset} {rng_txt} 매수1 {won(bid1)} "
+             f"매도1 {won(ask1)} 환율 {fx_txt} "
              f"HL 매수1 {usd(sig.hl_bid1)} 매도1 {usd(sig.hl_ask1)} est {usd(hl_est)}")
     # 통과 — 없으면 발주, 있고 역산가가 바뀌었으면 재발주 규칙(취소→후주문 확인→딜레이→신규)
     if leg.pre_order_id is None and leg.status is LegStatus.ARMED:
@@ -683,20 +732,23 @@ def on_pre_cancelled(s: AutoMSet, block: Block, mono: float, settings: AutoMSett
 
 
 def on_post_fill(
-    s: AutoMSet, block: Block, hl_qty: float, hl_price: float, fx_quote: float,
+    s: AutoMSet, block: Block, hl_qty: float, hl_price: float, fx_quote: float | None,
     mono: float, settings: AutoMSettings,
     stock_last: float | None = None, sf_theory: float | None = None,
 ) -> list[Action]:
     """후주문(HL) 체결 → RT 증감·누적(§9a)·헤지 완성 판정(exec ㄹ1).
 
-    fx_quote = 체결 시점 원달러선물 호가(진입 −환은 매수1호가, 청산 +환은 매도1호가).
+    fx_quote = 체결 시점 환진입가(원달러선물 호가 → LS 현물환, 진입 −환은 매수1호가, 청산 +환은
+    매도1호가). None(값 없음, 2026-09-15)이면 환 없이 쌓여 환평균·Sprd 분모에서 빠진다.
     stock_last·sf_theory = 체결 시점 S현재가·SF이론가 — Sprd 기준값(사용자 확정 2026-09-10,
     실시간 아님). 없으면 그 판의 Sprd는 계산 불가.
     """
     leg = s.leg(block)
     leg.pending.hl_qty += hl_qty
     leg.pending.hl_px_sum += hl_price * hl_qty
-    leg.pending.fx_sum += fx_quote * hl_qty
+    if fx_quote:  # 환진입가 있을 때만(0·None은 값 없음)
+        leg.pending.fx_sum += fx_quote * hl_qty
+        leg.pending.fx_qty += hl_qty
     if stock_last and sf_theory:  # 둘 다 있을 때만 기준값 기록(분모 ref_qty도 같이)
         leg.pending.s_px_sum += stock_last * hl_qty
         leg.pending.theory_sum += sf_theory * hl_qty
@@ -886,20 +938,27 @@ def release_halt(s: AutoMSet, block: Block) -> None:
 
 # ---------------------------------------------------------- 화면 단위 묶음 ---
 
-SET_COUNT = 3
+# 방향별 세트 수 — 정방향 4·역방향 2(사용자 확정 2026-09-15, 전엔 3·3). 화면(order_autom.SET_ROWS)도
+# 이 값을 쓴다. 저장 상태(core_state.json)의 세트 배열이 이보다 길면 앞에서부터 맞추고 나머지는
+# 버린다(버리는 세트에 RT·장부·중지가 남아 있으면 경고 로그).
+SET_COUNT_FWD = 4
+SET_COUNT_REV = 2
+SET_COUNT = SET_COUNT_FWD  # 옛 이름(정방향 기준) — 외부 참조 호환
 
 
 @dataclass
 class AutoMBook:
-    """종목 하나의 자동M 상태 — 정방향 3세트 + 기준수량 + 월물(사용자 확정 2026-09-08: 종목별 독립).
+    """종목 하나의 자동M 상태 — 정방향 4세트 + 역방향 2세트 + 기준수량 + 월물(사용자 확정
+    2026-09-08: 종목별 독립).
 
     창(order_autom)은 종목 콤보로 어느 책을 보여줄지 고를 뿐이고, 실행은 코어가 종목마다 따로 돈다.
     같은 종목을 두 창에서 열면 같은 책을 함께 보여준다(중복 실행 아님)."""
 
-    sets: list[AutoMSet] = field(default_factory=lambda: [AutoMSet() for _ in range(SET_COUNT)])
-    # 역방향 3세트(§7A·§7B, 2026-09-14) — 정방향과 같은 뼈대, reverse=True
+    sets: list[AutoMSet] = field(
+        default_factory=lambda: [AutoMSet() for _ in range(SET_COUNT_FWD)])
+    # 역방향 세트(§7A·§7B, 2026-09-14) — 정방향과 같은 뼈대, reverse=True
     rev_sets: list[AutoMSet] = field(
-        default_factory=lambda: [AutoMSet(reverse=True) for _ in range(SET_COUNT)])
+        default_factory=lambda: [AutoMSet(reverse=True) for _ in range(SET_COUNT_REV)])
     ref_qty: int = 1  # 상단 기준수량(계약) — 모니터 3칸(진입SF·진입S·청산SF) est 계산용
     future_month: str = "near"  # 선물 월물 "near"|"next" (exec §11.9, DESIGN §5.11)
 
@@ -970,8 +1029,23 @@ def _book_from_dict(book: AutoMBook, raw: object) -> None:
 
 
 def _sets_from_dict(targets: list[AutoMSet], sets: object) -> None:
-    """세트 목록(정방향 sets 또는 역방향 rev_sets) 복원 — 값 오류는 그 필드만 기본값."""
+    """세트 목록(정방향 sets 또는 역방향 rev_sets) 복원 — 값 오류는 그 필드만 기본값.
+    저장본이 지금 세트 수보다 길면(세트 수 변경 뒤 첫 재시동) 넘치는 세트는 버리되, 거기에
+    RT·장부·중지가 남아 있으면 경고를 남긴다(사람이 그 포지션을 확인해야 함)."""
     if isinstance(sets, list):
+        for extra in sets[len(targets):]:
+            if not isinstance(extra, dict):
+                continue
+            live = (extra.get("rt") or extra.get("sf_net") or extra.get("hl_net")
+                    or any(str((extra.get(k) or {}).get("status", "")) == LegStatus.HALTED.value
+                           for k in ("entry", "exit")))
+            if live:
+                import logging
+
+                logging.getLogger("kp_arb.autom").warning(
+                    "[자동M] 세트 수 축소로 버리는 저장 세트에 상태가 남아 있음 — RT %s 장부 SF %s "
+                    "HL %s (사람이 포지션 확인)", extra.get("rt"), extra.get("sf_net"),
+                    extra.get("hl_net"))
         for target, rs in zip(targets, sets, strict=False):
             if not isinstance(rs, dict):
                 continue
@@ -979,6 +1053,7 @@ def _sets_from_dict(targets: list[AutoMSet], sets: object) -> None:
                 target.target_qty = int(rs.get("target_qty", target.target_qty))
                 target.per_qty = int(rs.get("per_qty", target.per_qty))
                 target.switch_delay_s = int(rs.get("switch_delay_s", target.switch_delay_s))
+                target.price_offset = int(rs.get("price_offset", target.price_offset) or 0)
                 target.en_sf = _opt_float(rs.get("en_sf"))
                 target.en_s = _opt_float(rs.get("en_s"))
                 target.ex_sf = _opt_float(rs.get("ex_sf"))
@@ -1010,6 +1085,7 @@ def _sets_from_dict(targets: list[AutoMSet], sets: object) -> None:
                         leg.acc.hl_qty = float(acc.get("hl_qty", 0) or 0)
                         leg.acc.hl_px_sum = float(acc.get("hl_px_sum", 0) or 0)
                         leg.acc.fx_sum = float(acc.get("fx_sum", 0) or 0)
+                        leg.acc.fx_qty = float(acc.get("fx_qty", 0) or 0)  # 옛 저장본 0
                         leg.acc.s_px_sum = float(acc.get("s_px_sum", 0) or 0)
                         leg.acc.theory_sum = float(acc.get("theory_sum", 0) or 0)
                         leg.acc.ref_qty = float(acc.get("ref_qty", 0) or 0)  # 옛 저장분은 0

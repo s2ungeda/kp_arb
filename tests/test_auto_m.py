@@ -211,6 +211,25 @@ def test_three_consecutive_pre_rejects_turn_set_off_with_alarm() -> None:
     assert s2.entry.reject_streak == 0
 
 
+def test_restore_drops_extra_saved_sets_with_warning(caplog: pytest.LogCaptureFixture) -> None:
+    # 세트 수 3·3 → 4·2(2026-09-15) 뒤 첫 재시동: 저장본의 역방향 3번째 세트는 버리되, 거기에
+    # RT·장부가 남아 있으면 경고(사람이 포지션 확인). 정방향은 3개만 복원되고 4번째는 기본값.
+    import logging
+
+    from kp_arb.auto_m import AutoMBook, _book_from_dict
+
+    book = AutoMBook()
+    raw = {"sets": [{"target_qty": 5}, {"target_qty": 6}, {"target_qty": 7}],
+           "rev_sets": [{"target_qty": 1}, {"target_qty": 2},
+                        {"target_qty": 3, "rt": -1, "sf_net": -1, "hl_net": 10.0}]}
+    with caplog.at_level(logging.WARNING, logger="kp_arb.autom"):
+        _book_from_dict(book, raw)
+    assert [s.target_qty for s in book.sets] == [5, 6, 7, 0]
+    assert [s.target_qty for s in book.rev_sets] == [1, 2]
+    assert any("세트 수 축소" in r.getMessage() and "RT -1" in r.getMessage()
+               for r in caplog.records)
+
+
 def test_pre_reject_is_shown_with_reason_until_next_ack() -> None:
     # 사용자 2026-09-15: 선주문이 거부됐는지·사유가 뭔지 화면에서 알 수 없었다 → 마지막 거부를
     # 다리에 들고 있다가 상태줄에("거부(n/3): 사유"), 다음 접수가 오면 지운다. 3회째는
@@ -316,7 +335,9 @@ def test_reverse_sets_and_risk_round_trip_through_dict() -> None:
 
     screen = AutoMScreen()
     book = screen.book(U)
-    assert len(book.rev_sets) == 3 and all(s.reverse and s.entry.reverse for s in book.rev_sets)
+    # 세트 수: 정방향 4·역방향 2(사용자 확정 2026-09-15)
+    assert len(book.sets) == 4 and len(book.rev_sets) == 2
+    assert all(s.reverse and s.entry.reverse for s in book.rev_sets)
     assert len(book.all_sets()) == 6 and book.sets_of(True) is book.rev_sets
     book.rev_sets[1].target_qty, book.rev_sets[1].rt, book.rev_sets[1].sf_net = 7, -3, -3
     book.rev_sets[1].en_sf = -0.015
@@ -546,3 +567,94 @@ def test_sprd_is_fixed_at_post_fill_time_not_live() -> None:
                  stock_last=201_000.0, sf_theory=202_000.0)
     assert acc.s_avg() == 200_000.0 and acc.theory_avg() == 201_000.0
     assert acc.sprd() != first and acc.sprd() == acc.sprd()  # 이후 시세와 무관하게 같은 값
+
+
+def test_price_offset_shifts_order_unit_grid() -> None:
+    # 사용자 2026-09-15: 주문단위 3,000의 기준점을 세트마다 둔다. 0이면 0·3,000·6,000…, 1,000이면
+    # 1,000·4,000·7,000…. 매수 내림·매도 올림은 그대로.
+    from kp_arb.auto_m import price_offset_errors, snap_to_unit
+
+    assert snap_to_unit(Side.BUY, 1_797_500, 3000, 0) == 1_797_000
+    assert snap_to_unit(Side.SELL, 1_797_500, 3000, 0) == 1_800_000
+    assert snap_to_unit(Side.BUY, 1_797_500, 3000, 1000) == 1_795_000
+    assert snap_to_unit(Side.SELL, 1_797_500, 3000, 1000) == 1_798_000
+    assert snap_to_unit(Side.BUY, 1_798_000, 3000, 1000) == 1_798_000  # 격자 위면 그대로
+    assert pre_order_price(Side.BUY, 200_000, 0.01, 0.005, 3000, 1000) == 199_000
+    assert pre_order_price(Side.BUY, 200_000, 0.01, 0.005, 3000) == 201_000  # 기본 0 = 옛 결과
+    assert price_offset_errors(0, 3000) == [] and price_offset_errors(2999, 3000) == []
+    assert "0 이상" in price_offset_errors(-1, 3000)[0]
+    assert "미만" in price_offset_errors(3000, 3000)[0]
+
+
+def test_gate_applies_set_price_offset_and_rejects_off_tick_price() -> None:
+    # 기준배수 1,000 → 역산가 201,000이 199,000으로(범위 밖이라 미발주), 근거 줄에 기준배수 표기.
+    s = _set(price_offset=1000)
+    set_running(s, Block.ENTRY, True)
+    assert evaluate(s, Block.ENTRY, _sig(), SETTINGS, U) == []
+    assert s.entry.block_reason.startswith("G6 범위 밖 역산가 199,000")
+    # 기준배수 250 → 198,250은 시세 호가단위 500에 안 맞아 LS가 거부 → 내지 않고 사유 표시
+    s2 = _set(price_offset=250)
+    set_running(s2, Block.ENTRY, True)
+    assert evaluate(s2, Block.ENTRY, _sig(), SETTINGS, U) == []
+    assert "호가단위 500에 안 맞음" in s2.entry.block_reason
+    assert "기준배수 250" in s2.entry.block_reason
+    # 통과 줄에도 기준배수가 남는다
+    s3 = _set()
+    set_running(s3, Block.ENTRY, True)
+    evaluate(s3, Block.ENTRY, _sig(), SETTINGS, U)
+    assert "주문단위 3000 기준배수 0 " in s3.entry.block_reason
+
+
+def test_price_offset_survives_restore() -> None:
+    from kp_arb.auto_m import AutoMBook, _book_from_dict
+
+    book = AutoMBook()
+    _book_from_dict(book, {"sets": [{"target_qty": 5, "price_offset": 1000}, {"target_qty": 6}]})
+    assert book.sets[0].price_offset == 1000 and book.sets[1].price_offset == 0
+
+
+def test_post_fill_without_fx_is_excluded_from_fx_average() -> None:
+    # 사용자 확정 2026-09-15: 환진입가는 원달러선물 1호가 → LS 현물환 → 없음. 없으면 그 체결은
+    # 환 없이 쌓여 환평균·Sprd 분모에서 빠진다(0으로 희석하지 않는다).
+    from kp_arb.auto_m import Accum
+
+    s = _set()
+    s.rt = 1
+    on_pre_fill(s, Block.ENTRY, 1, 201_000.0, mono=100)
+    on_post_fill(s, Block.ENTRY, 4, 1184.0, None, mono=101, settings=SETTINGS,
+                 stock_last=199_000.0, sf_theory=200_000.0)
+    assert s.entry.pending.fx_avg() is None and s.entry.pending.fx_qty == 0
+    on_post_fill(s, Block.ENTRY, 6, 1184.0, 1356.0, mono=102, settings=SETTINGS,
+                 stock_last=199_000.0, sf_theory=200_000.0)
+    # 10 = 1 SF × 10이라 판이 끝나 누적으로 합쳐짐 — 분모(fx_qty)는 환이 있던 6만
+    acc = s.entry.acc
+    assert acc.hl_qty == 10 and acc.fx_qty == 6 and acc.fx_avg() == 1356.0
+    # 짝맞춤(중지)으로 합칠 때도 환이 있던 판만 분모에 들어간다
+    pend = Accum(hl_qty=10, hl_px_sum=11840.0, fx_sum=1356.0 * 6, fx_qty=6, sf_qty=1,
+                 sf_px_sum=201_000.0)
+    part = Accum()
+    part.add_round(pend, matched_only=True)
+    assert part.fx_avg() == 1356.0 and part.fx_qty == part.matched_hl() == 10
+    no_fx = Accum(hl_qty=10, hl_px_sum=11840.0, sf_qty=1, sf_px_sum=201_000.0)
+    part2 = Accum()
+    part2.add_round(no_fx, matched_only=True)
+    assert part2.fx_qty == 0 and part2.fx_avg() is None
+    none_at_all = Accum(hl_qty=10, hl_px_sum=11840.0)
+    assert none_at_all.fx_avg() is None and none_at_all.sprd() is None
+    old_saved = Accum(hl_qty=10, hl_px_sum=11840.0, fx_sum=13560.0)  # fx_qty 없는 옛 저장본
+    assert old_saved.fx_avg() == 1356.0
+
+
+def test_missing_judgment_fx_halts_the_set() -> None:
+    # 사용자 확정 2026-09-15: 판정 환율(현물환 → 원달러선물 이론가)을 못 구하면 세트를 중지한다
+    # (G0). 값 없이 판정하지 않고, 사람이 해제해야 재개. 실행이 꺼진 다리는 건드리지 않는다.
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    acts = evaluate(s, Block.ENTRY, _sig(fx=None), SETTINGS, U)
+    assert [a.kind for a in acts][:2] == ["halt", "notify"]
+    assert s.entry.status is LegStatus.HALTED and s.exit.status is LegStatus.HALTED
+    assert not s.entry.running and "환율 계산불가" in s.entry.halt_reason
+    # 실행이 꺼져 있으면(G1) 환율이 없어도 그냥 대기
+    idle = _set()
+    assert evaluate(idle, Block.EXIT, _sig(fx=None), SETTINGS, U) == []
+    assert idle.exit.status is not LegStatus.HALTED

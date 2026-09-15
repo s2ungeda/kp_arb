@@ -118,3 +118,62 @@ def ask_yes_no(parent: Any, title: str, message: str) -> bool:
 def show_message(parent: Any, title: str, message: str) -> None:
     """확인 버튼 하나짜리 알림."""
     _dialog(parent, title, message, [("확인", True)])
+
+
+def hint_position(anchor_x: int, anchor_y: int, anchor_h: int, pop_w: int, pop_h: int,
+                  bounds: tuple[int, int, int, int] | None) -> tuple[int, int]:
+    """상태줄 위에 띄우는 전문 팝업의 위치(순수) — 기본은 상태줄 바로 위, 위에 자리가 없으면
+    아래. 모니터 작업 영역(bounds=(x, y, w, h)) 안에 좌우도 맞춘다."""
+    x, y = anchor_x, anchor_y - pop_h - 4
+    if bounds is not None:
+        bx, by, bw, bh = bounds
+        if y < by:
+            y = anchor_y + anchor_h + 4
+        x = max(bx, min(x, bx + bw - pop_w))
+        y = max(by, min(y, by + bh - pop_h))
+    elif y < 0:
+        y = anchor_y + anchor_h + 4
+    return x, y
+
+
+def attach_full_text_popup(label: Any, root: Any) -> None:
+    """상태줄(한 줄로 잘리는 라벨)을 **더블클릭**하면 전문을 힌트 창으로 보여 준다(사용자
+    2026-09-15: 상태줄이 좁아져 다 못 읽음). 창 폭에 맞춰 줄바꿈, 클릭·Esc·포커스 이탈로 닫힘.
+    여러 번 눌러도 하나."""
+    import tkinter as tk
+
+    box: dict[str, Any] = {"win": None}
+
+    def close(_e: object = None) -> None:
+        win = box["win"]
+        box["win"] = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    def show(_e: object = None) -> None:
+        close()
+        text = str(label.cget("text") or "")
+        if not text.strip():
+            return
+        win = tk.Toplevel(root)
+        win.overrideredirect(True)  # 제목줄 없는 힌트 창
+        win.attributes("-topmost", True)
+        wrap = max(240, root.winfo_width() - 40)
+        tk.Label(win, text=text, justify="left", anchor="w", wraplength=wrap, bg="#ffffe0",
+                 relief="solid", bd=1, padx=8, pady=6).pack()
+        win.update_idletasks()
+        x, y = hint_position(label.winfo_rootx(), label.winfo_rooty(), label.winfo_height(),
+                             win.winfo_reqwidth(), win.winfo_reqheight(), monitor_work_area(label))
+        win.geometry(f"+{x}+{y}")
+        win.bind("<Button-1>", close)
+        win.bind("<Escape>", close)
+        win.bind("<FocusOut>", close)
+        win.focus_force()
+        box["win"] = win
+
+    label.bind("<Double-Button-1>", show)
+    label.bind("<Destroy>", close)
+    label.show_full_text = show  # 프로그램·미리보기 캡처에서 직접 부를 수 있게(더블클릭 합성 불가)

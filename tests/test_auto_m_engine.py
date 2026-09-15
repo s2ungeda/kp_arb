@@ -698,6 +698,19 @@ async def test_autom_commands_set_settings_and_validation() -> None:
                                             "direction": "rev", "set": 0, "rt_manual": 2})
     assert not res["ok"] and "역방향 RT" in res["errors"][0]
     assert state.autom.book(U).rev_sets[0].rt == -3
+    # 주문가 기준배수(2026-09-15): 저장되고, 음수는 거부
+    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
+                                            "set": 1, "price_offset": 1000})
+    assert res["ok"] and s1.price_offset == 1000
+    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
+                                            "set": 1, "price_offset": -500})
+    assert not res["ok"] and s1.price_offset == 1000
+    # 누적 clear는 set "all"로 그 방향 전 세트를 한 번에(화면 깜빡임 원인 제거, 2026-09-15)
+    for st in state.autom.book(U).sets:
+        st.entry.acc.hl_qty = 5.0
+    res = await _autom_command(eng, state, {"cmd": "autom_clear_acc", "underlying": U.value,
+                                            "set": "all", "block": "entry"})
+    assert res["ok"] and all(st.entry.acc.hl_qty == 0 for st in state.autom.book(U).sets)
     res = await _autom_command(eng, state, {
         "cmd": "autom_settings", "windows": [["08:30:10", "08:46:20"], ["15:35:30", "15:46:55"]],
         "pre_tick": {"sk_hynix": 3000, "samsung": 500, "hyundai": 1000}, "pre_delay_ms": 1500,

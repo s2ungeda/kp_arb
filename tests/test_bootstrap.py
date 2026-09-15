@@ -227,13 +227,16 @@ def _system(
 
 def test_fx_entry_rate_fallback_order() -> None:
     # 자동M 환진입가(§10 -환/+환): 원달러선물 1호가(HL 매도=매수1호가, HL 매수=매도1호가) → 없으면
-    # 현물환율(LS CUR/백업) → 없으면 선물 직전 체결가 → 없으면 None(사용자 확정 2026-09-14).
+    # LS 현물환(CUR)만 → 없으면 None(사용자 확정 2026-09-15 — 하나고시 백업값·선물 직전 체결가는
+    # 정산에 쓰지 않는다).
     system, _, _ = _system([], deriv_frames=[])
     assert system.fx_entry_rate(Side.SELL) is None            # 월물도 값도 없음
     system._fx_futures = ("A7569000", 202610)
-    system.fx_futures_price["A7569000"] = 1_350.0             # 직전 체결가만
-    assert system.fx_entry_rate(Side.SELL) == 1_350.0
-    system.usdkrw_spot = 1_349.6                              # 현물이 생기면 체결가보다 우선
+    system.fx_futures_price["A7569000"] = 1_350.0             # 직전 체결가만 → 값 없음
+    assert system.fx_entry_rate(Side.SELL) is None
+    system.usdkrw_spot, system.usdkrw_spot_src = 1_348.0, "하나고시"  # 백업값 → 값 없음
+    assert system.fx_entry_rate(Side.SELL) is None
+    system.usdkrw_spot, system.usdkrw_spot_src = 1_349.6, "LS"  # LS 현물환이 있으면 그 값
     assert system.fx_entry_rate(Side.SELL) == 1_349.6 and system.fx_entry_rate(Side.BUY) == 1_349.6
     system.fx_futures_quote["A7569000"] = (1_349.4, 1_349.5)  # 호가가 있으면 방향별 1호가
     assert system.fx_entry_rate(Side.SELL) == 1_349.4         # HL 매도 → 매수1호가
@@ -402,6 +405,7 @@ def test_set_carry_rates_recomputes_fx_theory_immediately() -> None:
     system._fx_futures = ("175W09", 202609)
     system._fx_months = [("175W09", 202609)]
     system._apply_fx_price("175W09", 1357.9)
+    system._apply_fx_quote("175W09", 1357.8, 1358.0)  # 이론가는 현재가+1호가 셋 평균(2026-09-15)
     before = system.usdkrw_theory
     assert before is not None
     system.set_carry_rates(fx=0.004, eq=0.03)  # 1.0% → 0.4%
@@ -416,14 +420,37 @@ def test_fx_price_only_near_month_feeds_theory() -> None:
     system._fx_months = [("175W07", 202607), ("175W08", 202608)]
 
     system._apply_fx_price("175W08", 1600.0)  # 차근월물 먼저
+    system._apply_fx_quote("175W08", 1599.0, 1601.0)
     assert system.fx_futures_price["175W08"] == 1600.0
     assert system.usdkrw_theory is None       # 차근은 이론가에 안 먹임
     assert system.usdkrw_futures is None
 
-    system._apply_fx_price("175W07", 1530.0)  # 최근월물
+    system._apply_fx_price("175W07", 1530.0)  # 최근월물 현재가만 → 아직 계산불가(호가 없음)
     assert system.fx_futures_price["175W07"] == 1530.0
     assert system.usdkrw_futures == 1530.0
+    assert system.usdkrw_theory is None
+    system._apply_fx_quote("175W07", 1529.0, 1531.0)  # 1호가까지 오면 계산
     assert system.usdkrw_theory is not None    # 최근월물만 이론가 갱신
+
+
+def test_fx_theory_is_mean_of_last_and_top_quotes_or_none() -> None:
+    # 사용자 확정 2026-09-15: 환율이론가 = (현재가 + 매수1호가 + 매도1호가)/3 × (1 + 연이자율 ×
+    # 잔존일/365). 셋 중 하나라도 없으면 계산불가(None) → 판정 환율 없음 → 자동M 세트 중지.
+    from kp_arb.theory import carry_theory, fx_theory_base_and_carry
+
+    assert fx_theory_base_and_carry(1350.0, (1349.0, 1352.0), 30, 0.01) == carry_theory(
+        1350.3333333333333, 30, 0.01)
+    assert fx_theory_base_and_carry(None, (1349.0, 1352.0), 30, 0.01) is None
+    assert fx_theory_base_and_carry(1350.0, None, 30, 0.01) is None
+    assert fx_theory_base_and_carry(1350.0, (0.0, 1352.0), 30, 0.01) is None  # 빈 호가
+    system, _, _ = _system([])
+    system._fx_futures = ("175W09", 202609)
+    system._fx_months = [("175W09", 202609)]
+    system._apply_fx_quote("175W09", 1349.0, 1352.0)  # 호가만 → 계산불가
+    assert system.usdkrw_theory is None
+    system._apply_fx_price("175W09", 1350.0)
+    assert system.usdkrw_theory is not None
+    assert abs(system.usdkrw_theory / (1350.0 + 1349.0 + 1352.0) * 3 - 1.0) < 0.01  # 캐리만큼
 
 
 async def test_ws_reconnect_triggers_resync() -> None:
@@ -935,6 +962,11 @@ def test_usdkrw_effective_spot_window() -> None:
     assert system.usdkrw_effective(datetime(2026, 7, 20, 7, 50)) == (1_498.5, "현물")
     assert system.usdkrw_effective(day) == (1_498.5, "현물")
     assert system.usdkrw_effective(datetime(2026, 7, 20, 18, 10)) == (1_500.0, "선물이론")
+    # 이론가도 없으면 계산불가(2026-09-15) — 자동M은 이 값으로 세트를 중지한다
+    system.usdkrw_theory = None
+    assert system.usdkrw_effective(datetime(2026, 7, 20, 18, 10)) == (None, "계산불가")
+    system.usdkrw_spot, system.usdkrw_spot_src = 1_497.0, "하나고시"  # 창 안이면 백업값도 현물
+    assert system.usdkrw_effective(day) == (1_497.0, "현물")
 
 
 def test_disparity_board_computes_pairs() -> None:

@@ -482,6 +482,11 @@ def _autom_set_from_body(target: Any, body: dict[str, Any]) -> None:
         target.per_qty = int(body["per_qty"])
     if "switch_delay_s" in body:
         target.switch_delay_s = int(body["switch_delay_s"])
+    if "price_offset" in body:  # 주문가 기준배수(원, 2026-09-15) — 음수는 거부, 상한은 화면·G6에서
+        offset = int(body["price_offset"] or 0)
+        if offset < 0:
+            raise ValueError(f"기준배수는 0 이상이어야 함: {offset}")
+        target.price_offset = offset
     for key in ("en_sf", "en_s", "ex_sf"):
         if key in body:
             setattr(target, key, _opt_float(body[key]))
@@ -567,7 +572,12 @@ async def _autom_command(
                 am.risk_rev_en, am.risk_rev_ex, am.risk_rev_gap)
             return _ok()
         if cmd == "autom_clear_acc":
-            _sets()[int(body["set"])].leg(Block(str(body["block"]))).acc.clear()
+            # set 생략 또는 "all" = 그 방향 전 세트를 한 번에(2026-09-15: 세트마다 따로 보내면
+            # 그 사이 스냅샷이 반쯤 지워진 합계를 실어 화면이 깜빡였다)
+            idx = body.get("set")
+            targets = list(_sets()) if idx in (None, "all") else [_sets()[int(str(idx))]]
+            for target in targets:
+                target.leg(Block(str(body["block"]))).acc.clear()
             return _ok()
         if cmd == "autom_ref_qty":  # 상단 기준수량 — 모니터 3칸 est 계산 수량(종목별)
             _book().ref_qty = max(0, int(body["qty"]))
