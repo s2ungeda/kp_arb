@@ -486,7 +486,14 @@ def _autom_set_from_body(target: Any, body: dict[str, Any]) -> None:
         if key in body:
             setattr(target, key, _opt_float(body[key]))
     if body.get("rt_manual") is not None:  # RT 진입수량 수동 입력
-        target.rt = int(body["rt_manual"])
+        rt = int(body["rt_manual"])
+        # 부호는 방향을 따른다(§7A, 2026-09-15): 정방향 RT ≥ 0, 역방향 RT ≤ 0(보유 −n).
+        # 어긋나면 거부(ValueError → 화면에 "잘못된 자동M 인자").
+        if getattr(target, "reverse", False) and rt > 0:
+            raise ValueError(f"역방향 RT는 0 또는 음수여야 함: {rt}")
+        if not getattr(target, "reverse", False) and rt < 0:
+            raise ValueError(f"정방향 RT는 0 이상이어야 함: {rt}")
+        target.rt = rt
     if body.get("clear_diff"):
         target.fill_diff = 0
         target.sf_net, target.hl_net = 0, 0.0
@@ -582,8 +589,13 @@ async def _autom_command(
                     errors.append("진입SF·진입S 기준값을 입력하세요")
                 if block is Block.EXIT and target.ex_sf is None:
                     errors.append("청산 기준값을 입력하세요")
-                if target.leg(block).status.value == "halted":
-                    errors.append("중지 상태 — 먼저 해제하세요")
+                # 중지는 세트 단위(exec §2) — 진입·청산 어느 쪽이 중지든 그 세트는 해제 전엔 못 켠다
+                # (실측 2026-09-15: 역방향 청산 중지인 채 진입을 켜 검은 행 위에서 진입이 돌았음)
+                halted = [b for b in (Block.ENTRY, Block.EXIT)
+                          if target.leg(b).status.value == "halted"]
+                if halted:
+                    names = "·".join("진입" if b is Block.ENTRY else "청산" for b in halted)
+                    errors.append(f"세트 중지 상태({names}) — 먼저 해제하세요")
                 if errors:
                     return _fail(errors)
             engine.set_running(u, index, block, value, reverse)

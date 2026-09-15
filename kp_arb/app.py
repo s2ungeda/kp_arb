@@ -8,6 +8,7 @@ exe 하나가 인자를 보고 분기한다 (main_window.launch_module이 인자
     meme.exe autoT      # 자동T 주문 화면
     meme.exe autoM      # 자동M 주문 화면
     meme-core.exe core  # 코어 (콘솔 exe — 로그 표시)
+    meme-core.exe report [YYYYMMDD]  # 자동M 지연·슬리피지 리포트(logs/ → logs/report_날짜.md)
 """
 from __future__ import annotations
 
@@ -27,6 +28,10 @@ def main() -> None:
     if arg == "core":
         from kp_arb.core_server import main as run
         run()
+    elif arg == "report":  # 운영 PC에서 로그만으로 리포트(콘솔 exe에서)
+        from kp_arb.report_latency import main as report
+
+        raise SystemExit(report(sys.argv[1:]))
     elif arg == "monitor":
         from kp_arb.monitor import main as run
         run()

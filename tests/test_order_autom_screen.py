@@ -1,11 +1,21 @@
 """자동M 화면(order_autom) 순수 부분 — 코어 명령 페이로드·누적 합산."""
 from kp_arb.order_autom import (
     pct_to_frac,
+    rt_manual_errors,
     set_inputs_sig,
     set_payload,
     settings_payload,
     sum_acc,
 )
+
+
+def test_rt_manual_sign_follows_direction() -> None:
+    # 사용자 2026-09-15: 역방향 RT 수동 입력은 '-'도 되어야 한다 — 부호는 방향을 따른다(§7A).
+    assert rt_manual_errors("fwd", "3") == [] and rt_manual_errors("fwd", "0") == []
+    assert "정방향" in rt_manual_errors("fwd", "-1")[0]
+    assert rt_manual_errors("rev", "-3") == [] and rt_manual_errors("rev", "0") == []
+    assert "역방향" in rt_manual_errors("rev", "2")[0]
+    assert "정수" in rt_manual_errors("rev", "-")[0]  # '-'만 치고 확인
 
 
 def test_set_inputs_sig_changes_only_with_set_inputs() -> None:

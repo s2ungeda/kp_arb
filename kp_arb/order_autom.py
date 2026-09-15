@@ -21,6 +21,7 @@ from .order_autot import (
     UNDERLYINGS,
     is_decimal_text,
     is_int_text,
+    is_signed_int_text,
     is_time_text,
     parse_qty,
     parse_threshold,
@@ -150,6 +151,21 @@ def set_inputs_sig(book: dict[str, Any]) -> str:
                        if isinstance(r, dict)], sort_keys=True)
 
 
+def rt_manual_errors(dtag: str, text: str) -> list[str]:
+    """RT 수동 입력 부호 검사(순수) — 정방향은 0 이상, 역방향은 0 이하(§7A: 역방향 RT는 음수
+    그대로). '-'만 있거나 숫자가 아니면 오류."""
+    raw = text.strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return ["RT 진입수량은 정수로 입력하세요"]
+    if dtag == "rev" and value > 0:
+        return ["역방향 RT는 0 또는 음수(−)로 입력하세요 — 보유 1계약 = -1"]
+    if dtag != "rev" and value < 0:
+        return ["정방향 RT는 0 이상으로 입력하세요"]
+    return []
+
+
 def check_risk(dtag: str, en_sf: float | None, ex_sf: float | None,
                risk_en: float, risk_ex: float, risk_gap: float) -> list[str]:
     """자동M 리스크방지 입력 검증 (exec §11.9). 위반 메시지 목록(빈 목록=통과).
@@ -213,6 +229,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     T.apply_base(root)
     root.option_add("*Font", T.FONT_BASE_LG)  # 큰 화면 — 자동T와 같은 11pt
     vcmd_int = (root.register(is_int_text), "%P")
+    vcmd_sint = (root.register(is_signed_int_text), "%P")  # 역방향 RT 수동 입력('-' 허용)
     vcmd_dec = (root.register(is_decimal_text), "%P")
     vcmd_time = (root.register(is_time_text), "%P")
 
@@ -504,22 +521,25 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if turning_on:
             # 중지(HALTED)는 사람이 직접 풀어야 재개(exec §2) — 확인 뒤 해제 + 실행(2026-09-07)
             live_sets = _live_sets(dtag)
-            leg_live = ((live_sets[i] if i < len(live_sets) else {})
-                        .get("entry" if side == "en" else "exit") or {})
-            if leg_live.get("status") == "halted":
+            row_live = live_sets[i] if i < len(live_sets) else {}
+            # 중지는 세트 단위 — 진입·청산 어느 쪽이 중지든 해제 확인을 먼저(실측 2026-09-15:
+            # 역방향 청산만 중지로 남은 채 진입을 켜니 검은 행 위에서 진입이 돌았다)
+            halted_legs = [(k, row_live.get(k) or {}) for k in ("entry", "exit")
+                           if isinstance(row_live, dict)
+                           and (row_live.get(k) or {}).get("status") == "halted"]
+            if halted_legs:
                 from .ui_dialog import ask_yes_no
 
-                name = f"{i + 1}세트 {'진입' if side == 'en' else '청산'}"
-                reason = str(leg_live.get("halt_reason") or "")
-                row_live = live_sets[i] if i < len(live_sets) else {}
+                names = "·".join("진입" if k == "entry" else "청산" for k, _ in halted_legs)
+                reason = "\n".join(str(lg.get("halt_reason") or "") for _, lg in halted_legs)
                 diff = row_live.get("fill_diff") if isinstance(row_live, dict) else None
                 diff_txt = _fmt_num(diff) if isinstance(diff, int | float) else "-"
                 if not ask_yes_no(root, "중지 해제",
-                                  f"{name}이(가) 중지 상태입니다.\n{reason}\n"
+                                  f"{i + 1}세트가 중지 상태입니다({names}).\n{reason}\n"
                                   f"세트 체결차(장부): {diff_txt}\n\n"
                                   "해제해도 체결차 장부는 그대로입니다. 헤지를 정리했으면\n"
                                   "세트설정의 '체결차 Clear'로 0을 만든 뒤 해제하세요.\n"
-                                  "'예' — 중지를 풀고 실행합니다."):
+                                  "'예' — 세트 중지를 풀고(진입·청산 모두) 실행합니다."):
                     return
                 release = True
         if turning_on:  # 실행 시작 전 필수 입력 + 리스크방지 검증(인라인 현재값 확정)
@@ -624,10 +644,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         # RT 수동 입력·체결차 Clear는 **1회성** — 열 때마다 꺼진 상태로 시작하고 저장하지 않는다
         # (사용자 확정 2026-09-07). 값이 남아 있으면 실행 켤 때마다 RT를 덮어쓰는 사고가 난다.
         rt_var = tk.BooleanVar(value=False)
+        # 역방향 RT는 0 또는 음수(보유 = −n)라 '-'를 칠 수 있어야 한다(사용자 2026-09-15).
+        # 정방향은 숫자만.
         rt_ent = tk.Entry(win, width=10, justify="right", validate="key",
-                          validatecommand=vcmd_int)
-        tk.Checkbutton(win, text="RT 진입수량 수동 입력", variable=rt_var).grid(
-            row=len(rows), column=0, sticky="w", padx=6)
+                          validatecommand=vcmd_sint if dtag == "rev" else vcmd_int)
+        tk.Checkbutton(win, text="RT 진입수량 수동 입력" + (" (0 또는 −)" if dtag == "rev" else ""),
+                       variable=rt_var).grid(row=len(rows), column=0, sticky="w", padx=6)
         rt_ent.grid(row=len(rows), column=1, padx=6, pady=2)
         diff_var = tk.BooleanVar(value=False)
         tk.Checkbutton(win, text="체결차 Clear", variable=diff_var).grid(
@@ -653,6 +675,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             errs += check_risk(dtag, en_sf, ex_sf, *_risk_of(dtag))
             if rt_var.get() and not rt_ent.get().strip():  # 체크만 하고 값 없음 → 확인창
                 errs.append("RT 진입수량 수동 입력이 켜져 있는데 값이 없습니다")
+            elif rt_var.get():
+                errs += rt_manual_errors(dtag, rt_ent.get())
             if errs:  # 필수 미입력·위반 — 경고만, 저장·닫기 안 함
                 warn_center("\n".join(errs))
                 return

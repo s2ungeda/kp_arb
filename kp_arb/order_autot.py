@@ -36,6 +36,12 @@ def is_int_text(text: str) -> bool:
     return text == "" or text.isdigit()
 
 
+def is_signed_int_text(text: str) -> bool:
+    """부호 있는 정수 입력칸 — 빈칸·'-'(입력 중)·-?숫자. 역방향 RT 수동 입력용(사용자 2026-09-15:
+    역방향 RT는 0 또는 음수라 '-'를 칠 수 있어야 한다)."""
+    return re.fullmatch(r"-?\d*", text) is not None
+
+
 def is_decimal_text(text: str) -> bool:
     """소수 입력칸 허용 — 부호·소수점 포함 숫자 형태(입력 중간 상태 허용)."""
     return re.fullmatch(r"-?\d*\.?\d*", text) is not None

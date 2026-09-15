@@ -6,6 +6,7 @@ from kp_arb.order_autot import (
     UNDER_MAP,
     is_decimal_text,
     is_int_text,
+    is_signed_int_text,
     is_time_text,
     parse_qty,
     parse_threshold,
@@ -16,6 +17,10 @@ def test_input_filters() -> None:
     # 정수칸: 숫자만 / 소수칸: 부호·소수점 / 시간칸: 숫자·콜론 (입력 중간 상태 허용)
     assert is_int_text("") and is_int_text("120")
     assert not is_int_text("1.5") and not is_int_text("abc") and not is_int_text("-3")
+    # 부호 정수칸(역방향 RT 수동 입력, 2026-09-15): '-' 입력 중 상태와 음수 허용
+    assert is_signed_int_text("") and is_signed_int_text("-") and is_signed_int_text("-3")
+    assert is_signed_int_text("7") and not is_signed_int_text("1.5")
+    assert not is_signed_int_text("--1")
     assert is_decimal_text("") and is_decimal_text("-") and is_decimal_text("0.075")
     assert is_decimal_text("-.3") and is_decimal_text("12.")
     assert not is_decimal_text("1.2.3") and not is_decimal_text("1e3")

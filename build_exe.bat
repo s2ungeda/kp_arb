@@ -20,6 +20,13 @@ rem key registration shortcut for the target PC (double-click)
     echo @echo off
     echo start "" "%%~dp0meme.exe" keys
 ) > "dist\meme\keys.bat"
+rem auto-M latency/slippage report from logs (today, or pass YYYYMMDD) -> logs\report_DATE.md
+(
+    echo @echo off
+    echo cd /d "%%~dp0"
+    echo "%%~dp0meme-core.exe" report %%*
+    echo pause
+) > "dist\meme\report.bat"
 echo.
 echo build complete: dist\meme\
 echo copy that folder to the target PC and run meme.exe (edit .env if needed)

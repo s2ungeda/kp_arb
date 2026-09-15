@@ -627,9 +627,18 @@ async def test_engine_cancel_on_signal_loss_and_halt_on_post_reject() -> None:
     res = await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry",
                                             "value": True})
     assert not res["ok"] and "중지" in res["errors"][0]
+    # 중지는 세트 단위 — 다른 쪽(청산)도 못 켠다. 한쪽만 중지로 남은 상태(실측 2026-09-15 역방향
+    # 청산 중지 + 진입 실행)도 막는다.
+    assert s.exit.status is LegStatus.HALTED
+    res = await _autom_command(eng, state, {**RUN, "set": 0, "block": "exit", "value": True})
+    assert not res["ok"] and "세트 중지 상태(진입·청산)" in res["errors"][0]
+    s.entry.status = LegStatus.IDLE  # 진입만 풀린 비정상 상태를 흉내
+    res = await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
+    assert not res["ok"] and "세트 중지 상태(청산)" in res["errors"][0]
+    s.entry.status = LegStatus.HALTED
     await _autom_command(eng, state, {"cmd": "autom_release", "underlying": U.value, "set": 0,
                                       "block": "entry"})
-    assert s.entry.status is LegStatus.IDLE
+    assert s.entry.status is LegStatus.IDLE and s.exit.status is LegStatus.IDLE
 
 
 async def test_autom_commands_set_settings_and_validation() -> None:
@@ -645,6 +654,17 @@ async def test_autom_commands_set_settings_and_validation() -> None:
     res = await _autom_command(eng, state, {**RUN, "set": 1, "block": "entry",
                                             "value": True})
     assert not res["ok"] and "진입SF·진입S" in res["errors"][0]  # en_s 없음
+    # RT 수동 입력 부호(2026-09-15): 정방향은 음수 거부, 역방향은 0 또는 음수만(양수 거부)
+    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
+                                            "set": 1, "rt_manual": -2})
+    assert not res["ok"] and "정방향 RT" in res["errors"][0] and s1.rt == 7
+    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
+                                            "direction": "rev", "set": 0, "rt_manual": -3})
+    assert res["ok"] and state.autom.book(U).rev_sets[0].rt == -3
+    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
+                                            "direction": "rev", "set": 0, "rt_manual": 2})
+    assert not res["ok"] and "역방향 RT" in res["errors"][0]
+    assert state.autom.book(U).rev_sets[0].rt == -3
     res = await _autom_command(eng, state, {
         "cmd": "autom_settings", "windows": [["08:30:10", "08:46:20"], ["15:35:30", "15:46:55"]],
         "pre_tick": {"sk_hynix": 3000, "samsung": 500, "hyundai": 1000}, "pre_delay_ms": 1500,

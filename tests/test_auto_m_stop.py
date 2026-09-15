@@ -71,6 +71,17 @@ def test_halt_is_set_wide_and_cancels_other_leg_resting_order() -> None:
     assert s.exit.status is LegStatus.HALTED and not s.exit.running
     assert s.entry.status is LegStatus.HALTED and not s.entry.running
     assert "청산 체결차로 세트 중지" in s.entry.halt_reason
+    # 실측 2026-09-15(역방향 청산 중지): 중지가 낸 진입 선주문 취소의 **확인 통보**가 진입을 idle로
+    # 되돌려 진입만 중지가 아니게 됐고, 진입을 켜니 확인창 없이 검은 행 위에서 돌았다 — 중지 유지.
+    from kp_arb.auto_m import AutoMSettings, on_pre_cancelled, on_pre_reject
+
+    on_pre_cancelled(s, Block.ENTRY, mono=11.0, settings=AutoMSettings())
+    assert s.entry.status is LegStatus.HALTED and s.entry.pre_order_id is None
+    assert not s.entry.running and "세트 중지" in s.entry.halt_reason
+    # 중지 뒤 도착한 선주문 거부도 마찬가지(딜레이·재발주 없이 중지 유지)
+    s.entry.pre_order_id, s.entry.pre_qty = "E2", 1
+    assert on_pre_reject(s, Block.ENTRY, mono=12.0, settings=AutoMSettings()) == []
+    assert s.entry.status is LegStatus.HALTED and s.entry.pre_order_id is None
     release_halt(s, Block.ENTRY)                   # 진입·청산 어느 쪽에서 풀든 세트 전체
     assert s.entry.status is LegStatus.IDLE and s.exit.status is LegStatus.IDLE
 

@@ -596,6 +596,8 @@ def on_pre_reject(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
     leg = s.leg(block)
     leg.replace_pending = False
     leg._clear_pre()  # 거부된 주문은 취소할 것도 없음 — 번호·취소 표시 정리
+    if leg.status is LegStatus.HALTED:  # 중지 뒤 도착한 거부 — 딜레이·재발주 없이 중지 유지
+        return []
     leg.reject_streak += 1
     why = f"선주문 거부{(': ' + reason) if reason else ''}"
     if leg.reject_streak >= PRE_REJECT_LIMIT:
@@ -628,7 +630,10 @@ def on_pre_fill(
         s.rt += -qty if s.reverse else qty
     else:
         s.rt = min(0, s.rt + qty) if s.reverse else max(0, s.rt - qty)
-    if leg.pre_filled >= leg.pre_qty and leg.pre_qty > 0:
+    if leg.status is LegStatus.HALTED:
+        # 중지 뒤 뒤늦은 선주문 체결(결정 19: 헤지는 낸다) — 중지 표시는 유지, 판 끝은 _finish_round
+        pass
+    elif leg.pre_filled >= leg.pre_qty and leg.pre_qty > 0:
         leg.status = LegStatus.POST_PENDING
     else:
         leg.status = LegStatus.PRE_PARTIAL
@@ -650,6 +655,13 @@ def on_pre_cancelled(s: AutoMSet, block: Block, mono: float, settings: AutoMSett
     """선주문 취소 확인 — 재발주 취소면 병행 후주문 확인 뒤 딜레이, 아니면 감시로."""
     leg = s.leg(block)
     leg.reject_streak = 0  # 걸렸다가 취소된 것 = 접수는 정상 → 거부 연속 끊김
+    if leg.status is LegStatus.HALTED:
+        # 세트 중지가 이 다리의 걸린 선주문을 취소한 경우(_halt_set) — 취소 확인이 와도 중지는
+        # 그대로. 실측 2026-09-15: 역방향 청산 체결차 중지 → 진입 선주문 취소 확인 → 여기서
+        # idle로 풀려 진입만 중지가 아닌 채 남았고, 진입을 켜니 확인창 없이 검은 행 위에서 돌았다.
+        leg.replace_pending = False
+        leg._clear_pre()
+        return
     if leg.replace_pending:
         leg.replace_pending = False
         if not post_done(leg):
