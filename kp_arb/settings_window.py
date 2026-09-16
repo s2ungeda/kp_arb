@@ -123,11 +123,22 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     e_spot_e.pack(side="left")
     tk.Label(spot_row, text="HH:MM · 이 시간 밖은 환율이론가", fg=T.C_MUTED).pack(
         side="left", padx=(8, 0))
+    # 2구간(사용자 2026-09-16) — 바로 아랫줄(옆에 붙이면 창 폭이 늘어남). 비우면 미사용, 둘 중
+    # 어느 구간이든 안이면 현물환.
+    tk.Label(form, text="  2구간").grid(row=4, column=0, sticky="w", pady=2)
+    spot_row2 = tk.Frame(form)
+    spot_row2.grid(row=4, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    e_spot_s2 = tk.Entry(spot_row2, width=6, justify="center", font=T.FONT_NUM)
+    e_spot_s2.pack(side="left")
+    tk.Label(spot_row2, text="~").pack(side="left", padx=4)
+    e_spot_e2 = tk.Entry(spot_row2, width=6, justify="center", font=T.FONT_NUM)
+    e_spot_e2.pack(side="left")
+    tk.Label(spot_row2, text="비우면 미사용", fg=T.C_MUTED).pack(side="left", padx=(8, 0))
 
     # 알람 3줄 — [체크박스] 이벤트명  [wav 경로]  [찾아보기] [듣기]
-    tk.Label(form, text="알람 (wav)").grid(row=4, column=0, sticky="w", pady=(10, 2))
+    tk.Label(form, text="알람 (wav)").grid(row=5, column=0, sticky="w", pady=(10, 2))
     rows: dict[str, dict[str, Any]] = {}
-    for i, (key, name) in enumerate(_ALARMS, start=5):
+    for i, (key, name) in enumerate(_ALARMS, start=6):
         var = tk.BooleanVar(value=False)
         tk.Checkbutton(form, text=name, variable=var, width=10, anchor="w").grid(
             row=i, column=0, sticky="w", pady=1)
@@ -163,13 +174,18 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             set_status("한도·이자율은 숫자로 입력하세요", err=True)
             return
         spot_s, spot_e = e_spot_s.get().strip(), e_spot_e.get().strip()
+        spot_s2, spot_e2 = e_spot_s2.get().strip(), e_spot_e2.get().strip()
         if not (is_time_text(spot_s) and is_time_text(spot_e)):
             set_status("현물환율 사용시간은 HH:MM 형식으로 입력하세요", err=True)
+            return
+        if (spot_s2 or spot_e2) and not (is_time_text(spot_s2) and is_time_text(spot_e2)):
+            set_status("현물환율 사용시간 2구간은 HH:MM 둘 다 넣거나 둘 다 비우세요", err=True)
             return
         payload: dict[str, Any] = {
             "cmd": "settings_global", "hl_daily_limit_usdc": limit,
             "fx_carry_rate": fx_rate, "eq_carry_rate": eq_rate,
-            "fx_spot_start": spot_s, "fx_spot_end": spot_e}
+            "fx_spot_start": spot_s, "fx_spot_end": spot_e,
+            "fx_spot_start2": spot_s2, "fx_spot_end2": spot_e2}
         for key, r in rows.items():
             payload[key] = {"enabled": bool(r["var"].get()),
                             "path": r["entry"].get().strip()}
@@ -211,7 +227,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             e_eq_rate.delete(0, "end")
             e_eq_rate.insert(0, f"{float(settings.get('eq_carry_rate', 0.030) or 0) * 100:g}")
             for entry, key, default in ((e_spot_s, "fx_spot_start", "07:00"),
-                                        (e_spot_e, "fx_spot_end", "18:10")):
+                                        (e_spot_e, "fx_spot_end", "18:10"),
+                                        (e_spot_s2, "fx_spot_start2", ""),
+                                        (e_spot_e2, "fx_spot_end2", "")):
                 entry.delete(0, "end")
                 entry.insert(0, str(settings.get(key) or default))
             for key, r in rows.items():

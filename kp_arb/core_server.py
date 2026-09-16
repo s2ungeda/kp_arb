@@ -209,7 +209,16 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
             spot_e = str(body.get("fx_spot_end", g.fx_spot_end)).strip()
             parse_hhmm(spot_s)
             parse_hhmm(spot_e)
+            # 2구간(사용자 2026-09-16): 둘 다 비면 미사용, 하나만 비면 거부
+            spot_s2 = str(body.get("fx_spot_start2", g.fx_spot_start2)).strip()
+            spot_e2 = str(body.get("fx_spot_end2", g.fx_spot_end2)).strip()
+            if spot_s2 or spot_e2:
+                if not (spot_s2 and spot_e2):
+                    raise ValueError("현물환율 2구간은 시작·끝을 둘 다 넣거나 둘 다 비우기")
+                parse_hhmm(spot_s2)
+                parse_hhmm(spot_e2)
             g.fx_spot_start, g.fx_spot_end = spot_s, spot_e
+            g.fx_spot_start2, g.fx_spot_end2 = spot_s2, spot_e2
             for name, snd in (("sound_fill", g.sound_fill),
                               ("sound_error", g.sound_error), ("sound_ws", g.sound_ws)):
                 raw = body.get(name)
@@ -441,8 +450,10 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
             if account is not None:
                 entry["balance"] = ob.balance(account)
             symbols[f"{u.value}|{inst.value}"] = entry
-    fills = list(getattr(system, "fills", []))[:50]  # 최신 우선(코어 보관), 최근 50건
-    cancels = list(getattr(system, "cancels", []))[:50]
+    # 체결·취소는 코어가 든 **당일치 전부**(사용자 확정 2026-09-16 — 옛 50건 상한으로 주문리스트에
+    # 09:08 이전 체결이 안 보였음). 화면이 설정 필터로 거른다.
+    fills = list(getattr(system, "fills", []))  # 최신 우선(코어 보관)
+    cancels = list(getattr(system, "cancels", []))
     # 원달러선물 동시호가 대응(§9.1) — 화면 콤보 코드·실행상태·발주내역.
     fx_codes = system.fx_futures_codes() if hasattr(system, "fx_futures_codes") else []
     fx_running = getattr(getattr(system, "fx_auction", None), "running", False)
@@ -1072,7 +1083,8 @@ def make_app(
     if system is not None:  # 저장된 공통설정을 시동 시 LiveSystem에 주입
         system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)
         system.set_carry_rates(state.settings.fx_carry_rate, state.settings.eq_carry_rate)
-        system.set_fx_spot_window(state.settings.fx_spot_start, state.settings.fx_spot_end)
+        system.set_fx_spot_window(state.settings.fx_spot_start, state.settings.fx_spot_end,
+                                  state.settings.fx_spot_start2, state.settings.fx_spot_end2)
 
     def state_payload() -> dict[str, Any]:
         """/state 본문 — HTTP와 WS `state` 채널(§12.1)이 같은 함수를 쓴다."""
@@ -1132,8 +1144,9 @@ def make_app(
             system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)  # 한도 즉시 반영
             system.set_carry_rates(  # 이자율 즉시 반영(이론가 재계산에 반영)
                 state.settings.fx_carry_rate, state.settings.eq_carry_rate)
-            system.set_fx_spot_window(  # 현물환율 사용시간 즉시 반영
-                state.settings.fx_spot_start, state.settings.fx_spot_end)
+            system.set_fx_spot_window(  # 현물환율 사용시간(2구간) 즉시 반영
+                state.settings.fx_spot_start, state.settings.fx_spot_end,
+                state.settings.fx_spot_start2, state.settings.fx_spot_end2)
         if payload.get("cmd") == "shutdown" and result.get("ok") and on_shutdown:
             # 응답을 먼저 보내고 잠시 뒤 종료 (화면이 결과를 받을 시간)
             asyncio.get_running_loop().call_later(0.2, on_shutdown)

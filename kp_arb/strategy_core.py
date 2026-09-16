@@ -163,6 +163,9 @@ class GlobalSettings:
     # config.yaml fx_spot_window가 초기값이었으나 사용자 입력으로 전환(2026-09-04).
     fx_spot_start: str = "07:00"
     fx_spot_end: str = "18:10"
+    # 2구간(사용자 2026-09-16) — 비우면 미사용. 두 구간 중 하나라도 안이면 현물환.
+    fx_spot_start2: str = ""
+    fx_spot_end2: str = ""
     sound_fill: SoundSetting = field(default_factory=SoundSetting)   # 주문 체결 시
     sound_error: SoundSetting = field(default_factory=SoundSetting)  # 에러(발주 거부·실패)
     sound_ws: SoundSetting = field(default_factory=SoundSetting)     # WS 끊김
@@ -328,9 +331,12 @@ def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
         s.eq_carry_rate = float(raw.get("eq_carry_rate", s.eq_carry_rate))
     except (TypeError, ValueError):
         pass
-    for name in ("fx_spot_start", "fx_spot_end"):  # 형식 틀리면 그 필드만 기본값 유지
-        val = raw.get(name)
+    for name in ("fx_spot_start", "fx_spot_end", "fx_spot_start2", "fx_spot_end2"):
+        val = raw.get(name)  # 형식 틀리면 그 필드만 기본값 유지. 2구간은 빈 문자열 = 미사용
         if isinstance(val, str):
+            if val.strip() == "" and name.endswith("2"):
+                setattr(s, name, "")
+                continue
             try:
                 parse_hhmm(val)
             except ValueError:

@@ -137,6 +137,20 @@ def test_settings_global_fx_spot_window_user_input() -> None:
     _global_settings_from_dict(restored.settings,
                                {"fx_spot_start": "09:00", "fx_spot_end": "bad"})
     assert (restored.settings.fx_spot_start, restored.settings.fx_spot_end) == ("09:00", "18:10")
+    # 2구간(사용자 2026-09-16): 둘 다 넣으면 저장, 하나만 넣으면 거부, 둘 다 비우면 미사용
+    ok2 = apply_command(state, {"cmd": "settings_global",
+                                "fx_spot_start2": "19:00", "fx_spot_end2": "23:00"})
+    assert ok2["ok"] and (state.settings.fx_spot_start2, state.settings.fx_spot_end2) == (
+        "19:00", "23:00")
+    half = apply_command(state, {"cmd": "settings_global", "fx_spot_start2": "19:00",
+                                 "fx_spot_end2": ""})
+    assert not half["ok"] and state.settings.fx_spot_end2 == "23:00"
+    off = apply_command(state, {"cmd": "settings_global", "fx_spot_start2": "",
+                                "fx_spot_end2": ""})
+    assert off["ok"] and state.settings.fx_spot_start2 == "" and state.settings.fx_spot_end2 == ""
+    r2 = CoreState()
+    _global_settings_from_dict(r2.settings, {"fx_spot_start2": "20:00", "fx_spot_end2": "21:00"})
+    assert (r2.settings.fx_spot_start2, r2.settings.fx_spot_end2) == ("20:00", "21:00")
 
 
 def test_settings_global_command_and_persistence(tmp_path: Path) -> None:
@@ -186,7 +200,8 @@ async def test_hl_trades_endpoint_returns_newest_first_or_empty() -> None:
         # make_app이 시동 때 주입하는 공통설정 훅 — 여기선 아무것도 안 함
         def set_hl_daily_limit(self, usdc: float) -> None: ...
         def set_carry_rates(self, fx: float, eq: float) -> None: ...
-        def set_fx_spot_window(self, start: str, end: str) -> None: ...
+        def set_fx_spot_window(self, start: str, end: str, start2: str = "",
+                               end2: str = "") -> None: ...
 
     client = TestClient(TestServer(make_app(CoreState(), system=_Sys())))  # type: ignore[arg-type]
     await client.start_server()

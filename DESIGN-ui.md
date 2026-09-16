@@ -88,7 +88,7 @@
 ## 5. 적용 상태 (추적)
 
 - ✅ 토큰 정의: `kp_arb/ui_theme.py` (+ `tests/test_ui_theme.py`)
-- ✅ `order_list` — ui_theme 적용 + Label 그리드 표(매매 칸 매수=빨강/매도=파랑)
+- ✅ `order_list` — ui_theme 적용 + **Treeview 표**(2026-09-16 Label 그리드에서 전환, 사용자 확정: 코어가 당일 체결·취소 전부를 보내 수백 행이 되자 그리드는 체결마다 0.2초 멈칫. 색은 행 단위 매수=빨강/매도=파랑, HL 체결 창과 같음. 캡처 docs/preview/order_list_tree.png)
 - ✅ `hl_trades`(2026-09-15) — ui_theme 토큰으로 처음부터(Treeview 행 태그 매수=빨강/매도=파랑)
 - ⬜ order_hl 이전(값 동일 → 무변화) · monitor · fx_monitor · main_window
 - ⬜ [OPEN] 숫자 표시 포맷(`_fmt`/`_fmt_qty`/`_fmt_px`) 공용화 — 현재 창별 중복

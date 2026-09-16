@@ -4,13 +4,14 @@
 manual_cancel/manual_amend 사용(주문창과 별도 화면). 화면 스레드는 네트워크 금지 —
 전송·폴링은 뒷단 스레드 + 큐, 화면은 저장된 결과만 after()로 읽는다.
 
-표는 ttk.Treeview가 아니라 **Label 그리드**(스크롤 캔버스) — 셀 단위 색을 주려고. 지금은
-'매매' 칸만 매수=빨강/매도=파랑, 나머지는 검정. 스타일은 ui_theme 토큰(DESIGN-ui.md).
+표는 **ttk.Treeview**(2026-09-16 전환, 사용자 확정) — 코어가 당일 체결·취소를 전부 보내게 되면서
+Label 그리드(셀마다 위젯)는 500행에 다시 그리기 178ms가 걸려 체결마다 창이 멈칫했다. Treeview는
+수천 행도 몇 ms. 대신 색은 셀이 아니라 **행 단위**(매수 빨강/매도 파랑, HL 체결 창과 같은 규칙).
+스타일은 ui_theme 토큰(DESIGN-ui.md).
 """
 from __future__ import annotations
 
 import queue
-from collections.abc import Callable
 from typing import Any, cast
 
 from . import ui_theme as T
@@ -102,11 +103,7 @@ _COLS: tuple[tuple[str, int, str], ...] = (
     ("체결량", 52, "e"), ("상태", 44, "center"), ("접수시각", 66, "center"),
     ("체결시각", 66, "center"), ("주문번호", 104, "e"),
     ("출처", 52, "center"))  # 출처(자동M/일반/따라가기) — 맨 끝(앞 칸 index 유지, 2026-09-11)
-_SIDE_COL = 2  # 색을 주는 유일한 칸(매매)
-_NORM_BG = "white"
-_SEL_BG = "#cce5ff"   # 선택 행 바탕
-_HDR_BG = "#f0f0f0"   # 헤더 바탕(연회색)
-_GRID_LINE = "#c8c8c8"  # 셀 사이 1px 구분선 — 프레임 bg가 틈으로 비침(시세 모니터와 동일)
+_ROW_H = 20  # Treeview 행 높이(px) — FONT_LABEL 9pt 기준
 
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
@@ -152,9 +149,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     threading.Thread(target=poller, daemon=True).start()
 
-    # ===== 레이아웃 (grid: 필터[0]·컬럼 헤더[1] 고정, 표[2]만 세로 확장, 상태바[3]) =====
+    # ===== 레이아웃 (grid: 필터[0] 고정, 표[1]만 세로 확장(헤더는 Treeview 자체), 상태바[2]) =====
     root.columnconfigure(0, weight=1)
-    root.rowconfigure(2, weight=1)
+    root.rowconfigure(1, weight=1)
 
     # --- 필터 줄 (row 0) — 표 컬럼과 같은 격자에 놓아 콤보가 해당 컬럼 위에 오게(이름 라벨 없이,
     # 사용자 2026-09-11). 표의 세로 스크롤바 폭만큼 고정 칸을 끝에 두어 늘어나는 폭을 표와 맞춘다.
@@ -213,100 +210,50 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                    command=_on_filter).pack(side="left")
     _combo("source", _F_SOURCE, 6, span=2, sticky="w", width=8)  # 출처 — 컬럼 자리와 무관
 
-    # --- 컬럼 헤더 (row 1) — 세로 스크롤에 안 밀리게 표 밖에 따로 두고, 가로만 표와 같이 움직인다
-    # (사용자 2026-09-11: 스크롤하면 컬럼 제목이 사라짐).
-    hbar = tk.Canvas(root, highlightthickness=0, width=1, height=1, bg=_GRID_LINE)
-    hbar.grid(row=1, column=0, sticky="ew", padx=6, pady=(2, 0))
-    head = tk.Frame(hbar, bg=_GRID_LINE)
-    _hwin = hbar.create_window((0, 0), window=head, anchor="nw")
-    head.bind("<Configure>", lambda e: hbar.configure(
-        height=e.height, scrollregion=hbar.bbox("all")))
-    for c, (title, w, _a) in enumerate(_COLS):
-        head.columnconfigure(c, minsize=w, weight=w)
-        tk.Label(head, text=title, font=T.FONT_LABEL, bg=_HDR_BG).grid(
-            row=0, column=c, sticky="nsew", padx=(0, 1), pady=(0, 1))  # 1px 틈=구분선
-
-    # --- 표: Label 그리드 + 스크롤 캔버스 (row 2, 확장) ---
+    # --- 표: ttk.Treeview (row 1, 확장) — 컬럼 헤더는 Treeview 자체(세로 스크롤에 안 밀림).
+    # 2026-09-16 Label 그리드에서 전환: 코어가 당일 체결·취소를 전부 보내므로(수백 행) 셀마다
+    # 위젯인 그리드는 새 체결마다 전 칸을 다시 써 0.2초씩 멈칫했다. 색은 행 단위(매수 빨강/매도
+    # 파랑 — HL 체결 창과 같은 규칙), 선택은 Treeview 기본(파란 행).
     table = tk.Frame(root)
-    table.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 2))
-    canvas = tk.Canvas(table, highlightthickness=0, bg=_NORM_BG, width=1, height=1)
-    vsb = ttk.Scrollbar(table, orient="vertical", command=canvas.yview)
+    table.grid(row=1, column=0, sticky="nsew", padx=6, pady=(2, 2))
+    style = ttk.Style()
+    style.configure("OL.Treeview", font=T.FONT_LABEL, rowheight=_ROW_H)
+    style.configure("OL.Treeview.Heading", font=T.FONT_LABEL)
+    col_ids = [f"c{i}" for i in range(len(_COLS))]
+    tree = ttk.Treeview(table, columns=col_ids, show="headings", style="OL.Treeview",
+                        selectmode="browse")
+    for cid, (title, w, a) in zip(col_ids, _COLS, strict=True):
+        tree.heading(cid, text=title)
+        # width=minwidth=최소폭(헤더와 동일), stretch → 창을 넓히면 컬럼도 늘어남
+        tree.column(cid, width=w, minwidth=w, anchor=cast(Any, a), stretch=True)
+    tree.tag_configure("buy", foreground=T.C_BUY)
+    tree.tag_configure("sell", foreground=T.C_SELL)
+    vsb = ttk.Scrollbar(table, orient="vertical", command=tree.yview)
 
-    def _xview(*args: Any) -> None:  # 표·컬럼 헤더·필터 줄을 같이 가로 스크롤
-        canvas.xview(*args)
-        hbar.xview(*args)
+    def _xview(*args: Any) -> None:  # 표·필터 줄을 같이 가로 스크롤
+        tree.xview(*args)
         fbar.xview(*args)
 
     hsb = ttk.Scrollbar(table, orient="horizontal", command=_xview)
-    canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
     vsb.pack(side="right", fill="y")
     hsb.pack(side="bottom", fill="x")
-    canvas.pack(side="left", fill="both", expand=True)
-    grid = tk.Frame(canvas, bg=_GRID_LINE)  # 이 회색이 셀 틈(1px)으로 비쳐 구분선이 됨
-    _gwin = canvas.create_window((0, 0), window=grid, anchor="nw")
-    def _fit_scroll(_e: Any = None) -> None:
-        # 내용이 캔버스보다 작으면 위로 붙여 둔다 — 휠로 밀리면 표가 아래로 내려가 위가 비는
-        # 현상(사용자 2026-09-11 캡처) 방지.
-        canvas.configure(scrollregion=canvas.bbox("all"))
-        if grid.winfo_reqheight() <= canvas.winfo_height():
-            canvas.yview_moveto(0)
+    tree.pack(side="left", fill="both", expand=True)
 
-    grid.bind("<Configure>", _fit_scroll)
-
-    def _on_canvas_resize(e: Any) -> None:
-        # 넓으면 캔버스 폭까지 채워 셀이 늘어나고(weight), 좁으면 자연폭 유지 → 가로 스크롤.
+    def _on_tree_resize(e: Any) -> None:
         # 필터 줄은 표 폭 + 스크롤바 칸(18)으로 같이 맞춰 콤보가 컬럼 위에 머문다.
-        gw = max(e.width, grid.winfo_reqwidth())
-        canvas.itemconfigure(_gwin, width=gw)
-        hbar.itemconfigure(_hwin, width=gw)  # 헤더는 표와 같은 폭(세로 스크롤바 자리는 빈 채)
-        fbar.itemconfigure(_fwin, width=gw + 18)
-        _fit_scroll()  # 창을 키워 내용이 다 보이게 되면 위로 붙임
+        fbar.itemconfigure(_fwin, width=max(e.width, sum(w for _t, w, _a in _COLS)) + 18)
 
-    canvas.bind("<Configure>", _on_canvas_resize)
-    def _wheel(e: Any) -> None:
-        lo, hi = canvas.yview()
-        if lo <= 0.0 and hi >= 1.0:
-            return  # 내용이 다 보이면 스크롤할 게 없음(표가 밀려 내려가지 않게)
-        canvas.yview_scroll(int(-e.delta / 120), "units")
+    tree.bind("<Configure>", _on_tree_resize)
 
-    canvas.bind_all("<MouseWheel>", _wheel)
-    for c, (_title, w, _a) in enumerate(_COLS):
-        # weight → 창을 넓히면 컬럼(셀)도 폭에 비례해 늘어남. minsize는 최소폭(헤더와 동일).
-        grid.columnconfigure(c, minsize=w, weight=w)
-
-    cells: list[list[tk.Label]] = []          # 재사용 행 풀 — cells[r] = 컬럼 수만큼 Label
-    row_iid: list[str] = []                    # 각 행의 현재 iid(주문번호/__체결·__취소)
-    row_vals: dict[str, tuple[Any, ...]] = {}  # iid → 값 튜플(정정/선택 편의용)
+    row_vals: dict[str, tuple[Any, ...]] = {}  # iid → 값 튜플(선택 편의용)
     sel: dict[str, str | None] = {"iid": None}
 
-    def _highlight() -> None:
-        nvis = int(state_box.get("_nvis") or 0)
-        for r in range(nvis):
-            bg = _SEL_BG if sel["iid"] and row_iid[r] == sel["iid"] else _NORM_BG
-            for lbl in cells[r]:
-                lbl.configure(bg=bg)
+    def _on_select(_e: object = None) -> None:
+        chosen = tree.selection()
+        sel["iid"] = chosen[0] if chosen else None
 
-    def _select_row(r: int) -> None:
-        if r < len(row_iid) and row_iid[r]:
-            sel["iid"] = row_iid[r]
-            _highlight()
-
-    def _clicker(i: int) -> Callable[[Any], None]:
-        return lambda _e: _select_row(i)  # 행 index 고정 — 재사용 행이라 클릭 시 현재 iid
-
-    def _ensure_rows(n: int) -> None:
-        while len(cells) < n:
-            rr = len(cells)
-            labels: list[tk.Label] = []
-            for c, (_t, _w, a) in enumerate(_COLS):
-                lbl = tk.Label(grid, font=T.FONT_LABEL, bg=_NORM_BG,
-                               anchor=cast(Any, a), padx=3)
-                lbl.grid(row=rr, column=c, sticky="nsew",  # 헤더는 표 밖(hbar)에 있음
-                         padx=(0, 1), pady=(0, 1))  # 1px 회색 구분선(프레임 bg 비침)
-                lbl.bind("<Button-1>", _clicker(rr))
-                labels.append(lbl)
-            cells.append(labels)
-            row_iid.append("")
+    tree.bind("<<TreeviewSelect>>", _on_select)
 
     def set_status(text: str, err: bool = False) -> None:
         status.config(text=text[:90], fg=T.C_ERR if err else T.C_ZERO)
@@ -453,28 +400,23 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if sig == state_box.get("_sig"):
             return  # 변화 없으면 다시 안 그림(선택·스크롤 유지)
         state_box["_sig"] = sig
-        _ensure_rows(len(rows))
+        keep = sel["iid"]
+        top = tree.yview()[0]  # 다시 채운 뒤 스크롤 위치 유지
+        tree.delete(*tree.get_children(""))
         row_vals.clear()
-        for r, (iid, side, vals) in enumerate(rows):
-            row_iid[r] = iid
+        for iid, side, vals in rows:
+            try:
+                tree.insert("", "end", iid=iid, values=vals, tags=(side,))
+            except tk.TclError:  # 같은 iid가 두 줄(주문번호 중복) — 자동 iid로
+                iid = tree.insert("", "end", values=vals, tags=(side,))
             row_vals[iid] = vals
-            for c, text in enumerate(vals):
-                fg = (T.C_BUY if side == "buy" else T.C_SELL) if c == _SIDE_COL \
-                    else T.C_ZERO  # 매매 칸만 색, 나머지 검정
-                cells[r][c].configure(text=text, fg=fg)
-                cells[r][c].grid()  # 숨겼던 행 되살림
-        for r in range(len(rows), len(cells)):  # 남는 행 숨김
-            row_iid[r] = ""
-            for lbl in cells[r]:
-                lbl.grid_remove()
-        # 행이 하나도 없으면 tk 프레임이 마지막 크기를 유지해 회색 덩어리로 남는다(필터로 전부
-        # 걸러진 실측 2026-09-11) → 캔버스 창 높이를 1로. 행이 있으면 0(=자연 높이)으로 되돌린다.
-        canvas.itemconfigure(_gwin, height=1 if not rows else 0)
-        _fit_scroll()
         state_box["_nvis"] = len(rows)
-        if sel["iid"] not in row_vals:  # 선택 행이 사라졌으면 해제
+        if keep in row_vals:  # 선택 행이 남아 있으면 선택 유지, 사라졌으면 해제
+            tree.selection_set(keep)
+        else:
             sel["iid"] = None
-        _highlight()
+        if rows:
+            tree.yview_moveto(top)
 
     def _rerender() -> None:
         state_box["_sig"] = None  # 필터 바뀜 → 강제 재그림

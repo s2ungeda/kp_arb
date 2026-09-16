@@ -389,6 +389,12 @@ def test_set_fx_spot_window_changes_effective_rate_source() -> None:
     assert system.usdkrw_effective(at_9)[1] != "현물"          # 새 창 밖 → 이론가
     with pytest.raises(ValueError):
         system.set_fx_spot_window("25:00", "15:00")
+    # 2구간(사용자 2026-09-16): 어느 구간이든 안이면 현물. 비우면 1구간만
+    system.set_fx_spot_window("10:00", "15:00", "08:30", "09:30")
+    assert system.usdkrw_effective(at_9)[1] == "현물"
+    assert system.usdkrw_effective(datetime(2026, 9, 4, 9, 45))[1] != "현물"
+    system.set_fx_spot_window("10:00", "15:00", "", "")
+    assert system.usdkrw_effective(at_9)[1] != "현물"
 
 
 def test_fx_spot_source_marked_ls() -> None:
@@ -1197,3 +1203,21 @@ def test_spread_csv_rows() -> None:
     sf = next(r for r in rows if r[2] == "SF")
     assert sf[0] == "09:00:00" and sf[1] == SAMSUNG.value  # 시각·기초
     assert len(sf) == 13  # time..kr_last_d 13열
+
+
+def test_daily_logs_keep_whole_day_and_roll_at_midnight() -> None:
+    # 사용자 확정 2026-09-16: 체결·취소내역은 시동 이후 당일치 전부(옛 최근 200건·화면 50건
+    # 상한 폐지), 날짜가 바뀌면 비운다. 코어 스냅샷도 자르지 않는다.
+    from collections import deque
+
+    from kp_arb.bootstrap import roll_daily_logs
+
+    fills: deque[dict[str, object]] = deque()
+    cancels: deque[dict[str, object]] = deque()
+    state: dict[str, str] = {}
+    assert roll_daily_logs(state, "2026-09-16", fills, cancels) is True  # 첫 기록 — 날짜만 잡음
+    for i in range(500):
+        fills.appendleft({"i": i})
+    assert roll_daily_logs(state, "2026-09-16", fills, cancels) is False and len(fills) == 500
+    assert roll_daily_logs(state, "2026-09-17", fills, cancels) is True
+    assert not fills and not cancels and state["day"] == "2026-09-17"

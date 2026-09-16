@@ -134,6 +134,17 @@ def select_months(
 
 
 FX_SPOT_SILENT_S = 600.0  # 현물환율(CUR) 무수신 → 하나고시 대체 기준(사용자 확정 2026-09-04: 10분)
+
+
+def roll_daily_logs(state: dict[str, str], today: str, *logs: deque[dict[str, Any]]) -> bool:
+    """체결·취소내역은 시동 이후 **당일치만** 보관(사용자 확정 2026-09-16) — 날짜(today,
+    YYYY-MM-DD)가 보관분의 날짜와 다르면 전부 비우고 True. 같은 날이면 False. 순수 로직."""
+    if state.get("day") == today:
+        return False
+    state["day"] = today
+    for lg in logs:
+        lg.clear()
+    return True
 HL_TRADES_KEEP = 30  # HL 체결 창에 보여 줄 최근 공개 체결 건수(사용자 2026-09-15: 30줄)
 
 
@@ -284,7 +295,10 @@ class LiveSystem:
         self.usdkrw_spot: float | None = None
         self._fx_spot_ts = 0.0  # 마지막 LS 현물환율(CUR) 수신 시각 — Naver 백업 억제용
         self.usdkrw_spot_src: str | None = None  # 현물환율 출처 "LS"|"하나고시" — 상태줄 표시
-        self._fx_spot_window = (parse_hhmm(fx_spot_window[0]), parse_hhmm(fx_spot_window[1]))
+        # 현물환 사용 시간대 — 1~2구간(2구간은 공통설정, 사용자 2026-09-16). 어느 구간이든 안이면
+        # 현물환. 원소 = (시작 time, 끝 time)
+        self._fx_spot_windows: list[tuple[Any, Any]] = [
+            (parse_hhmm(fx_spot_window[0]), parse_hhmm(fx_spot_window[1]))]
         self._hl = hl_gateway
         self._hl_ws = hl_ws
         # HL cloid → 발주 의도(응답 대기 중). 응답보다 먼저 온 orderUpdates의 cloid로 oid를 식별해
@@ -333,8 +347,11 @@ class LiveSystem:
         self.on_expected: list[Callable[[ExpectedPrice], None]] = []  # 예상체결가
         self.on_funding: list[Callable[[Underlying, float], None]] = []  # HL 예정 펀딩률
         self.on_fill: list[Callable[[Fill], None]] = []  # 체결통보 (OrderBook 반영 후 호출)
-        self.fills: deque[dict[str, Any]] = deque(maxlen=200)  # 체결내역(최신 우선, 주문리스트)
-        self.cancels: deque[dict[str, Any]] = deque(maxlen=200)  # 취소내역(최신 우선)
+        # 체결·취소내역(최신 우선, 주문리스트) — 시동 이후 **당일치 전부**(사용자 확정 2026-09-16:
+        # 옛 최근 200건·화면 50건 상한으로 09:08 이전 체결이 안 보였음). 날짜가 바뀌면 비운다.
+        self.fills: deque[dict[str, Any]] = deque()
+        self.cancels: deque[dict[str, Any]] = deque()
+        self._daylog_state: dict[str, str] = {}  # roll_daily_logs — 보관분의 날짜
         # 원달러선물 동시호가 대응주문(§9.1, DESIGN-fx-auction) — 감시 컨트롤러 + 발주 로그.
         self.fx_hedges: deque[dict[str, Any]] = deque(maxlen=200)
         self.fx_auction = FxAuctionController(
@@ -418,6 +435,8 @@ class LiveSystem:
         import time as _t
 
         it = order.intent
+        roll_daily_logs(getattr(self, "_daylog_state", {}), _t.strftime("%Y-%m-%d"),
+                        self.fills, getattr(self, "cancels", deque()))
         self.fills.appendleft({
             "time": _t.strftime("%H:%M:%S"),        # 체결시각
             "order_id": order.order_id,             # 주문번호(주문리스트 표시)
@@ -435,6 +454,8 @@ class LiveSystem:
         import time as _t
 
         it = order.intent
+        roll_daily_logs(getattr(self, "_daylog_state", {}), _t.strftime("%Y-%m-%d"),
+                        getattr(self, "fills", deque()), self.cancels)
         self.cancels.appendleft({
             "time": _t.strftime("%H:%M:%S"),        # 취소시각(현재 열엔 미표시)
             "order_id": order.order_id,             # 주문번호
@@ -511,11 +532,19 @@ class LiveSystem:
             return self.usdkrw_spot
         return None
 
-    def set_fx_spot_window(self, start: str, end: str) -> None:
+    def set_fx_spot_window(self, start: str, end: str, start2: str = "",
+                           end2: str = "") -> None:
         """현물환율(CUR) 사용 시간대 반영("HH:MM") — 코어가 공통설정에서 주입(사용자 입력,
-        2026-09-04). usdkrw_effective·백업 조회가 다음 호출부터 이 창을 쓴다.
-        형식 오류는 ValueError."""
-        self._fx_spot_window = (parse_hhmm(start), parse_hhmm(end))
+        2026-09-04). 2구간(start2·end2, 사용자 2026-09-16)은 둘 다 있을 때만 추가 — 비우면 1구간.
+        usdkrw_effective·백업 조회가 다음 호출부터 이 창을 쓴다. 형식 오류는 ValueError."""
+        windows = [(parse_hhmm(start), parse_hhmm(end))]
+        if start2.strip() and end2.strip():
+            windows.append((parse_hhmm(start2), parse_hhmm(end2)))
+        self._fx_spot_windows = windows
+
+    def in_fx_spot_window(self, t: Any) -> bool:
+        """지금 시각이 현물환 사용 시간대(1~2구간) 안인가."""
+        return any(in_time_window(t, s, e) for s, e in self._fx_spot_windows)
 
     def _hl_order_notional(self, intent: OrderIntent) -> float:
         """HL 주문 금액(USDC) = |수량| × 가격. 시장가(가격 없음)는 마크가로 추정."""
@@ -1194,9 +1223,7 @@ class LiveSystem:
            (현재가+매수1호가+매도1호가)/3 × 캐리.
         ③ 이론가도 못 구하면 (None, "계산불가") — 자동M은 실행 중인 세트를 중지한다(exec §4 G0)."""
         moment = now if now is not None else datetime.now()
-        if self.usdkrw_spot is not None and in_time_window(
-            moment.time(), *self._fx_spot_window
-        ):
+        if self.usdkrw_spot is not None and self.in_fx_spot_window(moment.time()):
             return self.usdkrw_spot, "현물"
         if self.usdkrw_theory is None:
             return None, "계산불가"
@@ -1249,7 +1276,7 @@ class LiveSystem:
         #  공식 한도 10회를 표에 넣어 시동 초기값(월물 2건) 직후 바로 조회해도 안 걸린다.)
         while True:
             now = datetime.now()
-            in_spot = in_time_window(now.time(), *self._fx_spot_window)
+            in_spot = self.in_fx_spot_window(now.time())
             if not in_spot and not 8 <= now.hour < 16:  # 세션 밖 — 마지막 값 유지
                 await asyncio.sleep(60.0)
                 continue
