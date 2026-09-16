@@ -17,7 +17,7 @@ from .core_client import (
     stale_seconds,
     watch_parent_exit,
 )
-from .order_autot import UNDER_MAP, is_decimal_text
+from .ui_fields import UNDER_MAP, is_decimal_text
 
 INSTRUMENT = "hl_perp"  # 이 창은 HL perp 전용
 UNDERLYINGS = ("삼성", "하이닉스", "현대차")

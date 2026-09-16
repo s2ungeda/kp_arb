@@ -138,3 +138,15 @@ def test_acc_clear_keeps_dash_until_core_snapshot_is_cleared() -> None:
     pending = {("rev", "진입"): 100.0}
     assert acc_clear_pending(pending, ("rev", "진입"), 25.0, 100.0 + ACC_CLEAR_WAIT_S) is False
     assert not pending  # 상한 지나면 굳지 않게 그린다
+
+
+def test_run_caption_marks_credit_orders() -> None:
+    # 주식 세트설정 신용 체크(사용자 2026-09-16): 실행 버튼 글자로 구분 — 진입 신용 '신용', 청산
+    # 신용상환 '상환', 아니면 '진입'/'청산'. 진행 상태(색)와 무관.
+    from kp_arb.order_autom import run_caption, set_payload
+
+    assert run_caption("en", False) == "진입" and run_caption("en", True) == "신용"
+    assert run_caption("ex", False) == "청산" and run_caption("ex", True) == "상환"
+    w = {"target": 1, "per": 1, "en_s": 0.5, "ex_sf": -0.1, "credit_en": True}
+    p = set_payload(0, w, "samsung")
+    assert p["credit_en"] is True and p["credit_ex"] is False

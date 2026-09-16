@@ -45,10 +45,12 @@ from .auto_m import (
     release_halt,
     set_running,
 )
+from .auto_m import _halt_set as halt_set
 from .disparity import disp, est_price
 from .domain.enums import Block, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import InstrumentInfo, OrderIntent, Quote
 from .gateways.ls import OrderGoneError
+from .gateways.ls_rest import RestTimeoutError
 from .hl_merge import merge_tick_options
 from .hl_price import hl_round_price
 from .logs import attach_daily_file
@@ -313,6 +315,17 @@ class AutoMEngine:
                              source=SOURCE)
         try:
             oid = await self._system.place(intent)
+        except RestTimeoutError as exc:
+            # 응답 없음은 거부가 아니다 — LS가 접수했을 수 있어 재발주하면 두 장(실증 09-16 #3326).
+            # 쌍이 맞는 게 최우선이라 **바로 세트 중지**(사용자 확정 2026-09-16). 사람이 LS
+            # 미체결·잔고를 확인해 정리한 뒤 해제.
+            reason = (f"선주문 응답 없음(타임아웃) — LS에 접수됐을 수 있음, 미체결·잔고 확인 뒤 "
+                      f"해제: {reject_reason_text(str(exc))}")
+            self._log.error("[자동M] %s 선주문 응답 없음 %s → 세트 중지 — %s",
+                            u.value, self._tag(u, index, block, reverse), exc)
+            self._apply(u, index, block, halt_set(s, block, reason), reverse)
+            s.leg(block).last_reject_at = time.strftime("%H:%M:%S")
+            return
         except Exception as exc:  # noqa: BLE001 - 거부/오류 → 딜레이 뒤 재시도(exec ㄴ5)
             self._log.warning("[자동M] %s 선주문 실패 %s — %s",
                               u.value, self._tag(u, index, block, reverse), exc)

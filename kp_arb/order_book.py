@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
@@ -228,8 +229,8 @@ class OrderBook:
         )
         self._apply_fill_to_position(order.intent, qty, price)
         self._apply_fill_to_balance(order.intent, qty, price, fee)
-        order_log.order_filled(  # 거래소별 파일에 체결통보(부분/전량·누적) 기록
-            order.intent, qty, price, fill_id, order.filled_qty)
+        order_log.order_filled(  # 거래소별 파일에 체결통보(부분/전량·누적·주문번호) 기록
+            order.intent, qty, price, fill_id, order.filled_qty, order_id=order.order_id)
         for cb in self.on_fill_applied:  # 실제 적용 1회 — 체결내역·누적(타이밍 무관)
             cb(order, qty, price, fill_id)
         self._changed()
@@ -271,12 +272,21 @@ class OrderBook:
     _PENDING_CAP = 512  # 상한 — 외부(내가 안 낸) 주문 이벤트가 무한정 쌓이지 않게
 
     def _buffer_event(self, order_id: str, kind: str, fill: Fill | None = None) -> None:
-        """track 안 된 주문번호로 온 WS 이벤트를 도착 순서대로 보관 — track 시 replay."""
+        """track 안 된 주문번호로 온 WS 이벤트를 도착 순서대로 보관 — track 시 replay.
+
+        체결이면 경고 한 줄(주문번호마다 1회) — 실증 2026-09-16: 응답 없는 발주(#3326)가 체결됐는데
+        조용히 보관만 해서 헤지 없는 SF 매도를 아무도 몰랐다. 발주 응답 전 체결(정상 역전)도 같은
+        경고가 뜨지만 곧 track되며 replay되니 로그에서 짝을 확인할 수 있다."""
         buf = self._pending.get(order_id)
         if buf is None:
             if len(self._pending) >= self._PENDING_CAP:  # 가장 오래된 미아부터 버림
                 del self._pending[next(iter(self._pending))]
             buf = self._pending[order_id] = []
+        if kind == "fill" and fill is not None and not any(k == "fill" for k, _f in buf):
+            logging.getLogger("kp_arb.order").warning(
+                "미추적 주문 #%s 체결 통보 %g @ %g — 이 프로세스가 낸 주문이 아니거나 응답 없는 "
+                "발주(보관, 등록되면 반영 / 안 되면 포지션 직접 확인)",
+                order_id, fill.qty, fill.price)
         buf.append((kind, fill))
 
     def replay_pending(self, order_id: str) -> None:

@@ -1,11 +1,14 @@
-"""자동T 화면 순수 로직 테스트 (파싱·입력필터·매핑)."""
+"""주문 화면 공용 입력 헬퍼(ui_fields) — 파싱·입력필터·매핑.
+
+옛 자동T 화면 테스트에서 옮김(2026-09-16, 자동T 화면 삭제)."""
 from kp_arb.domain.enums import Underlying
-from kp_arb.order_autot import (
-    AGG_CHOICES,
+from kp_arb.ui_fields import (
     ORDER_TYPES,
     UNDER_MAP,
+    format_qty,
     is_decimal_text,
     is_int_text,
+    is_qty_text,
     is_signed_int_text,
     is_time_text,
     parse_qty,
@@ -45,7 +48,14 @@ def test_under_map_matches_domain() -> None:
     assert {Underlying(v) for v in UNDER_MAP.values()} == set(Underlying)
 
 
-def test_maps_present() -> None:
-    assert AGG_CHOICES["원시"] == (None, None) and "10배" in AGG_CHOICES
+def test_order_types_present() -> None:
     assert ORDER_TYPES["003"] == "유통/자기융자신규"
     assert ORDER_TYPES["105"] == "유통대주상환"
+
+
+def test_qty_text_allows_thousand_commas() -> None:
+    # 체결쏴 주식 세트설정(사용자 2026-09-16): 목표수량·1회주문수량 천 단위 쉼표 표시·입력
+    assert is_qty_text("") and is_qty_text("10,000") and is_qty_text("1000")
+    assert not is_qty_text("1.5") and not is_qty_text("-1")
+    assert parse_qty("10,000") == 10000 and parse_qty("1,0,0") == 100 and parse_qty(",") == 0
+    assert format_qty(10000) == "10,000" and format_qty(0) == "0"

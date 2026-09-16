@@ -1,4 +1,6 @@
 """OrderBook 계약 테스트 — 스냅샷 1회 + 이후 이벤트로만 상태·포지션·잔고 갱신."""
+import pytest
+
 from kp_arb.domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent, Position
 from kp_arb.gateways.ls_ws import Fill
@@ -362,3 +364,15 @@ def test_genuine_partial_stays_partial() -> None:
     order = ob.order("P")
     assert order is not None
     assert order.status is OrderStatus.PARTIAL and order.remaining_qty == 4.0
+
+
+def test_untracked_fill_logs_a_warning_once(caplog: pytest.LogCaptureFixture) -> None:
+    # 실증 2026-09-16: 응답 없는 발주 #3326의 체결이 조용히 보관만 돼 아무도 몰랐다 → 경고 1회
+    import logging
+
+    ob = OrderBook()
+    with caplog.at_level(logging.WARNING, logger="kp_arb.order"):
+        assert ob.on_fill(fill("X9", 1, 1_717_000.0)) is None
+        assert ob.on_fill(fill("X9", 1, 1_717_000.0)) is None
+    msgs = [r.getMessage() for r in caplog.records if "미추적 주문 #X9" in r.getMessage()]
+    assert len(msgs) == 1 and "1 @ 1.717e+06" in msgs[0]

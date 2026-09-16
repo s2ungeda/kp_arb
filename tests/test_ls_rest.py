@@ -259,3 +259,20 @@ async def test_rejection_logs_masked_body(caplog: pytest.LogCaptureFixture) -> N
     assert "20142871001" in text and "03669" in text  # 계좌번호·코드는 보임
     assert "1004" not in text                          # 비번 평문은 로그에 없음
     assert "1**4(len=4)" in text                        # 마스킹된 형태로만
+
+
+async def test_order_tr_is_never_retried_and_raises_timeout_error() -> None:
+    # 실증 2026-09-16: 발주(CFOAT00100) 시간 초과 뒤 재전송이 같은 주문을 두 장 만들었다
+    # (#3326·#3330).
+    # 주문 TR(CSPAT*/CFOAT*)은 1회만 보내고 전송 실패는 RestTimeoutError(거부 아님)로 올린다.
+    from kp_arb.gateways.ls_rest import RestTimeoutError, is_order_tr
+
+    assert is_order_tr("CFOAT00100") and is_order_tr("CSPAT00801") and not is_order_tr("CSPAQ13700")
+    clock = FakeClock()
+    transport = FlakyTransport(fail_times=1)
+    client = _client(transport, clock, max_retries=3)
+    with pytest.raises(RestTimeoutError):
+        await client.request("CFOAT00100", {"x": 1})
+    assert transport.calls == 1  # 재전송 없음
+    ok = await _client(FlakyTransport(fail_times=0), clock, max_retries=3).request("CFOAT00100")
+    assert ok.status_code == 200

@@ -97,8 +97,8 @@ def test_restart_gives_up_after_max() -> None:
 def test_launch_command_dev() -> None:
     cmd = launch_command("kp_arb.monitor", ())
     assert cmd[0] == sys.executable and cmd[1:] == ["-m", "kp_arb.monitor"]
-    cmd = launch_command("kp_arb.order_autot", ())
-    assert cmd[1:] == ["-m", "kp_arb.order_autot"]
+    cmd = launch_command("kp_arb.order_autom", ())
+    assert cmd[1:] == ["-m", "kp_arb.order_autom"]
 
 
 def test_launch_command_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -107,7 +107,7 @@ def test_launch_command_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
     assert launch_command("kp_arb.core_server", ())[0].endswith("meme-core.exe")
     assert launch_command("kp_arb.core_server", ())[-1] == "core"
     assert launch_command("kp_arb.monitor", ())[-1] == "monitor"
-    assert launch_command("kp_arb.order_autot", ())[-1] == "autoT"
+    assert launch_command("kp_arb.order_autom", ())[-1] == "autoM"
     assert launch_command("kp_arb.main_window", ())[0].endswith("meme.exe")
 
 
@@ -143,3 +143,14 @@ def test_auto_running_detects_running_set(monkeypatch: pytest.MonkeyPatch) -> No
     assert mw._auto_running() is False
     monkeypatch.setattr(mw, "core_request", lambda *a, **k: None)
     assert mw._auto_running() is False  # 미접속이면 False
+
+
+def test_alarm_skip_reason() -> None:
+    # 자동매매 중지(체결차·타임아웃·환율 없음)·3회 거부 → 코어 에러 카운터 → 메인 에러 알람.
+    # 재생/건너뜀/실패를 화면 로그에 남기기 위한 판정(사용자 2026-09-16: 소리 났는지 확인 불가였음).
+    from kp_arb.main_window import alarm_skip_reason
+
+    assert alarm_skip_reason({}) == "꺼짐"
+    assert alarm_skip_reason({"enabled": False, "path": "a.wav"}) == "꺼짐"
+    assert alarm_skip_reason({"enabled": True, "path": " "}) == "wav 경로 없음"
+    assert alarm_skip_reason({"enabled": True, "path": "C:/snd/error.wav"}) is None

@@ -97,10 +97,12 @@ def order_amend_rejected(venue: Venue, order_id: str, error: object,
 
 
 def order_filled(intent: OrderIntent, fill_qty: float, fill_price: float,
-                 fill_id: str, cum_qty: float) -> None:
-    """체결통보(WS) — 부분/전량 + 누적/목표 수량(주문이 어디로 갔는지 추적)."""
+                 fill_id: str, cum_qty: float, order_id: str | None = None) -> None:
+    """체결통보(WS) — 부분/전량 + 누적/목표 수량(주문이 어디로 갔는지 추적). 주문번호도
+    같이(2026-09-16: 체결 줄만으로 LS 주문번호를 못 찾아 자동M 로그와 시각 대조를 해야 했음)."""
     kind = "전량" if cum_qty >= intent.qty - 1e-6 else "부분"  # 부동소수점 톨러런스
+    oid = f" #{order_id}" if order_id else ""
     logger_for(intent.venue).info(
-        "체결(%s) %s%s %g @ %s [체결#%s] 누적 %g/%g",
+        "체결(%s) %s%s %g @ %s%s [체결#%s] 누적 %g/%g",
         kind, _src(intent), _fmt(intent, with_price=False), fill_qty, fill_price,
-        fill_id, cum_qty, intent.qty)
+        oid, fill_id, cum_qty, intent.qty)

@@ -77,6 +77,23 @@ class RestError(RuntimeError):
     """REST 호출 실패(재시도 소진 포함)."""
 
 
+class RestTimeoutError(RestError):
+    """주문 TR의 응답 없음(전송 실패·시간 초과) — 거부가 아니다. LS가 첫 요청을 이미 접수했을
+    수 있어 재전송하지 않는다(실증 2026-09-16 09:20: 선물 발주 10초 시간 초과 → 재전송이 #3330,
+    첫 요청은 #3326으로 접수돼 체결됐는데 코어가 몰라 헤지 없이 SF 1계약이 팔림)."""
+
+
+# 주문 TR(신규·정정·취소) — LS 이름 규칙: 주식 CSPAT*, 선물옵션 CFOAT*
+# ("AT" = 주문, "AQ/BQ" = 조회).
+# 이 TR은 전송 실패·시간 초과에도 **재전송 금지**(주문이 두 장 될 수 있다) → RestTimeoutError.
+_NO_RETRY_TR_PREFIXES = ("CSPAT", "CFOAT")
+
+
+def is_order_tr(tr_cd: str) -> bool:
+    """주문 TR인가(재전송 금지 대상) — 순수."""
+    return tr_cd.startswith(_NO_RETRY_TR_PREFIXES)
+
+
 class RestResponse(BaseModel):
     """LS REST 응답(상태코드 + JSON 본문). 본문 스키마는 TR별로 다양."""
 
@@ -199,11 +216,20 @@ class LSRestClient:
         url = f"{self._base_url}/{path.lstrip('/')}"
 
         last_exc: Exception | None = None
-        for attempt in range(1, self._max_retries + 1):
+        # 주문 TR은 1회만(재전송 금지, 2026-09-16) — 나머지(조회)는 지수 백오프 재시도
+        tries = 1 if is_order_tr(tr_cd) else self._max_retries
+        for attempt in range(1, tries + 1):
             try:
                 resp = await self._transport.request(method, url, headers, body)
-            except Exception as exc:  # 전송 계층의 임의 실패를 재시도
+            except Exception as exc:  # 전송 계층의 임의 실패(연결·시간 초과)
                 last_exc = exc
+                if is_order_tr(tr_cd):
+                    _log.warning("LS %s 응답 없음(전송 실패·시간 초과) — 재전송 안 함, 주문이 "
+                                 "접수됐을 수 있음: %s | 보낸본문=%s", tr_cd, exc,
+                                 mask_secrets(body))
+                    raise RestTimeoutError(f"REST {tr_cd} 응답 없음: {exc}") from exc
+                # 실증 2026-09-16: 재시도가 조용히 지나가 로그로 알 수 없었다 → 매번 남긴다
+                _log.warning("LS %s 전송 실패 %d/%d — 재시도: %s", tr_cd, attempt, tries, exc)
             else:
                 if resp.status_code < 500:
                     # 거부 응답(rsp_cd가 "00"으로 시작 안 함)이면 보낸 본문을 남긴다
@@ -218,11 +244,11 @@ class LSRestClient:
                     return resp
                 last_exc = RestError(f"server error {resp.status_code} for {tr_cd}")
 
-            if attempt < self._max_retries:
+            if attempt < tries:
                 await self._sleep_backoff(attempt)
 
         raise RestError(
-            f"REST {tr_cd} failed after {self._max_retries} attempts"
+            f"REST {tr_cd} failed after {tries} attempts"
         ) from last_exc
 
     async def _sleep_backoff(self, attempt: int) -> None:

@@ -5,8 +5,7 @@ exe 하나가 인자를 보고 분기한다 (main_window.launch_module이 인자
 
     meme.exe            # 메인 화면 (기본)
     meme.exe monitor    # 시세 모니터
-    meme.exe autoT      # 자동T 주문 화면
-    meme.exe autoM      # 자동M 주문 화면
+    meme.exe autoM      # 자동M 주문 화면 (autoT 화면은 2026-09-16 삭제 — 체결쏴 T 모드로 대체 예정)
     meme-core.exe core  # 코어 (콘솔 exe — 로그 표시)
     meme-core.exe report [YYYYMMDD]  # 자동M 지연·슬리피지 리포트(logs/ → logs/report_날짜.md)
 """
@@ -34,9 +33,6 @@ def main() -> None:
         raise SystemExit(report(sys.argv[1:]))
     elif arg == "monitor":
         from kp_arb.monitor import main as run
-        run()
-    elif arg == "autoT":
-        from kp_arb.order_autot import main as run
         run()
     elif arg == "autoM":
         from kp_arb.order_autom import main as run

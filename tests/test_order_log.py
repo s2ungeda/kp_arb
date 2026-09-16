@@ -60,11 +60,12 @@ def test_ws_raw_logger_names_separate() -> None:
 def test_fill_partial_then_full(caplog: pytest.LogCaptureFixture) -> None:
     # 0.14 주문에 0.054만 체결 → '부분', 누적/목표 함께 남겨 추적 가능.
     with caplog.at_level(logging.INFO, logger="kp_arb.order.hl"):
-        order_log.order_filled(_hl(0.14), 0.054, 163.45, "F1", 0.054)
+        order_log.order_filled(_hl(0.14), 0.054, 163.45, "F1", 0.054, order_id="777")
         order_log.order_filled(_hl(0.14), 0.086, 163.45, "F2", 0.14)
     msgs = [r.message for r in caplog.records if r.name == "kp_arb.order.hl"]
     assert "부분" in msgs[0] and "0.054/0.14" in msgs[0]
-    assert "전량" in msgs[1] and "0.14/0.14" in msgs[1]
+    assert " #777 [체결#F1]" in msgs[0]  # 주문번호도 체결 줄에(2026-09-16)
+    assert "전량" in msgs[1] and "0.14/0.14" in msgs[1] and " #" not in msgs[1]
 
 
 def _ls_manual() -> OrderIntent:

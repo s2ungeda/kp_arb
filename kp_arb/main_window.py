@@ -26,7 +26,8 @@ _BASE_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", Fal
 UI_STATE_PATH = _BASE_DIR / "ui_state.json"
 # 화면 모듈 → 메뉴 이름 (화면 구성 되돌리기 목록 표시용)
 _SCREEN_NAMES = {
-    "kp_arb.order_autot": "바로쏴", "kp_arb.order_autom": "체결쏴",
+    # 바로쏴(자동T) 화면은 2026-09-16 삭제 — 체결쏴 T 모드로 대체 예정
+    "kp_arb.order_autom": "체결쏴",
     "kp_arb.monitor": "시세 모니터", "kp_arb.fx_monitor": "FX 노출 감시",
     "kp_arb.order_hl": "HL 일반주문", "kp_arb.order_list": "주문 리스트",
     "kp_arb.fx_auction_order": "원달러선물 동시호가", "kp_arb.settings_window": "공통설정",
@@ -146,6 +147,16 @@ def layout_choices(
     return out
 
 
+def alarm_skip_reason(snd: dict[str, Any]) -> str | None:
+    """알람을 재생하지 않는 이유(순수) — 공통설정 항목이 꺼졌거나 wav 경로가 비었으면 그 사유,
+    재생해야 하면 None. 로그에 남겨 "소리가 났나"를 확인할 수 있게(사용자 2026-09-16)."""
+    if not snd.get("enabled"):
+        return "꺼짐"
+    if not str(snd.get("path") or "").strip():
+        return "wav 경로 없음"
+    return None
+
+
 def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
     """실행 명령 구성 — 개발(파이썬)과 배포판(exe, app.py 분기)을 모두 지원."""
     if not getattr(sys, "frozen", False):
@@ -171,8 +182,6 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "meme.exe"), "fx_auction_order"]
     if module == "kp_arb.settings_window":
         return [str(exe_dir / "meme.exe"), "settings"]
-    if module == "kp_arb.order_autot":
-        return [str(exe_dir / "meme.exe"), "autoT"]
     if module == "kp_arb.order_autom":
         return [str(exe_dir / "meme.exe"), "autoM"]
     return [str(exe_dir / "meme.exe")]
@@ -279,10 +288,20 @@ def main() -> None:
     # 시동 시점 값은 기준으로만 잡고 재생 안 함(첫 관측은 None→값).
     sound_box: dict[str, Any] = {"fill": None, "error": None, "ws": {}}
 
-    def _play_alarm(settings: dict[str, Any], key: str) -> None:
+    def _play_alarm(settings: dict[str, Any], key: str, why: str) -> None:
+        # 재생·건너뜀·실패를 화면 로그에 남긴다(사용자 2026-09-16: 체결차 중지 때 소리가 났는지
+        # 확인할 길이 없었음). 자동M 중지(체결차·타임아웃·환율 없음)·3회 거부는 코어가 에러
+        # 카운터를 올리므로 전부 여기(sound_error)로 온다.
         snd = settings.get(key) or {}
-        if snd.get("enabled") and snd.get("path"):
-            sound.play_wav(str(snd["path"]))
+        skip = alarm_skip_reason(snd)
+        if skip:
+            _slog().warning("알람 건너뜀 %s(%s) — 공통설정 %s", key, why, skip)
+            return
+        err = sound.play_wav(str(snd["path"]))
+        if err:
+            _slog().error("알람 재생 실패 %s(%s) — %s: %s", key, why, err, snd["path"])
+        else:
+            _slog().info("알람 재생 %s(%s) %s", key, why, snd["path"])
 
     def check_sounds(data: dict[str, Any] | None) -> None:
         if not data:
@@ -293,13 +312,13 @@ def main() -> None:
             if isinstance(seq, int):
                 prev = sound_box[seq_field]
                 if prev is not None and seq > prev:
-                    _play_alarm(settings, key)
+                    _play_alarm(settings, key, f"{seq_field}_seq {prev}→{seq}")
                 sound_box[seq_field] = seq
         for row in (data.get("ws") or []):  # WS 연결→끊김 전이마다 재생
             name = str(row.get("name"))
             conn = bool(row.get("connected"))
             if sound_box["ws"].get(name) is True and not conn:
-                _play_alarm(settings, "sound_ws")
+                _play_alarm(settings, "sound_ws", f"{name} 끊김")
             sound_box["ws"][name] = conn
 
     def poll_core() -> None:
@@ -522,8 +541,6 @@ def main() -> None:
 
     menubar = tk.Menu(root)
     m_screen = tk.Menu(menubar, tearoff=0)
-    m_screen.add_command(label="바로쏴 (자동T)",
-                         command=lambda: open_screen("kp_arb.order_autot"))
     m_screen.add_command(label="체결쏴 (자동M)",
                          command=lambda: open_screen("kp_arb.order_autom"))
     m_screen.add_command(label="시세 모니터",

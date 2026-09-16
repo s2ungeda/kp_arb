@@ -81,6 +81,10 @@ class FakeSystem:
             from kp_arb.gateways.ls_rest import RestError
 
             raise RestError(fail_pre)
+        if getattr(self, "timeout_pre", False) and intent.instrument is SF:  # 응답 없음 흉내
+            from kp_arb.gateways.ls_rest import RestTimeoutError
+
+            raise RestTimeoutError("REST CFOAT00100 응답 없음: TimeoutError")
         self._ids += 1
         oid = f"O{self._ids}"
         self.placed.append(intent)
@@ -760,3 +764,25 @@ async def test_snapshot_sf_tick_falls_back_to_last_price_after_hours() -> None:
     assert eng.live_snapshot()[U.value]["sf_tick"] is None  # 호가도 현재가도 없음
     sys_.trades[(U, SF, "krx")] = 243_000.0  # 삼성 24만 원대 → 500
     assert eng.live_snapshot()[U.value]["sf_tick"] == 500
+
+
+async def test_pre_order_timeout_halts_the_set_without_reorder() -> None:
+    # 실증 2026-09-16 09:20: 선물 발주 REST가 10초 시간 초과 → 재전송이 #3330, 첫 요청은 #3326으로
+    # 접수·체결됐는데 코어가 몰라 헤지 없는 SF 매도가 남았다. 사용자 확정: 응답 없음은 거부가
+    # 아니다 — 재발주·거부 횟수 없이 **바로 세트 중지**(사람이 LS 미체결·잔고 확인 뒤 해제).
+    eng, sys_, state = _engine()
+    sys_.timeout_pre = True
+    await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.status is LegStatus.HALTED and s.exit.status is LegStatus.HALTED
+    assert not s.entry.running and "응답 없음" in s.entry.halt_reason
+    assert sys_.placed == []  # 재발주 없음
+    eng.tick(datetime(2026, 9, 4, 10, 0, 1), 101.0)  # 다음 틱에도 그대로 중지(거부 딜레이 아님)
+    await _settle()
+    assert s.entry.status is LegStatus.HALTED and sys_.placed == []
+    # 화면 상태줄(사용자 2026-09-16 "상태줄에 타임아웃 보여줘야") — 스냅샷 중지 사유에 그대로
+    row = eng.live_snapshot()[U.value]["sets"][0]["entry"]
+    assert row["status"] == "halted" and "타임아웃" in row["halt_reason"]
+    assert "미체결·잔고 확인" in row["halt_reason"]
