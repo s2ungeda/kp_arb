@@ -108,6 +108,7 @@ def test_launch_command_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
     assert launch_command("kp_arb.core_server", ())[-1] == "core"
     assert launch_command("kp_arb.monitor", ())[-1] == "monitor"
     assert launch_command("kp_arb.order_autom", ())[-1] == "autoM"
+    assert launch_command("kp_arb.order_autom_stock", ())[-1] == "autoMS"  # 주식 화면(09-16)
     assert launch_command("kp_arb.main_window", ())[0].endswith("meme.exe")
 
 

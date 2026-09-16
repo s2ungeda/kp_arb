@@ -115,14 +115,16 @@ def test_sum_acc_uses_matched_smaller_side() -> None:
 
 
 def test_set_payload_carries_price_offset() -> None:
-    # 세트설정 기준배수(2026-09-15) — 없으면 0
+    # 세트설정 시작호가(2026-09-15) — 없으면 0
     w = {"target": 1, "per": 1, "delay": 0, "offset": 1000, "en_sf": 0.5, "en_s": 0.5,
          "ex_sf": -0.1}
     assert set_payload(0, w, "sk_hynix")["price_offset"] == 1000
+    assert set_payload(0, w, "sk_hynix")["pre_tick"] == 0  # 주문단위 없으면 0 = 종목 기본
+    assert set_payload(0, {**w, "tick": 3000}, "sk_hynix")["pre_tick"] == 3000
     assert set_payload(0, {**w, "offset": None}, "sk_hynix")["price_offset"] == 0
     sig_a = set_inputs_sig({"sets": [{"target_qty": 1, "price_offset": 0}]})
     sig_b = set_inputs_sig({"sets": [{"target_qty": 1, "price_offset": 1000}]})
-    assert sig_a != sig_b  # 다른 창이 기준배수를 바꾸면 이 창도 다시 읽는다
+    assert sig_a != sig_b  # 다른 창이 시작호가를 바꾸면 이 창도 다시 읽는다
 
 
 def test_acc_clear_keeps_dash_until_core_snapshot_is_cleared() -> None:
@@ -147,6 +149,32 @@ def test_run_caption_marks_credit_orders() -> None:
 
     assert run_caption("en", False) == "진입" and run_caption("en", True) == "신용"
     assert run_caption("ex", False) == "청산" and run_caption("ex", True) == "상환"
-    w = {"target": 1, "per": 1, "en_s": 0.5, "ex_sf": -0.1, "credit_en": True}
-    p = set_payload(0, w, "samsung")
-    assert p["credit_en"] is True and p["credit_ex"] is False
+    # 체크 하나(2026-09-16 정리): 신용 세트는 진입 신용매수·청산 신용상환, 행 바탕 초록
+    w = {"target": 1, "per": 1, "en_s": 0.5, "ex_sf": -0.1, "credit": True}
+    assert set_payload(0, w, "samsung")["credit"] is True
+    assert set_payload(0, {**w, "credit": False}, "samsung")["credit"] is False
+
+
+def test_latest_round_picks_most_recent_across_sets() -> None:
+    # 8세트 배치의 '마지막 판' 블록 — 세트들의 last_round 중 seq가 가장 큰 것(진입/청산 각각)
+    from kp_arb.order_autom import latest_round
+
+    # 정·역 구분 없이(사용자 2026-09-16) — 방향 태그를 같이 돌려 라벨 부호를 그 방향으로
+    fwd = [{"entry": {"last_round": {"seq": 3, "sprd": 0.001}}, "exit": {}},
+           {"entry": {"last_round": {"seq": 7, "sprd": 0.002}}, "exit": {"last_round": None}}]
+    rev = [{"entry": {"last_round": {"seq": 9, "sprd": -0.003}},
+            "exit": {"last_round": {"seq": 5, "sprd": -0.001}}}]
+    assert latest_round({"fwd": fwd, "rev": rev}, "entry") == ("rev", {"seq": 9, "sprd": -0.003})
+    assert latest_round({"fwd": fwd, "rev": rev}, "exit") == ("rev", {"seq": 5, "sprd": -0.001})
+    assert latest_round({"fwd": fwd}, "entry") == ("fwd", {"seq": 7, "sprd": 0.002})
+    assert latest_round({"fwd": [], "rev": []}, "entry") is None
+
+
+def test_monitor_ready_blocks_run_without_numbers() -> None:
+    # 사용자 2026-09-16: 모니터 수치가 안 떠 있으면('적' 전·시세 없음) 실행을 켜지 못한다
+    from kp_arb.order_autom import monitor_ready
+
+    assert monitor_ready(["-0.82", "-0.82", "-0.52"])
+    assert not monitor_ready(["-0.82", "-", "-0.52"])
+    assert not monitor_ready(["", "0.1"])
+    assert not monitor_ready([])

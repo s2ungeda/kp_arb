@@ -37,6 +37,9 @@ def main() -> None:
     elif arg == "autoM":
         from kp_arb.order_autom import main as run
         run()
+    elif arg == "autoMS":  # 체결쏴 주식 화면(2026-09-16, 화면만 연결)
+        from kp_arb.order_autom_stock import main as run
+        run()
     elif arg == "fx_monitor":
         from kp_arb.fx_monitor import main as run
         run()

@@ -253,13 +253,14 @@ async def test_engine_reverse_round_sells_sf_then_buys_hl() -> None:
     sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_605_000.0, ts=0))
     await _settle()
     assert len(sys_.placed) == 2 and sys_.placed[1].side is Side.BUY    # 후주문 HL 매수 100
+    assert [i.tag for i in sys_.placed] == ["역1진입", "역1진입"]  # 주문 리스트 '세트'(2026-09-16)
     assert sys_.placed[1].qty == 100 and r.rt == -10 and r.sf_net == -10
     sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=100, price=1184.5, ts=0))
     await _settle()
     assert r.hl_net == 100 and r.fill_diff == 0 and r.entry.status is LegStatus.SETTLE_DELAY
     snap = eng.live_snapshot()[U.value]
     assert snap["rev_sets"][0]["rt"] == -10 and snap["rev_sets"][0]["reverse"] is True
-    assert snap["sf_tick"] == 1000  # 세트설정 기준배수 검사용 SF 호가단위(2026-09-15, 160만 원대)
+    assert snap["sf_tick"] == 1000  # 세트설정 시작호가 검사용 SF 호가단위(2026-09-15, 160만 원대)
     assert snap["sets"][0]["rt"] == 0
     assert eng._tag(U, 0, Block.ENTRY, True) == "역방향 1세트 진입"
 
@@ -704,13 +705,20 @@ async def test_autom_commands_set_settings_and_validation() -> None:
                                             "direction": "rev", "set": 0, "rt_manual": 2})
     assert not res["ok"] and "역방향 RT" in res["errors"][0]
     assert state.autom.book(U).rev_sets[0].rt == -3
-    # 주문가 기준배수(2026-09-15): 저장되고, 음수는 거부
+    # 주문가 시작호가(2026-09-15): 저장되고, 음수는 거부
     res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
                                             "set": 1, "price_offset": 1000})
     assert res["ok"] and s1.price_offset == 1000
     res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
                                             "set": 1, "price_offset": -500})
     assert not res["ok"] and s1.price_offset == 1000
+    # 세트별 선주문 주문단위(2026-09-16): 저장되고 음수는 거부
+    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
+                                            "set": 1, "pre_tick": 2000})
+    assert res["ok"] and s1.pre_tick == 2000
+    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
+                                            "set": 1, "pre_tick": -1})
+    assert not res["ok"] and s1.pre_tick == 2000
     # 누적 clear는 set "all"로 그 방향 전 세트를 한 번에(화면 깜빡임 원인 제거, 2026-09-15)
     for st in state.autom.book(U).sets:
         st.entry.acc.hl_qty = 5.0
@@ -756,7 +764,7 @@ def test_autom_state_persists_inputs_not_runtime() -> None:
 
 
 async def test_snapshot_sf_tick_falls_back_to_last_price_after_hours() -> None:
-    # 실측 2026-09-15 저녁: 장 밖엔 SF 호가가 없어 sf_tick이 비고 세트설정 기준배수 경고가 안 떴다.
+    # 실측 2026-09-15 저녁: 장 밖엔 SF 호가가 없어 sf_tick이 비고 세트설정 시작호가 경고가 안 떴다.
     # 호가가 없으면 현재가(시동 초기값·마지막 체결)로 호가단위를 구한다.
     eng, sys_, _state = _engine()
     for key in [k for k in sys_.quotes if k[1] is SF]:
@@ -786,3 +794,16 @@ async def test_pre_order_timeout_halts_the_set_without_reorder() -> None:
     row = eng.live_snapshot()[U.value]["sets"][0]["entry"]
     assert row["status"] == "halted" and "타임아웃" in row["halt_reason"]
     assert "미체결·잔고 확인" in row["halt_reason"]
+
+
+async def test_stock_product_commands_are_rejected_until_core_has_stock_book() -> None:
+    # 2026-09-16: 주식 체결쏴는 화면만 메인 메뉴에 연결 — 코어에 주식 책이 생기기 전엔 명령을 전부
+    # 거부(안 하면 주식선물 책으로 들어간다). 주식선물(product 없음/"sf")은 그대로.
+    eng, _sys, state = _engine()
+    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
+                                            "set": 0, "target_qty": 7, "product": "stock"})
+    assert not res["ok"] and "준비 중" in res["errors"][0]
+    assert state.autom.book(U).sets[0].target_qty == 100  # 주식선물 책 안 건드림
+    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
+                                            "set": 0, "target_qty": 7, "product": "sf"})
+    assert res["ok"] and state.autom.book(U).sets[0].target_qty == 7

@@ -12,8 +12,9 @@ POST_PENDING 후주문대기 · SETTLE_DELAY 딜레이대기 · HALTED 중지(�
 """
 from __future__ import annotations
 
+import itertools
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from datetime import time as dtime
 from enum import StrEnum
@@ -261,6 +262,10 @@ class Leg:
     block_reason: str = ""
     acc: Accum = field(default_factory=Accum)      # 매매결과 누적 — 후주문 전량 체결 확인된 판만
     pending: Accum = field(default_factory=Accum)  # 진행 중인 한 판(SF·HL 체결 버퍼) — 표시 안 함
+    # 마지막으로 끝난 한 판의 매매결과(스냅샷, 사용자 목업 2026-09-16) — 누적에 합칠 때 복사.
+    # seq는 방향 안에서 "가장 최근 판"을 고르기 위한 순번(세트 간 비교)
+    last_round: Accum | None = None
+    last_round_seq: int = 0
 
     @property
     def pre_side(self) -> Side:
@@ -293,7 +298,10 @@ class AutoMSet:
     target_qty: int = 0
     per_qty: int = 0
     switch_delay_s: int = 0                 # 전환딜레이(초)
-    # 주문가 기준배수(원, 사용자 2026-09-15) — 역산가를 주문단위로 맞출 때의 기준점. 0이면
+    # 선주문 주문단위(원, 세트별 — 2026-09-16 공통설정(종목별)에서 세트설정으로 이동). 0이면
+    # 공통설정의 종목별 값(옛 저장본·기본값 호환)
+    pre_tick: int = 0
+    # 주문가 시작호가(원, 사용자 2026-09-15) — 역산가를 주문단위로 맞출 때의 기준점. 0이면
     # 0·3,000·6,000…(0원 기준 배수), 1,000이면 1,000·4,000·7,000…. 0 이상 주문단위 미만.
     price_offset: int = 0
     en_sf: float | None = None              # 진입 SF 기준값(소수, 0.005 = 0.5%)
@@ -360,7 +368,7 @@ def limit_price(side: Side, rel_px: float, tick: int, rng: float) -> float:
 
 def snap_to_unit(side: Side, raw: float, unit: int, offset: int = 0) -> float:
     """역산가 원값을 주문단위 격자(offset + k×unit)에 맞춘다 — 매수 내림 / 매도 올림(§11.6).
-    기준배수 offset(세트설정, 2026-09-15): 0이면 0·unit·2unit…, 1,000이면 1,000·1,000+unit…."""
+    시작호가 offset(세트설정, 2026-09-15): 0이면 0·unit·2unit…, 1,000이면 1,000·1,000+unit…."""
     base = raw - offset
     snapped = floor_to_tick(base, unit) if side is Side.BUY else ceil_to_tick(base, unit)
     return snapped + offset
@@ -371,25 +379,25 @@ def pre_order_price(
     offset: int = 0,
 ) -> float:
     """역산가(§6.1) P = 이론가 × (1 + HL_est괴리 − 기준값) → 주문단위(§6.2: 매수 내림/매도 올림,
-    세트의 기준배수 offset 반영). side = 선주문(SF) 방향(정방향 진입·역방향 청산 = 매수,
+    세트의 시작호가 offset 반영). side = 선주문(SF) 방향(정방향 진입·역방향 청산 = 매수,
     정방향 청산·역방향 진입 = 매도)."""
     raw = maker_price_for_spread(sf_theory, hl_disp, threshold)
     return snap_to_unit(side, raw, tick, offset)
 
 
 def price_offset_errors(offset: int, unit: int, mkt_tick: int | None = None) -> list[str]:
-    """세트설정 기준배수 검사(순수) — 0 이상, 선주문 주문단위 미만(같거나 크면 뜻이 없다: 3,000
+    """세트설정 시작호가 검사(순수) — 0 이상, 선주문 주문단위 미만(같거나 크면 뜻이 없다: 3,000
     단위에 4,000은 1,000과 같음), 그리고 시세 호가단위(mkt_tick, 코어 스냅샷 sf_tick — 지금
     가격대 기준)의 배수. 호가단위를 모르면(시세 없음) 그 검사는 건너뛰고 판정(G6)이 잡는다
     (사용자 2026-09-15: 잘못 넣으면 저장 때 바로 경고창)."""
     errs: list[str] = []
     if offset < 0:
-        errs.append("기준배수는 0 이상으로 입력하세요")
+        errs.append("시작호가는 0 이상으로 입력하세요")
     elif unit > 0 and offset >= unit:
-        errs.append(f"기준배수는 선주문 주문단위({unit:,}) 미만이어야 합니다")
+        errs.append(f"시작호가는 선주문 주문단위({unit:,}) 미만이어야 합니다")
     elif mkt_tick and offset % mkt_tick != 0:
         usable = ", ".join(f"{v:,}" for v in range(0, unit, mkt_tick)) if unit > 0 else "0"
-        errs.append(f"기준배수는 시세 호가단위({mkt_tick:,})의 배수여야 합니다 — "
+        errs.append(f"시작호가는 시세 호가단위({mkt_tick:,})의 배수여야 합니다 — "
                     f"주문단위 {unit:,}에서 가능한 값: {usable}")
     return errs
 
@@ -400,6 +408,13 @@ def within_limit(side: Side, price: float, limit: float) -> bool:
 
 
 _EPS = 1e-9  # HL 소수 계약 비교용(0.588 같은 체결이 오므로 "== 0" 대신 사용)
+_ROUND_SEQ = itertools.count(1)  # 끝난 판 순번 — 방향 안에서 가장 최근 판(스냅샷) 고르기
+
+
+def _snapshot_round(leg: Leg) -> None:
+    """누적에 합치기 직전 한 판(pending)을 스냅샷으로 복사(사용자 목업 2026-09-16)."""
+    leg.last_round = replace(leg.pending)
+    leg.last_round_seq = next(_ROUND_SEQ)
 
 
 def post_done(leg: Leg) -> bool:
@@ -553,7 +568,7 @@ def evaluate(
     # 매도호가창
     side = leg.pre_side
     hl_disp = sig.hl_disp_bid if leg.post_side is Side.SELL else sig.hl_disp_ask
-    tick = settings.pre_tick.get(underlying)
+    tick = s.pre_tick or settings.pre_tick.get(underlying)  # 세트값 우선(2026-09-16), 0이면 공통
     if sig.sf_theory is None or hl_disp is None or thr is None or not tick:
         return hold(f"G6 입력 없음 (이론가 {sig.sf_theory} HL괴리 {pct(hl_disp)} 틱 {tick})")
     price = pre_order_price(side, sig.sf_theory, hl_disp, thr, tick, s.price_offset)
@@ -564,15 +579,15 @@ def evaluate(
     # 한계의 "상대N호가 ∓ 1틱"에서 1틱은 **시세(호가창)의 호가단위** = 한 호가 옆(사용자 확정
     # 2026-09-08). 선주문 주문단위(settings.pre_tick)는 역산가를 주문 단위로 맞추는 데만 쓴다.
     mkt_tick = tick_for(Instrument.KR_STOCK_FUTURE, rel)
-    # 주문단위·기준배수가 시세 호가단위에 안 맞으면(예: 하이닉스 1,000 호가에 기준배수 500)
+    # 주문단위·시작호가가 시세 호가단위에 안 맞으면(예: 하이닉스 1,000 호가에 시작호가 500)
     # LS가 거부하므로 내지 않는다(2026-09-15). 상태줄에 사유가 보인다.
     if round(price) % mkt_tick != 0:
         return hold(f"G6 주문가 {price:,.0f}이 시세 호가단위 {mkt_tick}에 안 맞음 "
-                    f"(주문단위 {tick} 기준배수 {s.price_offset:,})",
+                    f"(주문단위 {tick} 시작호가 {s.price_offset:,})",
                     _cancel_if_resting(leg, mono=sig.mono))
     start = range_start(side, rel, mkt_tick)
     limit = limit_price(side, rel, mkt_tick, settings.pre_range)
-    # 범위 = 시작호가(상대N호가 ∓ 1틱)부터 한계까지 — 둘 다 로그에(사용자 2026-09-11)
+    # 범위 = 범위 시작(상대N호가 ∓ 1틱)부터 한계까지 — 둘 다 로그에(사용자 2026-09-11)
     rng_txt = f"범위 {start:,.0f}~{limit:,.0f}(호가단위 {mkt_tick})"
     if not within_limit(side, price, limit):
         return hold(f"G6 범위 밖 역산가 {price:,.0f} {rng_txt} 상대호가 {rel:,.0f}",
@@ -588,7 +603,7 @@ def evaluate(
     # HL 쪽도 남긴다(사용자 2026-09-14): 1호가와 후주문 수량만큼 쓸어담은 est 평균가(후주문 방향)
     hl_est = sig.hl_est_bid if leg.post_side is Side.SELL else sig.hl_est_ask
     basis = (f"역산가 {price:,.0f} = 이론가 {sig.sf_theory:,.0f}×(1+{pct(hl_disp)}−{pct(thr)}) "
-             f"주문단위 {tick} 기준배수 {s.price_offset} {rng_txt} 매수1 {won(bid1)} "
+             f"주문단위 {tick} 시작호가 {s.price_offset} {rng_txt} 매수1 {won(bid1)} "
              f"매도1 {won(ask1)} 환율 {fx_txt} "
              f"HL 매수1 {usd(sig.hl_bid1)} 매도1 {usd(sig.hl_ask1)} est {usd(hl_est)}")
     # 통과 — 없으면 발주, 있고 역산가가 바뀌었으면 재발주 규칙(취소→후주문 확인→딜레이→신규)
@@ -795,6 +810,7 @@ def _finish_round(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
     diff = round(fill_diff(s.sf_net, s.hl_net), 6)
     s.fill_diff = diff
     clean = leg.pending.hl_qty + _EPS >= leg.pending.sf_qty * HL_PER_SF
+    _snapshot_round(leg)  # 마지막 판 스냅샷(화면 오른쪽 아래 블록)
     leg.acc.add_round(leg.pending, matched_only=not clean)
     leg.pending.clear()
     limit = diff_limit(s)
@@ -852,6 +868,8 @@ def _halt_set(s: AutoMSet, block: Block, reason: str) -> list[Action]:
     leg.running = False  # 중지 = 실행 꺼짐(버튼 원색). 다시 켜려면 사람이 해제
     leg.halt_reason = reason
     # 판이 중지로 끝남 — 짝이 맞은(적은 쪽) 몫만 매매결과에 넣고 버퍼를 비운다(사용자 확정 09-08)
+    if leg.pending.hl_qty > 0 or leg.pending.sf_qty > 0:  # 체결이 있던 판만 스냅샷
+        _snapshot_round(leg)
     leg.acc.add_round(leg.pending, matched_only=True)
     leg.pending.clear()
     acts: list[Action] = [Action("halt", reason=reason), Action("notify", reason=reason)]
@@ -943,11 +961,11 @@ def release_halt(s: AutoMSet, block: Block) -> None:
 
 # ---------------------------------------------------------- 화면 단위 묶음 ---
 
-# 방향별 세트 수 — 정방향 4·역방향 2(사용자 확정 2026-09-15, 전엔 3·3). 화면(order_autom.SET_ROWS)도
-# 이 값을 쓴다. 저장 상태(core_state.json)의 세트 배열이 이보다 길면 앞에서부터 맞추고 나머지는
-# 버린다(버리는 세트에 RT·장부·중지가 남아 있으면 경고 로그).
-SET_COUNT_FWD = 4
-SET_COUNT_REV = 2
+# 방향별 세트 수 — 정방향 8·역방향 4(사용자 확정 2026-09-16, 전엔 4·2, 그 전 3·3). 화면
+# (order_autom.SET_ROWS)도 이 값을 쓴다. 저장 상태(core_state.json)의 세트 배열이 이보다 길면
+# 앞에서부터 맞추고 나머지는 버린다(버리는 세트에 RT·장부·중지가 남아 있으면 경고 로그).
+SET_COUNT_FWD = 8
+SET_COUNT_REV = 4
 SET_COUNT = SET_COUNT_FWD  # 옛 이름(정방향 기준) — 외부 참조 호환
 
 
@@ -1059,6 +1077,7 @@ def _sets_from_dict(targets: list[AutoMSet], sets: object) -> None:
                 target.per_qty = int(rs.get("per_qty", target.per_qty))
                 target.switch_delay_s = int(rs.get("switch_delay_s", target.switch_delay_s))
                 target.price_offset = int(rs.get("price_offset", target.price_offset) or 0)
+                target.pre_tick = int(rs.get("pre_tick", target.pre_tick) or 0)
                 target.en_sf = _opt_float(rs.get("en_sf"))
                 target.en_s = _opt_float(rs.get("en_s"))
                 target.ex_sf = _opt_float(rs.get("ex_sf"))

@@ -68,7 +68,15 @@ class ScreenSpec:
     entry_s_label: str = "진입S"   # 세트설정 창 진입 S 칸 라벨(주식은 "진입" — SF 칸이 없으니)
     color_dialog: bool = False    # 바탕색: 콤보(기본) 대신 색 고르기 대화상자(주식, 09-16)
     qty_commas: bool = False      # 세트설정 목표수량·1회주문수량 천 단위 쉼표 표시(주식, 09-16)
-    credit_boxes: bool = False    # 세트설정 '진입 신용'·'청산 신용상환' 체크(주식, 09-16)
+    credit_boxes: bool = False    # 세트설정 '신용' 체크(주식, 09-16) — 진입 신용매수·청산 신용상환
+    credit_default_rows: int = 0  # 아래쪽 n개 세트는 기본 신용 체크(주식 2, 사용자 09-16)
+    set_rows: dict[str, int] | None = None  # 방향별 세트 줄 수(None = 코어 SET_ROWS, 주식은 4)
+    alt_row_bg: bool = False      # 짝수 세트 행 하늘색 바탕(주식선물 8세트, 사용자 09-16)
+    snapshot_rows: int = 0        # 마지막 판 스냅샷 줄 수(4 = Sprd·HP·SF·환, 1 = Sprd만, 0 = 없음)
+
+    def directions_names(self) -> list[tuple[str, str]]:
+        """(방향 태그, 표시 이름) 목록 — 스냅샷 블록의 방향 라벨용."""
+        return [(d[0], d[1]) for d in self.directions]
 
 
 SF_SPEC = ScreenSpec(
@@ -76,7 +84,8 @@ SF_SPEC = ScreenSpec(
     screen_tag="autoM", log_tag="자동M", directions=_DIRECTIONS,
     acc_rows={"fwd": _ACC_ROWS_FWD, "rev": _ACC_ROWS_REV}, has_en_sf=True, has_month=True,
     qty_unit="계약", settings_title="체결쏴 설정",
-    pre_tick={"sk_hynix": 3000, "samsung": 500, "hyundai": 1000})
+    pre_tick={"sk_hynix": 3000, "samsung": 500, "hyundai": 1000},
+    snapshot_rows=4)  # 8세트 아래 마지막 판 스냅샷(Sprd·HP·SF·환). 짝수 줄 하늘색은 원복(09-16)
 
 # 주식: 정방향만, 기준값 칸은 진입 S(-HP/+S)·청산 S(+HP/-S), 매매결과 +S/-S(주식 평균 체결가).
 # 주문단위 기본값은 주식 호가단위(20만~50만 원 100원, 50만 원 이상 500원)로 — 결정 전 임시.
@@ -88,7 +97,12 @@ STOCK_SPEC = ScreenSpec(
     has_en_sf=False, has_month=False, qty_unit="주", settings_title="체결쏴 설정(주식)",
     pre_tick={"sk_hynix": 1000, "samsung": 100, "hyundai": 500},
     diff_head="체결차", entry_s_label="진입", color_dialog=True, qty_commas=True,
-    credit_boxes=True)
+    credit_boxes=True, credit_default_rows=2, set_rows={"fwd": 5},  # 주식 5세트(09-16: 4→6→5)
+    snapshot_rows=1)  # 누적 블록은 위, 남는 줄에 마지막 판 Sprd 한 줄
+
+_CREDIT_BG = "#d9f2d9"  # 신용 세트 행 바탕(옅은 초록, 사용자 2026-09-16) — 중지(검정)가 우선
+# 짝수 세트 행 바탕(하늘, 사용자 2026-09-16 — 주식선물 8세트는 줄이 많아 헷갈림) + 스냅샷 Sprd 칸
+_ALT_BG = "#e8f0f8"
 
 
 def run_caption(side: str, credit: bool) -> str:
@@ -99,6 +113,10 @@ def run_caption(side: str, credit: bool) -> str:
     return "상환" if credit else "청산"
 # 방향별 세트 줄 수 = 코어 세트 수(정 4·역 2, 사용자 확정 2026-09-15). 배치 검토는 값을 바꿔 띄운다.
 SET_ROWS: dict[str, int] = {"fwd": SET_COUNT_FWD, "rev": SET_COUNT_REV}
+# 마지막 판 스냅샷 블록(사용자 목업 2026-09-16): 누적 블록(제목~세트3 줄) 아래 한 줄 띄우고
+# 사양의 snapshot_rows 줄(주식선물 4 = Sprd·HP·SF·환, 주식 1 = Sprd만). 세트 줄이 4+n 이상일
+# 때만(주식선물 8세트, 주식 5세트) 누적 블록을 위에 두고 스냅샷을 놓는다. 미만이면 결정 35대로
+# 끝 줄 맞춤.
 
 
 def section_height(rows: int) -> int:
@@ -127,12 +145,13 @@ def set_payload(index: int, w: dict[str, Any], underlying: str,
         "cmd": "autom_set", "underlying": underlying, "set": index, "direction": direction,
         "target_qty": int(w.get("target") or 0), "per_qty": int(w.get("per") or 0),
         "switch_delay_s": int(w.get("delay") or 0),
-        "price_offset": int(w.get("offset") or 0),  # 주문가 기준배수(원, 2026-09-15)
+        "price_offset": int(w.get("offset") or 0),  # 주문가 시작호가(원, 2026-09-15)
+        "pre_tick": int(w.get("tick") or 0),  # 선주문 주문단위(세트별, 2026-09-16; 0=종목 기본)
         "en_sf": pct_to_frac(w.get("en_sf")), "en_s": pct_to_frac(w.get("en_s")),
         "ex_sf": pct_to_frac(w.get("ex_sf")),
         "rt_manual": w.get("rt_manual"), "clear_diff": bool(w.get("clear_diff")),
-        # 주식 신용(2026-09-16): 진입 신용매수 / 청산 신용상환 — 코어 쪽 처리는 결정 뒤
-        "credit_en": bool(w.get("credit_en")), "credit_ex": bool(w.get("credit_ex")),
+        # 주식 신용(2026-09-16): 체크 하나 — 진입은 신용매수, 청산은 신용상환. 코어 처리는 결정 뒤
+        "credit": bool(w.get("credit")),
     }
 
 
@@ -186,6 +205,22 @@ def acc_clear_pending(pending: dict[tuple[str, str], float], key: tuple[str, str
     return True
 
 
+def latest_round(rows_by_dir: dict[str, list[dict[str, Any]]],
+                 leg: str) -> tuple[str, dict[str, Any]] | None:
+    """정·역 모든 세트 중 **가장 최근에 끝난 판**(진입 또는 청산)의 스냅샷과 그 방향 — 순수
+    (사용자 2026-09-16 '마지막 완료판은 정/역 구분 없이, 방향은 위에 표시'). 코어가 세트별
+    last_round(seq 포함)를 주면 seq가 가장 큰 것. 없으면 None."""
+    best: tuple[str, dict[str, Any]] | None = None
+    for dtag, rows in rows_by_dir.items():
+        for row in rows:
+            lr = (row.get(leg) or {}).get("last_round")
+            if not isinstance(lr, dict):
+                continue
+            if best is None or int(lr.get("seq") or 0) > int(best[1].get("seq") or 0):
+                best = (dtag, lr)
+    return best
+
+
 def sum_acc(rows: list[dict[str, Any]], leg: str) -> dict[str, float | None]:
     """세트별 누적(autom_live)을 방향 하나로 합산 — 수량은 **짝이 맞은(적은 쪽)** 체결량 합
     (사용자 확정 2026-09-08: LS·HL 누적 체결량이 다르면 적은 쪽 기준, SF 1 = HL 10), 환·HL평균가·
@@ -216,14 +251,13 @@ def sum_acc(rows: list[dict[str, Any]], leg: str) -> dict[str, float | None]:
 _STATUS_TEXT = {"armed": "감시", "pre_resting": "접수", "pre_partial": "부분",
                 "post_pending": "HL", "settle_delay": "쉼", "halted": "중지"}
 
-# 선주문 주문단위 설정 종목 순서 (목업 라벨 → underlying 코드)
-_PRE_TICK_ROWS = (("하이닉스", "sk_hynix"), ("삼성전자", "samsung"), ("현대차", "hyundai"))
+# (선주문 주문단위 종목별 틀은 2026-09-16 세트설정으로 이동 — 공통설정 창에서 뺌)
 # 상대호가 콤보 — 선주문 진입범위 §6.3: 매수는 상대호가−1틱, 매도는 +1틱
 _REL_CHOICES_BUY = [f"상대{n}호가 - 1틱" for n in range(1, 6)]
 _REL_CHOICES_SELL = [f"상대{n}호가 + 1틱" for n in range(1, 6)]
 
 
-_SET_INPUT_KEYS = ("target_qty", "per_qty", "switch_delay_s", "price_offset",
+_SET_INPUT_KEYS = ("target_qty", "per_qty", "switch_delay_s", "price_offset", "pre_tick",
                    "en_sf", "en_s", "ex_sf")
 
 
@@ -241,6 +275,12 @@ def set_inputs_sig(book: dict[str, Any]) -> str:
     both = rows[:SET_ROWS["fwd"]] + (rev[:SET_ROWS["rev"]] if isinstance(rev, list) else [])
     return json.dumps([[r.get(k) for k in _SET_INPUT_KEYS] for r in both
                        if isinstance(r, dict)], sort_keys=True)
+
+
+def monitor_ready(texts: list[str]) -> bool:
+    """실행 켜도 되는가 — 그 방향의 모니터 수치가 전부 떠 있어야(사용자 2026-09-16: 수치가 없는
+    상태에서 실수로 실행하면 안 됨). '적'을 안 눌렀거나 코어 시세가 없으면 "-"라 막힌다. 순수."""
+    return bool(texts) and all(t.strip() not in ("", "-") for t in texts)
 
 
 def rt_manual_errors(dtag: str, text: str) -> list[str]:
@@ -319,6 +359,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     root.resizable(True, True)
     win_state.attach(root, spec.state_key)
     dirs = tuple(d[0] for d in spec.directions)  # 이 화면의 방향 태그("fwd"[, "rev"])
+    # 방향별 세트 줄 수 — 사양이 정하면 그 값(주식 4), 아니면 코어 세트 수(주식선물 8·4)
+    rows_by = spec.set_rows or SET_ROWS
     T.apply_base(root)
     root.option_add("*Font", T.FONT_BASE_LG)  # 큰 화면 — 자동T와 같은 11pt
     vcmd_int = (root.register(is_int_text), "%P")
@@ -362,10 +404,14 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     # 세트: 진입 SF·S 2개 + 청산 SF 1개 (자동T는 진입/청산 1개씩)
     sets: dict[tuple[str, int], dict[str, Any]] = {}
     for d in dirs:
-        for i in range(SET_ROWS[d]):
-            sets[(d, i)] = {"target": 0, "per": 0, "delay": 0, "offset": 0, "en_sf": None,
+        for i in range(rows_by[d]):
+            # 신용(주식): 아래쪽 credit_default_rows개 세트는 기본 체크(사용자 2026-09-16)
+            credit_default = (spec.credit_boxes
+                              and i >= rows_by[d] - spec.credit_default_rows)
+            sets[(d, i)] = {"target": 0, "per": 0, "delay": 0, "offset": 0, "tick": 0,
+                            "en_sf": None,
                             "en_s": None, "ex_sf": None, "rt_manual": None,
-                            "clear_diff": False, "credit_en": False, "credit_ex": False}
+                            "clear_diff": False, "credit": credit_default}
 
     # ===================== 상단 바 =====================
     top = tk.Frame(root)
@@ -481,9 +527,18 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             if hexv:
                 (apply_bg if kind == "bg" else apply_fg)(str(hexv))
 
+        color_box: dict[str, tk.Toplevel | None] = {"win": None}
+
         def open_color_menu() -> None:
-            # 바탕색·글자색 두 가지(사용자 2026-09-16) — 작은 창에서 고른다. '기본'은 글자색 되돌림
+            # 바탕색·글자색 두 가지(사용자 2026-09-16) — 작은 창에서 고른다. '기본'은 글자색 되돌림.
+            # 한 번에 하나만(연속 클릭으로 여러 개 뜨던 것, 사용자 2026-09-16): 열려 있으면 앞으로.
+            cur = color_box["win"]
+            if cur is not None and cur.winfo_exists():
+                cur.lift()
+                cur.focus_set()
+                return
             win = tk.Toplevel(root)
+            color_box["win"] = win
             win.title("색상")
             win.resizable(False, False)
             win.transient(root)
@@ -493,6 +548,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 tk.Button(win, text=text, width=12, command=cmd).pack(padx=10, pady=4)
             tk.Button(win, text="닫기", width=12, command=win.destroy).pack(padx=10, pady=(4, 10))
             center_on_parent(win, root)
+            win.grab_set()  # 색상 창이 떠 있는 동안 본창 클릭 차단(설정 창들과 같은 규칙)
 
         tk.Button(top, text="색상", command=open_color_menu).pack(side="right", padx=(0, 6))
     else:
@@ -583,7 +639,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             mon["fx"] = tk.Label(grid, text="환율 -", font=T.FONT_LABEL, fg="gray25", anchor="e")
             mon["fx"].grid(row=rbase, column=col["rt"], columnspan=3, sticky="e", padx=(0, 2))
         ttk.Separator(grid, orient="vertical").grid(
-            row=rbase, column=nset, rowspan=section_height(SET_ROWS[dtag]), sticky="ns", padx=3)
+            row=rbase, column=nset, rowspan=section_height(rows_by[dtag]), sticky="ns", padx=3)
         acc_cols: dict[str, tuple[int, int, tuple[str, ...]]] = {}
         cum_labels: dict[str, tk.Label] = {}
         for gi, (glabel, comps) in enumerate(acc_rows):
@@ -601,10 +657,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             tk.Label(grid, text=h, fg="gray25", font=T.FONT_LABEL).grid(
                 row=rbase + 1, column=c, padx=1, sticky="nsew")
 
-        for i in range(SET_ROWS[dtag]):  # 세트 줄(기본 3)
+        for i in range(rows_by[dtag]):  # 세트 줄(기본 3)
             r = rbase + i + 2
             w = sets[(dtag, i)]
-            lbl_tg = tk.Label(grid, text="-", width=6, anchor="e", bg="#fffbcc",
+            lbl_tg = tk.Label(grid, text="-", width=6, anchor="e", bg="#fffbcc",  # 목표수량(노랑)
                               relief="solid", bd=1, font=T.FONT_BASE_LG)  # 목표수량
             lbl_tg.grid(row=r, column=col["tg"], padx=1, pady=1, sticky="nsew")
             lbl_per = tk.Label(grid, text="-", width=5, anchor="e", bg="#f0f0f0",
@@ -646,14 +702,28 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                       # 중지 표시(세트 행 검정/흰 글자, §9a) 되돌리기용 원래 배경
                       "row": [(lbl_tg, "#fffbcc"), (lbl_per, "#f0f0f0"), (lbl_rt, "white"),
                               (lbl_diff, "white"), (lbl_sec, "#f0f0f0")],
+                      # 짝수 세트(2·4·6·8)는 하늘색 바탕(사용자 2026-09-16, 주식선물). 값 칸만
+                      # 물들이면 띠가 끊겨 입력칸 3개·설정 버튼도 같이(진입·청산 버튼은 상태색 자리)
+                      "alt": bool(spec.alt_row_bg and i % 2 == 1),
+                      "band": [(e_en_sf, "white"), (e_en_s, "white"), (e_ex_sf, "white"),
+                               (btn_set, "SystemButtonFace")],
                       "halted": False})
+            _paint_row_bg(w)
+            # 버튼 글자도 처음부터 세트 상태대로(신용 기본 세트 = 신용/상환) — 코어 책이 없는 주식
+            # 화면에선 갱신 루프가 버튼을 안 건드려 '진입/청산'으로 남았음(사용자 2026-09-16)
+            btn_en.config(text=run_caption("en", bool(w.get("credit"))))
+            btn_ex.config(text=run_caption("ex", bool(w.get("credit"))))
             btn_en.config(command=partial(toggle_run, dtag, i, "en"))
             btn_ex.config(command=partial(toggle_run, dtag, i, "ex"))
 
         # 매매결과 값 — Sprd=컬럼헤더 줄, -HP/+SF/-환=세트1~3 줄. 탑·끝 라인 정렬.
         # 세트가 3줄을 넘으면 블록을 그만큼 내려 **끝 줄을 마지막 세트에 맞추고 위를 비운다**
-        # (사용자 2026-09-15, 4세트 배치 검토).
-        shift = max(0, SET_ROWS[dtag] - 3)
+        # (사용자 2026-09-15, 4세트 배치 검토). 단 세트 줄이 4 + 스냅샷 줄 수 이상이면 누적
+        # 블록은 위(컬럼 머리 줄)에 두고, 한 줄 띄워 **마지막 판 스냅샷**을 놓는다(사용자 목업
+        # 2026-09-16: 주식선물 8세트 4줄, 주식 5세트 Sprd 1줄).
+        n_snap = spec.snapshot_rows
+        with_snapshot = n_snap > 0 and rows_by[dtag] >= 4 + n_snap
+        shift = 0 if with_snapshot else max(0, rows_by[dtag] - 3)
         if shift:
             for lcol, vcol, _comps in acc_cols.values():
                 for acc_col in (lcol, vcol):
@@ -670,6 +740,29 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 v.grid(row=rbase + shift + ri + 1, column=vcol, padx=1, pady=1, sticky="nsew")
                 labels[comp] = v
             sets[(dtag, 0)].setdefault("_acc", {})[glabel] = labels
+            if with_snapshot:
+                # 마지막 판 스냅샷 — **정·역 구분 없이** 가장 최근에 끝난 판(진입/청산 각각)의
+                # Sprd·HP·SF·환(사용자 2026-09-16). 누적 블록 아래 빈 줄(세트4 줄)에 그 판의
+                # 방향("정방향"/"역방향")을 쓰고, 항목 이름의 부호(-HP/+SF/-환 ↔ +HP/-SF/+환)는
+                # 그 판의 방향에 맞춰 바꾼다. Sprd 칸은 누적(노랑)과 구분되게 하늘색.
+                # 방향이 하나뿐인 화면(주식)은 방향 대신 "마지막 판"
+                dir_lbl = tk.Label(grid, text="마지막 판" if len(dirs) == 1 else "-",
+                                   fg="gray30", font=T.FONT_LABEL)
+                dir_lbl.grid(row=rbase + 5, column=lcol, columnspan=2, sticky="ew")
+                names: list[tk.Label] = []
+                vals: list[tk.Label] = []
+                for ri, comp in enumerate(("Sprd", *comps)[:n_snap]):
+                    r_snap = rbase + 6 + ri
+                    n_lbl = tk.Label(grid, text=comp, fg="gray30", font=T.FONT_LABEL)
+                    n_lbl.grid(row=r_snap, column=lcol, padx=(2, 0), sticky="e")
+                    v2 = tk.Label(grid, text="-", width=7, anchor="e", relief="solid",
+                                  bd=1, font=T.FONT_BASE_LG,
+                                  bg=_ALT_BG if comp == "Sprd" else "white")
+                    v2.grid(row=r_snap, column=vcol, padx=1, pady=1, sticky="nsew")
+                    names.append(n_lbl)
+                    vals.append(v2)
+                sets[(dtag, 0)].setdefault("_snap", {})[glabel] = {
+                    "dir": dir_lbl, "names": names, "vals": vals}
 
     # --- 콜백들(v1: 로컬 동작) ---
     def toggle_run(dtag: str, i: int, side: str) -> None:
@@ -701,6 +794,13 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                                   "'예' — 세트 중지를 풀고(진입·청산 모두) 실행합니다."):
                     return
                 release = True
+        if turning_on:  # 모니터 수치가 안 떠 있으면 실행 금지(사용자 2026-09-16) — '적' 먼저
+            mon_texts = [str(lbl.cget("text")) for key, lbl in mon.items()
+                         if key.startswith(f"{dtag}_")]
+            if not monitor_ready(mon_texts):
+                warn_center("모니터 수치가 없습니다 — '적'을 눌러 종목·호가단위·기준수량을\n"
+                            "적용하고 수치가 뜬 뒤 실행하세요")
+                return
         if turning_on:  # 실행 시작 전 필수 입력 + 리스크방지 검증(인라인 현재값 확정)
             en_sf = parse_threshold(w["e_en_sf"].get())
             en_s = parse_threshold(w["e_en_s"].get())
@@ -735,7 +835,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             btn.config(bg=T.C_BUY if side == "en" else T.C_SELL, fg="white",
                        font=T.FONT_NUM_LG)
         else:
-            btn.config(bg="SystemButtonFace", fg="black", font=T.FONT_BASE_LG)
+            btn.config(bg=_idle_btn_bg(w), fg="black", font=T.FONT_BASE_LG)
         # 실행 중엔 해당 기준값 칸 잠금(진입=SF·S 두 칸 / 청산=SF 한 칸) — DESIGN-auto-m
         st = "disabled" if on else "normal"
         for ent in (("e_en_sf", "e_en_s") if side == "en" else ("e_ex_sf",)):
@@ -785,14 +885,19 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         win.resizable(False, False)
         win.transient(root)
         # 진입은 SF·S 두 칸, 청산은 SF 한 칸 (자동T 대비 한 줄 늘어남)
-        # 기준배수(원, 2026-09-15) = 역산가를 주문단위로 맞출 때의 기준점(0이면 0원 기준 배수).
+        # 시작호가(원, 2026-09-15) = 역산가를 주문단위로 맞출 때의 기준점(0이면 0원 기준 배수).
         # 목업(STG_2/세트설정.png) 6칸 뒤에 한 줄 추가.
         # 주식(사용자 2026-09-16): 목표수량·1회주문수량은 천 단위 쉼표로 보이고 쉼표 입력 허용
         vcmd_qty = (root.register(is_qty_text), "%P") if spec.qty_commas else vcmd_int
         rows = [("목표수량", "target", vcmd_qty), ("1회주문수량", "per", vcmd_qty),
                 ("전환딜레이(초)", "delay", vcmd_int), ("진입SF", "en_sf", vcmd_dec),
                 (spec.entry_s_label, "en_s", vcmd_dec), ("청산", "ex_sf", vcmd_dec),
-                ("주문가 기준배수(원)", "offset", vcmd_int)]
+                # 선주문 주문단위 — 공통설정(종목별)에서 세트설정으로 이동(사용자 2026-09-16).
+                # 값 0/빈칸이면 종목 기본값(옛 공통설정 값)을 채워 보여준다
+                ("선주문 주문단위(원)", "tick", vcmd_int),
+                ("선주문 시작호가(원)", "offset", vcmd_int)]
+        if not w.get("tick"):
+            w["tick"] = int(common["pre_tick"].get(cur_under(), 0))
         if not spec.has_en_sf:  # 주식: 진입SF 칸 없음
             rows = [row for row in rows if row[1] != "en_sf"]
         ents: dict[str, tk.Entry] = {}
@@ -804,7 +909,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                          validatecommand=vc)
             if key in inline_map:  # 진입SF·진입S·청산 = 화면 인라인 현재값
                 e.insert(0, w[inline_map[key]].get())
-            else:  # 목표수량·1회주문·전환딜레이·기준배수 = 세트 상태값 (딜레이·기준배수는 0도 값)
+            else:  # 목표·1회주문·딜레이·주문단위·시작호가 = 세트 상태값(딜레이·시작호가는 0도 값)
                 val = w.get(key)
                 blank = val is None or (val == 0 and key not in ("delay", "offset"))
                 commas = spec.qty_commas and key in ("target", "per")
@@ -824,15 +929,13 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         diff_var = tk.BooleanVar(value=False)
         tk.Checkbutton(win, text="체결차 Clear", variable=diff_var).grid(
             row=len(rows) + 1, column=0, sticky="w", padx=6, pady=(0, 4))
-        # 주식 신용(사용자 2026-09-16): 진입 신용매수 / 청산 신용상환 — 세트 상태값(저장·복원)
-        credit_en_var = tk.BooleanVar(value=bool(w.get("credit_en")))
-        credit_ex_var = tk.BooleanVar(value=bool(w.get("credit_ex")))
+        # 주식 신용(사용자 2026-09-16): 체크 하나 — 진입은 신용매수, 청산은 신용상환. 세트 상태값
+        credit_var = tk.BooleanVar(value=bool(w.get("credit")))
         extra_rows = 0
         if spec.credit_boxes:
-            tk.Checkbutton(win, text="진입 신용", variable=credit_en_var).grid(
-                row=len(rows) + 2, column=0, sticky="w", padx=6)
-            tk.Checkbutton(win, text="청산 신용상환", variable=credit_ex_var).grid(
-                row=len(rows) + 2, column=1, sticky="w", padx=6)
+            tk.Checkbutton(win, text="신용 (진입 신용매수 · 청산 신용상환)",
+                           variable=credit_var).grid(
+                row=len(rows) + 2, column=0, columnspan=2, sticky="w", padx=6)
             extra_rows = 1
 
         def save() -> None:
@@ -854,8 +957,11 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 errs.append("청산을 입력하세요")
             errs += check_risk(dtag, en_sf if spec.has_en_sf else en_s, ex_sf, *_risk_of(dtag))
             offset = parse_qty(ents["offset"].get())
+            unit = parse_qty(ents["tick"].get()) or int(common["pre_tick"].get(cur_under(), 0))
+            if unit <= 0:
+                errs.append("선주문 주문단위를 입력하세요")
             sf_tick = _live_book().get("sf_tick")  # 코어가 실은 지금 가격대의 SF 호가단위
-            errs += price_offset_errors(offset, int(common["pre_tick"].get(cur_under(), 0)),
+            errs += price_offset_errors(offset, unit,
                                         int(sf_tick) if isinstance(sf_tick, int) else None)
             if rt_var.get() and not rt_ent.get().strip():  # 체크만 하고 값 없음 → 확인창
                 errs.append("RT 진입수량 수동 입력이 켜져 있는데 값이 없습니다")
@@ -866,11 +972,11 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 return
             w["target"], w["per"] = target, per
             w["delay"] = parse_qty(ents["delay"].get())
-            w["offset"] = offset
+            w["tick"], w["offset"] = unit, offset
             w["en_sf"], w["en_s"], w["ex_sf"] = en_sf, en_s, ex_sf
             w["rt_manual"] = parse_qty(rt_ent.get()) if rt_var.get() else None
             w["clear_diff"] = diff_var.get()
-            w["credit_en"], w["credit_ex"] = credit_en_var.get(), credit_ex_var.get()
+            w["credit"] = credit_var.get()
             apply_set_display(dtag, i)
             win.destroy()
             # 코어에 세트 설정 전송(실행 중에도 가능 — 코어가 다음 판정부터 반영)
@@ -885,11 +991,43 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         tk.Button(btns, text="취소", width=8, command=win.destroy).pack(side="left", padx=4)
         _center(win)
 
+    def _idle_btn_bg(w: dict[str, Any]) -> str:
+        """쉬는 실행 버튼의 바탕 — 신용 세트는 초록, 짝수 줄(주식선물)은 하늘, 아니면 기본
+        버튼색(사용자 2026-09-16: 줄 띠가 버튼까지 이어지는 주식 쪽 모양이 낫다)."""
+        if w.get("credit"):
+            return _CREDIT_BG
+        return _ALT_BG if w.get("alt") else "SystemButtonFace"
+
+    def _paint_row_bg(w: dict[str, Any]) -> None:
+        """세트 행 바탕 — 중지면 검정·흰 글자(사용자 확정 2026-09-04), 아니면 신용 세트는 옅은
+        초록(2026-09-16), 그 외 원래 색."""
+        halted, credit, alt = bool(w.get("halted")), bool(w.get("credit")), bool(w.get("alt"))
+        for lbl, orig_bg in w.get("row", ()):
+            if halted:
+                bg = "black"
+            elif credit:
+                bg = _CREDIT_BG
+            else:
+                bg = _ALT_BG if alt else orig_bg  # 짝수 세트 하늘(주식선물)
+            lbl.config(bg=bg, fg="white" if halted else "black")
+        # 띠가 끊기지 않게 입력칸·설정 버튼도 — 신용 행은 초록(사용자 2026-09-16: 버튼까지),
+        # 짝수 행은 하늘, 중지 행은 원래 색(값 칸 검정이 이미 뜻을 가짐)
+        band_bg = None if halted else (_CREDIT_BG if credit else (_ALT_BG if alt else None))
+        for widget, orig in w.get("band", ()):
+            widget.config(bg=band_bg or orig)
+        # 진입·청산 버튼은 실행 중(빨강·파랑)·중지(검정)가 우선 — 쉬고 있을 때만 신용 초록
+        for side in ("en", "ex"):
+            btn = w.get(f"btn_{side}")
+            if btn is not None and not halted and not w.get(f"run_{side}"):
+                btn.config(bg=_idle_btn_bg(w))
+
     def apply_set_display(dtag: str, i: int) -> None:
         w = sets[(dtag, i)]
-        # 신용 구분은 실행 버튼 글자로(진입→신용, 청산→상환) — 색은 진행 상태 그대로(09-16)
-        w["btn_en"].config(text=run_caption("en", bool(w.get("credit_en"))))
-        w["btn_ex"].config(text=run_caption("ex", bool(w.get("credit_ex"))))
+        # 신용 구분(09-16): 실행 버튼 글자(진입→신용, 청산→상환) + 세트 행 바탕 옅은 초록.
+        # 버튼 색은 진행 상태 그대로, 중지(검정)가 초록보다 우선.
+        w["btn_en"].config(text=run_caption("en", bool(w.get("credit"))))
+        w["btn_ex"].config(text=run_caption("ex", bool(w.get("credit"))))
+        _paint_row_bg(w)
         w["tg"].config(text=str(w["target"]) if w["target"] else "-")
         w["per_lbl"].config(text=str(w["per"]) if w["per"] else "-")
         w["sec"].config(text=str(w["delay"]) if w["delay"] is not None else "-")  # 0도 표시
@@ -926,21 +1064,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             e.pack(side="left", padx=1)
             w_ents.append(e)
 
-        # 배치(사용자 확정 2026-09-04): 한 그리드에 두 줄 — 줄1 [선주문 주문단위 | 선주문(딜레이·
-        # 재개·범위)], 줄2 [상대호가 | 후주문 HP]. 행 수가 같은 틀끼리 같은 줄이라 가로선이 맞는다.
-        # '선주문 주문단위'(옛 이름 '선주문 호가 단위') — 역산가를 주문 단위로 맞추는 값. 시세
-        # 호가단위와 헷갈려 이름 변경(09-08). 한계의 1틱은 시세 호가단위(코어가 가격대로 계산).
-        pt = tk.LabelFrame(win, text="선주문 주문단위")
-        pt.grid(row=1, column=0, columnspan=2, sticky="new", padx=6, pady=4)
-        pt_ents: dict[str, tk.Entry] = {}
-        for r, (plabel, pcode) in enumerate(_PRE_TICK_ROWS):
-            tk.Label(pt, text=plabel, anchor="w", width=7).grid(  # 라벨 폭 통일 → 입력칸 세로 정렬
-                row=r, column=0, sticky="w", padx=4, pady=2)
-            e = tk.Entry(pt, width=9, justify="right", validate="key",
-                         validatecommand=vcmd_int)
-            e.insert(0, str(common["pre_tick"][pcode]))
-            e.grid(row=r, column=1, padx=4, pady=2)
-            pt_ents[pcode] = e
+        # 배치(사용자 확정 2026-09-04, 2026-09-16 정리): 한 그리드에 두 줄 — 줄1 [선주문(딜레이·
+        # 재개·범위) | 후주문 HP], 줄2 [상대호가]. '선주문 주문단위'(종목별) 틀은 세트설정으로
+        # 옮겨 뺐다(사용자 2026-09-16) — 종목 기본값(common["pre_tick"])은 세트값 0일 때 채우는
+        # 용도로만 남는다. 한계의 1틱은 시세 호가단위(코어가 가격대로 계산).
         # 줄2 왼쪽 — 상대호가 콤보. 라벨은 매수/매도(SF 주문 방향) — 09-11에 '진입/청산'으로
         # 바꿨다가 역방향(진입=SF 매도)에선 헷갈려 09-14 사용자가 되돌림. 코어도 주문 방향으로
         # 고른다(§6.3).
@@ -959,7 +1086,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # 줄2 오른쪽 — 후주문 HP(%) (자동T의 HP 여유와 같은 뜻: 매도 = 매수1호가×(1−여유)).
         # 2행짜리라 2행인 상대호가 틀과 같은 줄, 3행짜리 선주문 틀은 3행인 호가단위 틀과 같은 줄.
         hp = tk.LabelFrame(win, text="후주문 HP(%)")
-        hp.grid(row=2, column=2, columnspan=2, sticky="new", padx=6, pady=4)
+        hp.grid(row=1, column=2, columnspan=2, sticky="new", padx=6, pady=4)
         hp_ents: dict[str, tk.Entry] = {}
         for r, (hk, hlabel) in enumerate((("hl_margin_buy", "매수"), ("hl_margin_sell", "매도"))):
             tk.Label(hp, text=hlabel, anchor="w", width=7).grid(
@@ -971,7 +1098,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             hp_ents[hk] = e_hp
         # 줄1 오른쪽 — 선주문 딜레이·재개 딜레이·범위 (3행 — 호가단위 틀과 같은 줄, 행 높이 일치)
         pr = tk.LabelFrame(win, text="선주문")
-        pr.grid(row=1, column=2, columnspan=2, sticky="new", padx=6, pady=4)
+        pr.grid(row=1, column=0, columnspan=2, sticky="new", padx=6, pady=4)
         pr.columnconfigure(0, weight=1)  # 라벨은 오른쪽 붙임 → 입력칸이 오른쪽 끝에 정렬
         tk.Label(pr, text="딜레이(ms)").grid(row=0, column=0, sticky="e", pady=2)
         e_delay = tk.Entry(pr, width=7, justify="right", validate="key",
@@ -1013,8 +1140,6 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
 
         def save() -> None:
             common["windows"] = [e.get().strip() for e in w_ents]
-            for pcode, e in pt_ents.items():
-                common["pre_tick"][pcode] = parse_qty(e.get())
             common["pre_delay"] = parse_qty(e_delay.get())
             common["resume_delay"] = parse_qty(e_resume.get())
             common["pre_range"] = parse_threshold(e_range.get()) or 0.0
@@ -1046,7 +1171,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     for di, (dtag, name, en_sf, en_s, ex_sf) in enumerate(spec.directions):
         # 정방향 0~(높이−1), 구분선 1줄, 역방향 그 다음 — 기본 3·3세트면 0~4 / 5 / 6~10
         if di > 0:
-            rbase += section_height(SET_ROWS[spec.directions[di - 1][0]]) + 1
+            rbase += section_height(rows_by[spec.directions[di - 1][0]]) + 1
             ttk.Separator(board, orient="horizontal").grid(
                 row=rbase - 1, column=0, columnspan=16, sticky="ew", pady=3)
         build_section(board, rbase, dtag, name, en_sf, en_s, ex_sf, spec.acc_rows[dtag])
@@ -1058,6 +1183,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                       "-환": "1,418.5", "+환": "1,418.5"}
         for (dtag, _i), w in sets.items():
             w["target"], w["per"], w["delay"] = 10000, 100, 30  # 상태도 채워 설정창과 일관
+            w["tick"] = 3000  # 세트별 선주문 주문단위 표본(세트설정 창)
             w["tg"].config(text="10,000")
             w["per_lbl"].config(text="100")
             w["rt"].config(text="9,999")
@@ -1068,19 +1194,30 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             w["e_en_sf"].insert(0, en)
             w["e_en_s"].insert(0, en)
             w["e_ex_sf"].insert(0, ex)
-            if spec.credit_boxes and _i == 1:  # 2세트만 신용 표본 — 버튼 글자 신용/상환 대조
-                w["credit_en"] = w["credit_ex"] = True
-                w["btn_en"].config(text=run_caption("en", True))
-                w["btn_ex"].config(text=run_caption("ex", True))
+            # 신용 기본 세트(아래 2개)의 초록 바탕·버튼 글자까지 표본에(값 텍스트는 위 샘플 유지)
+            w["btn_en"].config(text=run_caption("en", bool(w["credit"])))
+            w["btn_ex"].config(text=run_caption("ex", bool(w["credit"])))
+            _paint_row_bg(w)
         for d in dirs:
             for labels in sets[(d, 0)].get("_acc", {}).values():
                 for comp, lbl in labels.items():
                     lbl.config(text=acc_sample.get(comp, "-"))
+            for glabel, snap in sets[(d, 0)].get("_snap", {}).items():  # 마지막 판 스냅샷 표본
+                # 표본: 진입은 역방향 판(+HP/-SF/+환), 청산은 정방향 판 — 부호 전환 대조용
+                sdir = "rev" if glabel == "진입" and "rev" in spec.acc_rows else "fwd"
+                if len(dirs) > 1:
+                    snap["dir"].config(text=dict(spec.directions_names())[sdir])
+                comps_s = dict(spec.acc_rows[sdir])[glabel]
+                for n_lbl, v_lbl, comp in zip(snap["names"], snap["vals"],
+                                              ("Sprd", *comps_s)[:len(snap["vals"])],
+                                              strict=True):
+                    n_lbl.config(text=comp)
+                    v_lbl.config(text=acc_sample.get(comp, "-"))
 
     # width=1: 상태줄 글이 길어도(중지 사유 등) 창 폭을 밀어 키우지 않게 — 라벨이 요구하는 폭을
     # 1글자로 두고 pack(fill="x")로 창 폭만큼만 보인다(넘치는 글은 잘림, 전문은 로그에). 09-08.
     status_text = "UI 미리보기 — 코어 미연결" if preview else "코어 확인 중 ..."
-    last_tag, last_rows = spec.directions[-1][0], SET_ROWS[spec.directions[-1][0]]
+    last_tag, last_rows = spec.directions[-1][0], rows_by[spec.directions[-1][0]]
     if last_rows < 3:
         # 마지막 방향의 세트가 3줄 미만이면 매매결과 블록 옆 빈 줄에 상태줄을 넣어 창 높이를 아낀다
         # (사용자 2026-09-15, 역방향 2세트 배치). 세트 컬럼(0~10) 폭만 차지.
@@ -1096,10 +1233,15 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     attach_full_text_popup(status, root)  # 더블클릭 → 잘린 상태줄 전문을 힌트 창으로(2026-09-15)
     refresh_windows_bar()  # 상단 주문가능시간 표시 초기화
 
+    def _book_key() -> str:
+        """코어 책 키 — 주식선물은 종목 그대로, 주식은 '종목|stock'(코어에 주식 책이 생기면 그
+        키로 옴. 그 전엔 없어서 빈 책 = 값 '-', 주식선물 책을 잘못 보여주지 않는다, 2026-09-16)."""
+        return cur_under() if spec.product == "sf" else f"{cur_under()}|{spec.product}"
+
     def _live_book() -> dict[str, Any]:
-        """이 창 종목의 실시간 책 스냅샷(autom_live[종목]) — 없으면 빈 dict."""
+        """이 창 종목의 실시간 책 스냅샷(autom_live[책 키]) — 없으면 빈 dict."""
         data = state_box.get("data") or {}
-        live = (data.get("autom_live") or {}).get(cur_under())
+        live = (data.get("autom_live") or {}).get(_book_key())
         return live if isinstance(live, dict) else {}
 
     def _live_sets(dtag: str = "fwd") -> list[dict[str, Any]]:
@@ -1234,14 +1376,14 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         btn = w["btn_en" if side == "en" else "btn_ex"]
         # 캡션은 항상 '진입'/'청산'(사용자 2026-09-04) — 진행 상태는 색(실행중 빨강/파랑,
         # 중지 검정)과 상태줄 상세로만 보여준다.
-        text = run_caption(side, bool(w.get(f"credit_{side}")))  # 주식 신용이면 신용/상환
+        text = run_caption(side, bool(w.get("credit")))  # 주식 신용이면 신용/상환
         if status_code == "halted":
             btn.config(text=text, bg="black", fg="white", font=T.FONT_NUM_LG)
         elif on:
             btn.config(text=text, bg=T.C_BUY if side == "en" else T.C_SELL, fg="white",
                        font=T.FONT_NUM_LG)
         else:
-            btn.config(text=text, bg="SystemButtonFace", fg="black", font=T.FONT_BASE_LG)
+            btn.config(text=text, bg=_idle_btn_bg(w), fg="black", font=T.FONT_BASE_LG)
         if w[key] == on:
             return
         w[key] = on
@@ -1279,13 +1421,12 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         if w["halted"] == halted:
             return
         w["halted"] = halted
-        for lbl, orig_bg in w["row"]:
-            lbl.config(bg="black" if halted else orig_bg, fg="white" if halted else "black")
+        _paint_row_bg(w)
 
     def _load_inputs_from_core(data: dict[str, Any]) -> None:
         """코어가 기억하는 **이 종목 책**(세트 입력값·기준수량·월물)을 화면에 채운다 — 코어가 원본.
         창을 열 때와 종목 콤보를 바꿀 때 1회(2026-09-08: 종목별 독립)."""
-        book = ((data.get("autom") or {}).get("books") or {}).get(cur_under()) or {}
+        book = ((data.get("autom") or {}).get("books") or {}).get(_book_key()) or {}
         rows = book.get("sets")
         if not isinstance(rows, list):
             return
@@ -1305,7 +1446,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         """코어 책의 세트 입력값(목표·1회·전환초·진입SF·진입S·청산)을 그 방향 3세트 칸에 채운다.
         skip_focused: 지금 인라인 칸을 편집 중인 세트는 건너뛴다(입력 중 값이 튀지 않게)."""
         focused = root.focus_get() if skip_focused else None
-        for i, raw in enumerate(rows[:SET_ROWS[dtag]]):
+        for i, raw in enumerate(rows[:rows_by[dtag]]):
             if not isinstance(raw, dict):
                 continue
             w = sets[(dtag, i)]
@@ -1315,6 +1456,9 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             w["per"] = int(raw.get("per_qty") or 0)
             w["delay"] = int(raw.get("switch_delay_s") or 0)
             w["offset"] = int(raw.get("price_offset") or 0)
+            w["tick"] = int(raw.get("pre_tick") or 0)  # 0 = 종목 기본값(공통설정 값)
+            if "credit" in raw:  # 주식 신용(코어 책에 실리면 따라감, 없으면 화면 기본값 유지)
+                w["credit"] = bool(raw["credit"])
             for key in ("en_sf", "en_s", "ex_sf"):
                 v = raw.get(key)
                 w[key] = float(v) * 100.0 if isinstance(v, int | float) else None
@@ -1327,7 +1471,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         그 창에서 다시 저장하면 옛 값으로 덮어쓴다. 코어가 원본이므로 바뀔 때만 다시 채운다
         (세트설정이 코어에 가는 시점 = 설정창 '확인'·실행 켬, 사용자 확정 2026-09-09).
         """
-        book = ((data.get("autom") or {}).get("books") or {}).get(cur_under()) or {}
+        book = ((data.get("autom") or {}).get("books") or {}).get(_book_key()) or {}
         sig = set_inputs_sig(book)
         if not sig or sig == state_box.get("_sets_sig"):
             return
@@ -1408,7 +1552,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             _sync_set_inputs_from_core(data)  # 다른 창이 바꾼 세트설정 반영(같은 종목)
         details: list[str] = []
         for dtag in dirs:  # 방향별 세트(역방향 2026-09-14, 주식 화면은 정방향만)
-            for i, row in enumerate(_live_sets(dtag)[:SET_ROWS[dtag]]):
+            for i, row in enumerate(_live_sets(dtag)[:rows_by[dtag]]):
                 w = sets[(dtag, i)]
                 en, ex = row.get("entry") or {}, row.get("exit") or {}
                 _paint_leg(w, "en", en)
@@ -1463,6 +1607,25 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 labels[fx_key].config(text=_fmt_num(agg["fx_avg"], 1))
                 sprd = agg["sprd"]
                 labels["Sprd"].config(text=f"{sprd * 100:.3f}" if sprd is not None else "-")
+                # 마지막 판 스냅샷 블록(8세트 배치) — 정·역 구분 없이 가장 최근에 끝난 판(진입/청산
+                # 각각). 방향 라벨과 항목 부호(-HP/+SF/-환 ↔ +HP/-SF/+환)는 그 판의 방향대로.
+                snap = sets[(dtag, 0)].get("_snap", {}).get(glabel)
+                if snap:
+                    found = latest_round({d: _live_sets(d) for d in dirs}, leg)
+                    ldir, lr = found if found else ("", {})
+                    if len(dirs) > 1:  # 방향 하나뿐이면 "마지막 판" 고정
+                        snap["dir"].config(text=dict(spec.directions_names()).get(ldir, "-"))
+                    comps_l = dict(spec.acc_rows.get(ldir, acc_rows))[glabel]
+                    vals_l = snap["vals"]
+                    for n_lbl, comp in zip(snap["names"], ("Sprd", *comps_l)[:len(vals_l)],
+                                           strict=True):
+                        n_lbl.config(text=comp)
+                    lsp = lr.get("sprd")
+                    texts = [f"{lsp * 100:.3f}" if isinstance(lsp, int | float) else "-",
+                             _fmt_num(lr.get("hl_avg"), 2), _fmt_num(lr.get("sf_avg"), 0),
+                             _fmt_num(lr.get("fx_avg"), 1)]
+                    for v_lbl, text in zip(vals_l, texts[:len(vals_l)], strict=True):
+                        v_lbl.config(text=text)
         _refresh_merge_combo(data)
         # 이 종목이 실행 중이면 호가단위·월물 콤보와 '적'만 잠금(실행 중 상대 상품·호가단위가
         # 바뀌면 판정 기준이 통째로 바뀜). **종목 콤보는 항상 열어 둔다** — 다른 창에서 다른

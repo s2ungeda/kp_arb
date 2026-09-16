@@ -218,14 +218,16 @@ def test_restore_drops_extra_saved_sets_with_warning(caplog: pytest.LogCaptureFi
 
     from kp_arb.auto_m import AutoMBook, _book_from_dict
 
+    # (2026-09-16 세트 수 8·4로 늘림 — 저장본이 더 긴 경우는 역방향 5개로 재현)
     book = AutoMBook()
     raw = {"sets": [{"target_qty": 5}, {"target_qty": 6}, {"target_qty": 7}],
-           "rev_sets": [{"target_qty": 1}, {"target_qty": 2},
-                        {"target_qty": 3, "rt": -1, "sf_net": -1, "hl_net": 10.0}]}
+           "rev_sets": [{"target_qty": 1}, {"target_qty": 2}, {"target_qty": 3},
+                        {"target_qty": 4},
+                        {"target_qty": 9, "rt": -1, "sf_net": -1, "hl_net": 10.0}]}
     with caplog.at_level(logging.WARNING, logger="kp_arb.autom"):
         _book_from_dict(book, raw)
-    assert [s.target_qty for s in book.sets] == [5, 6, 7, 0]
-    assert [s.target_qty for s in book.rev_sets] == [1, 2]
+    assert [s.target_qty for s in book.sets] == [5, 6, 7, 0, 0, 0, 0, 0]
+    assert [s.target_qty for s in book.rev_sets] == [1, 2, 3, 4]
     assert any("세트 수 축소" in r.getMessage() and "RT -1" in r.getMessage()
                for r in caplog.records)
 
@@ -335,10 +337,10 @@ def test_reverse_sets_and_risk_round_trip_through_dict() -> None:
 
     screen = AutoMScreen()
     book = screen.book(U)
-    # 세트 수: 정방향 4·역방향 2(사용자 확정 2026-09-15)
-    assert len(book.sets) == 4 and len(book.rev_sets) == 2
+    # 세트 수: 정방향 8·역방향 4(사용자 확정 2026-09-16, 전엔 4·2)
+    assert len(book.sets) == 8 and len(book.rev_sets) == 4
     assert all(s.reverse and s.entry.reverse for s in book.rev_sets)
-    assert len(book.all_sets()) == 6 and book.sets_of(True) is book.rev_sets
+    assert len(book.all_sets()) == 12 and book.sets_of(True) is book.rev_sets
     book.rev_sets[1].target_qty, book.rev_sets[1].rt, book.rev_sets[1].sf_net = 7, -3, -3
     book.rev_sets[1].en_sf = -0.015
     screen.risk_rev_en, screen.risk_rev_gap = 0.004, 0.002
@@ -587,22 +589,22 @@ def test_price_offset_shifts_order_unit_grid() -> None:
 
 
 def test_gate_applies_set_price_offset_and_rejects_off_tick_price() -> None:
-    # 기준배수 1,000 → 역산가 201,000이 199,000으로(범위 밖이라 미발주), 근거 줄에 기준배수 표기.
+    # 시작호가 1,000 → 역산가 201,000이 199,000으로(범위 밖이라 미발주), 근거 줄에 시작호가 표기.
     s = _set(price_offset=1000)
     set_running(s, Block.ENTRY, True)
     assert evaluate(s, Block.ENTRY, _sig(), SETTINGS, U) == []
     assert s.entry.block_reason.startswith("G6 범위 밖 역산가 199,000")
-    # 기준배수 250 → 198,250은 시세 호가단위 500에 안 맞아 LS가 거부 → 내지 않고 사유 표시
+    # 시작호가 250 → 198,250은 시세 호가단위 500에 안 맞아 LS가 거부 → 내지 않고 사유 표시
     s2 = _set(price_offset=250)
     set_running(s2, Block.ENTRY, True)
     assert evaluate(s2, Block.ENTRY, _sig(), SETTINGS, U) == []
     assert "호가단위 500에 안 맞음" in s2.entry.block_reason
-    assert "기준배수 250" in s2.entry.block_reason
-    # 통과 줄에도 기준배수가 남는다
+    assert "시작호가 250" in s2.entry.block_reason
+    # 통과 줄에도 시작호가가 남는다
     s3 = _set()
     set_running(s3, Block.ENTRY, True)
     evaluate(s3, Block.ENTRY, _sig(), SETTINGS, U)
-    assert "주문단위 3000 기준배수 0 " in s3.entry.block_reason
+    assert "주문단위 3000 시작호가 0 " in s3.entry.block_reason
 
 
 def test_price_offset_survives_restore() -> None:
@@ -661,7 +663,7 @@ def test_missing_judgment_fx_halts_the_set() -> None:
 
 
 def test_price_offset_must_be_multiple_of_market_tick() -> None:
-    # 사용자 2026-09-15: 잘못 넣으면(삼성 호가단위 500에 기준배수 100) 저장 때 바로 경고창.
+    # 사용자 2026-09-15: 잘못 넣으면(삼성 호가단위 500에 시작호가 100) 저장 때 바로 경고창.
     # 코어 스냅샷 sf_tick(지금 가격대 호가단위)이 있을 때만 검사, 없으면 G6이 잡는다.
     from kp_arb.auto_m import price_offset_errors
 
@@ -672,3 +674,42 @@ def test_price_offset_must_be_multiple_of_market_tick() -> None:
     assert price_offset_errors(1000, 3000, 1000) == []
     assert price_offset_errors(500, 1000, 500) == []
     assert price_offset_errors(500, 3000, None) == []  # 시세 없음 → 건너뜀
+
+
+def test_last_round_snapshot_is_kept_per_leg() -> None:
+    # 사용자 목업 2026-09-16: 오른쪽 아래 블록 = 그 방향에서 마지막으로 끝난 한 판의 매매내역.
+    # 판이 누적에 합쳐질 때 그 판(pending)을 복사해 두고 순번을 매긴다(세트 간 최근 비교용).
+    s = _set()
+    assert s.entry.last_round is None
+    on_pre_fill(s, Block.ENTRY, 1, 201_000.0, mono=100)
+    on_post_fill(s, Block.ENTRY, 10, 1184.0, 1356.0, mono=101, settings=SETTINGS,
+                 stock_last=199_000.0, sf_theory=200_000.0)
+    lr = s.entry.last_round
+    assert lr is not None and lr.hl_qty == 10 and lr.sf_avg() == 201_000.0
+    assert lr.fx_avg() == 1356.0 and lr.sprd() == s.entry.acc.sprd()
+    seq1 = s.entry.last_round_seq
+    on_pre_fill(s, Block.ENTRY, 1, 202_000.0, mono=102)
+    on_post_fill(s, Block.ENTRY, 10, 1190.0, 1356.0, mono=103, settings=SETTINGS,
+                 stock_last=199_000.0, sf_theory=200_000.0)
+    assert s.entry.last_round is not None and s.entry.last_round.sf_avg() == 202_000.0
+    assert s.entry.last_round_seq > seq1  # 최근 판이 큰 순번
+    assert s.entry.acc.sf_qty == 2  # 누적은 두 판 합
+
+
+def test_set_pre_tick_overrides_common_unit() -> None:
+    # 2026-09-16: 선주문 주문단위를 공통설정(종목별)에서 세트설정으로 — 세트값이 있으면 그것,
+    # 0이면 공통설정 종목값(옛 저장본 호환). 역산가 201,000은 3,000 배수·1,000 배수 모두 그대로,
+    # HL 괴리 2%면 원값 203,000 → 3,000 내림 201,000 / 1,000 내림 203,000.
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    acts = evaluate(s, Block.ENTRY, _sig(hl_disp_bid=0.02), SETTINGS, U)
+    assert acts[0].price == 201_000.0 and "주문단위 3000" in s.entry.block_reason  # 공통 3,000
+    s2 = _set(pre_tick=1000)
+    set_running(s2, Block.ENTRY, True)
+    acts = evaluate(s2, Block.ENTRY, _sig(hl_disp_bid=0.02), SETTINGS, U)
+    assert acts[0].price == 203_000.0 and "주문단위 1000" in s2.entry.block_reason
+    from kp_arb.auto_m import AutoMBook, _book_from_dict
+
+    book = AutoMBook()
+    _book_from_dict(book, {"sets": [{"pre_tick": 1000}, {"target_qty": 1}]})
+    assert book.sets[0].pre_tick == 1000 and book.sets[1].pre_tick == 0

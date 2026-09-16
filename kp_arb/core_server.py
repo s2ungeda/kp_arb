@@ -394,6 +394,7 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
             "price": it.price, "status": o.status.value,
             "time": o.placed_at,  # 접수 시각(HH:MM:SS) — 주문 리스트 '시각' 칸
             "source": it.source,  # 출처(자동M·일반주문창·따라가기) — 주문 리스트 '출처' 칸·필터
+            "tag": it.tag,        # 세트 꼬리표(자동M "정3진입" 등) — 주문 리스트 '세트' 칸·필터
         })
     symbols: dict[str, Any] = {}
     for u in Underlying:
@@ -493,10 +494,15 @@ def _autom_set_from_body(target: Any, body: dict[str, Any]) -> None:
         target.per_qty = int(body["per_qty"])
     if "switch_delay_s" in body:
         target.switch_delay_s = int(body["switch_delay_s"])
-    if "price_offset" in body:  # 주문가 기준배수(원, 2026-09-15) — 음수는 거부, 상한은 화면·G6에서
+    if "pre_tick" in body:  # 선주문 주문단위(원, 세트별 2026-09-16) — 0이면 공통설정 종목값
+        pre_tick = int(body["pre_tick"] or 0)
+        if pre_tick < 0:
+            raise ValueError(f"주문단위는 0 이상이어야 함: {pre_tick}")
+        target.pre_tick = pre_tick
+    if "price_offset" in body:  # 주문가 시작호가(원, 2026-09-15) — 음수는 거부, 상한은 화면·G6에서
         offset = int(body["price_offset"] or 0)
         if offset < 0:
-            raise ValueError(f"기준배수는 0 이상이어야 함: {offset}")
+            raise ValueError(f"시작호가는 0 이상이어야 함: {offset}")
         target.price_offset = offset
     for key in ("en_sf", "en_s", "ex_sf"):
         if key in body:
@@ -529,6 +535,10 @@ async def _autom_command(
 
     cmd = body.get("cmd")
     am = state.autom
+    # 주식 체결쏴(exec §7C, 2026-09-16): 화면만 메인 메뉴에 연결된 상태 — 코어에 주식 책이 생기기
+    # 전엔 명령을 전부 거부(안 하면 주식선물 책으로 들어간다).
+    if str(body.get("product", "sf")) != "sf":
+        return _fail(["주식 체결쏴는 코어 준비 중 — 화면만 연결됨(명령 미반영)"])
     # 방향(exec §7A·§7B, 2026-09-14): "fwd"(기본) = 정방향 sets, "rev" = 역방향 rev_sets
     reverse = str(body.get("direction", "fwd")) == "rev"
 

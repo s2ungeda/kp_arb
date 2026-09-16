@@ -180,6 +180,12 @@ class AutoMEngine:
         return attach_daily_file(f"kp_arb.autom.{u.value}", f"autom_{u.value}", self._log_dir)
 
     @staticmethod
+    def _set_tag(index: int, block: Block, reverse: bool = False) -> str:
+        """주문 꼬리표(짧은 세트 표기) — 주문 리스트 '세트' 칸·필터용: "정3진입"·"역1청산"
+        (2026-09-16)."""
+        return f"{'역' if reverse else '정'}{index + 1}{'진입' if block is Block.ENTRY else '청산'}"
+
+    @staticmethod
     def _tag(u: Underlying, index: int, block: Block, reverse: bool = False) -> str:
         # 방향 표기(사용자 2026-09-08: 진입/청산만으론 정/역 구분이 안 됨) — 세트의 방향 값으로
         direction = "역방향" if reverse else "정방향"
@@ -312,7 +318,7 @@ class AutoMEngine:
         assert act.side is not None and act.price is not None
         intent = OrderIntent(venue=Venue.LS, underlying=u, instrument=inst, side=act.side,
                              qty=act.qty, order_type=OrderType.LIMIT, price=act.price,
-                             source=SOURCE)
+                             source=SOURCE, tag=self._set_tag(index, block, reverse))
         try:
             oid = await self._system.place(intent)
         except RestTimeoutError as exc:
@@ -391,7 +397,8 @@ class AutoMEngine:
         price = hl_round_price(raw_price, act.side, info.sz_decimals if info else None)
         intent = OrderIntent(venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
                              side=act.side, qty=act.qty, order_type=OrderType.LIMIT,
-                             price=price, source=SOURCE)
+                             price=price, source=SOURCE,
+                             tag=self._set_tag(index, block, reverse))
         # cloid를 먼저 세트에 묶어 둔다 — 응답보다 먼저 온 통보로 코어가 oid를 식별하면
         # _on_hl_identified가 그 oid로 등록한다(결정 27). 응답이 먼저면 아래 _register.
         ref = _OrderRef(u, index, block, "post", reverse)
@@ -796,5 +803,12 @@ class AutoMEngine:
                 "hl_avg": leg.acc.hl_avg(), "sf_avg": leg.acc.sf_avg(),
                 # Sprd는 체결 시점 값들의 가중평균이라 판이 끝나면 고정(2026-09-10)
                 "fx_avg": leg.acc.fx_avg(), "sprd": leg.acc.sprd(),
+                # 마지막으로 끝난 한 판(스냅샷, 사용자 목업 2026-09-16) — 화면 오른쪽 아래 블록.
+                # seq로 그 방향에서 가장 최근 판을 고른다
+                "last_round": ({
+                    "seq": leg.last_round_seq, "hl_avg": leg.last_round.hl_avg(),
+                    "sf_avg": leg.last_round.sf_avg(), "fx_avg": leg.last_round.fx_avg(),
+                    "sprd": leg.last_round.sprd(),
+                } if leg.last_round is not None else None),
             }
         return row

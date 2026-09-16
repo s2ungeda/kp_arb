@@ -55,10 +55,14 @@ _F_SOURCE = ("전체", "자동M", "일반주문")
 
 
 def row_visible(filters: dict[str, str], venue: str, underlying: str, side: str,
-                source: str) -> bool:
-    """필터 4개(거래소·종목·매매·출처)를 행 하나에 적용. 출처 '일반주문' = 자동M이 아닌 전부
-    (일반주문창·따라가기·미상)."""
+                source: str, tag: str = "") -> bool:
+    """필터 5개(거래소·종목·매매·출처·세트)를 행 하나에 적용. 출처 '일반주문' = 자동M이 아닌 전부
+    (일반주문창·따라가기·미상). 세트(2026-09-16)는 꼬리표 앞부분 일치 — "정3"을 고르면 정3진입·
+    정3청산 둘 다."""
     if filters.get("venue", "전체") != "전체" and venue != filters["venue"]:
+        return False
+    want_tag = filters.get("set", "전체")
+    if want_tag != "전체" and not tag.startswith(want_tag):
         return False
     want_u = _F_UNDER.get(filters.get("under", "전체"))
     if want_u is not None and underlying != want_u:
@@ -76,6 +80,17 @@ def row_visible(filters: dict[str, str], venue: str, underlying: str, side: str,
 
 # 주문상태 한글 표시 — '구분'의 '주문'과 헷갈리지 않게 상태는 한글로(accepted=접수 등).
 _TITLE = "주문 리스트 (미체결·취소·정정)"
+
+
+def set_choices(tags: list[str]) -> list[str]:
+    """세트 콤보 항목 — 표에 있는 자동M 꼬리표에서 세트 부분만("정3진입" → "정3") 모아 정렬,
+    앞에 '전체'. 순수(2026-09-16)."""
+    seen: set[str] = set()
+    for t in tags:
+        base = t.replace("진입", "").replace("청산", "").strip()
+        if base:
+            seen.add(base)
+    return ["전체", *sorted(seen)]
 
 
 def window_title(age: float | None, fails: int, hidden: int) -> str:
@@ -101,8 +116,9 @@ _COLS: tuple[tuple[str, int, str], ...] = (
     ("거래소", 50, "center"), ("종목", 88, "w"), ("매매", 50, "center"),  # 콤보 글자 안 잘리게
     ("주문가", 70, "e"), ("수량", 52, "e"), ("체결가", 70, "e"),
     ("체결량", 52, "e"), ("상태", 44, "center"), ("접수시각", 66, "center"),
-    ("체결시각", 66, "center"), ("주문번호", 104, "e"),
-    ("출처", 52, "center"))  # 출처(자동M/일반/따라가기) — 맨 끝(앞 칸 index 유지, 2026-09-11)
+    ("체결시각", 66, "center"),
+    # 출처(자동M/일반/따라가기) · 세트(자동M 꼬리표 "정3진입", 2026-09-16) · 주문번호 순(사용자)
+    ("출처", 52, "center"), ("세트", 62, "center"), ("주문번호", 104, "e"))
 _ROW_H = 20  # Treeview 행 높이(px) — FONT_LABEL 9pt 기준
 
 
@@ -121,7 +137,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     root.resizable(True, True)  # 크기 조절 — 표 행만 확장(root.rowconfigure weight)
     # 기본 크기 — 컬럼 전부 + 여유가 보이는 폭(사용자 2026-09-11). 최소폭 고정을 없애면서 자연
     # 크기가 아주 작아졌으므로 명시. 위치는 win_state가 복원, 크기는 매번 이 값.
-    root.geometry("820x370")
+    root.geometry("890x370")  # 세트 칸(62px) 추가만큼 넓힘(2026-09-16)
     win_state.attach(root, "order_list")
     T.apply_base(root)
 
@@ -209,6 +225,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Checkbutton(checks, text="취소", variable=show_cancels,
                    command=_on_filter).pack(side="left")
     _combo("source", _F_SOURCE, 6, span=2, sticky="w", width=8)  # 출처 — 컬럼 자리와 무관
+    # 세트 콤보(2026-09-16) — 출처 옆. 항목은 지금 표에 있는 자동M 꼬리표("정3"·"역1")로 채움
+    _combo("set", ("전체",), 8, span=2, sticky="w", width=6)
 
     # --- 표: ttk.Treeview (row 1, 확장) — 컬럼 헤더는 Treeview 자체(세로 스크롤에 안 밀림).
     # 2026-09-16 Label 그리드에서 전환: 코어가 당일 체결·취소를 전부 보내므로(수백 행) 셀마다
@@ -341,7 +359,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             total += 1
             return row_visible(flt, _venue(str(row.get("instrument"))),
                                str(row.get("underlying")), str(row.get("side")),
-                               str(row.get("source") or ""))
+                               str(row.get("source") or ""), str(row.get("tag") or ""))
 
         if show_orders.get():
             # 미체결은 코어가 접수시각 내림차순(**새 주문이 위**)으로 보낸다 — 체결·취소와 같이
@@ -359,7 +377,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              _fmt_px(o.get("price")), _fmt_qty(o.get("qty")),
                              "", "",  # 체결가·체결량 공백(미체결)
                              stk, o.get("time", ""), "",  # 접수시각·체결시각(공백)
-                             str(o.get("order_id")), _src_label(o.get("source")))))
+                             _src_label(o.get("source")), str(o.get("tag") or ""),
+                             str(o.get("order_id")))))
         if show_fills.get():
             for i, f in enumerate(data.get("fills") or []):
                 if not keep(f):
@@ -373,7 +392,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              _fmt_qty(f.get("order_qty")),   # 원주문 수량
                              _fmt_px(f.get("price")), _fmt_qty(f.get("qty")),
                              "체결", f.get("accept_time", ""), f.get("time", ""),
-                             str(f.get("order_id", "")), _src_label(f.get("source")))))
+                             _src_label(f.get("source")), str(f.get("tag") or ""),
+                             str(f.get("order_id", "")))))
         if show_cancels.get():
             for i, c in enumerate(data.get("cancels") or []):
                 if not keep(c):
@@ -386,7 +406,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              _fmt_px(c.get("price")), _fmt_qty(c.get("qty")),
                              "", "",  # 체결가·체결량 공백(취소행)
                              "취소", c.get("accept_time", ""), "",  # 접수시각·체결시각(공백)
-                             str(c.get("order_id", "")), _src_label(c.get("source")))))
+                             _src_label(c.get("source")), str(c.get("tag") or ""),
+                             str(c.get("order_id", "")))))
         # 유형 체크를 끈 종류도 "숨김"에 넣는다 — 주문 체크를 끄고 잊으면 미체결이 안 보인다.
         unchecked = ((0 if show_orders.get() else len(data.get("open_orders") or []))
                      + (0 if show_fills.get() else len(data.get("fills") or []))
@@ -394,7 +415,21 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         state_box["_hidden"] = (total - len(out)) + unchecked
         return out
 
+    def _refresh_set_combo() -> None:
+        # 세트 콤보 항목을 지금 데이터의 꼬리표로 — 바뀔 때만. 고른 값이 사라지면 '전체'로
+        data = state_box["data"] or {}
+        tags = [str(r.get("tag") or "") for key in ("open_orders", "fills", "cancels")
+                for r in (data.get(key) or []) if isinstance(r, dict)]
+        choices = set_choices(tags)
+        cb = combos.get("set")
+        if cb is None or list(cb["values"]) == choices:
+            return
+        cb.config(values=choices)
+        if cb.get() not in choices:
+            cb.set("전체")
+
     def _render() -> None:
+        _refresh_set_combo()
         rows = _rows()
         sig = tuple((iid, *vals) for iid, _, vals in rows)
         if sig == state_box.get("_sig"):

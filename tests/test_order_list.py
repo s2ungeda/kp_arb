@@ -46,3 +46,18 @@ def test_src_label() -> None:
     assert _src_label("일반주문창") == "일반"
     assert _src_label("따라가기") == "따라가기"
     assert _src_label("") == "-" and _src_label(None) == "-"
+
+
+def test_set_filter_and_choices() -> None:
+    # 2026-09-16: 주문 리스트 '세트' 칸·콤보 — 자동M 꼬리표("정3진입")의 세트 부분("정3")으로 거른다
+    from kp_arb.order_list import row_visible, set_choices
+
+    assert set_choices(["정3진입", "정3청산", "역1진입", "", "일반"]) == [
+        "전체", "역1", "일반", "정3"]
+    assert set_choices([]) == ["전체"]
+    f = {"set": "정3"}
+    assert row_visible(f, "LS", "sk_hynix", "sell", "자동M", "정3진입")
+    assert row_visible(f, "HL", "sk_hynix", "buy", "자동M", "정3청산")
+    assert not row_visible(f, "LS", "sk_hynix", "sell", "자동M", "정1진입")
+    assert not row_visible(f, "LS", "sk_hynix", "sell", "일반주문창", "")
+    assert row_visible({"set": "전체"}, "LS", "sk_hynix", "sell", "일반주문창", "")
