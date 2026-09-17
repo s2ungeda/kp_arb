@@ -158,6 +158,7 @@ def attach(root: tk.Tk, name: str, *, interval_ms: int = 2000,
     """
     import tkinter as tk
 
+    set_taskbar_group()
     target = (saved_geometry(name) if keep_size else None) or saved_position(name)
     if target:
         try:
@@ -168,6 +169,83 @@ def attach(root: tk.Tk, name: str, *, interval_ms: int = 2000,
     def _tick() -> None:
         try:
             save(name, root.winfo_geometry(), keep_size=keep_size)
+            root.after(interval_ms, _tick)
+        except tk.TclError:
+            pass  # 창 닫힘
+
+    root.after(interval_ms, _tick)
+    if name != "main":
+        follow_main_minimize(root)
+
+
+TASKBAR_APP_ID = "kp-arb.meme"  # 메인·화면·(개발 실행의 python/pythonw) 전부 한 작업표시줄 묶음
+
+
+def set_taskbar_group(app_id: str = TASKBAR_APP_ID) -> None:
+    """이 프로세스의 창을 작업표시줄에서 다른 우리 창들과 **한 단추로** 묶는다(Windows 전용).
+
+    작업표시줄은 기본적으로 실행 파일 단위로 묶는다 — 개발 실행은 메인이 pythonw.exe, 화면이
+    python.exe라 단추가 둘로 갈려 헷갈렸다(사용자 2026-09-17). 창을 만들기 전에 같은 앱 식별자를
+    주면 하나로 묶인다. 배포판(meme.exe)은 원래 하나지만 같이 준다(무해)."""
+    import sys
+
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except (AttributeError, OSError):
+        pass
+
+
+def mirror_action(main_iconic: bool, my_state: str, auto_iconified: bool) -> str | None:
+    """메인 창 최소화를 따라가는 판단(순수 함수) — "iconify" / "deiconify" / "restore_main" / None.
+
+    - 메인이 최소화됐는데 내가 아니면 최소화. 단 내가 **메인 때문에** 최소화됐다가 (작업표시줄에서)
+      사용자가 나만 복원한 경우면 메인을 복원("restore_main") — 그러면 다른 창들도 따라 올라온다
+      (사용자 2026-09-17: 작업표시줄 아이콘을 누르면 모든 화면이 활성화돼야 함).
+    - 메인이 돌아왔는데 내가 메인 때문에 최소화된 상태면 복원(사용자가 따로 최소화해 둔 창은
+      건드리지 않음).
+    """
+    if main_iconic and my_state != "iconic":
+        return "restore_main" if auto_iconified else "iconify"
+    if not main_iconic and auto_iconified and my_state == "iconic":
+        return "deiconify"
+    return None
+
+
+def follow_main_minimize(root: tk.Tk, interval_ms: int = 300) -> None:
+    """메인 창(``KP_MAIN_HWND``)이 최소화되면 이 창도 최소화, 메인이 돌아오면 같이 복원
+    (사용자 2026-09-17: 다른 프로그램처럼 메인을 최소화하면 전부 최소화). 화면은 메인의 자식 창이
+    아니라 **별도 프로세스**라 윈도우가 알아서 묶어 주지 않는다 — 각 창이 메인 창 상태를
+    0.3초마다 보고 따라간다(작업표시줄 단추는 창마다 그대로). Windows 전용, 환경변수 없으면 무시."""
+    import sys
+    import tkinter as tk
+
+    raw = os.environ.get("KP_MAIN_HWND")
+    if sys.platform != "win32" or not raw:
+        return
+    try:
+        import ctypes
+
+        hwnd = int(raw)
+        user32 = ctypes.windll.user32
+    except (ValueError, AttributeError, OSError):
+        return
+    box = {"auto": False}
+
+    def _tick() -> None:
+        try:
+            if not user32.IsWindow(hwnd):
+                return  # 메인이 사라짐(감시는 watch_parent_exit가 맡음)
+            act = mirror_action(bool(user32.IsIconic(hwnd)), str(root.state()), box["auto"])
+            if act == "iconify":
+                root.iconify()
+                box["auto"] = True
+            elif act == "deiconify":
+                root.deiconify()
+                box["auto"] = False
             root.after(interval_ms, _tick)
         except tk.TclError:
             pass  # 창 닫힘

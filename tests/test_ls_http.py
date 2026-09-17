@@ -103,6 +103,21 @@ async def test_requests_carry_10s_timeout() -> None:
         assert call["timeout"] is not None and call["timeout"].total == 10.0
 
 
+async def test_order_tr_requests_carry_30s_timeout() -> None:
+    # 사용자 확정 2026-09-17: 주문 TR(발주·정정·취소)은 30초 — 운영 실측 LS 주문 서버 지연 10~14초가
+    # 10초 상한에 걸려 세트가 멈춤. 조회 TR은 그대로 10초.
+    from kp_arb.gateways.ls_http import ORDER_REQUEST_TIMEOUT_S, AiohttpRestTransport
+
+    session = FakeSession(FakeResp(200, json_body={"rsp_cd": "00040"}))
+    tx = AiohttpRestTransport(session)
+    await tx.request("POST", "https://x/stock/order", {"tr_cd": "CSPAT00601"}, {"a": 1})
+    await tx.request("POST", "https://x/futureoption/order", {"tr_cd": "CFOAT00300"}, {"a": 1})
+    await tx.request("POST", "https://x/stock/accno", {"tr_cd": "CSPAQ22200"}, {"a": 1})
+    assert session.calls[0]["timeout"].total == ORDER_REQUEST_TIMEOUT_S == 30.0
+    assert session.calls[1]["timeout"].total == 30.0
+    assert session.calls[2]["timeout"].total == 10.0
+
+
 async def test_rest_transport_non_json_falls_back_to_raw() -> None:
     session = FakeSession(FakeResp(500, text_body="Internal Error"))
     tx = AiohttpRestTransport(session)

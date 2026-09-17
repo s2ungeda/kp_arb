@@ -435,6 +435,18 @@ def main() -> None:
     root.resizable(False, False)
     root.option_add("*Font", ("Malgun Gothic", 9))
     win_state.attach(root, "main")  # 메인창 위치 저장·복원(슬롯 없음 — 단일 인스턴스)
+    # 메인 창 핸들을 자식 화면에 넘긴다(KP_MAIN_HWND) — 화면들이 메인 최소화·복원을 따라감
+    # (win_state.follow_main_minimize, 사용자 2026-09-17). 화면은 별도 프로세스라 OS가 안 묶어 줌.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(root.winfo_id())  # tk 최상위 창 핸들
+            if hwnd:
+                os.environ["KP_MAIN_HWND"] = str(hwnd)  # launch_module이 os.environ을 물려줌
+        except (AttributeError, OSError, tk.TclError):
+            pass
 
     lbl_core = tk.Label(root, text="코어: 확인 중 ...", anchor="w", width=42)
     lbl_core.pack(fill="x", padx=8, pady=(8, 2))

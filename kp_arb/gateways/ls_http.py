@@ -14,13 +14,18 @@ from typing import Any
 import aiohttp
 
 from .ls_auth import TokenResponse
-from .ls_rest import RestResponse
+from .ls_rest import RestResponse, is_order_tr
 
 # 요청 1건의 최대 대기(초) — 사용자 확정 2026-09-14: 10초. 전에는 aiohttp 기본(5분)이라 걸린 요청
 # 하나가 시동을 붙잡았다(운영 실측 10:33 잔고 조회 72초). 넘기면 전송 예외 → LSRestClient가
 # 0.3·0.6초 뒤 재시도(3회), 끝내 실패하면 RestError(시동은 그 계좌 없이 계속).
 REQUEST_TIMEOUT_S = 10.0
 _TIMEOUT = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S)
+# 주문 TR(발주·정정·취소)은 30초(사용자 확정 2026-09-17) — 운영 실측 LS 주문 서버 지연 10~14초가
+# 10초 상한에 걸려 세트가 멈췄다(발주 2건 중지, 취소 3건은 늦게 처리됨). 주문은 재전송하지 않으니
+# 기다리는 편이 안전하다. 조회 TR은 그대로 10초(재시도 있음).
+ORDER_REQUEST_TIMEOUT_S = 30.0
+_ORDER_TIMEOUT = aiohttp.ClientTimeout(total=ORDER_REQUEST_TIMEOUT_S)
 
 
 class AiohttpTokenTransport:
@@ -68,8 +73,9 @@ class AiohttpRestTransport:
         body: dict[str, Any] | None,
     ) -> RestResponse:
         payload = json.dumps(body) if body is not None else None
+        timeout = _ORDER_TIMEOUT if is_order_tr(str(headers.get("tr_cd", ""))) else _TIMEOUT
         async with self._session.request(
-            method, url, headers=headers, data=payload, timeout=_TIMEOUT
+            method, url, headers=headers, data=payload, timeout=timeout
         ) as resp:
             status = int(resp.status)
             try:

@@ -69,6 +69,18 @@ def test_slot_separates_instances(
     assert win_state.saved_fields("order_hl") == {"under": "삼성"}
 
 
+def test_mirror_action_follows_main_minimize_only_when_auto() -> None:
+    # 사용자 2026-09-17: 메인을 최소화하면 모든 화면 최소화, 메인을 복원하면 같이 복원. 사용자가
+    # 따로 최소화해 둔 창(auto 아님)은 메인 복원 때 건드리지 않는다.
+    m = win_state.mirror_action
+    assert m(True, "normal", False) == "iconify"
+    assert m(True, "iconic", True) is None            # 이미 최소화 — 반복 없음
+    assert m(False, "iconic", True) == "deiconify"    # 메인 복원 → 같이 복원
+    assert m(False, "iconic", False) is None          # 사용자가 직접 최소화한 창은 그대로
+    assert m(False, "normal", False) is None
+    assert m(True, "zoomed", False) == "iconify"
+
+
 def test_fresh_slot_inherits_newest_saved_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # 실측 2026-09-17: 창을 하나 더 띄웠다 닫는 사이 쓰던 창은 #1에 저장됐고, 다음에 혼자 띄운
