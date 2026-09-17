@@ -65,6 +65,22 @@ def test_settings_payload_shape() -> None:
     assert (p2["risk_rev_en"], p2["risk_rev_ex"], p2["risk_rev_gap"]) == (0.004, 0.0005, 0.002)
 
 
+def test_set_input_sigs_change_only_for_the_edited_set() -> None:
+    # 2026-09-17: 한 세트가 바뀌면 그 세트 서명만 달라진다 — 화면은 바뀐 세트만 다시 채운다
+    # (다른 세트의 미전송 인라인 괴리율이 옛 코어 값으로 되돌아가던 것)
+    from kp_arb.order_autom import set_input_sigs
+
+    book = {"sets": [{"target_qty": 100, "en_sf": -0.01}, {"target_qty": 50, "en_sf": -0.02}],
+            "rev_sets": [{"target_qty": 7, "en_sf": 0.005}]}
+    base = set_input_sigs(book)
+    assert set(base) == {("fwd", 0), ("fwd", 1), ("rev", 0)}
+    book["sets"][1]["en_sf"] = -0.03
+    after = set_input_sigs(book)
+    changed = {k for k, s in after.items() if base.get(k) != s}
+    assert changed == {("fwd", 1)}
+    assert set_input_sigs({}) == {} and set_input_sigs({"sets": None}) == {}
+
+
 def test_set_inputs_sig_includes_reverse_sets() -> None:
     book = {"sets": [{"target_qty": 1, "per_qty": 1, "switch_delay_s": 0,
                       "en_sf": 0.005, "en_s": 0.005, "ex_sf": -0.001}],

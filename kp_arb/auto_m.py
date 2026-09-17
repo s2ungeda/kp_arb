@@ -107,6 +107,7 @@ class Signals:
     market_halted: bool = False       # 선물시장 정지 오버레이(exec §8)
     resumed_mono: float | None = None  # 정지가 풀린 시각(재개 딜레이)
     fx: float | None = None           # HL 환산 환율(역산가의 HL괴리에 쓰인 값) — 로그용
+    product: str = "sf"               # "sf" | "stock" — 주식은 §7C 식(1호가 기준·H/(1+기준값))
 
 
 # --------------------------------------------------------------- 행동(출력) ---
@@ -145,6 +146,10 @@ class Accum:
     s_px_sum: float = 0.0
     theory_sum: float = 0.0
     ref_qty: float = 0.0     # 위 두 기준값이 기록된 HL 수량(옛 누적·시세 없던 체결 제외) — 분모
+    # 상품(2026-09-17, exec §7C): 국내 1단위 = HL 몇 계약(주식선물 10, 주식 1)과 주식 Sprd 식 여부.
+    # 종목 상태(AutoMBook)가 만들 때 넣어 준다
+    ratio: int = HL_PER_SF
+    stock: bool = False
 
     def add_round(self, pending: Accum, matched_only: bool = False) -> None:
         """한 판(pending)을 누적에 합친다 — 후주문 전량 체결이 확인된 뒤에만(사용자 확정 2026-09-08,
@@ -163,7 +168,7 @@ class Accum:
         hl_take = pending.matched_hl()
         if hl_take <= 0:
             return
-        sf_take = hl_take / HL_PER_SF
+        sf_take = hl_take / self.ratio
         hl_avg, fx_avg, sf_avg = pending.hl_avg(), pending.fx_avg(), pending.sf_avg()
         self.hl_qty += hl_take
         self.hl_px_sum += (hl_avg or 0.0) * hl_take
@@ -203,11 +208,11 @@ class Accum:
     def matched_hl(self) -> float:
         """짝이 맞은 체결량(HL 계약) — LS·HL 누적 체결량이 다르면 **적은 쪽** 기준(사용자 확정
         2026-09-08; 보통 HL이 적다 — 부분 체결·거부). SF 1계약 = HL 10계약으로 맞춰 비교."""
-        return min(self.hl_qty, self.sf_qty * HL_PER_SF)
+        return min(self.hl_qty, self.sf_qty * self.ratio)
 
     def matched_sf(self) -> float:
         """짝이 맞은 체결량(SF 계약, 소수 가능 — HL 0.588 체결이면 0.0588)."""
-        return self.matched_hl() / HL_PER_SF
+        return self.matched_hl() / self.ratio
 
     def sprd(self) -> float | None:
         """Sprd = (환×HL평균가 − S현재가)/S현재가 − (SF평균가 − SF이론가)/SF이론가 (엑셀 메인 I25).
@@ -217,6 +222,11 @@ class Accum:
         쓸 수 없었음.)"""
         fx, hl, sf = self.fx_avg(), self.hl_avg(), self.sf_avg()
         stock, theory = self.s_avg(), self.theory_avg()
+        if self.stock:  # 주식(exec §7C, 사용자 확정 2026-09-17): 국내 다리가 현물 자체 → HL 항만
+            if None in (fx, hl, stock):
+                return None
+            assert fx is not None and hl is not None and stock is not None
+            return (fx * hl - stock) / stock
         if None in (fx, hl, sf, stock, theory):
             return None
         assert fx is not None and hl is not None and sf is not None
@@ -314,6 +324,8 @@ class AutoMSet:
     sf_net: int = 0                         # 이 세트가 잡은 SF 순잔고(계약, 매수 +)
     hl_net: float = 0.0                     # 이 세트가 잡은 HL 순잔고(계약, 매도 −)
     reverse: bool = False                   # 역방향 세트(진입 = SF 매도 + HL 매수)
+    product: str = "sf"                     # "sf" 주식선물 | "stock" 주식(exec §7C, 2026-09-17)
+    credit: bool = False                    # 주식 신용 세트(결정 40) — 진입 신용매수·청산 신용상환
     entry: Leg = field(default_factory=lambda: Leg(Block.ENTRY))
     exit: Leg = field(default_factory=lambda: Leg(Block.EXIT))
     last_entry_fill_mono: float | None = None
@@ -330,8 +342,16 @@ class AutoMSet:
     def leg(self, block: Block) -> Leg:
         return self.entry if block is Block.ENTRY else self.exit
 
+    @property
+    def hl_ratio(self) -> int:
+        """국내 1단위(계약/주) = HL 몇 계약 — 주식선물 10, 주식 1(exec §7C)."""
+        return 1 if self.product == "stock" else HL_PER_SF
+
     def threshold(self, block: Block) -> float | None:
-        return self.en_sf if block is Block.ENTRY else self.ex_sf
+        """역산(G6)에 쓰는 기준값 — 주식선물 진입은 진입SF, 주식 진입은 진입(S) 칸(en_s)."""
+        if block is Block.ENTRY:
+            return self.en_s if self.product == "stock" else self.en_sf
+        return self.ex_sf
 
 
 # ---------------------------------------------------------------- 순수 계산 ---
@@ -429,9 +449,10 @@ def set_post_done(s: AutoMSet) -> bool:
     return post_done(s.entry) and post_done(s.exit)
 
 
-def fill_diff(sf_net_contracts: int, hl_net_contracts: float) -> float:
-    """체결차(§8) = SF 잔고 × 10 + HL 잔고(매도 −). 0이면 완전 헤지."""
-    return sf_net_contracts * HL_PER_SF + hl_net_contracts
+def fill_diff(sf_net_contracts: int, hl_net_contracts: float,
+              ratio: int = HL_PER_SF) -> float:
+    """체결차(§8) = 국내 잔고 × 비율(주식선물 10, 주식 1) + HL 잔고(매도 −). 0이면 완전 헤지."""
+    return sf_net_contracts * ratio + hl_net_contracts
 
 
 # ---------------------------------------------------------------- 상태변화 ---
@@ -483,6 +504,11 @@ def _passes_signal(s: AutoMSet, leg: Leg, sig: Signals) -> bool:
     체결로 보장되는 가격(maker)에 걸므로 SF 괴리를 따로 비교할 이유가 없다. S 괴리는
     진입 허용 조건으로만 본다(실제 매매는 SF+HL).
     """
+    if s.product == "stock":  # exec §7C(2026-09-17): d = (HL est×환율 − 1호가)/1호가
+        d = stock_monitor_value(sig, leg.post_side)
+        if leg.block is Block.ENTRY:
+            return s.en_s is not None and d is not None and d > s.en_s
+        return s.ex_sf is not None
     if leg.block is Block.ENTRY:
         if s.en_sf is None or s.en_s is None:
             return False
@@ -490,6 +516,18 @@ def _passes_signal(s: AutoMSet, leg: Leg, sig: Signals) -> bool:
             return sig.s_spread_exit is not None and sig.s_spread_exit < s.en_s
         return sig.s_spread_entry is not None and sig.s_spread_entry > s.en_s
     return s.ex_sf is not None
+
+
+def stock_monitor_value(sig: Signals, post_side: Side) -> float | None:
+    """주식 모니터·판정 수치(exec §7C, 사용자 확정 2026-09-16) — 진입(HL 매도) = (HL 매수호가창
+    est × 환율 − 주식 매수1호가) / 매수1호가, 청산(HL 매수) = (HL 매도호가창 est × 환율 − 매도1호가)
+    / 매도1호가. 입력이 없으면 None. 순수."""
+    est = sig.hl_est_bid if post_side is Side.SELL else sig.hl_est_ask
+    base = ((sig.sf_bids[0][0] if sig.sf_bids else None) if post_side is Side.SELL
+            else (sig.sf_asks[0][0] if sig.sf_asks else None))
+    if est is None or sig.fx is None or not base:
+        return None
+    return (est * sig.fx - base) / base
 
 
 def _switch_wait(s: AutoMSet, leg: Leg, mono: float) -> bool:
@@ -558,7 +596,8 @@ def evaluate(
         if block is Block.ENTRY:
             # 실시간 괴리값을 넣지 않는다 — 틱마다 "바뀐 근거"가 되어 줄이 쌓임(실측 09-10).
             # 이 근거는 파일 로그에도 안 남긴다(엔진 _trace가 "G5 미달" 건너뜀, 사용자 09-10).
-            why = f"G5 미달 S괴리 < 진입S {pct(s.en_s)}"
+            why = (f"G5 미달 수치 < 진입 {pct(s.en_s)}" if s.product == "stock"
+                   else f"G5 미달 S괴리 < 진입S {pct(s.en_s)}")
         else:
             why = "G5 청산 기준값 없음"
         return hold(why, _cancel_if_resting(leg, mono=sig.mono))
@@ -569,16 +608,29 @@ def evaluate(
     side = leg.pre_side
     hl_disp = sig.hl_disp_bid if leg.post_side is Side.SELL else sig.hl_disp_ask
     tick = s.pre_tick or settings.pre_tick.get(underlying)  # 세트값 우선(2026-09-16), 0이면 공통
-    if sig.sf_theory is None or hl_disp is None or thr is None or not tick:
-        return hold(f"G6 입력 없음 (이론가 {sig.sf_theory} HL괴리 {pct(hl_disp)} 틱 {tick})")
-    price = pre_order_price(side, sig.sf_theory, hl_disp, thr, tick, s.price_offset)
+    hl_est = sig.hl_est_bid if leg.post_side is Side.SELL else sig.hl_est_ask
+    if s.product == "stock":
+        # exec §7C: 주문가 = H/(1+기준값), H = 후주문 방향 HL est × 환율. 매수 내림·매도 올림
+        if hl_est is None or sig.fx is None or thr is None or not tick:
+            return hold(f"G6 입력 없음 (HL est {hl_est} 환율 {sig.fx} 틱 {tick})")
+        h_krw = hl_est * sig.fx
+        price = snap_to_unit(side, h_krw / (1.0 + thr), tick, s.price_offset)
+        mkt_inst = Instrument.KR_STOCK
+        formula = f"주문가 {price:,.0f} = H {h_krw:,.0f}/(1+{pct(thr)})"
+    else:
+        if sig.sf_theory is None or hl_disp is None or thr is None or not tick:
+            return hold(f"G6 입력 없음 (이론가 {sig.sf_theory} HL괴리 {pct(hl_disp)} 틱 {tick})")
+        price = pre_order_price(side, sig.sf_theory, hl_disp, thr, tick, s.price_offset)
+        mkt_inst = Instrument.KR_STOCK_FUTURE
+        formula = (f"역산가 {price:,.0f} = 이론가 {sig.sf_theory:,.0f}"
+                   f"×(1+{pct(hl_disp)}−{pct(thr)})")
     rel = (rel_quote(sig.sf_asks, settings.rel_buy) if side is Side.BUY
            else rel_quote(sig.sf_bids, settings.rel_sell))
     if rel is None:
         return hold("G6 SF 호가 없음")
     # 한계의 "상대N호가 ∓ 1틱"에서 1틱은 **시세(호가창)의 호가단위** = 한 호가 옆(사용자 확정
     # 2026-09-08). 선주문 주문단위(settings.pre_tick)는 역산가를 주문 단위로 맞추는 데만 쓴다.
-    mkt_tick = tick_for(Instrument.KR_STOCK_FUTURE, rel)
+    mkt_tick = tick_for(mkt_inst, rel)  # 주식선물/주식 호가단위(상품별)
     # 주문단위·시작호가가 시세 호가단위에 안 맞으면(예: 하이닉스 1,000 호가에 시작호가 500)
     # LS가 거부하므로 내지 않는다(2026-09-15). 상태줄에 사유가 보인다.
     if round(price) % mkt_tick != 0:
@@ -601,8 +653,7 @@ def evaluate(
         return f"{v:g}" if v is not None else "-"
 
     # HL 쪽도 남긴다(사용자 2026-09-14): 1호가와 후주문 수량만큼 쓸어담은 est 평균가(후주문 방향)
-    hl_est = sig.hl_est_bid if leg.post_side is Side.SELL else sig.hl_est_ask
-    basis = (f"역산가 {price:,.0f} = 이론가 {sig.sf_theory:,.0f}×(1+{pct(hl_disp)}−{pct(thr)}) "
+    basis = (f"{formula} "
              f"주문단위 {tick} 시작호가 {s.price_offset} {rng_txt} 매수1 {won(bid1)} "
              f"매도1 {won(ask1)} 환율 {fx_txt} "
              f"HL 매수1 {usd(sig.hl_bid1)} 매도1 {usd(sig.hl_ask1)} est {usd(hl_est)}")
@@ -675,12 +726,14 @@ def on_pre_reject(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
     leg.reject_streak += 1
     why = f"선주문 거부{(': ' + reason) if reason else ''}"
     if leg.reject_streak >= PRE_REJECT_LIMIT:
+        # 연속 거부 → **세트 중지(검정)** + 알람(사용자 2026-09-17 — 결정 29의 "실행 끔"을 중지로
+        # 정정). 체결차 중지와 같이 진입·청산 둘 다 멈추고 반대쪽 걸린 선주문 취소, 사람이 해제.
         s.entry.reject_streak = s.exit.reject_streak = 0
-        leg.last_reject = f"선주문 거부 연속 {PRE_REJECT_LIMIT}회 → 실행 끔: {reason or '-'}"
-        acts = set_running(s, Block.ENTRY, False, mono) + set_running(s, Block.EXIT, False, mono)
-        acts.append(Action("alarm", reason=f"{why} — 연속 {PRE_REJECT_LIMIT}회, 세트 진입·청산 "
-                                           f"실행 끔(원인 정리 뒤 다시 켜세요)"))
-        return acts
+        leg.last_reject = f"선주문 거부 연속 {PRE_REJECT_LIMIT}회 → 세트 중지: {reason or '-'}"
+        side_name = "청산" if block is Block.EXIT else "진입"
+        return _halt_set(
+            s, block, f"{why} — 연속 {PRE_REJECT_LIMIT}회, 세트 중지(원인 정리 뒤 해제)",
+            other_reason=f"{side_name} 선주문 연속 거부로 세트 중지")
     leg.last_reject = f"선주문 거부({leg.reject_streak}/{PRE_REJECT_LIMIT}): {reason or '-'}"
     _start_delay(leg, mono, settings)
     return [Action("notify", reason=f"{why} — 딜레이 뒤 재시도({leg.reject_streak}/"
@@ -697,7 +750,7 @@ def on_pre_fill(
     # 선주문 체결은 판 버퍼(pending)에 보관 — 매매결과(acc)는 후주문 전량 체결 확인 뒤 합친다
     leg.pending.sf_qty += qty
     leg.pending.sf_px_sum += price * qty
-    leg.post_pending += float(qty * HL_PER_SF)
+    leg.post_pending += float(qty * s.hl_ratio)
     s.sf_net += qty if leg.pre_side is Side.BUY else -qty
     # RT선진입은 **선주문(SF) 체결 계약수** 기준(사용자 확정 2026-09-08) — HL 체결(소수·부분)로
     # 환산하지 않는다. 정방향: 진입 +, 청산 −(0 아래로는 안 감). 역방향: 진입 −, 청산 +(0 위로는
@@ -714,7 +767,7 @@ def on_pre_fill(
     else:
         leg.status = LegStatus.PRE_PARTIAL
     _refresh_fill_diff(s)  # 화면 체결차 칸 = 장부 실시간(후주문 대기 중엔 +값이 잠깐 보임 — 정상)
-    return [Action("place_post", side=leg.post_side, qty=qty * HL_PER_SF)]
+    return [Action("place_post", side=leg.post_side, qty=qty * s.hl_ratio)]
 
 
 def _refresh_fill_diff(s: AutoMSet) -> None:
@@ -724,7 +777,7 @@ def _refresh_fill_diff(s: AutoMSet) -> None:
     멈춰 있었다(칸은 판이 끝날 때·중지 때만 갱신). 사람이 정리할 수량을 잘못 보게 되므로 체결마다
     갱신한다.
     """
-    s.fill_diff = round(fill_diff(s.sf_net, s.hl_net), 6)
+    s.fill_diff = round(fill_diff(s.sf_net, s.hl_net, s.hl_ratio), 6)
 
 
 def on_pre_cancelled(s: AutoMSet, block: Block, mono: float, settings: AutoMSettings) -> None:
@@ -769,9 +822,12 @@ def on_post_fill(
     if fx_quote:  # 환진입가 있을 때만(0·None은 값 없음)
         leg.pending.fx_sum += fx_quote * hl_qty
         leg.pending.fx_qty += hl_qty
-    if stock_last and sf_theory:  # 둘 다 있을 때만 기준값 기록(분모 ref_qty도 같이)
+    # 기준값 기록(분모 ref_qty도 같이) — 주식선물은 S현재가·SF이론가 둘 다, 주식은 SF이론가가
+    # 없으므로(exec §7C, Sprd = HL 항만) S현재가만 있으면 기록(실측 2026-09-17: 둘 다 요구해
+    # 주식 Sprd가 판마다 "-"였음)
+    if stock_last and (sf_theory or leg.pending.stock):
         leg.pending.s_px_sum += stock_last * hl_qty
-        leg.pending.theory_sum += sf_theory * hl_qty
+        leg.pending.theory_sum += (sf_theory or 0.0) * hl_qty
         leg.pending.ref_qty += hl_qty
     leg.post_pending = max(0.0, leg.post_pending - hl_qty)
     # RT는 선주문(SF) 체결에서 갱신(on_pre_fill) — 여기서는 HL 순잔고·전환딜레이 기준 시각만.
@@ -788,9 +844,9 @@ def on_post_fill(
 
 
 def diff_limit(s: AutoMSet) -> float:
-    """체결차 중지 한도(HL 계약) = 1회주문수량 × 10(사용자 확정 2026-09-10). 1회주문수량이 0이면
-    어떤 차이든 중지."""
-    return s.per_qty * HL_PER_SF
+    """체결차 중지 한도(HL 계약) = 1회주문수량 × 비율(주식선물 10 — 사용자 확정 2026-09-10,
+    주식 1 — 2026-09-17). 1회주문수량이 0이면 어떤 차이든 중지."""
+    return s.per_qty * s.hl_ratio
 
 
 def _over_limit(s: AutoMSet, diff: float) -> bool:
@@ -807,9 +863,9 @@ def _finish_round(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
       그 미만이면 경고만 남기고 딜레이 → 다음 판으로 계속 간다(작은 잔량으로는 멈추지 않음).
     """
     leg = s.leg(block)
-    diff = round(fill_diff(s.sf_net, s.hl_net), 6)
+    diff = round(fill_diff(s.sf_net, s.hl_net, s.hl_ratio), 6)
     s.fill_diff = diff
-    clean = leg.pending.hl_qty + _EPS >= leg.pending.sf_qty * HL_PER_SF
+    clean = leg.pending.hl_qty + _EPS >= leg.pending.sf_qty * s.hl_ratio
     _snapshot_round(leg)  # 마지막 판 스냅샷(화면 오른쪽 아래 블록)
     leg.acc.add_round(leg.pending, matched_only=not clean)
     leg.pending.clear()
@@ -857,11 +913,13 @@ def on_post_recovered(s: AutoMSet, block: Block, qty: float) -> list[Action]:
                                     f"체결로 장부 보정")]
 
 
-def _halt_set(s: AutoMSet, block: Block, reason: str) -> list[Action]:
+def _halt_set(s: AutoMSet, block: Block, reason: str,
+              other_reason: str | None = None) -> list[Action]:
     """세트 중지(exec §2·결정 로그 7·9: 헤지 깨진 **세트**는 멈춤 — 사용자 확인 2026-09-07).
 
     체결차를 낸 쪽뿐 아니라 **진입·청산 모두** 실행을 끄고 중지로 둔다(청산 체결차인데 진입이 계속
     새 선주문을 내면 안 됨). 다른 쪽에 걸린 선주문은 취소. 해제(release_halt)도 세트 단위.
+    other_reason: 반대쪽 줄에 남길 사유(없으면 "…체결차로 세트 중지").
     """
     leg = s.leg(block)
     leg.status = LegStatus.HALTED
@@ -878,7 +936,8 @@ def _halt_set(s: AutoMSet, block: Block, reason: str) -> list[Action]:
         acts += _cancel_if_resting(other)  # 걸린 선주문 취소(취소 확인은 통보로)
         other.status = LegStatus.HALTED
         other.running = False
-        other.halt_reason = f"{'청산' if block is Block.EXIT else '진입'} 체결차로 세트 중지"
+        other.halt_reason = (other_reason if other_reason is not None
+                             else f"{'청산' if block is Block.EXIT else '진입'} 체결차로 세트 중지")
     return acts
 
 
@@ -974,8 +1033,9 @@ class AutoMBook:
     """종목 하나의 자동M 상태 — 정방향 4세트 + 역방향 2세트 + 기준수량 + 월물(사용자 확정
     2026-09-08: 종목별 독립).
 
-    창(order_autom)은 종목 콤보로 어느 책을 보여줄지 고를 뿐이고, 실행은 코어가 종목마다 따로 돈다.
-    같은 종목을 두 창에서 열면 같은 책을 함께 보여준다(중복 실행 아님)."""
+    창(order_autom)은 종목 콤보로 어느 종목 상태를 보여줄지 고를 뿐이고, 실행은 코어가 종목마다
+    따로 돈다.
+    같은 종목을 두 창에서 열면 같은 종목 상태를 함께 보여준다(중복 실행 아님)."""
 
     sets: list[AutoMSet] = field(
         default_factory=lambda: [AutoMSet() for _ in range(SET_COUNT_FWD)])
@@ -984,6 +1044,38 @@ class AutoMBook:
         default_factory=lambda: [AutoMSet(reverse=True) for _ in range(SET_COUNT_REV)])
     ref_qty: int = 1  # 상단 기준수량(계약) — 모니터 3칸(진입SF·진입S·청산SF) est 계산용
     future_month: str = "near"  # 선물 월물 "near"|"next" (exec §11.9, DESIGN §5.11)
+    product: str = "sf"  # "sf" 주식선물 | "stock" 주식(exec §7C, 2026-09-17) — 세트·매매결과에 전파
+    # 주식 거래소(사용자 2026-09-17: 주식 API가 통합(SOR)을 지원하지 않아 KRX/NXT 중 선택) — 시세·
+    # 상대호가·현재가·주문 시장. 주식선물은 안 씀
+    market: str = "krx"
+
+    def __post_init__(self) -> None:
+        self.apply_product()
+        self.apply_stock_defaults()
+
+    def apply_stock_defaults(self) -> None:
+        """주식 종목 상태의 세트 기본값 — 화면 5세트 중 아래 2개는 기본 신용(사용자 2026-09-16).
+        코어가 원본이라 여기서 정한다(2026-09-17 실측: 화면만 기본 신용이라 코어에 붙자 풀렸음).
+        새 종목 상태에서만(복원은 저장값 우선)."""
+        if self.product != "stock":
+            return
+        self.market = "nxt"  # 거래소 기본 NXT(사용자 2026-09-17)
+        for i, st in enumerate(self.sets):
+            st.credit = STOCK_SET_ROWS - STOCK_CREDIT_DEFAULT_ROWS <= i < STOCK_SET_ROWS
+
+    def apply_product(self) -> None:
+        """상품을 세트·진입/청산 줄·매매결과 버퍼에 전파(복원 뒤에도 호출)."""
+        ratio = self.hl_ratio
+        for _r, _i, st in self.all_sets():
+            st.product = self.product
+            for leg in (st.entry, st.exit):
+                for acc in (leg.acc, leg.pending, leg.last_round):
+                    if acc is not None:
+                        acc.ratio, acc.stock = ratio, self.product == "stock"
+
+    @property
+    def hl_ratio(self) -> int:
+        return 1 if self.product == "stock" else HL_PER_SF
 
     def sets_of(self, reverse: bool) -> list[AutoMSet]:
         return self.rev_sets if reverse else self.sets
@@ -998,13 +1090,51 @@ class AutoMBook:
 
     @property
     def counterpart(self) -> Instrument:
+        if self.product == "stock":
+            return Instrument.KR_STOCK
         return (Instrument.KR_STOCK_FUTURE_NEXT if self.future_month == "next"
                 else Instrument.KR_STOCK_FUTURE)
 
 
+# 주식 화면 세트 수와 기본 신용 세트 수(사용자 2026-09-16: 5세트, 아래 2개 기본 신용) — 화면
+# 스펙(order_autom.STOCK_SPEC)과 코어 기본값(AutoMBook.apply_stock_defaults)이 같은 값을 쓴다.
+STOCK_SET_ROWS = 5
+STOCK_CREDIT_DEFAULT_ROWS = 2
+
+# 주식 신용 세트의 LS 신용거래코드(MgntrnCode) — ui_fields.ORDER_TYPES 표에서 고른 **추측값**
+# (사용자 2026-09-17: "추측한 대로 넣어 보고 거부 나면 알려 주겠다"). 진입 = 유통/자기융자신규 003,
+# 청산 = 유통융자상환 101. 거부 시 여기만 바꾼다.
+CREDIT_ENTRY_CODE = "003"
+CREDIT_EXIT_CODE = "101"
+
+
+def credit_code_for(block: Block, credit: bool) -> str:
+    """세트의 선주문 신용거래코드 — 신용 세트가 아니면 보통("000")."""
+    if not credit:
+        return "000"
+    return CREDIT_ENTRY_CODE if block is Block.ENTRY else CREDIT_EXIT_CODE
+
+
+def book_key(u: Underlying, product: str = "sf") -> str:
+    """종목 상태 키 — 주식선물은 종목값 그대로(옛 저장본 호환), 주식은 "종목|stock"(2026-09-17)."""
+    return u.value if product == "sf" else f"{u.value}|{product}"
+
+
+def parse_book_key(key: str) -> tuple[Underlying, str] | None:
+    """종목 상태 키 → (종목, 상품). 모르는 종목·상품이면 None."""
+    name, _, product = key.partition("|")
+    product = product or "sf"
+    if product not in ("sf", "stock"):
+        return None
+    try:
+        return Underlying(name), product
+    except ValueError:
+        return None
+
+
 @dataclass
 class AutoMScreen:
-    """자동M 전체 = 종목별 책(books) + 체결쏴 공통설정 + 리스크방지. core_state.json에 저장.
+    """자동M 전체 = 종목별 세트 상태(books) + 체결쏴 공통설정 + 리스크방지. core_state.json에 저장.
 
     복원(autom_from_dict)은 **입력값·RT·누적**만 되살리고 실행 상태(running·status·주문번호)는
     항상 꺼진 채로 시작한다(자동T와 같은 원칙). 설정·리스크방지는 모든 종목 공통(09-08)."""
@@ -1012,6 +1142,12 @@ class AutoMScreen:
     books: dict[str, AutoMBook] = field(
         default_factory=lambda: {u.value: AutoMBook() for u in Underlying})
     settings: AutoMSettings = field(default_factory=AutoMSettings)
+    # 주식 체결쏴(exec §7C, 2026-09-17): 종목 상태 키 "종목|stock", 공통설정·리스크방지는 따로
+    settings_stock: AutoMSettings = field(default_factory=lambda: AutoMSettings(pre_tick={
+        Underlying.SK_HYNIX: 1000, Underlying.SAMSUNG: 100, Underlying.HYUNDAI: 500}))
+    risk_stock_en: float = 0.0
+    risk_stock_ex: float = 0.005
+    risk_stock_gap: float = 0.001
     # 리스크방지(exec §11.9, 화면 입력 검증용) — 정방향 진입 > en, 청산 < ex, 진입−청산 > gap
     risk_fwd_en: float = 0.0
     risk_fwd_ex: float = 0.005
@@ -1021,8 +1157,21 @@ class AutoMScreen:
     risk_rev_ex: float = 0.0
     risk_rev_gap: float = 0.001
 
-    def book(self, u: Underlying) -> AutoMBook:
-        return self.books.setdefault(u.value, AutoMBook())
+    def book(self, u: Underlying, product: str = "sf") -> AutoMBook:
+        """종목(·상품)의 세트 상태 — 없으면 만든다. 주식은 키 "종목|stock"(exec §7C)."""
+        return self.books.setdefault(book_key(u, product), AutoMBook(product=product))
+
+    def books_of(self, product: str) -> list[tuple[Underlying, AutoMBook]]:
+        """상품 하나의 (종목, 세트 상태) 목록 — 엔진 순회용(주식선물 엔진·주식 엔진 각각)."""
+        out: list[tuple[Underlying, AutoMBook]] = []
+        for key, book in self.books.items():
+            parsed = parse_book_key(key)
+            if parsed is not None and parsed[1] == product:
+                out.append((parsed[0], book))
+        return out
+
+    def settings_for(self, product: str) -> AutoMSettings:
+        return self.settings_stock if product == "stock" else self.settings
 
     def any_running(self) -> bool:
         return any(b.any_running() for b in self.books.values())
@@ -1038,7 +1187,8 @@ def _opt_float(raw: object) -> float | None:
 
 
 def _book_from_dict(book: AutoMBook, raw: object) -> None:
-    """저장 스냅샷의 책 하나(sets·ref_qty·future_month) → AutoMBook. 값 오류는 그 필드만 기본값."""
+    """저장 스냅샷의 종목 상태 하나(sets·ref_qty·future_month) → AutoMBook. 값 오류는 그 필드만
+    기본값."""
     if not isinstance(raw, dict):
         return
     try:
@@ -1047,8 +1197,14 @@ def _book_from_dict(book: AutoMBook, raw: object) -> None:
         pass
     month = str(raw.get("future_month", book.future_month))
     book.future_month = month if month in ("near", "next") else "near"
+    product = str(raw.get("product", book.product))  # 주식 종목 상태(exec §7C, 2026-09-17)
+    book.product = product if product in ("sf", "stock") else "sf"
+    book.apply_stock_defaults()  # 주식 기본값(거래소 NXT·아래 2세트 신용) — 저장본 값이 우선
+    market = str(raw.get("market", book.market))
+    book.market = market if market in ("krx", "nxt") else book.market
     for key, targets in (("sets", book.sets), ("rev_sets", book.rev_sets)):
         _sets_from_dict(targets, raw.get(key))
+    book.apply_product()  # 복원된 세트·매매결과에 상품·비율 다시 전파
 
 
 def _sets_from_dict(targets: list[AutoMSet], sets: object) -> None:
@@ -1078,31 +1234,26 @@ def _sets_from_dict(targets: list[AutoMSet], sets: object) -> None:
                 target.switch_delay_s = int(rs.get("switch_delay_s", target.switch_delay_s))
                 target.price_offset = int(rs.get("price_offset", target.price_offset) or 0)
                 target.pre_tick = int(rs.get("pre_tick", target.pre_tick) or 0)
+                target.credit = bool(rs.get("credit", target.credit))  # 주식 신용 세트(결정 40)
                 target.en_sf = _opt_float(rs.get("en_sf"))
                 target.en_s = _opt_float(rs.get("en_s"))
                 target.ex_sf = _opt_float(rs.get("ex_sf"))
                 target.rt = int(rs.get("rt", target.rt))
                 target.sf_net = int(rs.get("sf_net", target.sf_net))
                 target.hl_net = float(rs.get("hl_net", target.hl_net))
-                target.fill_diff = round(fill_diff(target.sf_net, target.hl_net), 6)
+                target.fill_diff = round(
+                    fill_diff(target.sf_net, target.hl_net, target.hl_ratio), 6)
             except (TypeError, ValueError):
                 pass
             for name, leg in (("entry", target.entry), ("exit", target.exit)):
                 found = rs.get(name)
                 raw_leg: dict[str, Any] = found if isinstance(found, dict) else {}
-                # 중지는 재시동 뒤에도 유지(사용자 확정 2026-09-10, exec §2 "사람이 직접 풀어야
-                # 재개"). 실측 10:42 재시동이 중지를 대기로 되살려 정리·해제 없이 다음 판이 돌았다.
-                # 다른 진행 상태(접수·후주문대기 등)는 주문 추적이 끊기므로 지금처럼 대기로.
+                # 재시동 복원은 진행 상태를 전부 **대기(idle)**로 — 중지(검정)도 정상 상태로
+                # 보여준다(사용자 2026-09-17; 09-10 결정 22의 "중지 유지"는 폐기). 세트 장부
+                # (SF·HL 순잔고·체결차)는 그대로 복원되므로 정리할 차이는 체결차 칸에 남는다.
+                # 다른 진행 상태(접수·후주문대기 등)도 주문 추적이 끊기므로 대기로.
                 if str(raw_leg.get("status", "")) == LegStatus.HALTED.value:
-                    leg.status = LegStatus.HALTED
-                    leg.running = False
-                    reason = str(raw_leg.get("halt_reason") or "")
-                    leg.halt_reason = (reason if reason.startswith("재시동 전")
-                                       else f"재시동 전 {reason}")
-                    try:
-                        leg.post_pending = float(raw_leg.get("post_pending") or 0.0)
-                    except (TypeError, ValueError):
-                        pass
+                    leg.halt_reason = ""  # 옛 저장본의 중지 사유는 버림(화면은 정상 표시)
                 acc = raw_leg.get("acc")
                 if isinstance(acc, dict):
                     try:
@@ -1123,27 +1274,27 @@ def autom_from_dict(screen: AutoMScreen, raw: object, legacy_underlying: str = "
     """저장 스냅샷 → AutoMScreen(입력값·RT·누적만). 값 오류는 그 필드만 기본값.
 
     새 형식은 ``books: {종목: {sets, ref_qty, future_month}}``. 옛 형식(2026-09-08 이전, 단일
-    ``sets``·``ref_qty``)은 그때 화면이 가리키던 종목(legacy_underlying)의 책으로 옮긴다.
+    ``sets``·``ref_qty``)은 그때 화면이 가리키던 종목(legacy_underlying)의 종목 상태으로 옮긴다.
     """
     if not isinstance(raw, dict):
         return
     books = raw.get("books")
     if isinstance(books, dict):
         for key, rb in books.items():
-            try:
-                u = Underlying(str(key))
-            except ValueError:
+            bk = parse_book_key(str(key))
+            if bk is None:
                 continue
-            _book_from_dict(screen.book(u), rb)
-    elif "sets" in raw:  # 옛 단일 형식 → 그 종목 책으로 이전
+            _book_from_dict(screen.book(bk[0], bk[1]), rb)
+    elif "sets" in raw:  # 옛 단일 형식 → 그 종목 상태으로 이전
         try:
             u = Underlying(legacy_underlying)
         except ValueError:
             u = Underlying.SAMSUNG
         _book_from_dict(screen.book(u), raw)
-    st = raw.get("settings")
-    if isinstance(st, dict):
-        s = screen.settings
+    for st_key, s in (("settings", screen.settings), ("settings_stock", screen.settings_stock)):
+        st = raw.get(st_key)
+        if not isinstance(st, dict):
+            continue
         try:
             win = st.get("windows")
             if isinstance(win, list) and win:
@@ -1165,7 +1316,8 @@ def autom_from_dict(screen: AutoMScreen, raw: object, legacy_underlying: str = "
         except (TypeError, ValueError):
             pass
     for key in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap",
-                "risk_rev_en", "risk_rev_ex", "risk_rev_gap"):
+                "risk_rev_en", "risk_rev_ex", "risk_rev_gap",
+                "risk_stock_en", "risk_stock_ex", "risk_stock_gap"):
         try:
             setattr(screen, key, float(raw.get(key, getattr(screen, key))))
         except (TypeError, ValueError):

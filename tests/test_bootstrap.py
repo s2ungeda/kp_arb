@@ -96,6 +96,45 @@ def test_record_cancel_captures_time_and_intent() -> None:
     assert sys.fills[0]["source"] == "자동M" and sys.fills[0]["qty"] == 0.05
 
 
+def test_ls_cancel_and_reject_events_record_cancels_once() -> None:
+    # 2026-09-17 운영 보고: 주문리스트 '취소' 체크를 켜도 취소 주문이 안 보임 — 취소내역 기록이
+    # HL 통보에만 연결돼 LS 취소(SC3/H01)·거부(SC4)가 빠져 있었다. LS 통보도 기록하고, 정정으로
+    # 장부에서 먼저 취소된 원주문에 통보가 또 와도 한 번만 남긴다. 상태(취소/거부)도 담는다.
+    from collections import deque
+    from types import SimpleNamespace
+
+    from kp_arb.gateways.ls_ws import OrderEvent
+
+    ob = OrderBook()
+    sys = SimpleNamespace(order_book=ob, cancels=deque(), fills=deque(),
+                          _daylog_state={})  # 날짜 상태가 없으면 기록마다 당일 보관분을 비운다
+
+    def apply_event(event: OrderEvent) -> None:  # bootstrap의 LS 통보 처리와 같은 순서
+        order = ob.on_order_event(event)
+        if event.kind in ("cancel", "reject") and order is not None:
+            LiveSystem._record_cancel(sys, order)  # type: ignore[arg-type]
+
+    intent = OrderIntent(venue=Venue.LS, underlying=Underlying.SK_HYNIX,
+                         instrument=Instrument.KR_STOCK_FUTURE, side=Side.SELL, qty=1,
+                         order_type=OrderType.LIMIT, price=1_700_000.0, source="자동M",
+                         tag="선정1진")
+    ob.track("3326", intent)
+    ob.track("3327", intent)
+    ob.track("3328", intent)
+    apply_event(OrderEvent(kind="ack", order_id="3326"))
+    assert not sys.cancels  # 접수 통보는 기록 안 함
+    apply_event(OrderEvent(kind="cancel", order_id="3400", org_order_id="3326"))  # 취소 통보
+    apply_event(OrderEvent(kind="reject", order_id="3327"))                         # 거부 통보
+    ob.on_cancel("3328")  # 정정 — 원주문을 장부에서 먼저 취소
+    apply_event(OrderEvent(kind="cancel", order_id="3401", org_order_id="3328"))  # 뒤따르는 통보
+    apply_event(OrderEvent(kind="cancel", order_id="3401", org_order_id="3328"))  # 같은 통보 재수신
+    assert [c["order_id"] for c in sys.cancels] == ["3328", "3327", "3326"]  # 최신 우선, 중복 없음
+    by_id = {c["order_id"]: c for c in sys.cancels}
+    assert by_id["3326"]["status"] == "cancelled" and by_id["3327"]["status"] == "rejected"
+    assert by_id["3326"]["tag"] == "선정1진" and by_id["3326"]["source"] == "자동M"
+    assert by_id["3326"]["price"] == 1_700_000.0 and by_id["3326"]["qty"] == 1
+
+
 async def test_guarded_ws_restarts_then_stops(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     # graceful close(run 정상 반환) → 재시작(재연결) / WSClosed → 종료 / 예외 → 포기.
     orig_sleep = asyncio.sleep

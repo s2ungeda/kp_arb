@@ -76,6 +76,10 @@ class OrderIntent(BaseModel):
     post_only: bool = False         # HL 전용 — 메이커 전용(tif=Alo). LS는 무시.
     source: str = ""                # 발주 출처(로그용): 일반주문창·따라가기·자동M 등. 빈값=미상.
     tag: str = ""                   # 세트 꼬리표(자동M "정3진입"·"역1청산") — 주문 리스트 '세트' 칸
+    # LS 현물 전용(2026-09-17, 체결쏴 주식) — 신용거래코드(MgntrnCode, "000" 보통)와 주문 시장
+    # ("" = KRX 기본, "nxt" = NXT: 주문 본문 MbrNo "NXT"). HL·선물은 무시.
+    credit_code: str = "000"
+    market: str = ""
 
     @field_validator("qty")
     @classmethod

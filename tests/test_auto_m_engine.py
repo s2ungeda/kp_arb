@@ -25,6 +25,7 @@ class FakeSystem:
         self.placed: list[OrderIntent] = []
         self.cancelled: list[str] = []
         self.halted = False
+        self.vi: set[Underlying] = set()      # VI 발동 중인 종목
         self._ids = 0
         self.on_hl_identified: list[Any] = []  # (cloid, oid) — 응답 전 식별 훅(결정 27)
         self.cloid: str | None = None          # new_hl_cloid()가 돌려줄 값(None=cloid 없음)
@@ -68,6 +69,12 @@ class FakeSystem:
 
     def futures_halted(self) -> bool:
         return self.halted
+
+    def stock_halted(self) -> bool:  # 주식 엔진용(exec §7C)
+        return self.halted
+
+    def stock_vi(self, underlying: Underlying) -> bool:  # 종목 VI(exec §8) — 주식 엔진용
+        return underlying in self.vi
 
     def new_hl_cloid(self) -> str | None:
         return self.cloid
@@ -253,7 +260,7 @@ async def test_engine_reverse_round_sells_sf_then_buys_hl() -> None:
     sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_605_000.0, ts=0))
     await _settle()
     assert len(sys_.placed) == 2 and sys_.placed[1].side is Side.BUY    # 후주문 HL 매수 100
-    assert [i.tag for i in sys_.placed] == ["역1진입", "역1진입"]  # 주문 리스트 '세트'(2026-09-16)
+    assert [i.tag for i in sys_.placed] == ["선역1진", "선역1진"]  # 주문 리스트 '세트'(09-17 형식)
     assert sys_.placed[1].qty == 100 and r.rt == -10 and r.sf_net == -10
     sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=100, price=1184.5, ts=0))
     await _settle()
@@ -796,14 +803,124 @@ async def test_pre_order_timeout_halts_the_set_without_reorder() -> None:
     assert "미체결·잔고 확인" in row["halt_reason"]
 
 
-async def test_stock_product_commands_are_rejected_until_core_has_stock_book() -> None:
-    # 2026-09-16: 주식 체결쏴는 화면만 메인 메뉴에 연결 — 코어에 주식 책이 생기기 전엔 명령을 전부
-    # 거부(안 하면 주식선물 책으로 들어간다). 주식선물(product 없음/"sf")은 그대로.
+async def test_stock_product_commands_route_to_stock_book() -> None:
+    # 2026-09-17: 주식 체결쏴 코어 착수 — product "stock" 명령은 "종목|stock" 종목 상태로 가고,
+    # 주식선물(product 없음/"sf") 종목 상태는 건드리지 않는다. 설정도 상품별.
     eng, _sys, state = _engine()
     res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
                                             "set": 0, "target_qty": 7, "product": "stock"})
-    assert not res["ok"] and "준비 중" in res["errors"][0]
-    assert state.autom.book(U).sets[0].target_qty == 100  # 주식선물 책 안 건드림
-    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
-                                            "set": 0, "target_qty": 7, "product": "sf"})
-    assert res["ok"] and state.autom.book(U).sets[0].target_qty == 7
+    assert res["ok"]
+    assert state.autom.book(U).sets[0].target_qty == 100  # 주식선물 종목 상태 그대로
+    stock_book = state.autom.book(U, "stock")
+    assert stock_book.product == "stock" and stock_book.sets[0].target_qty == 7
+    assert stock_book.sets[0].hl_ratio == 1 and stock_book.sets[0].entry.acc.stock
+    res = await _autom_command(eng, state, {"cmd": "autom_settings", "product": "stock",
+                                            "pre_delay_ms": 777, "risk_fwd_en": 0.002})
+    assert res["ok"] and state.autom.settings_stock.pre_delay_ms == 777
+    assert state.autom.settings.pre_delay_ms != 777 and state.autom.risk_stock_en == 0.002
+    bad = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
+                                            "set": 0, "product": "etf"})
+    assert not bad["ok"]
+
+
+def _stock_engine() -> tuple[AutoMEngine, FakeSystem, CoreState]:
+    state = CoreState()
+    sys_ = FakeSystem()
+    # 주식 시세: 현재가 100,000, 매수1호가 100,000 / 매도1호가 100,100
+    # HL est 74.30 × 1356 = 100,751
+    from kp_arb.domain.models import Quote
+    sys_.quotes[(U, Instrument.KR_STOCK, "krx")] = Quote(
+        underlying=U, instrument=Instrument.KR_STOCK, bid=100_000.0, ask=100_100.0, ts=0,
+        bids=[(100_000.0, 40.0)], asks=[(100_100.0, 50.0)])
+    sys_.quotes[(U, Instrument.HL_PERP, "hl")] = Quote(
+        underlying=U, instrument=Instrument.HL_PERP, bid=74.3, ask=74.4, ts=0, market="hl",
+        bids=[(74.3, 500.0)], asks=[(74.4, 500.0)])
+    sys_.trades[(U, Instrument.KR_STOCK, "krx")] = 100_000.0  # 주식 현재가는 거래소별 체결가
+    eng = AutoMEngine(state, sys_, product="stock")  # type: ignore[arg-type]
+    state.autom.book(U, "stock").market = "krx"  # 기본은 NXT — 이 준비물은 KRX 시세만 있음
+    s = state.autom.book(U, "stock").sets[0]
+    s.target_qty, s.per_qty, s.en_s, s.ex_sf, s.pre_tick = 100, 10, 0.005, -0.001, 100
+    state.autom.settings_stock.windows = (("09:00:00", "15:20:00"),)
+    return eng, sys_, state
+
+
+async def test_stock_engine_round_one_share_one_contract() -> None:
+    # 주식 엔진(product="stock", exec §7C): 수치 = (100,751 − 100,000)/100,000 = 0.75% > 0.5% 통과,
+    # 주문가 = 100,751/1.005 = 100,250 → 주문단위 100 내림 100,200 → 주식 매수 선주문(KR_STOCK).
+    # 체결 4주 → HL 매도 후주문 4계약(1:1) → 체결 → RT 4, 체결차 0. 꼬리표는 "주정1진".
+    eng, sys_, state = _stock_engine()
+    await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": 0,
+                                      "block": "entry", "value": True, "product": "stock"})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert len(sys_.placed) == 1
+    pre = sys_.placed[0]
+    assert pre.instrument is Instrument.KR_STOCK and pre.side is Side.BUY
+    assert pre.qty == 10 and pre.price == 100_200.0 and pre.tag == "주정1진"
+    assert pre.credit_code == "000" and pre.market == "krx"  # 일반 세트·KRX
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=100_200.0, ts=0))
+    await _settle()
+    post = sys_.placed[1]
+    assert post.instrument is Instrument.HL_PERP and post.side is Side.SELL and post.qty == 4
+    s = state.autom.book(U, "stock").sets[0]
+    assert s.entry.post_pending == 4 and s.fill_diff == 4
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=4, price=74.3, ts=0))
+    await _settle()
+    assert s.rt == 4 and s.fill_diff == 0 and s.entry.post_pending == 0
+    assert state.autom.book(U).sets[0].rt == 0  # 주식선물 종목 상태는 무관
+    snap = eng.live_snapshot()
+    assert f"{U.value}|stock" in snap and U.value not in snap
+    mon = snap[f"{U.value}|stock"]["monitor"]["fwd"]
+    assert mon["en_sf"] is None and abs(mon["en_s"] - 0.00751) < 1e-5
+
+
+async def test_stock_engine_uses_selected_market_only() -> None:
+    # 2026-09-17: 주식 API는 통합 미지원 → 화면 거래소 콤보(KRX/NXT)가 autom_market으로 오고,
+    # 주식 종목 상태는 그 거래소 시세만 본다(통합·다른 거래소로 대체하지 않음). NXT 주문 코드는
+    # [OPEN]이라 거래소가 NXT면 실행을 거부한다.
+    from kp_arb.domain.models import Quote
+    eng, sys_, state = _stock_engine()
+    res = await _autom_command(eng, state, {"cmd": "autom_market", "underlying": U.value,
+                                            "market": "NXT", "product": "stock"})
+    assert res["ok"] and state.autom.book(U, "stock").market == "nxt"
+    assert state.autom.book(U).market == "krx"  # 주식선물 종목 상태는 무관
+    snap = eng.live_snapshot()[f"{U.value}|stock"]
+    assert snap["market"] == "nxt"
+    assert snap["monitor"]["fwd"]["en_s"] is None  # KRX 시세만 있으면 수치 없음
+    sys_.quotes[(U, Instrument.KR_STOCK, "nxt")] = Quote(
+        underlying=U, instrument=Instrument.KR_STOCK, bid=99_000.0, ask=99_100.0, ts=0,
+        market="nxt", bids=[(99_000.0, 40.0)], asks=[(99_100.0, 50.0)])
+    sys_.trades[(U, Instrument.KR_STOCK, "nxt")] = 99_000.0
+    mon = eng.live_snapshot()[f"{U.value}|stock"]["monitor"]["fwd"]
+    assert abs(mon["en_s"] - (100_751 - 99_000) / 99_000) < 1e-4  # NXT 매수1호가 기준
+    # 신용 세트 + NXT 실행 → 선주문에 신용 코드(진입 003)와 시장 nxt(LS 본문 MbrNo NXT)가 실린다
+    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value, "set": 0,
+                                            "credit": True, "product": "stock"})
+    assert res["ok"] and state.autom.book(U, "stock").sets[0].credit
+    run = await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": 0,
+                                            "block": "entry", "value": True, "product": "stock"})
+    assert run["ok"]
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert len(sys_.placed) == 1
+    assert sys_.placed[0].credit_code == "003" and sys_.placed[0].market == "nxt"
+    bad = await _autom_command(eng, state, {"cmd": "autom_market", "underlying": U.value,
+                                            "market": "uni", "product": "stock"})
+    assert not bad["ok"]
+
+
+async def test_stock_engine_holds_during_stock_vi_then_resumes() -> None:
+    # 종목 VI(exec §8, 사용자 2026-09-17): 발동 중엔 주식 선주문을 내지 않고, 해제되면 재개
+    # 딜레이(여기선 0초) 뒤 낸다. 주식선물 종목 상태는 VI와 무관(다른 엔진).
+    eng, sys_, state = _stock_engine()
+    state.autom.settings_stock.resume_delay_s = 0
+    sys_.vi.add(U)
+    await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": 0,
+                                      "block": "entry", "value": True, "product": "stock"})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert sys_.placed == []  # VI 발동 중 — 선주문 없음
+    sys_.vi.clear()
+    eng.tick(datetime(2026, 9, 4, 10, 0, 1), 101.0)
+    await _settle()
+    assert len(sys_.placed) == 1 and sys_.placed[0].instrument is Instrument.KR_STOCK

@@ -28,7 +28,7 @@ UI_STATE_PATH = _BASE_DIR / "ui_state.json"
 _SCREEN_NAMES = {
     # 바로쏴(자동T) 화면은 2026-09-16 삭제 — 체결쏴 T 모드로 대체 예정
     "kp_arb.order_autom": "체결쏴",
-    "kp_arb.order_autom_stock": "체결쏴(주식)",  # 화면만 연결(코어 주식 책 전, 2026-09-16)
+    "kp_arb.order_autom_stock": "체결쏴(주식)",  # 화면만 연결(코어 주식 종목 상태 전, 2026-09-16)
     "kp_arb.monitor": "시세 모니터", "kp_arb.fx_monitor": "FX 노출 감시",
     "kp_arb.order_hl": "HL 일반주문", "kp_arb.order_list": "주문 리스트",
     "kp_arb.fx_auction_order": "원달러선물 동시호가", "kp_arb.settings_window": "공통설정",

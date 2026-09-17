@@ -23,11 +23,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .auto_m import (
-    HL_PER_SF,
     Action,
     AutoMBook,
     AutoMScreen,
     AutoMSet,
+    AutoMSettings,
     Leg,
     LegStatus,
     Signals,
@@ -92,6 +92,7 @@ class _SystemLike(Protocol):
     def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]: ...
     def fx_entry_rate(self, side: Side) -> float | None: ...
     def futures_halted(self) -> bool: ...
+    def stock_halted(self) -> bool: ...
     async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str: ...
     async def cancel(self, order_id: str) -> None: ...
     def new_hl_cloid(self) -> str | None: ...
@@ -112,9 +113,13 @@ class AutoMEngine:
 
     def __init__(self, state: CoreState, system: _SystemLike,
                  log_dir: Path | None = None,
-                 save: Callable[[], None] | None = None) -> None:
+                 save: Callable[[], None] | None = None,
+                 product: str = "sf") -> None:
         self._state = state
         self._system = system
+        # 상품(exec §7C, 2026-09-17): "sf" 주식선물 / "stock" 주식 — 엔진 인스턴스를 상품마다 따로
+        # 두고 자기 상품의 종목 상태만 돈다(설정·시장 정지·로그 파일·꼬리표도 상품별)
+        self.product = product
         # 상태 저장 훅(core_state.json) — RT·체결차·순잔고는 체결로 바뀌므로 명령 때만 저장하면
         # 재시동 때 잃는다. 체결·취소·중지 뒤마다 저장(사용자 2026-09-07: 재접속 때 물고 옴).
         self._save = save
@@ -141,6 +146,9 @@ class AutoMEngine:
         self._persist_pending = False  # 저장 예약됨(루프 다음 차례에 한 번)
         self._halt_since: float | None = None
         self._resumed_mono: float | None = None
+        # 종목 VI(변동성완화장치, exec §8) — 주식 종목 상태만. 발동 시각·해제 시각(재개 딜레이)
+        self._vi_since: dict[Underlying, float] = {}
+        self._vi_resumed: dict[Underlying, float] = {}
         self._bg: set[asyncio.Task[None]] = set()
         system.order_book.on_fill_applied.append(self._on_fill_applied)
         system.order_book.on_change.append(self._on_book_change)
@@ -148,16 +156,14 @@ class AutoMEngine:
         self._log_restored_halts()
 
     def _log_restored_halts(self) -> None:
-        """재시동 복원된 중지 세트를 로그에 남긴다(2026-09-10: 중지는 재시동 뒤에도 유지)."""
-        for key, book in self.screen.books.items():
-            u = Underlying(key)
+        """재시동 복원 뒤 체결차가 남은 세트를 로그에 남긴다 — 중지는 대기로 복원되므로(사용자
+        2026-09-17) 정리할 차이가 있는 세트는 장부로만 알 수 있다."""
+        for u, book in self.screen.books_of(self.product):
             for reverse, index, s in book.all_sets():
-                for block in (Block.ENTRY, Block.EXIT):
-                    leg = s.leg(block)
-                    if leg.status is LegStatus.HALTED:
-                        self.ulog(u).warning("복원 %s: 중지 유지(%s) | %s — 정리 뒤 화면에서 해제",
-                                             self._tag(u, index, block, reverse), leg.halt_reason,
-                                             self._ledger(s))
+                if abs(s.fill_diff) > 1e-9:
+                    self.ulog(u).warning("복원 %s: 체결차 남음 | %s — 정리 뒤 '체결차 Clear'",
+                                         self._tag(u, index, Block.ENTRY, reverse),
+                                         self._ledger(s))
 
     # ----------------------------------------------------------------- 편의 ---
     @property
@@ -165,31 +171,59 @@ class AutoMEngine:
         return self._state.autom
 
     def _book(self, u: Underlying) -> AutoMBook:
-        return self.screen.book(u)
+        return self.screen.book(u, self.product)
+
+    @property
+    def _settings(self) -> AutoMSettings:
+        """이 엔진 상품의 체결쏴 공통설정(주식선물/주식 따로)."""
+        return self.screen.settings_for(self.product)
 
     def _set(self, u: Underlying, index: int, reverse: bool = False) -> AutoMSet:
-        """종목 책의 세트 — 정방향(sets) 또는 역방향(rev_sets, §7A·§7B)."""
+        """종목 상태의 세트 — 정방향(sets) 또는 역방향(rev_sets, §7A·§7B)."""
         return self._book(u).sets_of(reverse)[index]
 
     @staticmethod
     def _counterpart(book: AutoMBook) -> Instrument:
         return book.counterpart
 
+    @staticmethod
+    def _markets(book: AutoMBook) -> tuple[str, ...]:
+        """국내 시세를 고를 시장 순서 — 주식은 종목 상태의 거래소(KRX/NXT) 하나만(사용자 2026-09-17:
+        주식 API는 통합 미지원), 주식선물은 통합·KRX·NXT 순."""
+        return (book.market,) if book.product == "stock" else ("uni", "krx", "nxt")
+
+    def _stock_last_for(self, u: Underlying, book: AutoMBook) -> float | None:
+        """주식 현재가 — 주식 종목 상태는 그 거래소 체결가, 주식선물은 통합(uni) 우선 현재가."""
+        if book.product == "stock":
+            trades = getattr(self._system, "trades", {})
+            last = trades.get((u, Instrument.KR_STOCK, book.market))
+            return float(last) if last else None
+        return self._system.stock_last(u)
+
     def ulog(self, u: Underlying) -> logging.Logger:
         """종목의 상세 로거 — logs/autom_<종목>_날짜.log (자정 롤오버, 코어 로그와 분리)."""
-        return attach_daily_file(f"kp_arb.autom.{u.value}", f"autom_{u.value}", self._log_dir)
+        suffix = "" if self.product == "sf" else f"_{self.product}"  # 주식: autom_<종목>_stock_
+        return attach_daily_file(f"kp_arb.autom.{u.value}{suffix}", f"autom_{u.value}{suffix}",
+                                 self._log_dir)
+
+    @property
+    def _tag_letter(self) -> str:
+        return "주" if self.product == "stock" else "선"
 
     @staticmethod
-    def _set_tag(index: int, block: Block, reverse: bool = False) -> str:
-        """주문 꼬리표(짧은 세트 표기) — 주문 리스트 '세트' 칸·필터용: "정3진입"·"역1청산"
-        (2026-09-16)."""
-        return f"{'역' if reverse else '정'}{index + 1}{'진입' if block is Block.ENTRY else '청산'}"
+    def _set_tag(index: int, block: Block, reverse: bool = False,
+                 product: str = "선") -> str:
+        """주문 꼬리표(짧은 세트 표기) — 주문 리스트 '세트' 칸·필터용(사용자 2026-09-17):
+        주식선물 "선정3진"·"선역4청", 주식 "주정3진"·"주역4청"(상품·방향·세트·진입/청산)."""
+        return (f"{product}{'역' if reverse else '정'}{index + 1}"
+                f"{'진' if block is Block.ENTRY else '청'}")
 
-    @staticmethod
-    def _tag(u: Underlying, index: int, block: Block, reverse: bool = False) -> str:
-        # 방향 표기(사용자 2026-09-08: 진입/청산만으론 정/역 구분이 안 됨) — 세트의 방향 값으로
+    def _tag(self, u: Underlying, index: int, block: Block, reverse: bool = False) -> str:
+        # 방향 표기(사용자 2026-09-08: 진입/청산만으론 정/역 구분이 안 됨) — 세트의 방향 값으로.
+        # 주식 엔진은 앞에 "주식 "(로그 파일이 따로라 짧게)
         direction = "역방향" if reverse else "정방향"
-        return f"{direction} {index + 1}세트 {'진입' if block is Block.ENTRY else '청산'}"
+        head = "주식 " if self.product == "stock" else ""
+        return f"{head}{direction} {index + 1}세트 {'진입' if block is Block.ENTRY else '청산'}"
 
     def _trace(self, u: Underlying, index: int, block: Block, leg: Leg,
                reverse: bool = False) -> None:
@@ -220,24 +254,52 @@ class AutoMEngine:
     def tick(self, now: datetime, mono: float) -> None:
         """전 종목·세트·진입/청산 1회 판정(now/mono 주입 — 테스트 가능)."""
         self._mono = mono
-        halted = self._system.futures_halted()
+        # 시장 정지 — 주식선물은 선물시장, 주식은 주식시장 오버레이(사용자 확정 2026-09-17)
+        halted = (self._system.stock_halted() if self.product == "stock"
+                  else self._system.futures_halted())
         if halted:
             self._halt_since = mono
             self._resumed_mono = None
         elif self._halt_since is not None:
             self._halt_since = None
             self._resumed_mono = mono
-        for key, book in self.screen.books.items():
-            u = Underlying(key)
+        for u, book in self.screen.books_of(self.product):
+            # 종목 VI(exec §8, 사용자 2026-09-17): 주식은 그 종목 VI 발동 중에도 정지로 본다 —
+            # 단일가 전환이라 호가에 걸어 두는 선주문이 무의미. 해제 뒤 재개 딜레이는 시장 정지와
+            # 같다.
+            vi_on = self.product == "stock" and not halted and self._vi_halted(u)
+            self._track_vi(u, vi_on, mono)
             for reverse, index, s in book.all_sets():
                 for block in (Block.ENTRY, Block.EXIT):
                     leg = s.leg(block)
                     if not leg.running and leg.status is LegStatus.IDLE:
                         continue
-                    sig = self.build_signals(u, book, s, block, now, mono, halted)
-                    self._apply(u, index, block, evaluate(s, block, sig, self.screen.settings, u),
+                    sig = self.build_signals(u, book, s, block, now, mono, halted or vi_on)
+                    self._apply(u, index, block, evaluate(s, block, sig, self._settings, u),
                                 reverse)
                     self._trace(u, index, block, leg, reverse)
+
+    def _vi_halted(self, u: Underlying) -> bool:
+        """코어의 종목 VI 상태(LS 실시간 VI_) — 없는 시스템(테스트·옛 코어)은 False."""
+        fn = getattr(self._system, "stock_vi", None)
+        return bool(fn(u)) if callable(fn) else False
+
+    def _track_vi(self, u: Underlying, vi_on: bool, mono: float) -> None:
+        """종목 VI 발동·해제 시각 추적 + 종목 로그(상태가 바뀔 때 1회)."""
+        if vi_on:
+            if u not in self._vi_since:
+                self._vi_since[u] = mono
+                self.ulog(u).warning("VI 발동 — 주식 선주문 중단(해제 뒤 재개 딜레이)")
+            self._vi_resumed.pop(u, None)
+        elif u in self._vi_since:
+            del self._vi_since[u]
+            self._vi_resumed[u] = mono
+            self.ulog(u).info("VI 해제 — 재개 딜레이 후 복귀")
+
+    def _resumed_for(self, u: Underlying) -> float | None:
+        """재개 딜레이 기준 시각 — 시장 정지 해제와 종목 VI 해제 중 나중 것."""
+        r, v = self._resumed_mono, self._vi_resumed.get(u)
+        return v if r is None or (v is not None and v > r) else r
 
     def build_signals(self, u: Underlying, book: AutoMBook, s: AutoMSet, block: Block,
                       now: datetime, mono: float, halted: bool) -> Signals:
@@ -247,19 +309,20 @@ class AutoMEngine:
                or s.leg(block).pre_qty or 1)
         sf_entry, sf_exit = self._system.pair_signal(u, inst, qty, qty)
         # S괴리는 매수·매도 쪽 둘 다 — 정방향 진입은 매수 쪽(entry), 역방향 진입은 매도 쪽(exit)
-        s_entry, s_exit = self._system.pair_signal(u, Instrument.KR_STOCK, qty * HL_PER_SF,
-                                                   qty * HL_PER_SF)
+        ratio = book.hl_ratio  # 주식선물 10 / 주식 1
+        s_entry, s_exit = self._system.pair_signal(u, Instrument.KR_STOCK, qty * ratio,
+                                                   qty * ratio)
         hl = self._system.quotes.get((u, Instrument.HL_PERP, "hl"))
         fx, _src = self._system.usdkrw_effective(now)
-        stock = self._system.stock_last(u)
+        stock = self._stock_last_for(u, book)
         hl_bid_d = hl_ask_d = None
         est_bid = est_ask = None
         if hl is not None and fx is not None and stock:
-            est_bid = est_price(hl.bids or [(hl.bid, hl.bid_qty or 1.0)], qty * HL_PER_SF)
-            est_ask = est_price(hl.asks or [(hl.ask, hl.ask_qty or 1.0)], qty * HL_PER_SF)
+            est_bid = est_price(hl.bids or [(hl.bid, hl.bid_qty or 1.0)], qty * ratio)
+            est_ask = est_price(hl.asks or [(hl.ask, hl.ask_qty or 1.0)], qty * ratio)
             hl_bid_d = disp(est_bid * fx if est_bid else None, stock)
             hl_ask_d = disp(est_ask * fx if est_ask else None, stock)
-        sf_quote = next((self._system.quotes.get((u, inst, m)) for m in ("uni", "krx", "nxt")
+        sf_quote = next((self._system.quotes.get((u, inst, m)) for m in self._markets(book)
                          if self._system.quotes.get((u, inst, m)) is not None), None)
         asks: tuple[tuple[float, float], ...] = ()
         bids: tuple[tuple[float, float], ...] = ()
@@ -272,7 +335,7 @@ class AutoMEngine:
             hl_disp_bid=hl_bid_d, hl_disp_ask=hl_ask_d,
             sf_theory=self._system.stock_futures_theory(u, inst), stock_last=stock,
             sf_asks=asks, sf_bids=bids, s_spread_exit=s_exit, market_halted=halted,
-            resumed_mono=self._resumed_mono, fx=fx,
+            resumed_mono=self._resumed_for(u), fx=fx, product=book.product,
             hl_bid1=hl.bid if hl is not None else None,
             hl_ask1=hl.ask if hl is not None else None,
             hl_est_bid=est_bid, hl_est_ask=est_ask)
@@ -316,9 +379,16 @@ class AutoMEngine:
         book = self._book(u)
         s, inst = book.sets_of(reverse)[index], self._counterpart(book)
         assert act.side is not None and act.price is not None
+        from .auto_m import credit_code_for
+
+        stock = book.product == "stock"
         intent = OrderIntent(venue=Venue.LS, underlying=u, instrument=inst, side=act.side,
                              qty=act.qty, order_type=OrderType.LIMIT, price=act.price,
-                             source=SOURCE, tag=self._set_tag(index, block, reverse))
+                             source=SOURCE,
+                             tag=self._set_tag(index, block, reverse, self._tag_letter),
+                             # 주식(exec §7C): 신용 세트 코드(진입 003·청산 101), 고른 거래소
+                             credit_code=credit_code_for(block, s.credit) if stock else "000",
+                             market=book.market if stock else "")
         try:
             oid = await self._system.place(intent)
         except RestTimeoutError as exc:
@@ -336,11 +406,14 @@ class AutoMEngine:
             self._log.warning("[자동M] %s 선주문 실패 %s — %s",
                               u.value, self._tag(u, index, block, reverse), exc)
             self._apply(u, index, block, on_pre_reject(
-                s, block, time.monotonic(), self.screen.settings,
+                s, block, time.monotonic(), self._settings,
                 reason=reject_reason_text(str(exc))), reverse)
             s.leg(block).last_reject_at = time.strftime("%H:%M:%S")  # 상태줄 표시용 시각
+            # 연속 거부로 실행이 꺼지면 판정 루프가 이 줄을 건너뛰어 "→ idle" 상태 줄이 안 남았다
+            # (실측 2026-09-17 14:40: 다음 켬 때 "pre_resting → armed"로 보여 안 꺼진 줄 알기 쉬움)
+            self._trace(u, index, block, s.leg(block), reverse)
             return
-        self._register(oid, _OrderRef(u, index, block, "pre", reverse))
+        self._register(oid, _OrderRef(u, index, block, "pre", reverse))  # 상품은 엔진 단위
         late = on_pre_ack(s, block, oid, mono=self._mono)  # 발주 중 꺼졌/중지됐으면 취소 행동
         if late:
             self._log.warning("[자동M] %s 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → 즉시 취소",
@@ -389,16 +462,16 @@ class AutoMEngine:
                             u.value, self._tag(u, index, block, reverse))
             self._apply(u, index, block, on_post_reject(
                 s, block, "HL 호가 없음", qty=act.qty, mono=time.monotonic(),
-                settings=self.screen.settings), reverse)
+                settings=self._settings), reverse)
             return
-        raw_price = self.screen.settings.post_price(act.side, hl.bid, hl.ask)
+        raw_price = self._settings.post_price(act.side, hl.bid, hl.ask)
         # HL 가격 격자(유효숫자 5·소수 6−szDecimals)에 맞춘다 — 안 맞으면 통째로 거부(실측 09-07)
         info = self._system.instruments.get((u, Instrument.HL_PERP))
         price = hl_round_price(raw_price, act.side, info.sz_decimals if info else None)
         intent = OrderIntent(venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
                              side=act.side, qty=act.qty, order_type=OrderType.LIMIT,
                              price=price, source=SOURCE,
-                             tag=self._set_tag(index, block, reverse))
+                             tag=self._set_tag(index, block, reverse, self._tag_letter))
         # cloid를 먼저 세트에 묶어 둔다 — 응답보다 먼저 온 통보로 코어가 oid를 식별하면
         # _on_hl_identified가 그 oid로 등록한다(결정 27). 응답이 먼저면 아래 _register.
         ref = _OrderRef(u, index, block, "post", reverse)
@@ -426,7 +499,7 @@ class AutoMEngine:
                             u.value, self._tag(u, index, block, reverse), exc)
             self._apply(u, index, block, on_post_reject(
                 s, block, str(exc)[:80], qty=act.qty, mono=time.monotonic(),
-                settings=self.screen.settings), reverse)
+                settings=self._settings), reverse)
             return
         if cloid:
             self._pending_refs.pop(cloid, None)
@@ -530,7 +603,7 @@ class AutoMEngine:
             # 2026-09-10 — 실시간을 쓰면 매매결과가 시세 따라 계속 바뀜). 로그에도 같은 값.
             stock = self._system.stock_last(u)
             theory = self._system.stock_futures_theory(u, self._counterpart(self._book(u)))
-            acts = on_post_fill(s, ref.block, qty, price, fx, mono, self.screen.settings,
+            acts = on_post_fill(s, ref.block, qty, price, fx, mono, self._settings,
                                 stock_last=stock, sf_theory=theory)
             acc = leg.acc
             sprd = acc.sprd()
@@ -560,7 +633,7 @@ class AutoMEngine:
         hl = self._system.quotes.get((u, Instrument.HL_PERP, "hl"))
         if hl is None or not hl.bid or not hl.ask:
             return None
-        qty = (leg.pre_qty or 1) * HL_PER_SF
+        qty = (leg.pre_qty or 1) * self._book(u).hl_ratio
         if leg.post_side is Side.SELL:
             return est_price(hl.bids or [(hl.bid, hl.bid_qty or 1.0)], qty)
         return est_price(hl.asks or [(hl.ask, hl.ask_qty or 1.0)], qty)
@@ -637,13 +710,14 @@ class AutoMEngine:
                               order.filled_qty, order.intent.qty)
             if ref.leg == "pre":
                 if status == "cancelled":
-                    on_pre_cancelled(s, ref.block, mono, self.screen.settings)
+                    on_pre_cancelled(s, ref.block, mono, self._settings)
                     self._forget(oid)
                 elif status == "rejected":
                     self._apply(u, ref.index, ref.block,
-                                on_pre_reject(s, ref.block, mono, self.screen.settings,
+                                on_pre_reject(s, ref.block, mono, self._settings,
                                               reason="LS 거부 통보(접수 뒤 거부)"), ref.reverse)
                     s.leg(ref.block).last_reject_at = time.strftime("%H:%M:%S")
+                    self._trace(u, ref.index, ref.block, s.leg(ref.block), ref.reverse)
                     self._forget(oid)
                 elif status == "filled":
                     self._forget(oid)
@@ -653,7 +727,7 @@ class AutoMEngine:
                 unfilled = round(order.intent.qty - order.filled_qty, 6)
                 if unfilled > 1e-9:
                     self._apply(u, ref.index, ref.block, on_post_partial_reject(
-                        s, ref.block, unfilled, mono=mono, settings=self.screen.settings),
+                        s, ref.block, unfilled, mono=mono, settings=self._settings),
                         ref.reverse)
                 self._forget(oid)
             elif status == "filled":
@@ -676,11 +750,11 @@ class AutoMEngine:
                              "취소로 정리" if ref.leg == "pre" else "미체결분 체결차 → 중지")
         if ref.leg == "pre":
             if leg.pre_order_id == oid:
-                on_pre_cancelled(s, ref.block, time.monotonic(), self.screen.settings)
+                on_pre_cancelled(s, ref.block, time.monotonic(), self._settings)
         elif leg.post_pending > 1e-9:
             self._apply(u, ref.index, ref.block, on_post_partial_reject(
                 s, ref.block, leg.post_pending, mono=time.monotonic(),
-                settings=self.screen.settings), ref.reverse)
+                settings=self._settings), ref.reverse)
         self._forget(oid)
         self._trace(u, ref.index, ref.block, s.leg(ref.block), ref.reverse)
         self._persist()
@@ -715,7 +789,7 @@ class AutoMEngine:
 
     def stop_all(self, u: Underlying | None = None) -> None:
         """실행 해제(창 닫기·안전종료) — 미체결 선주문 취소. u=None이면 전 종목."""
-        targets = [u] if u is not None else [Underlying(k) for k in self.screen.books]
+        targets = [u] if u is not None else [tu for tu, _b in self.screen.books_of(self.product)]
         for tu in targets:
             for reverse, index, s in self._book(tu).all_sets():
                 for block in (Block.ENTRY, Block.EXIT):
@@ -738,19 +812,36 @@ class AutoMEngine:
 
     # ------------------------------------------------------------- 스냅샷 ---
     def live_snapshot(self) -> dict[str, Any]:
-        """화면용 — 종목별 {세트 상태·RT·체결차·누적, 모니터 3칸, HL 호가단위}. 키 = 종목."""
-        return {key: self._snapshot_for(Underlying(key), book)
-                for key, book in self.screen.books.items()}
+        """화면용 — 종목별 {세트 상태·RT·체결차·누적, 모니터 3칸, HL 호가단위}. 키 = 종목 상태 키
+        (주식선물 "종목", 주식 "종목|stock")."""
+        from .auto_m import book_key
+
+        return {book_key(u, self.product): self._snapshot_for(u, book)
+                for u, book in self.screen.books_of(self.product)}
 
     def _snapshot_for(self, u: Underlying, book: AutoMBook) -> dict[str, Any]:
         inst = self._counterpart(book)
         # 상단 모니터 3칸(exec §11.9): 기준수량 est 괴리. 정방향 진입 = HL 매수호가창 est,
         # 청산 = 매도호가창; 역방향은 반대(진입 = 매도호가창, 청산 = 매수호가창).
         q = max(1, book.ref_qty)
+        ratio = book.hl_ratio
         sf_en, sf_ex = self._system.pair_signal(u, inst, q, q)
-        s_en, s_ex = self._system.pair_signal(u, Instrument.KR_STOCK, q * HL_PER_SF, q * HL_PER_SF)
+        s_en, s_ex = self._system.pair_signal(u, Instrument.KR_STOCK, q * ratio, q * ratio)
         monitor = {"fwd": {"en_sf": sf_en, "en_s": s_en, "ex_sf": sf_ex},
                    "rev": {"en_sf": sf_ex, "en_s": s_ex, "ex_sf": sf_en}}
+        if book.product == "stock":  # exec §7C: (HL est×환율 − 1호가)/1호가, 기준수량 est
+            from .auto_m import stock_monitor_value
+
+            probe = book.sets[0]
+            saved_qty = (probe.per_qty, probe.target_qty, probe.rt)
+            probe.per_qty, probe.target_qty, probe.rt = q, q, 0  # 기준수량으로 est 수량
+            try:
+                sig = self.build_signals(u, book, probe, Block.ENTRY, datetime.now(), self._mono,
+                                         False)
+            finally:
+                probe.per_qty, probe.target_qty, probe.rt = saved_qty
+            monitor = {"fwd": {"en_sf": None, "en_s": stock_monitor_value(sig, Side.SELL),
+                               "ex_sf": stock_monitor_value(sig, Side.BUY)}}
         fx_used, fx_src = self._system.usdkrw_effective()  # 지금 HL 환산에 쓰는 환율(화면 표시)
         out = [self._set_row(s) for s in book.sets]
         rev_out = [self._set_row(s) for s in book.rev_sets]  # 역방향 3세트(§7A·§7B)
@@ -764,7 +855,7 @@ class AutoMEngine:
         # SF 시세 호가단위(지금 가격대) — 세트설정 기준배수 검사용(사용자 2026-09-15).
         # 시세 없으면 None(화면은 그 검사를 건너뛴다)
         quotes = self._system.quotes
-        markets = ("uni", "krx", "nxt")
+        markets = self._markets(book)
         sf_q = next((quotes.get((u, inst, m)) for m in markets
                      if quotes.get((u, inst, m)) is not None), None)
         sf_ref = (sf_q.ask or sf_q.bid) if sf_q is not None else None
@@ -778,6 +869,7 @@ class AutoMEngine:
                 "monitor": monitor, "sf_tick": sf_tick,
                 "fx": {"used": fx_used, "src": fx_src},  # 사용 환율(값, 출처 현물|선물이론)
                 "ref_qty": book.ref_qty, "future_month": book.future_month,
+                "market": book.market,  # 주식 거래소(KRX/NXT) — 화면 콤보 복원용
                 "hl_merge_ticks": merge_ticks,
                 "hl_merge_active": ({"n_sig_figs": active[0], "mantissa": active[1]}
                                     if active is not None else None)}

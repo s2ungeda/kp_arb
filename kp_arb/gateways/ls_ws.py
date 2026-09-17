@@ -62,6 +62,10 @@ STOCK_FILL_TRS: tuple[str, ...] = ("SC0", "SC1", "SC2", "SC3", "SC4")     # 주�
 FUTURES_FILL_TRS: tuple[str, ...] = ("O01", "C01", "H01")                  # 선물옵션계좌 토큰 WS
 ACCOUNT_TRS: tuple[str, ...] = STOCK_FILL_TRS + FUTURES_FILL_TRS
 STATUS_TR = "JIF"
+# 종목 VI(변동성완화장치) 발동/해제 실시간 — tr_key 6자리 종목코드, body {vi_gubun, shcode,
+# time, svi_recprice, dvi_recprice, vi_trgprice, ref_shcode}(LS Open API 카탈로그 예시,
+# 2026-09-17 확인). vi_gubun: "0" 해제, 그 외(1 정적·2 동적·3 둘 — xingAPI 코드표 추정) 발동.
+VI_TR = "VI_"
 
 
 def _unified_key(code: str) -> str:
@@ -69,12 +73,27 @@ def _unified_key(code: str) -> str:
     return f"U{code}   "
 
 
+def _nxt_key(code: str) -> str:
+    """NXT 전용 TR(NH1/NS3) 구독 키 — "N"+6자리코드+공백3(LS 카탈로그 예시 "N000880   ")."""
+    return f"N{code}   "
+
+
 def _norm_code(raw: str) -> str:
-    """프레임의 종목코드 정규화 — 통합 TR은 "U005930   " 형태일 수 있음."""
+    """프레임의 종목코드 정규화 — 통합 TR은 "U005930   ", NXT 전용은 "N005930   " 형태일 수 있음."""
     code = raw.strip()
-    if len(code) >= 7 and code.startswith("U"):
+    if len(code) >= 7 and code[0] in "UN":
         code = code[1:].strip()
     return code
+
+
+class ViEvent(BaseModel):
+    """종목 VI 발동/해제(VI_). active = 발동 중(vi_gubun이 "0"이 아님)."""
+
+    underlying: Underlying
+    code: str
+    gubun: str
+    active: bool
+    time: str = ""
 
 
 def _depth(body: dict[str, Any], px_prefix: str, qty_prefix: str,
@@ -219,6 +238,7 @@ class LSWebSocketClient:
         # 통화선물 1호가 — (월물코드, 매수1호가, 매도1호가). 자동M 환진입가(§9a)용.
         self.on_fx_quote: list[Callable[[str, float, float], None]] = []
         self.on_fx_spot: list[Callable[[float], None]] = []  # 원달러 현물환율(원/달러) 실시간
+        self.on_vi: list[Callable[[ViEvent], None]] = []  # 종목 VI 발동/해제(체결쏴 주식 정지)
         self._fx_codes: set[str] = set()
         self.on_raw: list[Callable[[str], None]] = []  # 진단: 모든 원시 프레임
         # 재연결(최초 연결 제외) 후 재구독까지 끝나면 발화 — OrderBook 재스냅샷용(Phase 8-4).
@@ -234,6 +254,9 @@ class LSWebSocketClient:
         for code in codes:
             self._add("H1_", code)                  # KRX 전용 (모의에서도 동작)
             self._add("UH1", _unified_key(code))    # 통합(KRX+NXT) — 운영 전용
+        # NXT 전용 호가(NH1) — 체결쏴 주식이 거래소 NXT를 고르면 그 시세만 본다(주식 API가 통합
+        # 주문을 지원하지 않음, 사용자 2026-09-17). 모의는 N계열 미중계(ACK만) — 무해.
+        self._add("NH1", _nxt_key(underlying.krx_code))
 
     def subscribe_futures_quotes(
         self, symbols: dict[Underlying, str],
@@ -270,6 +293,7 @@ class LSWebSocketClient:
         self._add("YS3", code)
         self._add("US3", _unified_key(code))  # 통합 체결(NXT 포함) — 운영 전용
         self._add("UYS", _unified_key(code))
+        self._add("NS3", _nxt_key(code))      # NXT 전용 체결(현재가) — 체결쏴 주식 NXT용
         etf = self._etf_symbols.get(underlying)
         if etf is not None:
             # ETF 자신의 체결(현재가)·예상체결 — 괴리율 분자·동시호가 표시용
@@ -295,6 +319,10 @@ class LSWebSocketClient:
     def subscribe_market_status(self) -> None:
         # JIF는 시장 단위 — tr_key "0"(전체). 종목코드 구독은 무응답(실측).
         self._add(STATUS_TR, "0")
+
+    def subscribe_vi(self, underlying: Underlying) -> None:
+        """종목 VI 발동/해제(VI_) 구독 — tr_key 6자리 종목코드(카탈로그 예시 "145270")."""
+        self._add(VI_TR, underlying.krx_code)
 
     def _add(self, tr_cd: str, tr_key: str, *, tr_type: str = "3") -> None:
         if (tr_cd, tr_key, tr_type) not in self._subs:
@@ -442,7 +470,23 @@ class LSWebSocketClient:
             if spot is not None:
                 for spot_handler in self.on_fx_spot:
                     spot_handler(spot)
+        elif tr_cd == VI_TR:
+            vi = self._parse_vi(msg)
+            if vi is not None:
+                for vi_handler in self.on_vi:
+                    vi_handler(vi)
         # 알 수 없는 tr_cd는 무시
+
+    def _parse_vi(self, msg: dict[str, Any]) -> ViEvent | None:
+        """VI_ body → ViEvent. 취급 종목이 아니면 None. 필드는 카탈로그 예시 기준(미실측)."""
+        body = msg.get("body") or {}
+        code = _norm_code(str(body.get("shcode") or msg.get("header", {}).get("tr_key", "")))
+        underlying = Underlying.from_krx_code(code)
+        if underlying is None:
+            return None
+        gubun = str(body.get("vi_gubun", "")).strip()
+        return ViEvent(underlying=underlying, code=code, gubun=gubun,
+                       active=gubun not in ("", "0"), time=str(body.get("time", "")))
 
     def _parse_fx_spot(self, msg: dict[str, Any]) -> float | None:
         """CUR(원달러 현물환율) body → 환율. 필드는 ``price``(현재가, 실측 2026-08-21).

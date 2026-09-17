@@ -171,10 +171,10 @@ def test_signal_gate_uses_only_s_for_entry_and_nothing_for_exit() -> None:
     assert evaluate(s3, Block.EXIT, _sig(), SETTINGS, U) == []  # 기준값 없으면 역산 불가 → 안 냄
 
 
-def test_three_consecutive_pre_rejects_turn_set_off_with_alarm() -> None:
-    # 결정 29(사용자 확정 2026-09-11): 선주문이 연속 3회 거부되면 원인이 남아 있는 것(증거금 부족
-    # 등) → 세트 진입·청산 둘 다 실행 끔 + 알람. 체결 전이라 중지(검정)는 아님. 접수 뒤 체결이나
-    # 취소가 한 번이라도 있으면 연속은 끊긴다.
+def test_three_consecutive_pre_rejects_halt_set_with_alarm() -> None:
+    # 결정 29(사용자 확정 2026-09-11) + 정정 2026-09-17: 선주문이 연속 3회 거부되면 원인이 남아
+    # 있는 것(증거금 부족 등) → 세트 진입·청산 둘 다 **중지(검정)** + 알람(체결차 중지와 같은
+    # 경로, 사람이 해제). 접수 뒤 체결이나 취소가 한 번이라도 있으면 연속은 끊긴다.
     from kp_arb.auto_m import PRE_REJECT_LIMIT
 
     s = _set()
@@ -194,11 +194,16 @@ def test_three_consecutive_pre_rejects_turn_set_off_with_alarm() -> None:
     evaluate(s, Block.ENTRY, _sig(mono=106.0), SETTINGS, U)
     acts = on_pre_reject(s, Block.ENTRY, mono=106.5, settings=SETTINGS, reason="증거금 부족")
     kinds = [a.kind for a in acts]
-    assert "alarm" in kinds and "cancel_pre" in kinds          # 알람 + 청산 선주문 취소
+    assert "halt" in kinds and "cancel_pre" in kinds           # 중지(알람은 halt 행동) + 청산 취소
     assert not s.entry.running and not s.exit.running          # 세트 양쪽 실행 끔
-    assert s.entry.status is not LegStatus.HALTED               # 중지(검정) 아님
+    assert s.entry.status is LegStatus.HALTED and s.exit.status is LegStatus.HALTED  # 검정
+    assert "연속 거부" in s.exit.halt_reason and "연속 3회" in s.entry.halt_reason
     assert s.entry.reject_streak == 0 and s.exit.reject_streak == 0
-    assert "연속 3회" in next(a.reason for a in acts if a.kind == "alarm")
+    assert "연속 3회" in next(a.reason for a in acts if a.kind == "halt")
+    # 중지 뒤 또 거부가 와도 중지 유지·딜레이 없음
+    assert on_pre_reject(s, Block.ENTRY, mono=107.0, settings=SETTINGS, reason="x") == []
+    release_halt(s, Block.ENTRY)
+    assert s.entry.status is LegStatus.IDLE and s.exit.status is LegStatus.IDLE
     # 거부 2회 뒤 체결이 있으면 연속이 끊겨 다시 1부터
     s2 = _set()
     set_running(s2, Block.ENTRY, True)
@@ -246,8 +251,8 @@ def test_pre_reject_is_shown_with_reason_until_next_ack() -> None:
     assert s.entry.last_reject == ""  # 접수됐으면 거부 표시 끝
     s.entry.reject_streak = 2
     on_pre_reject(s, Block.ENTRY, mono=201.0, settings=SETTINGS, reason="LS 02752 증거금부족")
-    assert s.entry.last_reject.startswith("선주문 거부 연속 3회 → 실행 끔: LS 02752")
-    assert not s.entry.running and not s.exit.running
+    assert s.entry.last_reject.startswith("선주문 거부 연속 3회 → 세트 중지: LS 02752")
+    assert not s.entry.running and not s.exit.running and s.entry.status is LegStatus.HALTED
 
 
 def test_place_pre_keeps_hl_est_of_post_side_for_fill_comparison() -> None:
@@ -713,3 +718,146 @@ def test_set_pre_tick_overrides_common_unit() -> None:
     book = AutoMBook()
     _book_from_dict(book, {"sets": [{"pre_tick": 1000}, {"target_qty": 1}]})
     assert book.sets[0].pre_tick == 1000 and book.sets[1].pre_tick == 0
+
+
+def _stock_set() -> AutoMSet:
+    # 주식 종목 상태(exec §7C): 세트·매매결과에 상품(비율 1)이 전파된 세트
+    from kp_arb.auto_m import AutoMBook
+
+    book = AutoMBook(product="stock")
+    s = book.sets[0]
+    s.target_qty, s.per_qty, s.switch_delay_s = 100, 10, 0
+    s.en_s, s.ex_sf = 0.0025, -0.001  # 진입 0.25% / 청산 −0.1%
+    s.pre_tick = 100
+    return s
+
+
+def _stock_sig(**kw: object) -> Signals:
+    # 주식 100,000원, 매수1호가 100,000·매도1호가 100,100, HL 매수호가창 est 74.30 × 1,350 = 100,305
+    base = dict(now=NOW, mono=100.0, sf_spread_entry=None, s_spread_entry=None,
+                sf_spread_exit=None, hl_disp_bid=None, hl_disp_ask=None, sf_theory=None,
+                stock_last=100_000.0, sf_asks=[(100_100.0, 50), (100_200.0, 30)],
+                sf_bids=[(100_000.0, 40)], fx=1350.0, hl_bid1=74.3, hl_ask1=74.4,
+                hl_est_bid=74.30, hl_est_ask=74.40, product="stock")
+    base.update(kw)
+    return Signals(**base)  # type: ignore[arg-type]
+
+
+def test_stock_book_propagates_product_and_ratio() -> None:
+    # 주식 종목 상태는 세트 비율 1(주 1 = HL 1), 상대 상품 KR_STOCK, 매매결과 Sprd 주식 식
+    from kp_arb.auto_m import AutoMBook, _book_from_dict
+    from kp_arb.domain.enums import Instrument
+
+    book = AutoMBook(product="stock")
+    assert book.counterpart is Instrument.KR_STOCK and book.hl_ratio == 1
+    s = book.sets[0]
+    assert s.product == "stock" and s.hl_ratio == 1 and s.entry.acc.stock and s.entry.acc.ratio == 1
+    assert fill_diff(3, -3, 1) == 0 and fill_diff(3, -30) == 0  # 주식 1:1 / 주식선물 1:10
+    restored = AutoMBook()
+    _book_from_dict(restored, {"product": "stock", "sets": [{"target_qty": 5}]})
+    assert restored.product == "stock" and restored.sets[0].hl_ratio == 1
+    assert restored.sets[0].entry.pending.ratio == 1
+
+
+def test_stock_book_credit_defaults_live_in_core() -> None:
+    # 2026-09-17 실측: 화면만 아래 2세트를 기본 신용으로 그렸더니 코어에 붙자(코어 값이 원본)
+    # 풀렸다. 기본값은 코어 종목 상태에 — 새 주식 종목 상태는 5세트 중 4·5번 세트 신용, 복원은
+    # 저장값 우선, 저장본에 credit이 없는 옛 세트는 기본 규칙. 주식선물 종목 상태는 전부 False.
+    from kp_arb.auto_m import AutoMBook, _book_from_dict
+
+    book = AutoMBook(product="stock")
+    assert [s.credit for s in book.sets[:5]] == [False, False, False, True, True]
+    assert not any(s.credit for s in AutoMBook().sets)
+    restored = AutoMBook()
+    _book_from_dict(restored, {"product": "stock",
+                               "sets": [{"credit": True}, {}, {}, {"credit": False}]})
+    assert [s.credit for s in restored.sets[:5]] == [True, False, False, False, True]
+
+
+def test_credit_code_for_stock_sets() -> None:
+    # 결정 40 + 2026-09-17 추측값: 신용 세트 진입 003(융자신규)·청산 101(융자상환), 아니면 000
+    from kp_arb.auto_m import Block, credit_code_for
+
+    assert credit_code_for(Block.ENTRY, False) == "000"
+    assert credit_code_for(Block.EXIT, False) == "000"
+    assert credit_code_for(Block.ENTRY, True) == "003"
+    assert credit_code_for(Block.EXIT, True) == "101"
+
+
+def test_stock_book_market_default_and_restore() -> None:
+    # 2026-09-17: 주식 API는 통합 미지원 → 종목 상태에 거래소(krx/nxt) 보관. 주식 기본 NXT(사용자
+    # 같은 날), 저장·복원은 저장값 우선, 잘못된 값은 기본으로. 주식선물 종목 상태는 krx(안 씀).
+    from kp_arb.auto_m import AutoMBook, _book_from_dict
+
+    assert AutoMBook(product="stock").market == "nxt" and AutoMBook().market == "krx"
+    restored = AutoMBook()
+    _book_from_dict(restored, {"product": "stock", "market": "krx"})
+    assert restored.market == "krx"
+    old = AutoMBook()
+    _book_from_dict(old, {"product": "stock"})  # 옛 저장본(거래소 없음) → 기본 NXT
+    assert old.market == "nxt"
+    bad = AutoMBook()
+    _book_from_dict(bad, {"product": "stock", "market": "uni"})
+    assert bad.market == "nxt"
+
+
+def test_stock_entry_uses_top_quote_formula_and_one_to_one_hedge() -> None:
+    # exec §7C(사용자 확정 2026-09-16/17): 수치 = (H − 매수1호가)/매수1호가 = 0.305% > 0.25% 통과,
+    # 주문가 = H/(1+0.25%) = 100,054.9 → 주문단위 100 내림 100,000, 허용범위(매도1호가 100,100 −
+    # 1틱 100)×(1−0.4%) = 99,600 이상 → 발주. 체결되면 HL 후주문 = 주수 × 1.
+    from kp_arb.auto_m import stock_monitor_value
+
+    s = _stock_set()
+    sig = _stock_sig()
+    assert abs(stock_monitor_value(sig, Side.SELL) - 0.00305) < 1e-9
+    set_running(s, Block.ENTRY, True)
+    acts = evaluate(s, Block.ENTRY, sig, SETTINGS, U)
+    assert [(a.kind, a.side, a.qty, a.price) for a in acts] == [
+        ("place_pre", Side.BUY, 10, 100_000.0)]
+    assert "주문가 100,000 = H 100,305/(1+0.250%)" in s.entry.block_reason
+    assert "호가단위 100" in s.entry.block_reason
+    on_pre_ack(s, Block.ENTRY, "S1")
+    acts = on_pre_fill(s, Block.ENTRY, 4, 100_000.0, mono=101)
+    assert [(a.kind, a.side, a.qty) for a in acts] == [("place_post", Side.SELL, 4)]  # 1:1
+    assert s.entry.post_pending == 4 and s.fill_diff == 4
+    on_post_fill(s, Block.ENTRY, 4, 74.3, 1350.0, mono=102, settings=SETTINGS,
+                 stock_last=100_000.0, sf_theory=None)
+    assert s.rt == 4 and s.fill_diff == 0 and s.entry.post_pending == 0
+    # 미달: HL est가 낮아 수치 0.05% < 0.25% → 안 냄
+    s2 = _stock_set()
+    set_running(s2, Block.ENTRY, True)
+    assert evaluate(s2, Block.ENTRY, _stock_sig(hl_est_bid=74.11), SETTINGS, U) == []
+    assert s2.entry.block_reason.startswith("G5 미달 수치")
+
+
+def test_stock_sprd_and_halt_limit() -> None:
+    # 주식 Sprd = (환×HL평균 − S현재가)/S현재가 한 항, 중지 한도 = 1회주문수량(주)
+    from kp_arb.auto_m import Accum, diff_limit
+
+    s = _stock_set()
+    assert diff_limit(s) == 10  # 주식선물이면 100
+    acc = Accum(hl_qty=4, hl_px_sum=4 * 74.3, fx_sum=4 * 1350.0, fx_qty=4, sf_qty=4,
+                sf_px_sum=4 * 100_000.0, s_px_sum=4 * 100_000.0, ref_qty=4, ratio=1, stock=True)
+    assert abs(acc.sprd() - (74.3 * 1350.0 - 100_000.0) / 100_000.0) < 1e-12
+    assert acc.matched_hl() == 4 and acc.matched_sf() == 4
+
+
+def test_stock_post_fill_records_sprd_base_without_sf_theory() -> None:
+    # 실측 2026-09-17: 주식은 SF이론가가 없어(None) 후주문 체결 때 S현재가 기준값이 기록되지 않아
+    # 누적·마지막 판 Sprd가 "-"였다. 주식은 S현재가만 있으면 기록해 Sprd = (환×HL평균 − S)/S.
+    s = _stock_set()
+    set_running(s, Block.ENTRY, True)
+    on_pre_fill(s, Block.ENTRY, 1, 254_500.0, mono=100)  # 주식 1주 → HL 1계약 대기
+    on_post_fill(s, Block.ENTRY, 1, 184.6, 1381.9, mono=101, settings=SETTINGS,
+                 stock_last=255_000.0, sf_theory=None)
+    acc = s.entry.acc
+    assert acc.ref_qty == 1 and acc.s_avg() == 255_000.0
+    assert abs(acc.sprd() - (1381.9 * 184.6 - 255_000.0) / 255_000.0) < 1e-12
+    assert s.entry.last_round is not None and s.entry.last_round.sprd() == acc.sprd()
+    # 주식선물은 종전대로 둘 다 있어야 기록
+    sf = _set()
+    set_running(sf, Block.ENTRY, True)
+    on_pre_fill(sf, Block.ENTRY, 1, 201_000.0, mono=100)
+    on_post_fill(sf, Block.ENTRY, 10, 1184.0, 1356.1, mono=101, settings=SETTINGS,
+                 stock_last=199_000.0, sf_theory=None)
+    assert sf.entry.acc.ref_qty == 0 and sf.entry.acc.sprd() is None

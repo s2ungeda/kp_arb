@@ -16,7 +16,13 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
-from .auto_m import SET_COUNT_FWD, SET_COUNT_REV, price_offset_errors
+from .auto_m import (
+    SET_COUNT_FWD,
+    SET_COUNT_REV,
+    STOCK_CREDIT_DEFAULT_ROWS,
+    STOCK_SET_ROWS,
+    price_offset_errors,
+)
 from .ui_fields import (
     UNDER_MAP,
     UNDERLYINGS,
@@ -73,6 +79,7 @@ class ScreenSpec:
     set_rows: dict[str, int] | None = None  # 방향별 세트 줄 수(None = 코어 SET_ROWS, 주식은 4)
     alt_row_bg: bool = False      # 짝수 세트 행 하늘색 바탕(주식선물 8세트, 사용자 09-16)
     snapshot_rows: int = 0        # 마지막 판 스냅샷 줄 수(4 = Sprd·HP·SF·환, 1 = Sprd만, 0 = 없음)
+    market_combo: bool = False    # 거래소 콤보 KRX/NXT — 종목 콤보 왼쪽(주식, 사용자 09-17)
 
     def directions_names(self) -> list[tuple[str, str]]:
         """(방향 태그, 표시 이름) 목록 — 스냅샷 블록의 방향 라벨용."""
@@ -97,8 +104,11 @@ STOCK_SPEC = ScreenSpec(
     has_en_sf=False, has_month=False, qty_unit="주", settings_title="체결쏴 설정(주식)",
     pre_tick={"sk_hynix": 1000, "samsung": 100, "hyundai": 500},
     diff_head="체결차", entry_s_label="진입", color_dialog=True, qty_commas=True,
-    credit_boxes=True, credit_default_rows=2, set_rows={"fwd": 5},  # 주식 5세트(09-16: 4→6→5)
-    snapshot_rows=1)  # 누적 블록은 위, 남는 줄에 마지막 판 Sprd 한 줄
+    # 주식 5세트·아래 2개 기본 신용(09-16: 4→6→5) — 값은 코어 상수(코어 기본값과 한 값)
+    credit_boxes=True, credit_default_rows=STOCK_CREDIT_DEFAULT_ROWS,
+    set_rows={"fwd": STOCK_SET_ROWS},
+    snapshot_rows=1,  # 누적 블록은 위, 남는 줄에 마지막 판 Sprd 한 줄
+    market_combo=True)  # 주식 API는 통합 미지원 → 거래소 KRX/NXT 선택(사용자 2026-09-17)
 
 _CREDIT_BG = "#d9f2d9"  # 신용 세트 행 바탕(옅은 초록, 사용자 2026-09-16) — 중지(검정)가 우선
 # 짝수 세트 행 바탕(하늘, 사용자 2026-09-16 — 주식선물 8세트는 줄이 많아 헷갈림) + 스냅샷 Sprd 칸
@@ -131,6 +141,8 @@ _BG_CHOICES: dict[str, str | None] = {"기본": None, "흰색": "#ffffff", "하�
 
 # 선물 월물 콤보(상단) — 표시 → 코어 settings.future_month 값 (DESIGN §5.11)
 MONTH_MAP = {"최근": "near", "차근": "next"}  # 표시는 '최근/차근'(사용자 2026-09-03)
+# 주식 거래소 콤보(주식 화면, 2026-09-17) — 표시 → 코어 종목 상태 market 값
+MARKET_MAP = {"KRX": "krx", "NXT": "nxt"}
 
 
 def pct_to_frac(value: float | None) -> float | None:
@@ -140,7 +152,8 @@ def pct_to_frac(value: float | None) -> float | None:
 
 def set_payload(index: int, w: dict[str, Any], underlying: str,
                 direction: str = "fwd") -> dict[str, Any]:
-    """세트 화면 상태 → 코어 autom_set 명령(종목별 책, direction fwd|rev). 기준값은 %→소수."""
+    """세트 화면 상태 → 코어 autom_set 명령(종목별 세트 상태, direction fwd|rev). 기준값은
+    %→소수."""
     return {
         "cmd": "autom_set", "underlying": underlying, "set": index, "direction": direction,
         "target_qty": int(w.get("target") or 0), "per_qty": int(w.get("per") or 0),
@@ -261,20 +274,31 @@ _SET_INPUT_KEYS = ("target_qty", "per_qty", "switch_delay_s", "price_offset", "p
                    "en_sf", "en_s", "ex_sf")
 
 
-def set_inputs_sig(book: dict[str, Any]) -> str:
-    """코어 책의 세트 입력값(3세트) 서명 — 바뀌었을 때만 화면을 다시 채우기 위한 비교 키.
+def set_input_sigs(book: dict[str, Any]) -> dict[tuple[str, int], str]:
+    """코어의 종목 상태의 세트 입력값 서명을 **세트별로** — (방향, 번호) → 서명. 바뀐 세트만 화면을
+    다시 채우기 위한 비교 키(사용자 2026-09-17: 한 세트가 바뀌었다고 전 세트를 다시 채우면, 다른
+    세트에서 고치고 아직 안 보낸 인라인 값이 옛 코어 값으로 되돌아간다).
 
     세트설정이 코어에 반영되는 시점은 두 곳뿐(사용자 확정 2026-09-09): 세트설정 창 '확인'과
-    진입/청산 실행 버튼을 켤 때. 그때 코어 값이 바뀌므로 같은 종목을 연 다른 창도 이 서명이
-    달라진 것을 보고 입력값을 다시 읽는다.
+    진입/청산 실행 버튼을 켤 때. 그때 코어 값이 바뀌므로 같은 종목을 연 다른 창도 그 세트의
+    서명이 달라진 것을 보고 그 세트 입력값만 다시 읽는다. 세트가 없으면 빈 dict.
     """
     rows = book.get("sets")
     if not isinstance(rows, list):
-        return ""
+        return {}
     rev = book.get("rev_sets")  # 역방향 세트(2026-09-14) — 옛 코어 스냅샷엔 없을 수 있음
-    both = rows[:SET_ROWS["fwd"]] + (rev[:SET_ROWS["rev"]] if isinstance(rev, list) else [])
-    return json.dumps([[r.get(k) for k in _SET_INPUT_KEYS] for r in both
-                       if isinstance(r, dict)], sort_keys=True)
+    out: dict[tuple[str, int], str] = {}
+    for dtag, lst in (("fwd", rows), ("rev", rev if isinstance(rev, list) else [])):
+        for i, r in enumerate(lst[:SET_ROWS[dtag]]):
+            if isinstance(r, dict):
+                out[(dtag, i)] = json.dumps([r.get(k) for k in _SET_INPUT_KEYS], sort_keys=True)
+    return out
+
+
+def set_inputs_sig(book: dict[str, Any]) -> str:
+    """종목 상태 전체의 세트 입력값 서명 — 세트별 서명을 합친 것(없으면 "")."""
+    sigs = set_input_sigs(book)
+    return json.dumps(sorted((f"{d}:{i}", s) for (d, i), s in sigs.items())) if sigs else ""
 
 
 def monitor_ready(texts: list[str]) -> bool:
@@ -418,11 +442,20 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     top.pack(fill="x", padx=4, pady=(2, 2))
     # 종목 콤보 — 현대차 제외(사용자 2026-09-04, 시세 화면과 동일). 코어 취급 종목은 그대로.
     # 앞의 '종목' 제목 라벨은 뺐다(사용자 2026-09-11, 상단 공간 확보).
+    # 거래소 콤보(주식, 사용자 2026-09-17) — 종목 콤보 왼쪽. 실행 중에도 잠그지 않으며('적'은
+    # 잠기므로) 고르면 바로 코어의 종목 상태에 보낸다. '적'도 같은 값을 다시 보낸다.
+    cb_market = ttk.Combobox(top, values=list(MARKET_MAP), width=5, state="readonly")
+    cb_market.set("NXT")  # 기본 NXT(사용자 2026-09-17) — 코어 종목 상태 기본값과 같다
+    if spec.market_combo:
+        cb_market.pack(side="left", padx=(0, 4))
+        cb_market.bind("<<ComboboxSelected>>", lambda _e: send(
+            {"cmd": "autom_market", "underlying": cur_under(),
+             "market": MARKET_MAP[cb_market.get()]}, "거래소"))
     cb_under = ttk.Combobox(top, values=[u for u in UNDERLYINGS if u != "현대차"],
                             width=7, state="readonly")
     cb_under.set("하이닉스")
     cb_under.pack(side="left", padx=(0, 4))
-    cb_under.bind("<<ComboboxSelected>>", lambda e: on_under_change(e))  # 종목별 책 전환
+    cb_under.bind("<<ComboboxSelected>>", lambda e: on_under_change(e))  # 종목별 세트 상태 전환
     # HL 호가단위(틱) — 일반주문창처럼 코어가 계산한 실제 틱 숫자(autom_live.hl_merge_ticks)로
     # 채운다. 코어 가격 수신 전엔 "-" 하나.
     cb_agg = ttk.Combobox(top, values=["-"], width=6, state="readonly")
@@ -438,7 +471,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         cb_month.pack(side="left", padx=(0, 4))
 
     def cur_under() -> str:
-        """이 창이 보여주는 종목(코어 책 키). 자동M 상태는 코어가 종목별로 따로 든다(2026-09-08)."""
+        """이 창이 보여주는 종목(코어의 종목 상태 키). 자동M 상태는 코어가 종목별로 따로
+        든다(2026-09-08)."""
         return UNDER_MAP[cb_under.get()]
 
     def apply_market() -> None:
@@ -450,13 +484,16 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         if spec.has_month:
             send({"cmd": "autom_month", "underlying": u, "month": MONTH_MAP[cb_month.get()]},
                  "선물 월물")
+        if spec.market_combo:
+            send({"cmd": "autom_market", "underlying": u, "market": MARKET_MAP[cb_market.get()]},
+                 "거래소")
         send_ref_qty(force=True)
         state_box["_applied"] = True  # 모니터 수치는 '적'을 누른 뒤부터 표시(사용자 2026-09-04)
 
     def on_under_change(_e: object = None) -> None:
-        """종목 콤보 — 그 종목의 책(세트·RT·체결차·기준수량·월물)을 코어에서 다시 보여준다.
-        실행 중이어도 바꿀 수 있다(다른 창에서 다른 종목을 돌리기 위함, 사용자 확정 2026-09-08)."""
-        state_box["_loaded_under"] = None  # 다음 갱신 때 그 종목 책으로 입력값 다시 채움
+        """종목 콤보 — 그 종목의 종목 상태(세트·RT·체결차·기준수량·월물)을 코어에서 다시 보여준다.
+        이 창의 종목이 실행 중이면 콤보가 잠겨 바꿀 수 없다(사용자 확정 2026-09-17)."""
+        state_box["_loaded_under"] = None  # 다음 갱신 때 그 종목 상태으로 입력값 다시 채움
         agg_shown["under"] = ""
         agg_map.clear()
         cb_agg.config(values=["-"])
@@ -482,13 +519,24 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     def revert_ref_qty() -> None:
         """Enter 없이 포커스가 나가면 입력을 **마지막으로 보낸 값**으로 되돌린다(사용자 2026-09-07).
 
-        보낸 적이 없으면(창 연 직후, '적' 전) 입력을 그대로 둔다.
+        보낸 적이 없으면(창 연 직후, '적' 전) 입력을 그대로 둔다. '적' 버튼을 눌러 포커스가
+        빠진 경우는 되돌리지 않는다 — 버튼이 눌리는 순간 FocusOut이 먼저 와서 고친 값을 지우고,
+        '적'은 지워진 옛 값을 보냈다(사용자 2026-09-17 실측, 주식·주식선물 둘 다). 포커스가
+        어디로 갔는지는 잠깐 뒤에 봐야 알 수 있어 미룬다.
         """
-        last = ref_sent["qty"]
-        if last < 0 or ent_refqty.get() == str(last):
-            return
-        ent_refqty.delete(0, "end")
-        ent_refqty.insert(0, str(last))
+        def _do() -> None:
+            try:
+                if root.focus_get() is btn_apply:
+                    return  # '적'이 지금 입력값을 보낸다(send_ref_qty(force=True))
+            except (tk.TclError, KeyError):
+                pass
+            last = ref_sent["qty"]
+            if last < 0 or ent_refqty.get() == str(last):
+                return
+            ent_refqty.delete(0, "end")
+            ent_refqty.insert(0, str(last))
+
+        ent_refqty.after(30, _do)
 
     def flash_ref_qty() -> None:
         """보냈다는 표시 — 입력칸 배경을 잠깐 바꿨다 되돌린다(버튼 눌림처럼, 사용자 2026-09-07)."""
@@ -709,7 +757,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                                (btn_set, "SystemButtonFace")],
                       "halted": False})
             _paint_row_bg(w)
-            # 버튼 글자도 처음부터 세트 상태대로(신용 기본 세트 = 신용/상환) — 코어 책이 없는 주식
+            # 버튼 글자도 처음부터 세트 상태대로(신용 기본 세트 = 신용/상환) — 코어의 종목 상태가
+            # 없는 주식
             # 화면에선 갱신 루프가 버튼을 안 건드려 '진입/청산'으로 남았음(사용자 2026-09-16)
             btn_en.config(text=run_caption("en", bool(w.get("credit"))))
             btn_ex.config(text=run_caption("ex", bool(w.get("credit"))))
@@ -1234,12 +1283,14 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     refresh_windows_bar()  # 상단 주문가능시간 표시 초기화
 
     def _book_key() -> str:
-        """코어 책 키 — 주식선물은 종목 그대로, 주식은 '종목|stock'(코어에 주식 책이 생기면 그
-        키로 옴. 그 전엔 없어서 빈 책 = 값 '-', 주식선물 책을 잘못 보여주지 않는다, 2026-09-16)."""
+        """코어의 종목 상태 키 — 주식선물은 종목 그대로, 주식은 '종목|stock'(코어에 주식 종목
+        상태가 생기면 그
+        키로 옴. 그 전엔 없어서 빈 종목 상태 = 값 '-', 주식선물 종목 상태를 잘못 보여주지 않는다,
+        2026-09-16)."""
         return cur_under() if spec.product == "sf" else f"{cur_under()}|{spec.product}"
 
     def _live_book() -> dict[str, Any]:
-        """이 창 종목의 실시간 책 스냅샷(autom_live[책 키]) — 없으면 빈 dict."""
+        """이 창 종목의 실시간 종목 상태 스냅샷(autom_live[종목 상태 키]) — 없으면 빈 dict."""
         data = state_box.get("data") or {}
         live = (data.get("autom_live") or {}).get(_book_key())
         return live if isinstance(live, dict) else {}
@@ -1271,6 +1322,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # 창은 종목·호가단위·기준수량 표시값과 체결쏴 설정(공통)만 저장한다.
         return {
             "under": cb_under.get(), "agg": cb_agg.get(), "refqty": ent_refqty.get(),
+            "market": cb_market.get(),
             "bg": bg_state["name"],  # 콤보 이름 또는 '#rrggbb'
             "fg": fg_state["cur"],   # 글자색 '#rrggbb' 또는 None(기본)
             "common": {"windows": list(common["windows"]),
@@ -1288,6 +1340,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             return
         if saved.get("under") in cb_under["values"]:  # 현대차 등 제외된 종목은 복원 안 함
             cb_under.set(saved["under"])
+        if saved.get("market") in MARKET_MAP:
+            cb_market.set(saved["market"])
         if isinstance(saved.get("agg"), str):
             state_box["_want_agg"] = saved["agg"]  # 틱 목록이 오면 그때 고른다
         if isinstance(saved.get("refqty"), str):
@@ -1322,7 +1376,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 for k in common["risk"]:
                     if isinstance(sc["risk"].get(k), int | float):
                         common["risk"][k] = float(sc["risk"][k])
-        # 세트 값은 창 저장에서 복원하지 않는다 — 코어 책(종목별)이 원본(_load_inputs_from_core)
+        # 세트 값은 창 저장에서 복원하지 않는다 — 코어의 종목 상태(종목별)이
+        # 원본(_load_inputs_from_core)
         refresh_windows_bar()
 
     if preview and os.environ.get("KP_PREVIEW_BG"):  # 미리보기 캡처용 바탕색(이름 또는 #rrggbb)
@@ -1365,6 +1420,15 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
 
     def _fmt_num(v: Any, d: int = 0) -> str:
         return f"{float(v):,.{d}f}" if isinstance(v, int | float) else "-"
+
+    def _fmt_diff(v: Any) -> str:
+        """체결차 — 반올림 없이 코어 값(소수 6자리까지)을 그대로, 뒤의 0만 뗀다(사용자 2026-09-17:
+        "반올림하지 말고 보여줄 수 있는 자리까지"). 정수면 정수로."""
+        if not isinstance(v, int | float):
+            return "-"
+        if float(v) == int(v):
+            return f"{int(v):,}"
+        return f"{float(v):,.6f}".rstrip("0").rstrip(".")
 
     def _paint_leg(w: dict[str, Any], side: str, leg: dict[str, Any]) -> None:
         """실행 버튼 색·글자(진행 상태)·기준값 칸 잠금을 코어 상태에 맞춘다."""
@@ -1424,7 +1488,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         _paint_row_bg(w)
 
     def _load_inputs_from_core(data: dict[str, Any]) -> None:
-        """코어가 기억하는 **이 종목 책**(세트 입력값·기준수량·월물)을 화면에 채운다 — 코어가 원본.
+        """코어가 기억하는 **이 종목 상태**(세트 입력값·기준수량·월물)을 화면에 채운다 — 코어가
+        원본.
         창을 열 때와 종목 콤보를 바꿀 때 1회(2026-09-08: 종목별 독립)."""
         book = ((data.get("autom") or {}).get("books") or {}).get(_book_key()) or {}
         rows = book.get("sets")
@@ -1433,21 +1498,28 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         month_label = next((k for k, v in MONTH_MAP.items() if v == book.get("future_month")), None)
         if month_label and spec.has_month:
             cb_month.set(month_label)
+        market_label = next((k for k, v in MARKET_MAP.items() if v == book.get("market")), None)
+        if market_label and spec.market_combo:
+            cb_market.set(market_label)
         ref = book.get("ref_qty")
         if isinstance(ref, int):
             ent_refqty.delete(0, "end")
             ent_refqty.insert(0, str(ref))
             ref_sent["qty"] = ref
-        state_box["_sets_sig"] = set_inputs_sig(book)
+        state_box["_sets_sigs"] = set_input_sigs(book)
         _load_set_inputs(rows, "fwd")
         _load_set_inputs(book.get("rev_sets") or [], "rev")
 
-    def _load_set_inputs(rows: list[Any], dtag: str, skip_focused: bool = False) -> None:
-        """코어 책의 세트 입력값(목표·1회·전환초·진입SF·진입S·청산)을 그 방향 3세트 칸에 채운다.
-        skip_focused: 지금 인라인 칸을 편집 중인 세트는 건너뛴다(입력 중 값이 튀지 않게)."""
+    def _load_set_inputs(rows: list[Any], dtag: str, skip_focused: bool = False,
+                         only: set[int] | None = None) -> None:
+        """코어의 종목 상태의 세트 입력값(목표·1회·전환초·진입SF·진입S·청산)을 그 방향 세트 칸에
+        채운다.
+        skip_focused: 지금 인라인 칸을 편집 중인 세트는 건너뛴다(입력 중 값이 튀지 않게).
+        only: 이 번호의 세트만(코어 값이 바뀐 세트 — 나머지 세트의 미전송 인라인 수정은 그대로).
+        None이면 전부(창 열기·종목 전환)."""
         focused = root.focus_get() if skip_focused else None
         for i, raw in enumerate(rows[:rows_by[dtag]]):
-            if not isinstance(raw, dict):
+            if not isinstance(raw, dict) or (only is not None and i not in only):
                 continue
             w = sets[(dtag, i)]
             if focused is not None and focused in (w["e_en_sf"], w["e_en_s"], w["e_ex_sf"]):
@@ -1457,7 +1529,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             w["delay"] = int(raw.get("switch_delay_s") or 0)
             w["offset"] = int(raw.get("price_offset") or 0)
             w["tick"] = int(raw.get("pre_tick") or 0)  # 0 = 종목 기본값(공통설정 값)
-            if "credit" in raw:  # 주식 신용(코어 책에 실리면 따라감, 없으면 화면 기본값 유지)
+            if "credit" in raw:  # 주식 신용(코어의 종목 상태에 실리면 따라감, 없으면 화면 기본값
+            # 유지)
                 w["credit"] = bool(raw["credit"])
             for key in ("en_sf", "en_s", "ex_sf"):
                 v = raw.get(key)
@@ -1472,12 +1545,21 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         (세트설정이 코어에 가는 시점 = 설정창 '확인'·실행 켬, 사용자 확정 2026-09-09).
         """
         book = ((data.get("autom") or {}).get("books") or {}).get(_book_key()) or {}
-        sig = set_inputs_sig(book)
-        if not sig or sig == state_box.get("_sets_sig"):
+        sigs = set_input_sigs(book)
+        if not sigs:
             return
-        state_box["_sets_sig"] = sig
-        _load_set_inputs(book.get("sets") or [], "fwd", skip_focused=True)
-        _load_set_inputs(book.get("rev_sets") or [], "rev", skip_focused=True)
+        prev: dict[tuple[str, int], str] = state_box.get("_sets_sigs") or {}
+        changed = {key for key, s in sigs.items() if prev.get(key) != s}
+        if not changed:
+            return
+        state_box["_sets_sigs"] = sigs
+        # **바뀐 세트만** 다시 채운다(사용자 2026-09-17) — 전 세트를 채우면 다른 세트에서 고치고
+        # 아직 안 보낸 인라인 괴리율이 옛 코어 값으로 되돌아간다(여러 세트를 빠르게 고친 뒤 한
+        # 세트를 켰을 때 실증).
+        for dtag, key in (("fwd", "sets"), ("rev", "rev_sets")):
+            only = {i for d, i in changed if d == dtag}
+            if only:
+                _load_set_inputs(book.get(key) or [], dtag, skip_focused=True, only=only)
 
     def _load_common_from_core(data: dict[str, Any]) -> None:
         """체결쏴 설정(공통)을 코어 값으로 맞춘다 — 코어가 원본(단일 진실).
@@ -1486,12 +1568,19 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         창에서 주문가능시간을 줄였는데 삼성 창은 옛 값을 보여 "시간 안인데 왜 안 나가나"). 코어
         값이 바뀔 때만 다시 채운다(설정창 입력 중 덮어쓰기 방지 — 설정창은 열 때 읽음)."""
         am = data.get("autom") or {}
-        st = am.get("settings")
+        # 주식 화면은 **주식용 공통설정·리스크값**(settings_stock·risk_stock_*)을 읽는다 — 주식선물
+        # 것을 읽으면 저장한 값이 곧 주식선물 값으로 되돌아가 "2번째 시간 구간이 저장 안 됨"으로
+        # 보였다(실측 2026-09-17). 주식 리스크는 정방향 칸(fwd_*)에 대응, 역방향은 없음.
+        stock = spec.product == "stock"
+        st = am.get("settings_stock" if stock else "settings")
         if not isinstance(st, dict):
             return
-        sig = json.dumps(st, sort_keys=True) + json.dumps(
-            [am.get(k) for k in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap",
-                                 "risk_rev_en", "risk_rev_ex", "risk_rev_gap")])
+        risk_map = ((("risk_stock_en", "fwd_en"), ("risk_stock_ex", "fwd_ex"),
+                     ("risk_stock_gap", "fwd_gap")) if stock else
+                    (("risk_fwd_en", "fwd_en"), ("risk_fwd_ex", "fwd_ex"),
+                     ("risk_fwd_gap", "fwd_gap"), ("risk_rev_en", "rev_en"),
+                     ("risk_rev_ex", "rev_ex"), ("risk_rev_gap", "rev_gap")))
+        sig = json.dumps(st, sort_keys=True) + json.dumps([am.get(k) for k, _d in risk_map])
         if state_box.get("_common_sig") == sig:
             return
         state_box["_common_sig"] = sig
@@ -1511,9 +1600,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                          ("hl_margin_sell", "hl_margin_sell")):
             if isinstance(st.get(src), int | float):
                 common[dst] = float(st[src]) * 100.0  # 코어는 소수, 화면은 %
-        for src, dst in (("risk_fwd_en", "fwd_en"), ("risk_fwd_ex", "fwd_ex"),
-                         ("risk_fwd_gap", "fwd_gap"), ("risk_rev_en", "rev_en"),
-                         ("risk_rev_ex", "rev_ex"), ("risk_rev_gap", "rev_gap")):
+        for src, dst in risk_map:
             if isinstance(am.get(src), int | float):
                 common["risk"][dst] = float(am[src]) * 100.0
         refresh_windows_bar()
@@ -1546,7 +1633,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         data = state_box.get("data") or {}
         _load_common_from_core(data)  # 체결쏴 설정은 코어 값(공통) — 다른 창의 변경도 반영
         if state_box.get("_loaded_under") != cur_under() and data.get("autom"):
-            state_box["_loaded_under"] = cur_under()  # 종목이 바뀌면 그 책으로 다시 채움
+            state_box["_loaded_under"] = cur_under()  # 종목이 바뀌면 그 종목 상태으로 다시 채움
             _load_inputs_from_core(data)
         else:
             _sync_set_inputs_from_core(data)  # 다른 창이 바꾼 세트설정 반영(같은 종목)
@@ -1561,10 +1648,18 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 for side, leg in (("en", en), ("ex", ex)):
                     detail = _leg_detail(i, side, leg, dtag)
                     if detail:
+                        # 상태줄은 **가장 최근에 바뀐 메시지가 앞**(사용자 2026-09-17: 세트 순서로
+                        # 붙이니 새 거부 메시지가 뒤에 밀려 잘림). 줄 글이 바뀐 시각을 기억해 정렬
+                        seen = state_box.setdefault("_detail_seen", {})
+                        prev = seen.get((dtag, i, side))
+                        if prev is None or prev[0] != detail:
+                            seen[(dtag, i, side)] = (detail, time.monotonic())
                         details.append(detail)
                 # RT는 부호 그대로 — 역방향은 0 또는 음수(사용자 확정 2026-09-14)
                 w["rt"].config(text=_fmt_num(row.get("rt")))
-                w["diff"].config(text=_fmt_num(row.get("fill_diff")))
+                # 체결차는 HL 소수 계약 그대로(0.612 등) — 정수로 반올림하면 "1"로 보여 한도(1)에
+                # 걸린 줄 안다(실측 2026-09-17 주식 1회 1주, HL 0.388 부분 체결)
+                w["diff"].config(text=_fmt_diff(row.get("fill_diff")))
         # 상단 모니터 3칸 — 코어가 기준수량으로 계산한 est 괴리(%), 정/역 각각.
         # '적'을 누른 뒤부터 표시(종목·호가단위·기준수량이 코어에 적용된 값이라야 뜻이 있음).
         monitor = _live_book().get("monitor") or {}
@@ -1627,14 +1722,18 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                     for v_lbl, text in zip(vals_l, texts[:len(vals_l)], strict=True):
                         v_lbl.config(text=text)
         _refresh_merge_combo(data)
-        # 이 종목이 실행 중이면 호가단위·월물 콤보와 '적'만 잠금(실행 중 상대 상품·호가단위가
-        # 바뀌면 판정 기준이 통째로 바뀜). **종목 콤보는 항상 열어 둔다** — 다른 창에서 다른
-        # 종목을 돌릴 수 있어야 하므로(사용자 확정 2026-09-08). 자동M 상태는 코어가 종목별로 든다.
+        # 이 종목이 실행 중이면 종목·호가단위·월물 콤보와 '적' 잠금(실행 중 종목·상대 상품·
+        # 호가단위가 바뀌면 판정 기준이 통째로 바뀜). 종목 콤보 잠금은 사용자 2026-09-17 확정
+        # (09-08 "항상 열림"은 폐기 — 다른 종목은 다른 창에서 종목을 먼저 고른 뒤 돌린다).
+        # 거래소 콤보(주식)는 잠그지 않는다(사용자 2026-09-17) — 고르면 바로 코어에 간다.
         running = _any_running()
-        for cb in (cb_agg, cb_month):
+        for cb in (cb_under, cb_agg, cb_month):
             cb.config(state="disabled" if running else "readonly")
         btn_apply.config(state="disabled" if running else "normal")
-        if details:  # 진행 중인 세트의 상세(선주문 번호·가격·체결·HL 대기·중지 사유)
+        if details:  # 진행 중인 세트의 상세(선주문 번호·가격·체결·HL 대기·중지 사유) — 최근 순
+            seen = state_box.get("_detail_seen") or {}
+            when = {text: t for text, t in seen.values()}
+            details.sort(key=lambda d: when.get(d, 0.0), reverse=True)
             status.config(text=" / ".join(details))
 
     def refresh() -> None:

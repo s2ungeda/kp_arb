@@ -394,7 +394,7 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
             "price": it.price, "status": o.status.value,
             "time": o.placed_at,  # 접수 시각(HH:MM:SS) — 주문 리스트 '시각' 칸
             "source": it.source,  # 출처(자동M·일반주문창·따라가기) — 주문 리스트 '출처' 칸·필터
-            "tag": it.tag,        # 세트 꼬리표(자동M "정3진입" 등) — 주문 리스트 '세트' 칸·필터
+            "tag": it.tag,        # 세트 꼬리표(자동M "선정3진" 등) — 주문 리스트 '세트' 칸·필터
         })
     symbols: dict[str, Any] = {}
     for u in Underlying:
@@ -507,6 +507,8 @@ def _autom_set_from_body(target: Any, body: dict[str, Any]) -> None:
     for key in ("en_sf", "en_s", "ex_sf"):
         if key in body:
             setattr(target, key, _opt_float(body[key]))
+    if "credit" in body:  # 주식 신용 세트(결정 40) — 주식선물 세트는 화면이 안 보냄
+        target.credit = bool(body["credit"])
     if body.get("rt_manual") is not None:  # RT 진입수량 수동 입력
         rt = int(body["rt_manual"])
         # 부호는 방향을 따른다(§7A, 2026-09-15): 정방향 RT ≥ 0, 역방향 RT ≤ 0(보유 −n).
@@ -522,7 +524,8 @@ def _autom_set_from_body(target: Any, body: dict[str, Any]) -> None:
 
 
 async def _autom_command(
-    engine: AutoMEngine | None, state: CoreState, body: dict[str, Any]
+    engine: AutoMEngine | dict[str, AutoMEngine | None] | None, state: CoreState,
+    body: dict[str, Any],
 ) -> dict[str, Any]:
     """자동M 명령(화면 → 코어) — DESIGN-auto-m-exec. 실행/정지는 엔진이 있어야 한다.
 
@@ -535,15 +538,17 @@ async def _autom_command(
 
     cmd = body.get("cmd")
     am = state.autom
-    # 주식 체결쏴(exec §7C, 2026-09-16): 화면만 메인 메뉴에 연결된 상태 — 코어에 주식 책이 생기기
-    # 전엔 명령을 전부 거부(안 하면 주식선물 책으로 들어간다).
-    if str(body.get("product", "sf")) != "sf":
-        return _fail(["주식 체결쏴는 코어 준비 중 — 화면만 연결됨(명령 미반영)"])
+    # 상품(exec §7C, 2026-09-17): "sf" 주식선물(기본) / "stock" 주식 — 종목 상태·설정·엔진이 따로
+    product = str(body.get("product", "sf"))
+    if product not in ("sf", "stock"):
+        return _fail([f"알 수 없는 상품: {product!r}"])
+    if isinstance(engine, dict):  # 상품별 엔진 묶음 → 이 명령의 엔진
+        engine = engine.get(product)
     # 방향(exec §7A·§7B, 2026-09-14): "fwd"(기본) = 정방향 sets, "rev" = 역방향 rev_sets
     reverse = str(body.get("direction", "fwd")) == "rev"
 
     def _book() -> Any:
-        return am.book(Underlying(str(body["underlying"])))
+        return am.book(Underlying(str(body["underlying"])), product)
 
     def _sets() -> Any:
         return _book().sets_of(reverse)
@@ -552,6 +557,12 @@ async def _autom_command(
         if cmd == "autom_set":
             _autom_set_from_body(_sets()[int(body["set"])], body)
             return _ok()
+        if cmd == "autom_market":  # 주식 거래소 KRX/NXT — 종목별(exec §7C, 2026-09-17)
+            market = str(body["market"]).strip().lower()
+            if market not in ("krx", "nxt"):
+                return _fail([f"거래소 값 오류: {market!r}"])
+            _book().market = market
+            return _ok()
         if cmd == "autom_month":  # 선물 월물(근/차근) — 종목별(exec §11.9)
             month = str(body["month"]).strip()
             if month not in ("near", "next"):
@@ -559,7 +570,7 @@ async def _autom_command(
             _book().future_month = month
             return _ok()
         if cmd == "autom_settings":
-            st = am.settings
+            st = am.settings_for(product)
             if "windows" in body:
                 wins = tuple((str(a), str(b)) for a, b in body["windows"])
                 for a, b in wins:
@@ -578,8 +589,12 @@ async def _autom_command(
                     setattr(st, key, float(body[key]))
             for key in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap",
                         "risk_rev_en", "risk_rev_ex", "risk_rev_gap"):
-                if key in body:
-                    setattr(am, key, float(body[key]))
+                if key in body:  # 주식은 정방향 리스크값을 주식 칸(risk_stock_*)에
+                    if product == "stock" and key.startswith("risk_rev"):
+                        continue
+                    target_key = (key.replace("risk_fwd", "risk_stock") if product == "stock"
+                                  else key)
+                    setattr(am, target_key, float(body[key]))
             # 설정 변경은 코어 로그에 남긴다 — "왜 그때 주문이 나갔/막혔나"를 따질 근거
             # (실측 2026-09-08: 주문가능시간을 줄인 순간 걸린 선주문이 취소됐는데 기록이 없었음).
             logging.getLogger("kp_arb.autom").info(
@@ -609,15 +624,18 @@ async def _autom_command(
             u = Underlying(str(body["underlying"]))
             index, block = int(body["set"]), Block(str(body["block"]))
             value = bool(body["value"])
-            target = am.book(u).sets_of(reverse)[index]
+            target = am.book(u, product).sets_of(reverse)[index]
             if value:
                 errors: list[str] = []
                 if target.per_qty <= 0:
                     errors.append("1회주문수량을 입력하세요")
                 if target.target_qty <= 0:
                     errors.append("목표수량을 입력하세요")
-                if block is Block.ENTRY and (target.en_sf is None or target.en_s is None):
-                    errors.append("진입SF·진입S 기준값을 입력하세요")
+                need_sf = product != "stock"  # 주식은 진입(S) 칸 하나
+                if block is Block.ENTRY and ((need_sf and target.en_sf is None)
+                                             or target.en_s is None):
+                    errors.append("진입SF·진입S 기준값을 입력하세요" if need_sf
+                                  else "진입 기준값을 입력하세요")
                 if block is Block.EXIT and target.ex_sf is None:
                     errors.append("청산 기준값을 입력하세요")
                 # 중지는 세트 단위(exec §2) — 진입·청산 어느 쪽이 중지든 그 세트는 해제 전엔 못 켠다
@@ -1083,6 +1101,7 @@ def make_app(
     boot_errors: list[str] | None = None,
     hub: WsHub | None = None,
     autom: AutoMEngine | None = None,
+    autom_stock: AutoMEngine | None = None,  # 주식 체결쏴 엔진(exec §7C, 2026-09-17)
 ) -> web.Application:
     """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅.
 
@@ -1115,7 +1134,8 @@ def make_app(
             [system.startup_load_error]
             if system is not None and system.startup_load_error else [])
         # 자동M 실시간 상태(세트별 상태·RT·체결차·누적 Sprd) — 엔진 없으면 빈 값
-        payload["autom_live"] = autom.live_snapshot() if autom is not None else {}
+        payload["autom_live"] = {**(autom.live_snapshot() if autom is not None else {}),
+                                 **(autom_stock.live_snapshot() if autom_stock is not None else {})}
         return payload
 
     if hub is not None and hub.state_provider is None:
@@ -1143,7 +1163,7 @@ def make_app(
             result = _fx_command(fx_service, payload)
             return web.json_response(result, dumps=_dumps)
         if isinstance(cmd, str) and cmd.startswith("autom_"):
-            result = await _autom_command(autom, state, payload)
+            result = await _autom_command({"sf": autom, "stock": autom_stock}, state, payload)
             if result.get("ok") and save:
                 save()  # 세트 설정·공통설정·RT 저장
             return web.json_response(result, dumps=_dumps)
@@ -1286,6 +1306,7 @@ async def _serve() -> None:
         engine = None
         fx_service = None
         autom_engine = None
+        autom_engine_stock = None
         tasks: list[asyncio.Task[None]] = []
         boot_errors: list[str] = []  # 코어 조립 실패 사유 → /state load_errors → 메인창 팝업
         try:
@@ -1310,9 +1331,13 @@ async def _serve() -> None:
             autom_engine = _AutoMEngine(  # 자동M 실행(정방향) — 실행은 화면 버튼
                 state, system, log_dir=_base_dir() / "logs",
                 save=lambda: save_state(STATE_PATH, state))  # 체결마다 RT·체결차 저장
+            autom_engine_stock = _AutoMEngine(  # 주식 체결쏴(exec §7C) — 같은 골격, 상품만 다름
+                state, system, log_dir=_base_dir() / "logs",
+                save=lambda: save_state(STATE_PATH, state), product="stock")
             tasks.append(asyncio.create_task(engine.run()))
             tasks.append(asyncio.create_task(fx_service.run()))
             tasks.append(asyncio.create_task(autom_engine.run()))
+            tasks.append(asyncio.create_task(autom_engine_stock.run()))
             log.info("LiveSystem 결합 완료 — 리허설 판정 + FX 보고 시작 (발주 없음)")
         except Exception as exc:  # noqa: BLE001 - 키 없음/네트워크 등
             log.exception("LiveSystem 시동 실패 — API만 운영 (시세 없음)")
@@ -1326,7 +1351,8 @@ async def _serve() -> None:
             state, on_shutdown=stop.set,
             save=lambda: save_state(STATE_PATH, state),
             system=system, engine=engine, fx_service=fx_service,
-            boot_errors=boot_errors, hub=hub, autom=autom_engine), access_log=None)
+            boot_errors=boot_errors, hub=hub, autom=autom_engine,
+            autom_stock=autom_engine_stock), access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, HOST, DEFAULT_PORT)
         await site.start()
@@ -1336,6 +1362,8 @@ async def _serve() -> None:
             # 안전종료 1단계 — 자동M 전 종목 정지 + 미체결 선주문 취소가 **끝날 때까지**(최대 3초)
             # 기다린다. 0.3초만 기다리던 때 취소가 한도에 걸려 선주문이 LS에 남았다(실측 09-08).
             await autom_engine.shutdown()
+        if autom_engine_stock is not None:
+            await autom_engine_stock.shutdown()
         if system is not None:
             await system.stop()  # WS(_guarded_ws)·시동 태스크 명시 취소 — 종료 중 재접속 방지
         for task in tasks:

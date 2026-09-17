@@ -57,8 +57,8 @@ _F_SOURCE = ("전체", "자동M", "일반주문")
 def row_visible(filters: dict[str, str], venue: str, underlying: str, side: str,
                 source: str, tag: str = "") -> bool:
     """필터 5개(거래소·종목·매매·출처·세트)를 행 하나에 적용. 출처 '일반주문' = 자동M이 아닌 전부
-    (일반주문창·따라가기·미상). 세트(2026-09-16)는 꼬리표 앞부분 일치 — "정3"을 고르면 정3진입·
-    정3청산 둘 다."""
+    (일반주문창·따라가기·미상). 세트(2026-09-16)는 꼬리표 앞부분 일치 — "선정3"을 고르면 선정3진·
+    선정3청 둘 다."""
     if filters.get("venue", "전체") != "전체" and venue != filters["venue"]:
         return False
     want_tag = filters.get("set", "전체")
@@ -83,11 +83,13 @@ _TITLE = "주문 리스트 (미체결·취소·정정)"
 
 
 def set_choices(tags: list[str]) -> list[str]:
-    """세트 콤보 항목 — 표에 있는 자동M 꼬리표에서 세트 부분만("정3진입" → "정3") 모아 정렬,
-    앞에 '전체'. 순수(2026-09-16)."""
+    """세트 콤보 항목 — 표에 있는 자동M 꼬리표에서 세트 부분만("선정3진" → "선정3") 모아 정렬,
+    앞에 '전체'. 순수(2026-09-16, 형식 2026-09-17: 상품·방향·세트·진/청)."""
     seen: set[str] = set()
     for t in tags:
-        base = t.replace("진입", "").replace("청산", "").strip()
+        base = t.strip()
+        if base.endswith(("진", "청")):
+            base = base[:-1]
         if base:
             seen.add(base)
     return ["전체", *sorted(seen)]
@@ -117,7 +119,7 @@ _COLS: tuple[tuple[str, int, str], ...] = (
     ("주문가", 70, "e"), ("수량", 52, "e"), ("체결가", 70, "e"),
     ("체결량", 52, "e"), ("상태", 44, "center"), ("접수시각", 66, "center"),
     ("체결시각", 66, "center"),
-    # 출처(자동M/일반/따라가기) · 세트(자동M 꼬리표 "정3진입", 2026-09-16) · 주문번호 순(사용자)
+    # 출처(자동M/일반/따라가기) · 세트(자동M 꼬리표 "선정3진", 2026-09-17) · 주문번호 순(사용자)
     ("출처", 52, "center"), ("세트", 62, "center"), ("주문번호", 104, "e"))
 _ROW_H = 20  # Treeview 행 높이(px) — FONT_LABEL 9pt 기준
 
@@ -405,7 +407,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              "매수" if buy else "매도",
                              _fmt_px(c.get("price")), _fmt_qty(c.get("qty")),
                              "", "",  # 체결가·체결량 공백(취소행)
-                             "취소", c.get("accept_time", ""), "",  # 접수시각·체결시각(공백)
+                             # 상태: 코어가 준 status(cancelled/rejected → 취소/거부), 없으면 취소
+                             _ST_KR.get(str(c.get("status") or ""), "취소"),
+                             c.get("accept_time", ""), "",  # 접수시각·체결시각(공백)
                              _src_label(c.get("source")), str(c.get("tag") or ""),
                              str(c.get("order_id", "")))))
         # 유형 체크를 끈 종류도 "숨김"에 넣는다 — 주문 체크를 끄고 잊으면 미체결이 안 보인다.

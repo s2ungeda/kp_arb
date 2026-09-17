@@ -55,7 +55,7 @@ from .limits import DailyFilled, DailyLimitExceeded, would_exceed_daily_limit
 from .order_book import OrderBook, TrackedOrder
 from .risk import RiskManager, RiskState
 from .session import reference_instrument
-from .session_service import FUTURES_MARKET, SessionService
+from .session_service import FUTURES_MARKET, STOCK_MARKET, SessionService
 from .strategy.base import Strategy
 from .theory import (
     carry_theory,
@@ -351,6 +351,9 @@ class LiveSystem:
         # 옛 최근 200건·화면 50건 상한으로 09:08 이전 체결이 안 보였음). 날짜가 바뀌면 비운다.
         self.fills: deque[dict[str, Any]] = deque()
         self.cancels: deque[dict[str, Any]] = deque()
+        self._cancel_recorded: set[str] = set()  # 취소내역에 이미 넣은 주문번호(통보 중복 방지)
+        # 종목 VI 상태(vi_gubun, "0" = 해제) — LS 실시간 VI_(exec §8, 체결쏴 주식 정지)
+        self.vi_state: dict[Underlying, str] = {}
         self._daylog_state: dict[str, str] = {}  # roll_daily_logs — 보관분의 날짜
         # 원달러선물 동시호가 대응주문(§9.1, DESIGN-fx-auction) — 감시 컨트롤러 + 발주 로그.
         self.fx_hedges: deque[dict[str, Any]] = deque(maxlen=200)
@@ -451,15 +454,28 @@ class LiveSystem:
 
     def _record_cancel(self, order: TrackedOrder) -> None:
         """취소내역 보관(주문 리스트 '취소' 행) — 원주문 정보 기준(주문번호·주문가·주문수량·
-        접수시각). 취소시각(time)은 보관하되 현재 열엔 미표시."""
+        접수시각). 취소시각(time)은 보관하되 현재 열엔 미표시.
+
+        HL 주문상태 통보와 LS 취소·거부 통보(SC3/SC4/H01) 양쪽에서 불린다(2026-09-17 전엔 HL만
+        연결돼 자동M 선주문의 LS 취소가 주문리스트에 한 건도 안 보였음). 같은 주문번호는 1회만 —
+        정정으로 소멸한 원주문은 장부에서 먼저 취소된 뒤 통보가 또 오므로 통보 쪽 1회로 남긴다."""
         import time as _t
 
+        seen: set[str] | None = getattr(self, "_cancel_recorded", None)
+        if seen is None:
+            seen = set()
+            self._cancel_recorded = seen
+        if order.order_id in seen:
+            return
         it = order.intent
-        roll_daily_logs(getattr(self, "_daylog_state", {}), _t.strftime("%Y-%m-%d"),
-                        getattr(self, "fills", deque()), self.cancels)
+        if roll_daily_logs(getattr(self, "_daylog_state", {}), _t.strftime("%Y-%m-%d"),
+                           getattr(self, "fills", deque()), self.cancels):
+            seen.clear()  # 날짜가 바뀌어 보관분을 비웠으면 중복 방지 기록도 같이
+        seen.add(order.order_id)
         self.cancels.appendleft({
             "time": _t.strftime("%H:%M:%S"),        # 취소시각(현재 열엔 미표시)
             "order_id": order.order_id,             # 주문번호
+            "status": order.status.value,           # cancelled/rejected — 화면 상태 칸(취소/거부)
             "accept_time": order.placed_at,         # 접수시각
             "underlying": it.underlying.value, "instrument": it.instrument.value,
             "side": it.side.value, "qty": it.qty, "price": it.price,  # 주문수량·주문가
@@ -520,6 +536,23 @@ class LiveSystem:
     def futures_halted(self) -> bool:
         """선물시장(5) 정지 오버레이(사이드카·서킷) 여부 — 자동M 판정용(exec §8)."""
         return self.session.halt_for(FUTURES_MARKET) is not None
+
+    def stock_halted(self) -> bool:
+        """주식시장(1) 정지 오버레이 여부 — 주식 체결쏴 판정용(exec §7C, 사용자 확정 2026-09-17)."""
+        return self.session.halt_for(STOCK_MARKET) is not None
+
+    def stock_vi(self, underlying: Underlying) -> bool:
+        """종목 VI 발동 중인가(LS 실시간 VI_, exec §8) — 체결쏴 주식은 그 종목 선주문을 멈춘다."""
+        return self.vi_state.get(underlying, "0") not in ("", "0")
+
+    def _on_vi(self, ev: Any) -> None:
+        """VI_ 수신 → 종목별 vi_gubun 보관 + 로그(발동/해제 모두 — 코드표 실측 확인용)."""
+        import logging
+
+        self.vi_state[ev.underlying] = ev.gubun
+        logging.getLogger("kp_arb.core").warning(
+            "VI %s %s 구분 %s(0 해제·1 정적·2 동적·3 둘 — 추정) %s",
+            "해제" if not ev.active else "발동", ev.underlying.value, ev.gubun, ev.time)
 
     def fx_entry_rate(self, side: Side) -> float | None:
         """자동M 환진입가(§10) — 최근월물 원달러선물의 매수1호가(HL 매도, −환) / 매도1호가(HL 매수).
@@ -978,7 +1011,9 @@ class LiveSystem:
                 handler(fill)
 
         def apply_event(event: OrderEvent) -> None:
-            self.order_book.on_order_event(event)
+            order = self.order_book.on_order_event(event)
+            if event.kind in ("cancel", "reject") and order is not None:
+                self._record_cancel(order)  # LS 취소·거부 통보 → 취소내역(주문 리스트 '취소' 행)
             # [임시 진단] fx-auction 감시 흐름 확인 — 선물 접수 수신·판정 근거를 한 줄로.
             if event.kind == "ack" and str(event.body.get("trcode1", "")).startswith("FO"):
                 import logging as _lg
@@ -1005,6 +1040,7 @@ class LiveSystem:
         for underlying in Underlying:
             self._stock_ws.subscribe_quotes(underlying)
             self._stock_ws.subscribe_trades(underlying)  # 현재가(S3_) + 예상체결(YS3)
+            self._stock_ws.subscribe_vi(underlying)      # 종목 VI 발동/해제(체결쏴 주식 정지)
         if self.futures_symbols:
             self._stock_ws.subscribe_futures_quotes(self.futures_symbols)
         if self.next_futures_symbols:  # 차근월물 호가·체결·예상체결(§5.11)
@@ -1028,6 +1064,7 @@ class LiveSystem:
         self._stock_ws.on_trade.append(fan_trade)
         self._stock_ws.on_expected.append(fan_expected)
         self._stock_ws.on_market_status.append(self.session.on_market_status)
+        self._stock_ws.on_vi.append(self._on_vi)
         self._stock_ws.on_fill.append(apply_fill)
         self._stock_ws.on_order_event.append(apply_event)
         self._stock_ws.on_reconnect.append(lambda: self._on_ws_reconnect("주식"))

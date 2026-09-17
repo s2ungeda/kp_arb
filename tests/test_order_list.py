@@ -52,12 +52,13 @@ def test_set_filter_and_choices() -> None:
     # 2026-09-16: 주문 리스트 '세트' 칸·콤보 — 자동M 꼬리표("정3진입")의 세트 부분("정3")으로 거른다
     from kp_arb.order_list import row_visible, set_choices
 
-    assert set_choices(["정3진입", "정3청산", "역1진입", "", "일반"]) == [
-        "전체", "역1", "일반", "정3"]
+    # 형식(사용자 2026-09-17): 주식선물 선정3진/선역4청, 주식 주정3진/주역4청
+    assert set_choices(["선정3진", "선정3청", "선역1진", "주정2진", "", "일반"]) == [
+        "전체", "선역1", "선정3", "일반", "주정2"]
     assert set_choices([]) == ["전체"]
-    f = {"set": "정3"}
-    assert row_visible(f, "LS", "sk_hynix", "sell", "자동M", "정3진입")
-    assert row_visible(f, "HL", "sk_hynix", "buy", "자동M", "정3청산")
-    assert not row_visible(f, "LS", "sk_hynix", "sell", "자동M", "정1진입")
+    f = {"set": "선정3"}
+    assert row_visible(f, "LS", "sk_hynix", "sell", "자동M", "선정3진")
+    assert row_visible(f, "HL", "sk_hynix", "buy", "자동M", "선정3청")
+    assert not row_visible(f, "LS", "sk_hynix", "sell", "자동M", "선정1진")
     assert not row_visible(f, "LS", "sk_hynix", "sell", "일반주문창", "")
     assert row_visible({"set": "전체"}, "LS", "sk_hynix", "sell", "일반주문창", "")

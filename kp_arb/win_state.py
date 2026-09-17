@@ -104,10 +104,40 @@ def saved_geometry(name: str) -> str | None:
     return geom if isinstance(geom, str) and is_full_geometry(geom) else None
 
 
+def _newest_sibling_fields(name: str) -> dict[str, Any] | None:
+    """같은 창 이름의 다른 슬롯 파일(``name.json``·``name#n.json``) 중 **가장 최근 저장** 필드값.
+
+    슬롯은 "살아 있는 같은 창이 안 쓰는 가장 작은 번호"라, 창을 하나 더 띄웠다 닫는 사이에 쓰던
+    창이 #1에 저장되면 다음에 혼자 띄운 창(#0)은 옛 #0 파일을 복원해 값이 사라진 것처럼 보인다
+    (실측 2026-09-17 체결쏴 주식: 종목·거래소가 기본값으로 돌아옴). 새로 뜬 창의 슬롯에 저장된
+    필드가 없으면 최근 파일을 물려받는다.
+    """
+    safe = _key_path(name).stem
+    best: tuple[float, dict[str, Any]] | None = None
+    try:
+        candidates = list(_STATE_DIR.glob(f"{safe}.json")) + list(_STATE_DIR.glob(f"{safe}#*.json"))
+    except OSError:
+        return None
+    for path in candidates:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            mtime = path.stat().st_mtime
+        except (OSError, json.JSONDecodeError):
+            continue
+        fields = raw.get("fields") if isinstance(raw, dict) else None
+        if isinstance(fields, dict) and fields and (best is None or mtime > best[0]):
+            best = (mtime, {str(k): v for k, v in fields.items()})
+    return best[1] if best else None
+
+
 def saved_fields(name: str) -> dict[str, Any]:
-    """저장된 화면 폼 필드값(dict). 없으면 빈 dict. (종목·체크박스 등)"""
+    """저장된 화면 폼 필드값(dict). 없으면 빈 dict. (종목·체크박스 등)
+
+    이 슬롯에 저장된 필드가 없으면 같은 창 이름의 가장 최근 파일 것(_newest_sibling_fields)."""
     val = _read(_slotted(name)).get("fields")
-    return {str(k): v for k, v in val.items()} if isinstance(val, dict) else {}
+    if isinstance(val, dict) and val:
+        return {str(k): v for k, v in val.items()}
+    return _newest_sibling_fields(name) or {}
 
 
 def save_fields(name: str, fields: dict[str, Any]) -> None:

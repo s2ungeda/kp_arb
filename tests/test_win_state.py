@@ -60,10 +60,35 @@ def test_slot_separates_instances(
     monkeypatch.setenv("KP_WIN_SLOT", "1")            # 다른 인스턴스
     win_state.save("order_hl", "300x200+2+2")
     assert win_state.saved_position("order_hl") == "+2+2"  # 슬롯1
-    assert win_state.saved_fields("order_hl") == {}         # 슬롯1은 아직 필드 없음
+    # 슬롯1에 저장된 필드가 없으면 같은 창의 가장 최근 파일(슬롯0) 것을 물려받는다(2026-09-17)
+    assert win_state.saved_fields("order_hl") == {"under": "삼성"}
+    win_state.save_fields("order_hl", {"under": "하이닉스"})
+    assert win_state.saved_fields("order_hl") == {"under": "하이닉스"}  # 자기 슬롯 값 우선
     monkeypatch.setenv("KP_WIN_SLOT", "0")
     assert win_state.saved_position("order_hl") == "+1+1"  # 슬롯0 그대로
     assert win_state.saved_fields("order_hl") == {"under": "삼성"}
+
+
+def test_fresh_slot_inherits_newest_saved_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 실측 2026-09-17: 창을 하나 더 띄웠다 닫는 사이 쓰던 창은 #1에 저장됐고, 다음에 혼자 띄운
+    # 창(#0)은 옛 #0 파일(기본값)을 복원해 종목·거래소가 사라진 것처럼 보였다 → 자기 슬롯에
+    # 필드가 없으면 가장 최근 파일을, 있어도 빈 dict면 최근 파일을 쓴다. 다른 이름은 안 섞인다.
+    import os
+    import time
+
+    monkeypatch.setattr(win_state, "_STATE_DIR", tmp_path / ".win_state")
+    monkeypatch.setenv("KP_WIN_SLOT", "1")
+    win_state.save_fields("autoMS", {"under": "삼성", "market": "NXT"})
+    monkeypatch.setenv("KP_WIN_SLOT", "0")
+    win_state.save_fields("autoM", {"under": "현대차"})  # 다른 창 이름 — 후보 아님
+    old = time.time() - 100
+    os.utime(tmp_path / ".win_state" / "autoM#0.json", (old, old))
+    monkeypatch.setenv("KP_WIN_SLOT", "2")  # 새 슬롯 — 파일 없음
+    assert win_state.saved_fields("autoMS") == {"under": "삼성", "market": "NXT"}
+    assert win_state.saved_fields("autoM") == {"under": "현대차"}
+    win_state.save("autoMS", "100x100+3+3")  # 위치만 저장된 자기 슬롯(필드 없음)도 최근 파일로
+    assert win_state.saved_fields("autoMS") == {"under": "삼성", "market": "NXT"}
 
 
 def test_keep_size_saves_and_restores_full_geometry(_statedir: Path) -> None:

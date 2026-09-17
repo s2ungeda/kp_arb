@@ -676,19 +676,23 @@ class LSApiGateway(LSGateway):
         return f"A{intent.underlying.krx_code}"
 
     def _spot_order_body(self, intent: OrderIntent, account: Account) -> dict[str, Any]:
-        return {
-            f"{self.SPOT_ORDER_TR}InBlock1": {
-                **self._order_account_fields(account),
-                "IsuNo": self._spot_isu(intent),
-                "OrdQty": int(intent.qty),
-                "OrdPrc": int(intent.price) if intent.price is not None else 0,
-                "BnsTpCode": "2" if intent.side is Side.BUY else "1",  # 1매도 2매수
-                "OrdprcPtnCode": "00" if intent.order_type is OrderType.LIMIT else "03",
-                "MgntrnCode": "000",  # 신용거래 없음
-                "LoanDt": "",
-                "OrdCndiTpCode": "0",
-            }
+        block: dict[str, Any] = {
+            **self._order_account_fields(account),
+            "IsuNo": self._spot_isu(intent),
+            "OrdQty": int(intent.qty),
+            "OrdPrc": int(intent.price) if intent.price is not None else 0,
+            "BnsTpCode": "2" if intent.side is Side.BUY else "1",  # 1매도 2매수
+            "OrdprcPtnCode": "00" if intent.order_type is OrderType.LIMIT else "03",
+            # 신용거래코드 — 보통 "000". 체결쏴 주식 신용 세트는 진입 003·청산 101(추측값,
+            # exec §7C — 거부 나면 사용자가 알려 주기로, 2026-09-17). 대출일(LoanDt)은 비움.
+            "MgntrnCode": intent.credit_code or "000",
+            "LoanDt": "",
+            "OrdCndiTpCode": "0",
+            # 회원사번호(필수, LS 공식 문서 CSPAT00601 — 사용자 제공 2026-09-17): "KRX" / "NXT",
+            # 공백 포함 그 외 값은 KRX로 처리. 거래소는 체결쏴 주식 화면 콤보(OrderIntent.market)
+            "MbrNo": "NXT" if intent.market == "nxt" else "KRX",
         }
+        return {f"{self.SPOT_ORDER_TR}InBlock1": block}
 
     # 선물 주문 InBlock 필드는 카탈로그 기반(선물 주문 자체는 미실측 — 첫 라이브 주문 시 확인).
     def _future_order_body(self, intent: OrderIntent, account: Account) -> dict[str, Any]:

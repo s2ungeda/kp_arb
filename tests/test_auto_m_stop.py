@@ -292,9 +292,9 @@ def test_halted_leg_stays_halted_when_pending_post_order_fills() -> None:
     assert s.entry.status is LegStatus.HALTED
 
 
-def test_halted_state_survives_restart() -> None:
-    # 사용자 확정 2026-09-10: 중지는 재시동 뒤에도 유지(사람이 직접 풀어야 재개). 실측 10:42
-    # 재시동이 중지를 대기로 되살려 정리·해제 없이 다음 판이 돌았다.
+def test_halted_state_restores_as_idle_with_ledger() -> None:
+    # 사용자 2026-09-17: 검은색 중지는 재시동(재접속) 때 정상 상태(대기)로 보여준다 — 09-10 결정
+    # 22의 "중지 유지"는 폐기. 세트 장부(순잔고·체결차)는 그대로 복원돼 정리할 차이는 칸에 남는다.
     import dataclasses
     import json
 
@@ -312,9 +312,8 @@ def test_halted_state_survives_restart() -> None:
     on_post_reject(s, Block.EXIT, "Invalid nonce")
     raw = json.loads(json.dumps(dataclasses.asdict(state), default=str))
     r = state_from_dict(raw).autom.book(u).sets[0]
-    assert r.exit.status is LegStatus.HALTED and not r.exit.running
-    assert r.exit.halt_reason.startswith("재시동 전 ") and "Invalid nonce" in r.exit.halt_reason
-    assert r.entry.status is LegStatus.HALTED                    # 세트 단위 중지도 그대로
+    assert r.exit.status is LegStatus.IDLE and not r.exit.running
+    assert r.exit.halt_reason == "" and r.entry.status is LegStatus.IDLE  # 검정 없이 정상 표시
     assert r.exit.post_pending == 0 and (r.sf_net, r.hl_net, r.fill_diff) == (1, -20.0, -10.0)
 
 

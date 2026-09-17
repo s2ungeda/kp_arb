@@ -503,6 +503,39 @@ async def test_unified_quote_and_trade_parse() -> None:
     assert any(f"U{SAMSUNG_CODE}   " in m and '"US3"' in m for m in session.sent)
 
 
+async def test_nxt_quote_and_vi_event() -> None:
+    # 2026-09-17: 체결쏴 주식 — NXT 전용 호가(NH1, tr_key "N"+코드+공백3)는 market="nxt"로
+    # 오고, 종목 VI(VI_)는 ViEvent(발동/해제)로 온다. 구독 목록에 NH1·NS3·VI_ 키가 있어야 한다.
+    nh1 = json.dumps({"header": {"tr_cd": "NH1", "tr_key": f"N{SAMSUNG_CODE}   "},
+                      "body": {"shcode": f"N{SAMSUNG_CODE}   ", "bidho1": "70000",
+                               "offerho1": "70100", "hotime": "090002",
+                               "bidrem1": "10", "offerrem1": "20"}})
+    vi_on = json.dumps({"header": {"tr_cd": "VI_", "tr_key": SAMSUNG_CODE},
+                        "body": {"vi_gubun": "1", "shcode": SAMSUNG_CODE, "time": "092415",
+                                 "svi_recprice": "70000", "dvi_recprice": "0",
+                                 "vi_trgprice": "70500", "ref_shcode": SAMSUNG_CODE}})
+    vi_off = json.dumps({"header": {"tr_cd": "VI_", "tr_key": SAMSUNG_CODE},
+                         "body": {"vi_gubun": "0", "shcode": SAMSUNG_CODE, "time": "092700"}})
+    session = FakeConnection([nh1, vi_on, vi_off])
+    client = LSWebSocketClient(FakeConnector([session]))
+    client.subscribe_quotes(Underlying.SAMSUNG)
+    client.subscribe_trades(Underlying.SAMSUNG)
+    client.subscribe_vi(Underlying.SAMSUNG)
+    quotes: list[Quote] = []
+    vis = []
+    client.on_quote.append(quotes.append)
+    client.on_vi.append(vis.append)
+
+    await client.run()
+
+    assert quotes[0].market == "nxt" and quotes[0].bid == 70_000 and quotes[0].bid_qty == 10
+    assert [(v.gubun, v.active) for v in vis] == [("1", True), ("0", False)]
+    assert vis[0].underlying is Underlying.SAMSUNG and vis[0].time == "092415"
+    assert any(f"N{SAMSUNG_CODE}   " in m and '"NH1"' in m for m in session.sent)
+    assert any(f"N{SAMSUNG_CODE}   " in m and '"NS3"' in m for m in session.sent)
+    assert any(f'"{SAMSUNG_CODE}"' in m and '"VI_"' in m for m in session.sent)
+
+
 async def test_expected_price_for_futures_and_etf() -> None:
     # 예상체결: 선물 YJC(focode) + ETF UYS. 예상등락률 jnilydrate(부호 4/5=음수).
     yjc = json.dumps({"header": {"tr_cd": "YJC", "tr_key": "A1167000"},
