@@ -823,11 +823,14 @@ def test_stock_entry_uses_top_quote_formula_and_one_to_one_hedge() -> None:
     on_post_fill(s, Block.ENTRY, 4, 74.3, 1350.0, mono=102, settings=SETTINGS,
                  stock_last=100_000.0, sf_theory=None)
     assert s.rt == 4 and s.fill_diff == 0 and s.entry.post_pending == 0
-    # 미달: HL est가 낮아 수치 0.05% < 0.25% → 안 냄
+    # 수치가 낮아도(0.05% < 0.25%) 주식은 **필터 없이** 역산가로 걸어 둔다(사용자 확정 2026-09-18,
+    # 주식선물의 S괴리 필터와 다름): H = 74.11×1350 = 100,048 → /1.0025 = 99,799 → 단위 100 내림
+    # 99,700 — 매수1호가(100,000) 뒤에 서지만 체결되면 기준값이 보장된다.
     s2 = _stock_set()
     set_running(s2, Block.ENTRY, True)
-    assert evaluate(s2, Block.ENTRY, _stock_sig(hl_est_bid=74.11), SETTINGS, U) == []
-    assert s2.entry.block_reason.startswith("G5 미달 수치")
+    acts = evaluate(s2, Block.ENTRY, _stock_sig(hl_est_bid=74.11), SETTINGS, U)
+    assert [(a.kind, a.side, a.qty, a.price) for a in acts] == [
+        ("place_pre", Side.BUY, 10, 99_700.0)]
 
 
 def test_stock_sprd_and_halt_limit() -> None:

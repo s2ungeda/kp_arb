@@ -504,11 +504,11 @@ def _passes_signal(s: AutoMSet, leg: Leg, sig: Signals) -> bool:
     체결로 보장되는 가격(maker)에 걸므로 SF 괴리를 따로 비교할 이유가 없다. S 괴리는
     진입 허용 조건으로만 본다(실제 매매는 SF+HL).
     """
-    if s.product == "stock":  # exec §7C(2026-09-17): d = (HL est×환율 − 1호가)/1호가
-        d = stock_monitor_value(sig, leg.post_side)
-        if leg.block is Block.ENTRY:
-            return s.en_s is not None and d is not None and d > s.en_s
-        return s.ex_sf is not None
+    if s.product == "stock":
+        # 주식은 **수치 필터 없음**(사용자 확정 2026-09-18) — 기준값만 있으면 바로 낸다. 주문가가
+        # H/(1+기준값)로 역산되므로 그 가격에 걸어 두면 체결 시 기준값이 보장된다(호가 뒤에 서는
+        # 것도 허용). 주식선물의 S괴리 필터(아래)는 그대로.
+        return (s.en_s if leg.block is Block.ENTRY else s.ex_sf) is not None
     if leg.block is Block.ENTRY:
         if s.en_sf is None or s.en_s is None:
             return False
