@@ -378,7 +378,7 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
     """
     if system is None:
         return {"connected": False, "symbols": {}, "open_orders": [],
-                "fills": [], "cancels": []}
+                "fills": [], "cancels": [], "rejects": []}
     ob = system.order_book
     pending_sell: dict[tuple[Underlying, Instrument], float] = {}
     open_orders: list[dict[str, Any]] = []
@@ -455,12 +455,13 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
     # 09:08 이전 체결이 안 보였음). 화면이 설정 필터로 거른다.
     fills = list(getattr(system, "fills", []))  # 최신 우선(코어 보관)
     cancels = list(getattr(system, "cancels", []))
+    rejects = list(getattr(system, "rejects", []))  # 거부내역(주문리스트 '거부' 행, 2026-09-18)
     # 원달러선물 동시호가 대응(§9.1) — 화면 콤보 코드·실행상태·발주내역.
     fx_codes = system.fx_futures_codes() if hasattr(system, "fx_futures_codes") else []
     fx_running = getattr(getattr(system, "fx_auction", None), "running", False)
     fx_hedges = list(getattr(system, "fx_hedges", []))[:50]
     return {"connected": True, "symbols": symbols, "open_orders": open_orders,
-            "fills": fills, "cancels": cancels,
+            "fills": fills, "cancels": cancels, "rejects": rejects,
             "fx_auction": {"running": fx_running, "codes": fx_codes,
                            "hedges": fx_hedges}}
 

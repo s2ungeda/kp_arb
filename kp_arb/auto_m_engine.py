@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -95,6 +95,7 @@ class _SystemLike(Protocol):
     def stock_halted(self) -> bool: ...
     async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str: ...
     async def cancel(self, order_id: str) -> None: ...
+    async def query_credit_loans(self, underlying: Underlying) -> Sequence[tuple[str, float]]: ...
     def new_hl_cloid(self) -> str | None: ...
     on_hl_identified: list[Callable[[str, str], None]]  # (cloid, oid) — 응답 전 식별 통지
 
@@ -149,6 +150,9 @@ class AutoMEngine:
         # 종목 VI(변동성완화장치, exec §8) — 주식 종목 상태만. 발동 시각·해제 시각(재개 딜레이)
         self._vi_since: dict[Underlying, float] = {}
         self._vi_resumed: dict[Underlying, float] = {}
+        # 신용융자 (대출일, 수량) 캐시(종목별, 2026-09-18) — 상환 선주문마다 조회하면 CSPAQ12300
+        # 초당 한도에 걸린다(재발주 왕복). 20초 재사용, 이 종목의 주식 선주문 체결 뒤엔 다시 조회
+        self._loan_cache: dict[Underlying, tuple[float, list[tuple[str, float]]]] = {}
         self._bg: set[asyncio.Task[None]] = set()
         system.order_book.on_fill_applied.append(self._on_fill_applied)
         system.order_book.on_change.append(self._on_book_change)
@@ -233,8 +237,9 @@ class AutoMEngine:
         if leg.block_reason and leg.block_reason != self._logged_reason.get(key):
             self._logged_reason[key] = leg.block_reason
             # G5 미달(조건 안 맞아 기다리는 평상시)은 파일에 안 남긴다 — 하루 종일 쌓여 로그가
-            # 넘침(사용자 2026-09-10). 통과·G6·취소 등 나머지 근거는 그대로.
-            if not leg.block_reason.startswith("G5 미달"):
+            # 넘침(사용자 2026-09-10). '유지 역산가'(걸어 둔 선주문을 그대로 두는 판정)도 안 남긴다
+            # (사용자 2026-09-18). 통과·역산가 변경·G6·취소 등 나머지 근거는 그대로.
+            if not leg.block_reason.startswith(("G5 미달", "유지 역산가")):
                 self.ulog(u).info("판정 %s: %s", tag, leg.block_reason)
         status = leg.status.value
         if status != self._logged_status.get(key):
@@ -382,13 +387,19 @@ class AutoMEngine:
         from .auto_m import credit_code_for
 
         stock = book.product == "stock"
+        loan_date = ""
+        if stock and s.credit and block is Block.EXIT:
+            # 신용 상환은 대출일이 필수(실측 2026-09-18 LS 01486) — 잔고 조회의 대출일 중 고름.
+            # 수량은 1회주문수량 그대로(사용자 2026-09-18: 신용 세트는 1주씩 낸다 — 한 대출일 잔량을
+            # 넘는 수량은 LS가 거부해 거부내역에 남는다)
+            loan_date = await self._pick_loan_date(u, act.qty)
         intent = OrderIntent(venue=Venue.LS, underlying=u, instrument=inst, side=act.side,
                              qty=act.qty, order_type=OrderType.LIMIT, price=act.price,
                              source=SOURCE,
                              tag=self._set_tag(index, block, reverse, self._tag_letter),
                              # 주식(exec §7C): 신용 세트 코드(진입 003·청산 101), 고른 거래소
                              credit_code=credit_code_for(block, s.credit) if stock else "000",
-                             market=book.market if stock else "")
+                             market=book.market if stock else "", loan_date=loan_date)
         try:
             oid = await self._system.place(intent)
         except RestTimeoutError as exc:
@@ -422,6 +433,28 @@ class AutoMEngine:
         self._log.info("[자동M] %s 선주문 %s %s %d @ %g → #%s",
                        u.value, self._tag(u, index, block, reverse), act.side.value, act.qty,
                        act.price, oid)
+
+    async def _pick_loan_date(self, u: Underlying, qty: int) -> str:
+        """상환 선주문에 실을 대출일 — 신용융자 잔고(대출일별 수량) 중 **오래된 것부터** 수량이 되는
+        첫 대출일, 없으면 수량이 가장 많은 대출일. 잔고가 없으면 빈칸(LS가 거부 → 거부내역에 남음).
+        조회가 실패하면 마지막 조회값을 그대로 쓴다."""
+        now = time.monotonic()
+        cached = self._loan_cache.get(u)
+        loans = cached[1] if cached is not None else []
+        if cached is None or now - cached[0] > 20.0:
+            try:
+                loans = sorted(await self._system.query_credit_loans(u))
+                self._loan_cache[u] = (now, loans)
+            except Exception as exc:  # noqa: BLE001 - 조회 실패면 옛 값으로(없으면 빈칸)
+                self._log.warning("[자동M] %s 신용융자 잔고 조회 실패 — 대출일 %s: %s", u.value,
+                                  "마지막 조회값 사용" if loans else "없음", exc)
+        if not loans:
+            self._log.warning("[자동M] %s 신용융자 잔고 없음 — 상환 선주문 대출일 빈칸", u.value)
+            return ""
+        for loan, avail in loans:  # 오래된 대출일부터 수량이 되는 것
+            if avail + 1e-9 >= qty:
+                return loan
+        return max(loans, key=lambda x: x[1])[0]
 
     async def _cancel_pre(self, u: Underlying, index: int, block: Block,
                           order_id: str, reason: str, reverse: bool = False) -> None:
@@ -574,6 +607,7 @@ class AutoMEngine:
         leg = s.leg(ref.block)
         if ref.leg == "pre":
             self._fill_perf[(u, ref.index, ref.block, ref.reverse)] = time.perf_counter()
+            self._loan_cache.pop(u, None)  # 주식 체결로 신용융자 잔고가 바뀜 → 다음 상환 때 재조회
         # 체결 줄을 먼저 찍고 행동(후주문 발주·중지)을 적용한다 — 행동 줄이 체결 줄보다 앞에 찍혀
         # "체결 전에 판단했다"로 읽힌 실측(2026-09-10 10:45:47.536/537)을 막는다.
         tag = self._tag(u, ref.index, ref.block, ref.reverse)

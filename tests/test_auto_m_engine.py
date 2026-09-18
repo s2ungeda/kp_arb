@@ -26,6 +26,9 @@ class FakeSystem:
         self.cancelled: list[str] = []
         self.halted = False
         self.vi: set[Underlying] = set()      # VI 발동 중인 종목
+        self.loans: list[tuple[str, float]] = []  # 신용융자 (대출일, 수량) — 상환 LoanDt
+        self.loan_queries = 0
+        self.query_fail = False
         self._ids = 0
         self.on_hl_identified: list[Any] = []  # (cloid, oid) — 응답 전 식별 훅(결정 27)
         self.cloid: str | None = None          # new_hl_cloid()가 돌려줄 값(None=cloid 없음)
@@ -75,6 +78,12 @@ class FakeSystem:
 
     def stock_vi(self, underlying: Underlying) -> bool:  # 종목 VI(exec §8) — 주식 엔진용
         return underlying in self.vi
+
+    async def query_credit_loans(self, underlying: Underlying) -> list[tuple[str, float]]:
+        self.loan_queries += 1
+        if self.query_fail:
+            raise RuntimeError("CSPAQ12300 per-second limit")
+        return list(self.loans)
 
     def new_hl_cloid(self) -> str | None:
         return self.cloid
@@ -907,6 +916,50 @@ async def test_stock_engine_uses_selected_market_only() -> None:
     bad = await _autom_command(eng, state, {"cmd": "autom_market", "underlying": U.value,
                                             "market": "uni", "product": "stock"})
     assert not bad["ok"]
+
+
+async def test_stock_credit_repay_carries_loan_date() -> None:
+    # 운영 실측 2026-09-18: 신용 진입(003) 통과, 상환(101)은 대출일 없이 내면 01486 거부 → 상환
+    # 선주문은 잔고 조회의 (대출일, 수량) 중 오래된 것부터 수량이 되는 첫 대출일을 LoanDt로.
+    # 조회는 캐시(20초).
+    eng, sys_, state = _stock_engine()
+    s = state.autom.book(U, "stock").sets[0]
+    s.credit, s.rt = True, 4  # 청산할 RT 4주
+    s.ex_sf = 0.005  # 청산 주문가 = H/(1+0.5%) = 100,400 — 허용범위(매수1호가+1틱)×1.004 안
+    sys_.loans = [("20260915", 2.0), ("20260917", 10.0)]
+    await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": 0,
+                                      "block": "exit", "value": True, "product": "stock"})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert len(sys_.placed) == 1
+    pre = sys_.placed[0]
+    assert pre.side is Side.SELL and pre.credit_code == "101"
+    # 수량은 1회주문수량 그대로(사용자 2026-09-18: 신용 세트는 1주씩), 대출일은 오래된 것부터 수량이
+    # 되는 첫 대출일 — 20260915는 2주뿐이라 20260917
+    assert pre.loan_date == "20260917" and pre.qty == 4 and s.exit.pre_qty == 4
+    assert sys_.loan_queries == 1
+    sys_.order_book.on_fill(Fill(fill_id="r1", order_id="O1", qty=4, price=100_400.0, ts=0))
+    await _settle()
+    assert sys_.placed[1].instrument is Instrument.HL_PERP and sys_.placed[1].qty == 4  # 1:1
+    assert s.rt == 0 and U not in eng._loan_cache  # 체결 뒤 다음 상환 때 잔고 재조회
+    # 진입(신용매수)은 대출일 없음, 잔고 조회도 안 함
+    eng2, sys2, state2 = _stock_engine()
+    state2.autom.book(U, "stock").sets[0].credit = True
+    await _autom_command(eng2, state2, {"cmd": "autom_run", "underlying": U.value, "set": 0,
+                                        "block": "entry", "value": True, "product": "stock"})
+    eng2.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert sys2.placed[0].credit_code == "003" and sys2.placed[0].loan_date == ""
+    assert sys2.loan_queries == 0
+    # 잔고 없음 → 빈칸(LS 거부 → 거부내역), 조회 실패 → 마지막 조회값
+    eng3, sys3, state3 = _stock_engine()
+    s3 = state3.autom.book(U, "stock").sets[0]
+    s3.credit, s3.rt, s3.ex_sf = True, 1, 0.005
+    await _autom_command(eng3, state3, {"cmd": "autom_run", "underlying": U.value, "set": 0,
+                                        "block": "exit", "value": True, "product": "stock"})
+    eng3.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert sys3.placed[0].loan_date == ""
 
 
 async def test_stock_engine_holds_during_stock_vi_then_resumes() -> None:

@@ -916,15 +916,19 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         r = common["risk"]
         return r[f"{dtag}_en"], r[f"{dtag}_ex"], r[f"{dtag}_gap"]
 
-    def warn_center(msg: str) -> None:
-        # 리스크방지 경고 — 메인 창 중앙에 모달로(닫을 때까지 대기).
-        win = tk.Toplevel(root)
+    def warn_center(msg: str, parent: tk.Toplevel | None = None) -> None:
+        # 경고 — **띄운 창(부모)** 중앙에 모달로(닫을 때까지 대기). 세트설정·공통설정 창에서 띄우면
+        # 그 창 중앙(사용자 2026-09-18: 메인 창 기준으로 떠서 엉뚱한 곳에 보였음), 아니면 메인 창.
+        owner: tk.Tk | tk.Toplevel = parent if parent is not None else root
+        win = tk.Toplevel(owner)
         win.title("리스크방지")
         win.resizable(False, False)
-        win.transient(root)
+        win.transient(owner)
         tk.Label(win, text=msg, justify="left", padx=16, pady=12).pack()
         tk.Button(win, text="확인", width=10, command=win.destroy).pack(pady=(0, 10))
-        _center(win)
+        center_on_parent(win, owner)  # 팝업은 항상 그 화면(부모) 중앙(DESIGN-ui §7)
+        win.grab_set()
+        win.focus_set()
         win.wait_window()
 
     def open_set_dialog(dtag: str, i: int) -> None:
@@ -985,7 +989,11 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             tk.Checkbutton(win, text="신용 (진입 신용매수 · 청산 신용상환)",
                            variable=credit_var).grid(
                 row=len(rows) + 2, column=0, columnspan=2, sticky="w", padx=6)
-            extra_rows = 1
+            # 주의(사용자 2026-09-18): 신용 상환은 한 주문에 대출일 하나라 1회주문수량은 1주만
+            tk.Label(win, text="※ 신용 세트는 1회주문수량 1주만 (상환은 대출일 하나씩)",
+                     fg="#a05000", font=T.FONT_LABEL).grid(
+                row=len(rows) + 3, column=0, columnspan=2, sticky="w", padx=24)
+            extra_rows = 2
 
         def save() -> None:
             en_sf = parse_threshold(ents["en_sf"].get()) if "en_sf" in ents else None
@@ -998,6 +1006,9 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 errs.append("목표수량을 입력하세요")
             if per <= 0:
                 errs.append("1회주문수량을 입력하세요")
+            if spec.credit_boxes and credit_var.get() and per > 1:
+                # 신용 상환은 한 주문에 대출일 하나 — 1주씩만(사용자 2026-09-18)
+                errs.append(f"신용 세트는 1회주문수량이 1주여야 합니다 (입력 {per})")
             if en_sf is None and spec.has_en_sf:
                 errs.append("진입SF를 입력하세요")
             if en_s is None:
@@ -1016,8 +1027,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 errs.append("RT 진입수량 수동 입력이 켜져 있는데 값이 없습니다")
             elif rt_var.get():
                 errs += rt_manual_errors(dtag, rt_ent.get())
-            if errs:  # 필수 미입력·위반 — 경고만, 저장·닫기 안 함
-                warn_center("\n".join(errs))
+            if errs:  # 필수 미입력·위반 — 경고만(이 설정창 중앙), 저장·닫기 안 함
+                warn_center("\n".join(errs), parent=win)
                 return
             w["target"], w["per"] = target, per
             w["delay"] = parse_qty(ents["delay"].get())

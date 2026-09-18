@@ -65,6 +65,21 @@ class OrderContext:
     replaces: str | None = None  # 정정으로 생성된 주문이면 원주문 id
 
 
+def merge_stock_positions(positions: Sequence[Position]) -> list[Position]:
+    """같은 (종목·상품·계좌)의 잔고 행을 하나로 — 수량 합, 평균단가는 수량 가중. 순수."""
+    merged: dict[tuple[Underlying, Instrument, Account | None], Position] = {}
+    for p in positions:
+        key = (p.underlying, p.instrument, p.account)
+        prev = merged.get(key)
+        if prev is None:
+            merged[key] = p
+            continue
+        total = prev.qty + p.qty
+        avg = ((prev.avg_price * prev.qty + p.avg_price * p.qty) / total) if total > 0 else 0.0
+        merged[key] = prev.model_copy(update={"qty": total, "avg_price": avg})
+    return list(merged.values())
+
+
 class LSApiGateway(LSGateway):
     """LS REST 기반 현물 주문 게이트웨이. ``LSRestClient`` 위에 TR 매핑을 얹는다."""
 
@@ -266,7 +281,10 @@ class LSApiGateway(LSGateway):
                 self.STOCK_POSITIONS_TR, self._account_fields(account), path=self.STOCK_ACC_PATH
             )
             rows = self._rows(resp, self.STOCK_POSITIONS_TR)
-            return [p for r in rows if (p := self._stock_position(r)) is not None]
+            # 같은 종목이 현금·신용(대출일별) 행으로 나뉘어 오면 합친다(2026-09-18 신용 세트 실측).
+            # 행마다 Position을 내면 장부(load_snapshot)가 마지막 행으로 덮어써 수량이 줄어 보인다.
+            return merge_stock_positions(
+                [p for r in rows if (p := self._stock_position(r)) is not None])
         # 운영 실측: CFOAQ50600은 형식을 맞춰도 거부(09604/08001) → t0441 사용.
         # 공식 초당 1회(재대조 2026-09-14) — 재동기가 겹치면 한 박자 쉬고 재시도(_request_paced).
         fields = self._account_fields(account)
@@ -609,6 +627,24 @@ class LSApiGateway(LSGateway):
             raise RestError(f"{field} missing in {tr_cd} response")
         return float(block[field])
 
+    async def get_credit_loans(self, underlying: Underlying) -> Sequence[tuple[str, float]]:
+        """신용융자 잔고의 (대출일, 수량) — CSPAQ12300 OutBlock3의 행 중 LoanDt가 있는 것(LS
+        카탈로그 필드, 2026-09-18). 상환 주문은 이 대출일을 LoanDt로 실어야 한다(실측 01486).
+        오래된 대출일부터."""
+        resp = await self._rest_for(Account.KR_STOCK).request(
+            self.STOCK_POSITIONS_TR, self._account_fields(Account.KR_STOCK),
+            path=self.STOCK_ACC_PATH)
+        code = f"A{underlying.krx_code}"
+        out: list[tuple[str, float]] = []
+        for row in self._rows(resp, self.STOCK_POSITIONS_TR):
+            loan = str(row.get("LoanDt") or "").strip()
+            if not loan or str(row.get("IsuNo") or "").strip() != code:
+                continue
+            qty = float(row.get("BnsBaseBalQty") or 0)
+            if qty > 0:
+                out.append((loan, qty))
+        return sorted(out)
+
     def _stock_position(self, row: dict[str, Any]) -> Position | None:
         # 주식/ETF 잔고는 롱 전용(공매도 미사용). 종목코드로 주식 vs ETF 판별.
         # 취급 외 종목(실계좌의 기존 보유 등)은 건너뛴다 — 시스템 추적 대상 아님.
@@ -686,7 +722,7 @@ class LSApiGateway(LSGateway):
             # 신용거래코드 — 보통 "000". 체결쏴 주식 신용 세트는 진입 003·청산 101(추측값,
             # exec §7C — 거부 나면 사용자가 알려 주기로, 2026-09-17). 대출일(LoanDt)은 비움.
             "MgntrnCode": intent.credit_code or "000",
-            "LoanDt": "",
+            "LoanDt": intent.loan_date,  # 신용 상환은 대출일 필수(실측 2026-09-18 01486)
             "OrdCndiTpCode": "0",
             # 회원사번호(필수, LS 공식 문서 CSPAT00601 — 사용자 제공 2026-09-17): "KRX" / "NXT",
             # 공백 포함 그 외 값은 KRX로 처리. 거래소는 체결쏴 주식 화면 콤보(OrderIntent.market)

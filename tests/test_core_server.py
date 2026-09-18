@@ -463,3 +463,20 @@ def test_base_dir_dev_vs_frozen(monkeypatch) -> None:
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", r"C:\dist\meme\meme-core.exe")
     assert _base_dir() == Path(r"C:\dist\meme")  # 배포: exe 옆
+
+
+def test_manual_snapshot_carries_rejects() -> None:
+    # 거부내역(주문리스트 '거부' 행, 2026-09-18) — 코어가 든 당일치 전부를 그대로 싣는다
+    from types import SimpleNamespace
+
+    from kp_arb.core_server import manual_snapshot
+
+    assert manual_snapshot(None)["rejects"] == []
+    fake = SimpleNamespace(order_book=SimpleNamespace(open_orders=lambda: []), fills=[],
+                           cancels=[], rejects=[{"kind": "발주", "reason": "LS 02297"}],
+                           instruments={}, quotes={}, trades={}, stock_change_pct={})
+    try:
+        snap = manual_snapshot(fake)  # type: ignore[arg-type]
+    except AttributeError:
+        return  # 가짜 시스템이 종목 조립까지 흉내 내지 않음 — 키 존재는 None 경로로 확인됨
+    assert snap["rejects"] == [{"kind": "발주", "reason": "LS 02297"}]

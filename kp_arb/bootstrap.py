@@ -352,6 +352,9 @@ class LiveSystem:
         self.fills: deque[dict[str, Any]] = deque()
         self.cancels: deque[dict[str, Any]] = deque()
         self._cancel_recorded: set[str] = set()  # 취소내역에 이미 넣은 주문번호(통보 중복 방지)
+        # 거부내역(주문리스트 '거부' 행, 사용자 2026-09-18) — 발주 거부(LS REST·HL)·취소 거부·
+        # 응답 없음. 당일치 전부(fills·cancels와 같이 날짜 바뀌면 비움)
+        self.rejects: deque[dict[str, Any]] = deque()
         # 종목 VI 상태(vi_gubun, "0" = 해제) — LS 실시간 VI_(exec §8, 체결쏴 주식 정지)
         self.vi_state: dict[Underlying, str] = {}
         self._daylog_state: dict[str, str] = {}  # roll_daily_logs — 보관분의 날짜
@@ -439,7 +442,8 @@ class LiveSystem:
 
         it = order.intent
         roll_daily_logs(getattr(self, "_daylog_state", {}), _t.strftime("%Y-%m-%d"),
-                        self.fills, getattr(self, "cancels", deque()))
+                        self.fills, getattr(self, "cancels", deque()),
+                        getattr(self, "rejects", deque()))
         self.fills.appendleft({
             "time": _t.strftime("%H:%M:%S"),        # 체결시각
             "order_id": order.order_id,             # 주문번호(주문리스트 표시)
@@ -469,7 +473,8 @@ class LiveSystem:
             return
         it = order.intent
         if roll_daily_logs(getattr(self, "_daylog_state", {}), _t.strftime("%Y-%m-%d"),
-                           getattr(self, "fills", deque()), self.cancels):
+                           getattr(self, "fills", deque()), self.cancels,
+                           getattr(self, "rejects", deque())):
             seen.clear()  # 날짜가 바뀌어 보관분을 비웠으면 중복 방지 기록도 같이
         seen.add(order.order_id)
         self.cancels.appendleft({
@@ -481,6 +486,28 @@ class LiveSystem:
             "side": it.side.value, "qty": it.qty, "price": it.price,  # 주문수량·주문가
             "source": it.source,                    # 출처(주문 리스트 '출처' 칸·필터)
             "tag": it.tag,                          # 세트 꼬리표(자동M, 2026-09-16)
+        })
+
+    def _record_reject(self, intent: OrderIntent, reason: str, *, kind: str = "발주",
+                       order_id: str = "") -> None:
+        """거부내역 보관(주문리스트 '거부' 행, 사용자 2026-09-18) — 발주가 REST에서 거부되면 주문
+        자체가 생기지 않아 주문리스트에 안 남고 상태줄엔 마지막 한 건만 보였다. kind: 발주/취소/
+        응답없음. 접수 뒤 거부 통보(SC4/H01)는 취소내역(status rejected)으로 남아 같은 '거부'
+        유형에 보인다."""
+        import time as _t
+
+        roll_daily_logs(getattr(self, "_daylog_state", {}), _t.strftime("%Y-%m-%d"),
+                        getattr(self, "fills", deque()), getattr(self, "cancels", deque()),
+                        self.rejects)
+        text = " ".join(str(reason).split())
+        self.rejects.appendleft({
+            "time": _t.strftime("%H:%M:%S"),        # 거부 시각(주문리스트 접수시각 칸에)
+            "kind": kind,                            # 발주 / 취소 / 응답없음
+            "order_id": order_id,                    # 취소 거부면 원주문번호, 발주 거부는 없음
+            "underlying": intent.underlying.value, "instrument": intent.instrument.value,
+            "side": intent.side.value, "qty": intent.qty, "price": intent.price,
+            "source": intent.source, "tag": intent.tag,
+            "reason": text if len(text) <= 300 else text[:299] + "…",
         })
 
     # --- 원달러선물 동시호가 대응주문 (§9.1, DESIGN-fx-auction) ---
@@ -553,6 +580,10 @@ class LiveSystem:
         logging.getLogger("kp_arb.core").warning(
             "VI %s %s 구분 %s(0 해제·1 정적·2 동적·3 둘 — 추정) %s",
             "해제" if not ev.active else "발동", ev.underlying.value, ev.gubun, ev.time)
+
+    async def query_credit_loans(self, underlying: Underlying) -> Sequence[tuple[str, float]]:
+        """신용융자 (대출일, 수량) 조회 — 주식 신용 세트의 상환 선주문 LoanDt용(2026-09-18)."""
+        return await self._gw.get_credit_loans(underlying)
 
     def fx_entry_rate(self, side: Side) -> float | None:
         """자동M 환진입가(§10) — 최근월물 원달러선물의 매수1호가(HL 매도, −환) / 매도1호가(HL 매수).
@@ -822,7 +853,15 @@ class LiveSystem:
         HL cloid(없으면 여기서 생성)는 응답 전 통보로 주문번호를 식별하는 데 쓴다(§HL cloid).
         """
         if intent.venue is Venue.LS:
-            order_id = await self._gw.place_order(intent)
+            try:
+                order_id = await self._gw.place_order(intent)
+            except Exception as exc:  # 거부·응답 없음 → 거부내역(주문리스트 '거부' 행)
+                from .gateways.ls_rest import RestTimeoutError
+
+                self._record_reject(
+                    intent, str(exc),
+                    kind="응답없음" if isinstance(exc, RestTimeoutError) else "발주")
+                raise
             self.order_book.track(order_id, intent)
             self.order_book.replay_pending(order_id)  # track 전에 온 이벤트 반영(역전 대비)
             return order_id
@@ -832,16 +871,18 @@ class LiveSystem:
         notional = self._hl_order_notional(intent)
         filled = self._hl_filled.total(self._today())
         if would_exceed_daily_limit(filled, notional, self.hl_daily_limit_usdc):
-            raise DailyLimitExceeded(
-                f"HL 일일 한도 초과 — 당일 {filled:,.0f} + 주문 {notional:,.0f} "
-                f"> 한도 {self.hl_daily_limit_usdc:,.0f} USDC")
+            limit_msg = (f"HL 일일 한도 초과 — 당일 {filled:,.0f} + 주문 {notional:,.0f} "
+                         f"> 한도 {self.hl_daily_limit_usdc:,.0f} USDC")
+            self._record_reject(intent, limit_msg)
+            raise DailyLimitExceeded(limit_msg)
         if cloid is None:
             cloid = self._hl.new_cloid()
         if cloid:
             self._hl_pending[cloid] = intent
         try:
             order_id = await self._hl.place_order(intent, cloid=cloid)
-        except Exception:
+        except Exception as exc:
+            self._record_reject(intent, str(exc))  # HL 발주 거부·통신 오류 → 거부내역
             if cloid:
                 self._hl_pending.pop(cloid, None)
                 # 거부가 확실한 경우도 섞여 있지만 구분이 어렵다 — 유예 안에 통보가 오면 그때 안다.
@@ -920,10 +961,18 @@ class LiveSystem:
             # 02897 "취소수량을 잘못 입력"으로 거부(운영 실측 2026-09-14 #6548 재시도 2·3회째).
             if order.remaining_qty <= 0:
                 raise OrderGoneError(f"order {order_id} has no remaining qty")
-            await self._gw.cancel_order(order_id, qty=order.remaining_qty)  # 상태는 통보로 전이
+            try:
+                await self._gw.cancel_order(order_id, qty=order.remaining_qty)  # 상태는 통보로
+            except Exception as exc:  # 취소 거부·응답 없음 → 거부내역(원주문번호와 함께)
+                self._record_reject(order.intent, str(exc), kind="취소", order_id=order_id)
+                raise
         else:
             assert self._hl is not None
-            await self._hl.cancel_order(order_id)
+            try:
+                await self._hl.cancel_order(order_id)
+            except Exception as exc:
+                self._record_reject(order.intent, str(exc), kind="취소", order_id=order_id)
+                raise
             self.order_book.on_cancel(order_id)
 
     async def update_leverage(

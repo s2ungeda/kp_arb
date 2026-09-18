@@ -980,6 +980,9 @@ def set_running(s: AutoMSet, block: Block, value: bool,
     if value:
         if leg.status is LegStatus.IDLE:
             leg.status = LegStatus.ARMED
+        # 다시 켬 = 새로 시작 — 앞선 거부 표시를 지운다(사용자 2026-09-18: 재개해도 상태줄에 "거부
+        # 연속 3회"가 남아 있었음. 전엔 다음 접수 때만 지워져 새 주문이 안 나가는 줄은 영영 남았다)
+        leg.last_reject = leg.last_reject_at = ""
         return []
     # 끔·정지·종료 — 취소 대기 표시와 무관하게 취소(mono는 확인 타임아웃 기준 시각)
     acts = _cancel_if_resting(leg, force=True, mono=mono)
@@ -1011,6 +1014,7 @@ def release_halt(s: AutoMSet, block: Block) -> None:
         leg.status = LegStatus.IDLE
         leg.running = False
         leg.halt_reason = ""
+        leg.last_reject = leg.last_reject_at = ""  # 해제 = 정리 끝(거부 표시도, 사용자 2026-09-18)
         leg._clear_pre()
         leg.post_pending = 0.0
         leg.pending.clear()

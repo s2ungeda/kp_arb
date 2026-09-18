@@ -253,6 +253,18 @@ def test_pre_reject_is_shown_with_reason_until_next_ack() -> None:
     on_pre_reject(s, Block.ENTRY, mono=201.0, settings=SETTINGS, reason="LS 02752 증거금부족")
     assert s.entry.last_reject.startswith("선주문 거부 연속 3회 → 세트 중지: LS 02752")
     assert not s.entry.running and not s.exit.running and s.entry.status is LegStatus.HALTED
+    # 해제하면 거부 표시도 사라진다(사용자 2026-09-18: 재개 뒤에도 상태줄에 남아 있었음)
+    release_halt(s, Block.ENTRY)
+    assert s.entry.last_reject == "" and s.entry.last_reject_at == ""
+    # 거부 1회 표시 중 실행을 껐다 켜도 지워진다(새 주문이 안 나가는 줄은 접수가 없어 영영 남았음)
+    s5 = _set()
+    set_running(s5, Block.ENTRY, True)
+    evaluate(s5, Block.ENTRY, _sig(), SETTINGS, U)
+    on_pre_reject(s5, Block.ENTRY, mono=100.5, settings=SETTINGS, reason="LS 02297 잔고 없음")
+    assert s5.entry.last_reject.startswith("선주문 거부(1/3)")
+    set_running(s5, Block.ENTRY, False)
+    set_running(s5, Block.ENTRY, True)
+    assert s5.entry.last_reject == ""
 
 
 def test_place_pre_keeps_hl_est_of_post_side_for_fill_comparison() -> None:

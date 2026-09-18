@@ -80,6 +80,9 @@ class OrderIntent(BaseModel):
     # ("" = KRX 기본, "nxt" = NXT: 주문 본문 MbrNo "NXT"). HL·선물은 무시.
     credit_code: str = "000"
     market: str = ""
+    # 신용 상환(101 계열) 주문의 대출일 YYYYMMDD(LS 필수 — 실측 2026-09-18 01486 "대출일을 잘못
+    # 입력"). 엔진이 발주 직전 잔고 조회(CSPAQ12300 LoanDt)로 채운다. 그 외 주문은 빈칸.
+    loan_date: str = ""
 
     @field_validator("qty")
     @classmethod

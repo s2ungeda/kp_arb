@@ -87,6 +87,11 @@ class LSGateway(ABC):
     async def get_open_orders(self, account: Account) -> Sequence[TrackedOrder]:
         """미체결 주문 스냅샷(최초 실행/온디맨드 조회용)."""
 
+    async def get_credit_loans(self, underlying: Underlying) -> Sequence[tuple[str, float]]:
+        """신용융자 잔고의 (대출일 YYYYMMDD, 수량) — 오래된 대출일부터. 상환 주문의 LoanDt용
+        (2026-09-18). 기본은 없음(모의·목 게이트웨이)."""
+        return []
+
     async def place_fx_futures(self, code: str, side: Side, qty: int,
                                price: float) -> str:
         """원달러선물 헤지 발주(KR_FX, §9.1) — 종목코드 직접 지정. 기본 미지원.

@@ -117,10 +117,12 @@ _ST_KR = {"new": "신규", "accepted": "접수", "partial": "부분", "filled": 
 _COLS: tuple[tuple[str, int, str], ...] = (
     ("거래소", 50, "center"), ("종목", 88, "w"), ("매매", 50, "center"),  # 콤보 글자 안 잘리게
     ("주문가", 70, "e"), ("수량", 52, "e"), ("체결가", 70, "e"),
-    ("체결량", 52, "e"), ("상태", 44, "center"), ("접수시각", 66, "center"),
+    ("체결량", 52, "e"), ("상태", 64, "center"), ("접수시각", 66, "center"),  # 상태: 취소거부까지
     ("체결시각", 66, "center"),
     # 출처(자동M/일반/따라가기) · 세트(자동M 꼬리표 "선정3진", 2026-09-17) · 주문번호 순(사용자)
-    ("출처", 52, "center"), ("세트", 62, "center"), ("주문번호", 104, "e"))
+    ("출처", 52, "center"), ("세트", 62, "center"), ("주문번호", 104, "e"),
+    # 사유(거부 행만, 2026-09-18 사용자) — 표 끝, 넘치면 잘리고 행을 고르면 상태줄에 전문
+    ("사유", 220, "w"))
 _ROW_H = 20  # Treeview 행 높이(px) — FONT_LABEL 9pt 기준
 
 
@@ -139,7 +141,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     root.resizable(True, True)  # 크기 조절 — 표 행만 확장(root.rowconfigure weight)
     # 기본 크기 — 컬럼 전부 + 여유가 보이는 폭(사용자 2026-09-11). 최소폭 고정을 없애면서 자연
     # 크기가 아주 작아졌으므로 명시. 위치는 win_state가 복원, 크기는 매번 이 값.
-    root.geometry("890x370")  # 세트 칸(62px) 추가만큼 넓힘(2026-09-16)
+    root.geometry("1000x370")  # 세트 칸(2026-09-16)·사유 칸(2026-09-18)만큼 넓힘
     win_state.attach(root, "order_list")
     T.apply_base(root)
 
@@ -191,6 +193,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     show_orders = tk.BooleanVar(value=bool(_saved.get("show_orders", True)))
     show_fills = tk.BooleanVar(value=bool(_saved.get("show_fills", True)))
     show_cancels = tk.BooleanVar(value=bool(_saved.get("show_cancels", True)))
+    show_rejects = tk.BooleanVar(value=bool(_saved.get("show_rejects", True)))
 
     # 항목 필터 콤보 4개(거래소·종목·매매·출처, 사용자 2026-09-11) — 마지막 값 복원
     combos: dict[str, ttk.Combobox] = {}
@@ -203,6 +206,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             "show_orders": show_orders.get(),
             "show_fills": show_fills.get(),
             "show_cancels": show_cancels.get(),
+            "show_rejects": show_rejects.get(),
             **{f"f_{k}": v for k, v in _filters().items()}})
         _rerender()
 
@@ -218,17 +222,19 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     _combo("venue", _F_VENUE, 0)             # '거래소' 컬럼 위
     _combo("under", tuple(_F_UNDER), 1)      # '종목' 컬럼 위
     _combo("side", tuple(_F_SIDE), 2)        # '매매' 컬럼 위
-    checks = tk.Frame(filt)                  # 유형 체크 3개 — 주문가~체결가 컬럼 자리
-    checks.grid(row=0, column=3, columnspan=3, sticky="w")
+    checks = tk.Frame(filt)                  # 유형 체크 4개 — 주문가~체결량 컬럼 자리
+    checks.grid(row=0, column=3, columnspan=4, sticky="w")
     tk.Checkbutton(checks, text="주문", variable=show_orders,
                    command=_on_filter).pack(side="left")
     tk.Checkbutton(checks, text="체결", variable=show_fills,
                    command=_on_filter).pack(side="left")
     tk.Checkbutton(checks, text="취소", variable=show_cancels,
                    command=_on_filter).pack(side="left")
-    _combo("source", _F_SOURCE, 6, span=2, sticky="w", width=8)  # 출처 — 컬럼 자리와 무관
+    tk.Checkbutton(checks, text="거부", variable=show_rejects,  # 거부내역(2026-09-18)
+                   command=_on_filter).pack(side="left")
+    _combo("source", _F_SOURCE, 7, span=2, sticky="w", width=8)  # 출처 — 컬럼 자리와 무관
     # 세트 콤보(2026-09-16) — 출처 옆. 항목은 지금 표에 있는 자동M 꼬리표("정3"·"역1")로 채움
-    _combo("set", ("전체",), 8, span=2, sticky="w", width=6)
+    _combo("set", ("전체",), 9, span=2, sticky="w", width=6)
 
     # --- 표: ttk.Treeview (row 1, 확장) — 컬럼 헤더는 Treeview 자체(세로 스크롤에 안 밀림).
     # 2026-09-16 Label 그리드에서 전환: 코어가 당일 체결·취소를 전부 보내므로(수백 행) 셀마다
@@ -248,6 +254,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         tree.column(cid, width=w, minwidth=w, anchor=cast(Any, a), stretch=True)
     tree.tag_configure("buy", foreground=T.C_BUY)
     tree.tag_configure("sell", foreground=T.C_SELL)
+    tree.tag_configure("reject", foreground="#777777")  # 거부 행은 회색(매수·매도 색 대신)
     vsb = ttk.Scrollbar(table, orient="vertical", command=tree.yview)
 
     def _xview(*args: Any) -> None:  # 표·필터 줄을 같이 가로 스크롤
@@ -272,6 +279,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def _on_select(_e: object = None) -> None:
         chosen = tree.selection()
         sel["iid"] = chosen[0] if chosen else None
+        vals = row_vals.get(sel["iid"] or "")
+        if vals and str(vals[-1]):  # 거부 행 — 사유 전문을 상태줄에(칸에선 잘림)
+            set_status(f"사유: {vals[-1]}")
 
     tree.bind("<<TreeviewSelect>>", _on_select)
 
@@ -380,7 +390,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              "", "",  # 체결가·체결량 공백(미체결)
                              stk, o.get("time", ""), "",  # 접수시각·체결시각(공백)
                              _src_label(o.get("source")), str(o.get("tag") or ""),
-                             str(o.get("order_id")))))
+                             str(o.get("order_id")), "")))
         if show_fills.get():
             for i, f in enumerate(data.get("fills") or []):
                 if not keep(f):
@@ -395,34 +405,58 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              _fmt_px(f.get("price")), _fmt_qty(f.get("qty")),
                              "체결", f.get("accept_time", ""), f.get("time", ""),
                              _src_label(f.get("source")), str(f.get("tag") or ""),
-                             str(f.get("order_id", "")))))
-        if show_cancels.get():
-            for i, c in enumerate(data.get("cancels") or []):
-                if not keep(c):
+                             str(f.get("order_id", "")), "")))
+        # 취소내역 — status rejected(접수 뒤 거부 통보)는 '거부' 유형, 나머지는 '취소' 유형
+        unchecked = 0
+        for i, c in enumerate(data.get("cancels") or []):
+            rejected = str(c.get("status") or "") == "rejected"
+            if not (show_rejects.get() if rejected else show_cancels.get()):
+                unchecked += 1
+                continue
+            if not keep(c):
+                continue
+            buy = c.get("side") == "buy"
+            inst = str(c.get("instrument"))
+            out.append((f"__cancel{i}", "reject" if rejected else ("buy" if buy else "sell"),
+                        (_venue(inst), _sym(c.get("underlying"), inst),
+                         "매수" if buy else "매도",
+                         _fmt_px(c.get("price")), _fmt_qty(c.get("qty")),
+                         "", "",  # 체결가·체결량 공백(취소행)
+                         "거부" if rejected else "취소",
+                         c.get("accept_time", ""), "",  # 접수시각·체결시각(공백)
+                         _src_label(c.get("source")), str(c.get("tag") or ""),
+                         str(c.get("order_id", "")),
+                         "접수 뒤 거부 통보" if rejected else "")))
+        if show_rejects.get():
+            # 거부내역(2026-09-18) — 발주 거부(REST·HL)·취소 거부·응답 없음. 주문번호는 취소 거부만.
+            for i, r in enumerate(data.get("rejects") or []):
+                if not keep(r):
                     continue
-                buy = c.get("side") == "buy"
-                inst = str(c.get("instrument"))
-                out.append((f"__cancel{i}", "buy" if buy else "sell",
-                            (_venue(inst), _sym(c.get("underlying"), inst),
+                buy = r.get("side") == "buy"
+                inst = str(r.get("instrument"))
+                kind = str(r.get("kind") or "발주")
+                out.append((f"__reject{i}", "reject",
+                            (_venue(inst), _sym(r.get("underlying"), inst),
                              "매수" if buy else "매도",
-                             _fmt_px(c.get("price")), _fmt_qty(c.get("qty")),
-                             "", "",  # 체결가·체결량 공백(취소행)
-                             # 상태: 코어가 준 status(cancelled/rejected → 취소/거부), 없으면 취소
-                             _ST_KR.get(str(c.get("status") or ""), "취소"),
-                             c.get("accept_time", ""), "",  # 접수시각·체결시각(공백)
-                             _src_label(c.get("source")), str(c.get("tag") or ""),
-                             str(c.get("order_id", "")))))
+                             _fmt_px(r.get("price")), _fmt_qty(r.get("qty")),
+                             "", "",
+                             {"발주": "거부", "취소": "취소거부"}.get(kind, kind),  # 응답없음
+                             r.get("time", ""), "",  # 거부 시각(접수시각 칸)
+                             _src_label(r.get("source")), str(r.get("tag") or ""),
+                             str(r.get("order_id", "")), str(r.get("reason") or ""))))
+        else:
+            unchecked += len(data.get("rejects") or [])
         # 유형 체크를 끈 종류도 "숨김"에 넣는다 — 주문 체크를 끄고 잊으면 미체결이 안 보인다.
-        unchecked = ((0 if show_orders.get() else len(data.get("open_orders") or []))
-                     + (0 if show_fills.get() else len(data.get("fills") or []))
-                     + (0 if show_cancels.get() else len(data.get("cancels") or [])))
+        unchecked += ((0 if show_orders.get() else len(data.get("open_orders") or []))
+                      + (0 if show_fills.get() else len(data.get("fills") or [])))
         state_box["_hidden"] = (total - len(out)) + unchecked
         return out
 
     def _refresh_set_combo() -> None:
         # 세트 콤보 항목을 지금 데이터의 꼬리표로 — 바뀔 때만. 고른 값이 사라지면 '전체'로
         data = state_box["data"] or {}
-        tags = [str(r.get("tag") or "") for key in ("open_orders", "fills", "cancels")
+        tags = [str(r.get("tag") or "")
+                for key in ("open_orders", "fills", "cancels", "rejects")
                 for r in (data.get(key) or []) if isinstance(r, dict)]
         choices = set_choices(tags)
         cb = combos.get("set")

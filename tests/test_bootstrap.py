@@ -96,6 +96,29 @@ def test_record_cancel_captures_time_and_intent() -> None:
     assert sys.fills[0]["source"] == "자동M" and sys.fills[0]["qty"] == 0.05
 
 
+def test_record_reject_keeps_reason_kind_and_intent() -> None:
+    # 사용자 2026-09-18: 거부내역을 주문리스트에서 보고 싶다 — REST 단계 거부는 주문이 안 생겨
+    # 어디에도 안 남았다. 발주/취소/응답없음 종류, 사유(공백 정리·300자), 출처·꼬리표를 담는다.
+    from collections import deque
+    from types import SimpleNamespace
+
+    sys = SimpleNamespace(rejects=deque(), fills=deque(), cancels=deque(), _daylog_state={})
+    intent = OrderIntent(venue=Venue.LS, underlying=Underlying.SAMSUNG,
+                         instrument=Instrument.KR_STOCK, side=Side.SELL, qty=1,
+                         order_type=OrderType.LIMIT, price=256_500.0, source="자동M",
+                         tag="주정1청")
+    LiveSystem._record_reject(  # type: ignore[arg-type]
+        sys, intent, "CSPAT00601 rejected (02297):  유가증권 잔고가\n없습니다.")
+    LiveSystem._record_reject(sys, intent, "REST CFOAT00300 응답 없음: ", kind="취소",  # type: ignore[arg-type]
+                              order_id="18780")
+    assert [r["kind"] for r in sys.rejects] == ["취소", "발주"]  # 최신 우선
+    r = sys.rejects[1]
+    assert r["reason"] == "CSPAT00601 rejected (02297): 유가증권 잔고가 없습니다."
+    assert (r["underlying"], r["side"], r["qty"], r["price"]) == ("samsung", "sell", 1, 256_500.0)
+    assert r["source"] == "자동M" and r["tag"] == "주정1청" and r["order_id"] == "" and r["time"]
+    assert sys.rejects[0]["order_id"] == "18780"
+
+
 def test_ls_cancel_and_reject_events_record_cancels_once() -> None:
     # 2026-09-17 운영 보고: 주문리스트 '취소' 체크를 켜도 취소 주문이 안 보임 — 취소내역 기록이
     # HL 통보에만 연결돼 LS 취소(SC3/H01)·거부(SC4)가 빠져 있었다. LS 통보도 기록하고, 정정으로
