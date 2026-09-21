@@ -832,8 +832,10 @@ class LiveSystem:
             logging.getLogger("kp_arb.core").warning(
                 "%s 재연결 재동기 실패", label, exc_info=True)
             return
-        # 알림은 블로킹(HTTP)이라 별도 스레드로 — 미설정이면 조용히 무시.
-        await _asyncio.to_thread(alert.notify, f"{label} WS 재연결·재동기 완료", "warn")
+        # 알림은 블로킹(HTTP)이라 별도 스레드로 — 미설정이면 조용히 무시. 종류 "ws"는 지금 꺼 둠
+        # (alert.MUTED_CATEGORIES, 사용자 2026-09-21: 당분간 자동주문 중지만 받는다).
+        await _asyncio.to_thread(
+            lambda: alert.notify(f"{label} WS 재연결·재동기 완료", "warn", category="ws"))
 
     async def price_snapshots(self) -> dict[tuple[Underlying, Instrument], float]:
         """취급 전 종목 현재가 1회 조회(창 오픈 시 초기 표시용 — 마감 후엔 종가)."""

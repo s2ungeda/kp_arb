@@ -86,3 +86,24 @@ def test_notify_false_on_non_2xx() -> None:
     ok = notify("x", secrets=_FakeSecrets(KP_TELEGRAM_TOKEN="T", KP_TELEGRAM_CHAT_ID="9"),
                 sender=lambda url, body: 500)
     assert ok is False
+
+
+def test_muted_categories_are_not_sent() -> None:
+    # 사용자 2026-09-21: 당분간 자동주문 중지(halt)만 받는다 — WS 재연결(ws)·코어 재기동(core)은
+    # 꺼 둠.
+    from kp_arb.alert import MUTED_CATEGORIES
+
+    calls: list[str] = []
+
+    def sender(url: str, _body: bytes) -> int:
+        calls.append(url)
+        return 200
+
+    secrets = _FakeSecrets(KP_TELEGRAM_TOKEN="T", KP_TELEGRAM_CHAT_ID="9")
+    assert {"ws", "core"} <= MUTED_CATEGORIES and "halt" not in MUTED_CATEGORIES
+    assert notify("주식 WS 재연결", "warn", category="ws", secrets=secrets, sender=sender) is False
+    assert notify("코어 재기동", "error", category="core", secrets=secrets, sender=sender) is False
+    assert calls == []
+    assert notify("세트 중지", "error", category="halt", secrets=secrets, sender=sender) is True
+    assert notify("수신: 상태", "info", category="reply", secrets=secrets, sender=sender) is True
+    assert len(calls) == 2

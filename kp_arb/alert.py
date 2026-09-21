@@ -39,6 +39,11 @@ _LEVEL_TAG: dict[str, str] = {
 # (url, json_body) -> HTTP 상태코드. 테스트는 여기에 목을 넣는다.
 Sender = Callable[[str, bytes], int]
 
+# 지금은 보내지 않는 알림 종류(사용자 2026-09-21: "당분간은 자동주문 중지됐을 때만") —
+# ws = WS 재연결·재동기 완료, core = 코어 미접속 자동 재기동·재기동 포기. 다시 받으려면 여기서 뺀다.
+# 보내는 종류: halt(자동주문 세트 중지), reply(수신 확인 답장), test(시험 전송), general(기타).
+MUTED_CATEGORIES: frozenset[str] = frozenset({"ws", "core"})
+
 
 def telegram_config(secrets: SecretProvider | None = None) -> tuple[str, str] | None:
     """(token, chat_id) — 둘 다 있을 때만. 하나라도 없으면 None(미설정 = no-op)."""
@@ -78,13 +83,18 @@ def notify(
     text: str,
     level: str = "info",
     *,
+    category: str = "general",
     secrets: SecretProvider | None = None,
     sender: Sender | None = None,
 ) -> bool:
-    """알림 전송. 성공 시 True. 미설정·실패는 False(예외 없이 삼킴).
+    """알림 전송. 성공 시 True. 미설정·실패·꺼 둔 종류는 False(예외 없이 삼킴).
 
+    ``category``가 ``MUTED_CATEGORIES``에 있으면 보내지 않는다(로그에만 debug).
     ``sender``는 (url, body)->상태코드. 기본은 실제 HTTP, 테스트는 목을 주입한다.
     """
+    if category in MUTED_CATEGORIES:
+        log.debug("telegram 꺼 둔 종류(%s) — 안 보냄: %s", category, text)
+        return False
     cfg = telegram_config(secrets)
     if cfg is None:
         log.debug("telegram 미설정 — 알림 버림: %s", text)
@@ -100,3 +110,20 @@ def notify(
         log.warning("telegram 전송 거부 status=%s", status)
         return False
     return True
+
+
+def _main() -> None:
+    """시험 전송 — ``python -m kp_arb.alert [메시지]``. 설정 여부와 전송 결과를 출력한다
+    (토큰·chat_id 값은 찍지 않는다)."""
+    import sys
+
+    text = " ".join(sys.argv[1:]) or "kp-arb 텔레그램 시험 전송"
+    if telegram_config() is None:
+        print("미설정 — KP_TELEGRAM_TOKEN / KP_TELEGRAM_CHAT_ID를 키 등록 화면에서 넣으세요")
+        return
+    ok = notify(text, "info", category="test")
+    print("전송 성공" if ok else "전송 실패 — 토큰·chat_id·네트워크 확인")
+
+
+if __name__ == "__main__":
+    _main()

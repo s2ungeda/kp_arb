@@ -812,6 +812,26 @@ async def test_pre_order_timeout_halts_the_set_without_reorder() -> None:
     assert "미체결·잔고 확인" in row["halt_reason"]
 
 
+async def test_set_halt_pushes_alert_once() -> None:
+    # 2026-09-21: 세트 중지는 사람 알림(텔레그램)으로도 나간다 — 코어가 넣어 준 alert(문구, 수준)을
+    # 스레드로 호출. 테스트는 목만 넣는다(라이브 텔레그램 금지). 없으면 아무 것도 안 함.
+    state = CoreState()
+    state.screens[ScreenKind.AUTO_M].underlying = U
+    sys_ = FakeSystem()
+    sent: list[tuple[str, str]] = []
+    eng = AutoMEngine(state, sys_, alert=lambda text, level: sent.append((text, level)))  # type: ignore[arg-type]
+    s = state.autom.book(U).sets[0]
+    s.target_qty, s.per_qty, s.en_sf, s.en_s, s.ex_sf = 100, 10, 0.005, 0.005, -0.001
+    state.autom.settings.windows = (("09:00:00", "15:20:00"),)
+    sys_.timeout_pre = True  # 선주문 응답 없음 → 세트 중지(결정 39)
+    await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    await asyncio.sleep(0.05)  # 알림은 스레드로
+    assert len(sent) == 1 and sent[0][1] == "error"
+    assert "중지" in sent[0][0] and "응답 없음" in sent[0][0] and U.value in sent[0][0]
+
+
 async def test_stock_product_commands_route_to_stock_book() -> None:
     # 2026-09-17: 주식 체결쏴 코어 착수 — product "stock" 명령은 "종목|stock" 종목 상태로 가고,
     # 주식선물(product 없음/"sf") 종목 상태는 건드리지 않는다. 설정도 상품별.

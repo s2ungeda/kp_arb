@@ -115,9 +115,13 @@ class AutoMEngine:
     def __init__(self, state: CoreState, system: _SystemLike,
                  log_dir: Path | None = None,
                  save: Callable[[], None] | None = None,
-                 product: str = "sf") -> None:
+                 product: str = "sf",
+                 alert: Callable[[str, str], object] | None = None) -> None:
         self._state = state
         self._system = system
+        # 사람에게 미는 알림(텔레그램, 2026-09-21) — (문구, 수준). 코어가 alert.notify를 넣어 준다.
+        # 없으면(테스트·미설정) 아무 것도 안 함. 전송은 스레드로 — 판정 루프를 막지 않는다.
+        self._alert = alert
         # 상품(exec §7C, 2026-09-17): "sf" 주식선물 / "stock" 주식 — 엔진 인스턴스를 상품마다 따로
         # 두고 자기 상품의 종목 상태만 돈다(설정·시장 정지·로그 파일·꼬리표도 상품별)
         self.product = product
@@ -366,6 +370,8 @@ class AutoMEngine:
                                 u.value, self._tag(u, index, block, reverse), act.reason,
                                 self._ledger(s))
                 self._system.error_seq += 1  # 메인창 에러 알람 소리(공통설정)
+                self._push_alert(f"[자동M] {u.value} {self._tag(u, index, block, reverse)} 중지"
+                                 f" — {act.reason} | {self._ledger(s)}", "error")
             elif act.kind == "notify":
                 self._log.warning("[자동M] %s %s — %s",
                                   u.value, self._tag(u, index, block, reverse), act.reason)
@@ -373,6 +379,15 @@ class AutoMEngine:
                 self._log.error("[자동M] %s %s — %s",
                                 u.value, self._tag(u, index, block, reverse), act.reason)
                 self._system.error_seq += 1
+
+    def _push_alert(self, text: str, level: str) -> None:
+        """사람 알림(텔레그램, 설정돼 있을 때만) — 스레드로 보내 루프를 막지 않는다. 실패는 삼킴."""
+        if self._alert is None:
+            return
+        try:
+            self._spawn(asyncio.to_thread(self._alert, text, level))
+        except RuntimeError:  # 돌고 있는 이벤트 루프 없음(동기 테스트 등)
+            pass
 
     def _spawn(self, coro: Any) -> None:
         task = asyncio.ensure_future(coro)

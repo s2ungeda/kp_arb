@@ -266,7 +266,7 @@ def main() -> None:
     def _alert(text: str, level: str = "warn") -> None:
         try:
             from . import alert
-            alert.notify(text, level)
+            alert.notify(text, level, category="core")  # 지금 꺼 둠(alert.MUTED_CATEGORIES)
         except Exception:  # noqa: BLE001 - 알림 실패가 감시를 멈추지 않게
             pass
 

@@ -1327,18 +1327,31 @@ async def _serve() -> None:
             fx_auto = os.environ.get("KP_FX_AUTO_SEND", "1").strip().lower()
             fx_service = FxReportService(
                 system, auto_send=fx_auto not in ("0", "false", "off", "no"))
+            from functools import partial
+
+            from . import alert as _tg  # 텔레그램 알림(미설정이면 조용히 무시)
+
+            # 세트 중지 알림 — 지금 텔레그램으로 받는 유일한 종류(alert.MUTED_CATEGORIES 참고)
+            halt_alert = partial(_tg.notify, category="halt")
             from .auto_m_engine import AutoMEngine as _AutoMEngine
 
             autom_engine = _AutoMEngine(  # 자동M 실행(정방향) — 실행은 화면 버튼
                 state, system, log_dir=_base_dir() / "logs",
-                save=lambda: save_state(STATE_PATH, state))  # 체결마다 RT·체결차 저장
+                save=lambda: save_state(STATE_PATH, state),  # 체결마다 RT·체결차 저장
+                alert=halt_alert)  # 세트 중지 → 텔레그램(2026-09-21)
             autom_engine_stock = _AutoMEngine(  # 주식 체결쏴(exec §7C) — 같은 골격, 상품만 다름
                 state, system, log_dir=_base_dir() / "logs",
-                save=lambda: save_state(STATE_PATH, state), product="stock")
+                save=lambda: save_state(STATE_PATH, state), product="stock",
+                alert=halt_alert)
             tasks.append(asyncio.create_task(engine.run()))
             tasks.append(asyncio.create_task(fx_service.run()))
             tasks.append(asyncio.create_task(autom_engine.run()))
             tasks.append(asyncio.create_task(autom_engine_stock.run()))
+            # 텔레그램 수신(2026-09-21, 수신만) — 봇에 온 글을 로그에 남기고 "수신: …" 답장.
+            # 명령 실행은 아직 없다. 토큰·chat_id 미설정이면 바로 끝난다.
+            from .telegram_rx import TelegramReceiver, log_and_ack
+
+            tasks.append(asyncio.create_task(TelegramReceiver(log_and_ack).run()))
             log.info("LiveSystem 결합 완료 — 리허설 판정 + FX 보고 시작 (발주 없음)")
         except Exception as exc:  # noqa: BLE001 - 키 없음/네트워크 등
             log.exception("LiveSystem 시동 실패 — API만 운영 (시세 없음)")
