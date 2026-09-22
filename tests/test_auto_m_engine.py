@@ -997,3 +997,104 @@ async def test_stock_engine_holds_during_stock_vi_then_resumes() -> None:
     eng.tick(datetime(2026, 9, 4, 10, 0, 1), 101.0)
     await _settle()
     assert len(sys_.placed) == 1 and sys_.placed[0].instrument is Instrument.KR_STOCK
+
+
+def _hl_first_engine() -> tuple[AutoMEngine, FakeSystem, CoreState]:
+    """주식선물 HL선(exec §7D) 엔진 — 선주문 HL ALO, 후주문 LS. FakeSystem 시세: S 1,600,000 ·
+    이론가 1,605,000 · SF 매도1 1,605,000 · 환율 1,356 · HL 1184.0/1184.5(szDecimals 1 → 격자 0.1).
+    진입 0.5% → 역산가 1,600,000×1.005/1356 = 1185.84 → 올림 1185.9(매수1호가 위, 한계 1188.8
+    안)."""
+    state = CoreState()
+    sys_ = FakeSystem()
+    eng = AutoMEngine(state, sys_, product="sf_hl_first")  # type: ignore[arg-type]
+    s = state.autom.book(U, "sf_hl_first").sets[0]
+    s.target_qty, s.per_qty, s.en_sf, s.en_s, s.ex_sf = 10, 1, 0.005, 0.005, -0.001
+    state.autom.settings.windows = (("09:00:00", "15:20:00"),)
+    return eng, sys_, state
+
+
+async def test_hl_first_engine_round_hl_alo_pre_then_ls_post() -> None:
+    # HL 매도 ALO 선주문 10 @1185.9 → HL 체결 조각 3.4 + 6.6 → 10에 찬 순간 LS SF 매수 1계약
+    # @상대 매도1호가(1,605,000) → LS 체결로 판 끝: RT 1, 체결차 0, 기준값은 LS 체결 시점.
+    eng, sys_, state = _hl_first_engine()
+    body = {"cmd": "autom_run", "underlying": U.value, "set": 0, "block": "entry",
+            "value": True, "product": "sf_hl_first"}
+    assert (await _autom_command(eng, state, body))["ok"]
+    eng.tick(datetime(2026, 9, 22, 10, 0, 0), 100.0)
+    await _settle()
+    assert len(sys_.placed) == 1
+    pre = sys_.placed[0]
+    assert pre.venue is Venue.HYPERLIQUID and pre.instrument is Instrument.HL_PERP
+    assert pre.side is Side.SELL and pre.qty == 10 and pre.price == 1185.9
+    assert pre.post_only and pre.tag == "H정1진"  # ALO + 꼬리표
+    s = state.autom.book(U, "sf_hl_first").sets[0]
+    assert s.entry.status is LegStatus.PRE_RESTING and s.entry.pre_order_id == "O1"
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=3.4, price=1185.9, ts=0))
+    await _settle()
+    assert len(sys_.placed) == 1 and abs(s.hl_net + 3.4) < 1e-9  # 조각 — LS 아직
+    assert s.entry.status is LegStatus.PRE_PARTIAL and abs(s.fill_diff + 3.4) < 1e-9
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O1", qty=6.6, price=1185.9, ts=0))
+    await _settle()
+    assert len(sys_.placed) == 2
+    post = sys_.placed[1]
+    assert post.venue is Venue.LS and post.instrument is SF and post.side is Side.BUY
+    assert post.qty == 1 and post.price == 1_605_000.0 and post.tag == "H정1진"
+    assert not post.post_only
+    assert s.entry.status is LegStatus.POST_PENDING and s.entry.post_pending == 1
+    assert s.rt == 0 and abs(s.fill_diff + 10) < 1e-9
+    sys_.order_book.on_fill(Fill(fill_id="f3", order_id="O2", qty=1, price=1_605_000.0, ts=0))
+    await _settle()
+    assert s.rt == 1 and s.sf_net == 1 and abs(s.hl_net + 10) < 1e-9 and s.fill_diff == 0
+    assert s.entry.status is LegStatus.SETTLE_DELAY and s.entry.running
+    acc = s.entry.acc
+    assert acc.hl_qty == 10 and acc.sf_qty == 1 and acc.hl_avg() == 1185.9
+    assert acc.fx_avg() == 1355.9  # 환진입가 = HL 다리(매도) 방향 매수1호가, LS 체결 시점
+    assert acc.sprd() is not None
+    snap = eng.live_snapshot()
+    key = f"{U.value}|sf_hl_first"
+    assert key in snap and U.value not in snap
+    row = snap[key]["sets"][0]["entry"]
+    assert row["hl_unhedged"] == 0 and row["pre_filled"] == 0  # 판 끝 — 선주문 정리됨
+    mon = snap[key]["monitor"]["fwd"]
+    # 모니터 = (HL 매수1 1184×1356 − 1,600,000)/1,600,000 − (1,605,000−1,605,000)/1,605,000
+    assert abs(mon["en_sf"] - (1184.0 * 1356 - 1_600_000) / 1_600_000) < 1e-9
+    assert mon["en_s"] is None
+
+
+async def test_hl_first_engine_ls_post_timeout_halts_and_alo_cross_reject_retries() -> None:
+    # 결정 B: LS 후주문 응답 없음 → 재전송 없이 세트 중지(체결차 −10 표시). ALO 겹침 거부는
+    # 연속 거부에 안 세고 딜레이 뒤 재역산.
+    eng, sys_, state = _hl_first_engine()
+    body = {"cmd": "autom_run", "underlying": U.value, "set": 0, "block": "entry",
+            "value": True, "product": "sf_hl_first"}
+    await _autom_command(eng, state, body)
+    s = state.autom.book(U, "sf_hl_first").sets[0]
+    # ALO 겹침 거부 흉내 — HL 선주문 place가 HL 거부 문구로 실패
+    from kp_arb.gateways.hl_live import HLError
+
+    orig_place = sys_.place
+
+    async def cross_reject(intent: OrderIntent, *, cloid: str | None = None) -> str:
+        if intent.instrument is Instrument.HL_PERP and getattr(sys_, "cross", False):
+            raise HLError("HL order not accepted: {'error': 'Post only order would have "
+                          "immediately matched, bbo was 204.98@205. asset=110034'}")  # 실측 09-22
+        return await orig_place(intent, cloid=cloid)
+
+    sys_.place = cross_reject  # type: ignore[method-assign]
+    sys_.cross = True
+    eng.tick(datetime(2026, 9, 22, 10, 0, 0), 100.0)
+    await _settle()
+    assert s.entry.reject_streak == 0 and s.entry.status is LegStatus.SETTLE_DELAY
+    assert "ALO 겹침" in s.entry.last_reject and not sys_.placed
+    sys_.cross = False
+    s.entry.delay_until = None  # 딜레이(실시계 기준) 지난 것으로 → 재역산·재발주
+    eng.tick(datetime(2026, 9, 22, 10, 0, 2), 102.0)
+    await _settle()
+    assert len(sys_.placed) == 1 and s.entry.status is LegStatus.PRE_RESTING
+    # LS 후주문 응답 없음
+    sys_.timeout_pre = True  # FakeSystem: SF 주문에 RestTimeoutError
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1185.9, ts=0))
+    await _settle()
+    assert s.entry.status is LegStatus.HALTED and s.exit.status is LegStatus.HALTED
+    assert "응답 없음" in s.entry.halt_reason and "재전송 없이" in s.entry.halt_reason
+    assert abs(s.fill_diff + 10) < 1e-9 and sys_.error_seq == 1

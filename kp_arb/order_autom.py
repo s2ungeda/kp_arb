@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from dataclasses import replace as dc_replace
 from functools import partial
 from typing import Any
 
@@ -93,6 +94,13 @@ SF_SPEC = ScreenSpec(
     qty_unit="계약", settings_title="체결쏴 설정",
     pre_tick={"sk_hynix": 3000, "samsung": 500, "hyundai": 1000},
     snapshot_rows=4)  # 8세트 아래 마지막 판 스냅샷(Sprd·HP·SF·환). 짝수 줄 하늘색은 원복(09-16)
+
+# 주식선물 HL선(exec §7D 시험, 사용자 2026-09-22): 선주문 HL ALO·후주문 LS — 화면은 주식선물 골격
+# 그대로(세트 수·칸 동일), 상품·제목·저장 키만 다르다. 코어 종목 상태 키 "종목|sf_hl_first".
+# 공통설정(주문가능시간·상대호가·범위)은 주식선물 것을 같이 쓴다(§7D).
+SF_HL_FIRST_SPEC = dc_replace(
+    SF_SPEC, product="sf_hl_first", title="체결쏴(자동M)-주식선물(HL선)",
+    product_tag="(주식선물 HL선)", state_key="autoMH", screen_tag="autoMH", log_tag="자동M HL선")
 
 # 주식: 정방향만, 기준값 칸은 진입 S(-HP/+S)·청산 S(+HP/-S), 매매결과 +S/-S(주식 평균 체결가).
 # 주문단위 기본값은 주식 호가단위(20만~50만 원 100원, 50만 원 이상 500원)로 — 결정 전 임시.

@@ -29,13 +29,26 @@ def hl_price_decimals(price: float, sz_decimals: int | None,
 
 
 def hl_round_price(price: float, side: Side, sz_decimals: int | None,
-                   max_decimals: int = MAX_DECIMALS_PERP) -> float:
-    """HL 격자에 맞춘 지정가 — 매수 올림 / 매도 내림(공격적). 0 이하면 그대로."""
+                   max_decimals: int = MAX_DECIMALS_PERP, maker: bool = False) -> float:
+    """HL 격자에 맞춘 지정가 — 기본(taker)은 매수 올림 / 매도 내림(공격적). 0 이하면 그대로.
+
+    maker=True(HL선 선주문, exec §7D): 반대로 매수 내림 / 매도 올림 — 호가창에 걸어 두는 값이라
+    유리한 쪽으로 맞춘다(그 가격에 잡히면 기준값이 보장된다).
+    """
     if price <= 0:
         return price
     decimals = hl_price_decimals(price, sz_decimals, max_decimals)
     quantum = Decimal(1).scaleb(-decimals)
-    mode = ROUND_CEILING if side is Side.BUY else ROUND_FLOOR
-    out = Decimal(repr(price)).quantize(quantum, rounding=mode)
+    up = (side is Side.BUY) != maker
+    out = Decimal(repr(price)).quantize(quantum, rounding=ROUND_CEILING if up else ROUND_FLOOR)
     # 올림으로 자릿수가 한 단계 오르면(999.99→1000.0) 그 값은 정수라 항상 허용
     return float(out)
+
+
+def hl_price_step(price: float, sz_decimals: int | None,
+                  max_decimals: int = MAX_DECIMALS_PERP) -> float:
+    """HL 격자 한 칸(= "1틱", exec §7D) — 그 가격대에서 허용되는 가장 작은 자릿수. HL은 고정
+    호가단위가 없어 유효숫자 규칙에서 나온 값을 쓴다. 예: 1,285.3 → 0.1, 185.60 → 0.01."""
+    if price <= 0:
+        return 0.0
+    return float(Decimal(1).scaleb(-hl_price_decimals(price, sz_decimals, max_decimals)))

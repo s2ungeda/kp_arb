@@ -540,8 +540,11 @@ async def _autom_command(
     cmd = body.get("cmd")
     am = state.autom
     # 상품(exec §7C, 2026-09-17): "sf" 주식선물(기본) / "stock" 주식 — 종목 상태·설정·엔진이 따로
+    # "sf_hl_first" = 주식선물 HL선(선주문 HL ALO·후주문 LS, exec §7D 시험 2026-09-22)
+    from .auto_m import PRODUCTS
+
     product = str(body.get("product", "sf"))
-    if product not in ("sf", "stock"):
+    if product not in PRODUCTS:
         return _fail([f"알 수 없는 상품: {product!r}"])
     if isinstance(engine, dict):  # 상품별 엔진 묶음 → 이 명령의 엔진
         engine = engine.get(product)
@@ -1103,6 +1106,7 @@ def make_app(
     hub: WsHub | None = None,
     autom: AutoMEngine | None = None,
     autom_stock: AutoMEngine | None = None,  # 주식 체결쏴 엔진(exec §7C, 2026-09-17)
+    autom_hl_first: AutoMEngine | None = None,  # 주식선물 HL선 엔진(exec §7D 시험, 2026-09-22)
 ) -> web.Application:
     """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅.
 
@@ -1135,8 +1139,10 @@ def make_app(
             [system.startup_load_error]
             if system is not None and system.startup_load_error else [])
         # 자동M 실시간 상태(세트별 상태·RT·체결차·누적 Sprd) — 엔진 없으면 빈 값
-        payload["autom_live"] = {**(autom.live_snapshot() if autom is not None else {}),
-                                 **(autom_stock.live_snapshot() if autom_stock is not None else {})}
+        payload["autom_live"] = {
+            **(autom.live_snapshot() if autom is not None else {}),
+            **(autom_stock.live_snapshot() if autom_stock is not None else {}),
+            **(autom_hl_first.live_snapshot() if autom_hl_first is not None else {})}
         return payload
 
     if hub is not None and hub.state_provider is None:
@@ -1164,7 +1170,9 @@ def make_app(
             result = _fx_command(fx_service, payload)
             return web.json_response(result, dumps=_dumps)
         if isinstance(cmd, str) and cmd.startswith("autom_"):
-            result = await _autom_command({"sf": autom, "stock": autom_stock}, state, payload)
+            result = await _autom_command(
+                {"sf": autom, "stock": autom_stock, "sf_hl_first": autom_hl_first}, state,
+                payload)
             if result.get("ok") and save:
                 save()  # 세트 설정·공통설정·RT 저장
             return web.json_response(result, dumps=_dumps)
@@ -1308,6 +1316,7 @@ async def _serve() -> None:
         fx_service = None
         autom_engine = None
         autom_engine_stock = None
+        autom_engine_hl_first = None
         tasks: list[asyncio.Task[None]] = []
         boot_errors: list[str] = []  # 코어 조립 실패 사유 → /state load_errors → 메인창 팝업
         try:
@@ -1343,10 +1352,15 @@ async def _serve() -> None:
                 state, system, log_dir=_base_dir() / "logs",
                 save=lambda: save_state(STATE_PATH, state), product="stock",
                 alert=halt_alert)
+            autom_engine_hl_first = _AutoMEngine(  # 주식선물 HL선 시험(exec §7D, 2026-09-22)
+                state, system, log_dir=_base_dir() / "logs",
+                save=lambda: save_state(STATE_PATH, state), product="sf_hl_first",
+                alert=halt_alert)
             tasks.append(asyncio.create_task(engine.run()))
             tasks.append(asyncio.create_task(fx_service.run()))
             tasks.append(asyncio.create_task(autom_engine.run()))
             tasks.append(asyncio.create_task(autom_engine_stock.run()))
+            tasks.append(asyncio.create_task(autom_engine_hl_first.run()))
             # 텔레그램 수신(2026-09-21, 수신만) — 봇에 온 글을 로그에 남기고 "수신: …" 답장.
             # 명령 실행은 아직 없다. 토큰·chat_id 미설정이면 바로 끝난다.
             from .telegram_rx import TelegramReceiver, log_and_ack
@@ -1366,7 +1380,8 @@ async def _serve() -> None:
             save=lambda: save_state(STATE_PATH, state),
             system=system, engine=engine, fx_service=fx_service,
             boot_errors=boot_errors, hub=hub, autom=autom_engine,
-            autom_stock=autom_engine_stock), access_log=None)
+            autom_stock=autom_engine_stock, autom_hl_first=autom_engine_hl_first),
+            access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, HOST, DEFAULT_PORT)
         await site.start()
@@ -1378,6 +1393,8 @@ async def _serve() -> None:
             await autom_engine.shutdown()
         if autom_engine_stock is not None:
             await autom_engine_stock.shutdown()
+        if autom_engine_hl_first is not None:
+            await autom_engine_hl_first.shutdown()
         if system is not None:
             await system.stop()  # WS(_guarded_ws)·시동 태스크 명시 취소 — 종료 중 재접속 방지
         for task in tasks:

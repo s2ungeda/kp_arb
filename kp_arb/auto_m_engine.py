@@ -32,6 +32,10 @@ from .auto_m import (
     LegStatus,
     Signals,
     evaluate,
+    on_hl_pre_fill,
+    on_hl_pre_reject,
+    on_ls_post_fill,
+    on_ls_post_reject,
     on_post_fill,
     on_post_partial_reject,
     on_post_recovered,
@@ -69,6 +73,16 @@ def reject_reason_text(exc_text: str, limit: int = 90) -> str:
     m = re.match(r"^\w+ rejected \((\w+)\): (.*)$", exc_text.strip())
     text = f"LS {m.group(1)} {m.group(2)}" if m else exc_text.strip()
     return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def is_alo_cross_reject(exc_text: str) -> bool:
+    """HL이 ALO(메이커 전용) 주문을 "넣는 순간 체결될 가격"이라 거부한 것인가(exec §7D) — 응답
+    statuses[0].error 문구 기준. **실측 2026-09-22 11:12(사용자가 일부러 낸 거부):**
+    "Post only order would have immediately matched, bbo was 204.98@205. asset=110034"
+    (실시간 통보 status는 badAloPxRejected). 이 거부는 연속 거부에 세지 않는다(사용자
+    2026-09-22)."""
+    text = exc_text.lower()
+    return "immediately match" in text or "post only" in text
 
 
 TICK_S = 0.1
@@ -210,13 +224,19 @@ class AutoMEngine:
 
     def ulog(self, u: Underlying) -> logging.Logger:
         """종목의 상세 로거 — logs/autom_<종목>_날짜.log (자정 롤오버, 코어 로그와 분리)."""
-        suffix = "" if self.product == "sf" else f"_{self.product}"  # 주식: autom_<종목>_stock_
+        # 주식: autom_<종목>_stock_ / HL선: autom_<종목>_sf_hl_first_
+        suffix = "" if self.product == "sf" else f"_{self.product}"
         return attach_daily_file(f"kp_arb.autom.{u.value}{suffix}", f"autom_{u.value}{suffix}",
                                  self._log_dir)
 
     @property
+    def _hl_first(self) -> bool:
+        """HL선 상품(exec §7D) — 선주문 HL ALO, 후주문 LS."""
+        return self.product == "sf_hl_first"
+
+    @property
     def _tag_letter(self) -> str:
-        return "주" if self.product == "stock" else "선"
+        return {"stock": "주", "sf_hl_first": "H"}.get(self.product, "선")
 
     @staticmethod
     def _set_tag(index: int, block: Block, reverse: bool = False,
@@ -230,7 +250,7 @@ class AutoMEngine:
         # 방향 표기(사용자 2026-09-08: 진입/청산만으론 정/역 구분이 안 됨) — 세트의 방향 값으로.
         # 주식 엔진은 앞에 "주식 "(로그 파일이 따로라 짧게)
         direction = "역방향" if reverse else "정방향"
-        head = "주식 " if self.product == "stock" else ""
+        head = {"stock": "주식 ", "sf_hl_first": "HL선 "}.get(self.product, "")
         return f"{head}{direction} {index + 1}세트 {'진입' if block is Block.ENTRY else '청산'}"
 
     def _trace(self, u: Underlying, index: int, block: Block, leg: Leg,
@@ -338,6 +358,13 @@ class AutoMEngine:
         if sf_quote is not None:
             asks = tuple(sf_quote.asks or [(sf_quote.ask, sf_quote.ask_qty or 1.0)])
             bids = tuple(sf_quote.bids or [(sf_quote.bid, sf_quote.bid_qty or 1.0)])
+        # HL선(§7D): HL 호가창(N호가 한계)·가격 격자 자릿수 — 다른 상품은 안 쓰지만 값은 같이 싣는다
+        hl_info = self._system.instruments.get((u, Instrument.HL_PERP))
+        hl_bids: tuple[tuple[float, float], ...] = ()
+        hl_asks: tuple[tuple[float, float], ...] = ()
+        if hl is not None and hl.bid and hl.ask:
+            hl_bids = tuple(hl.bids or [(hl.bid, hl.bid_qty or 1.0)])
+            hl_asks = tuple(hl.asks or [(hl.ask, hl.ask_qty or 1.0)])
         return Signals(
             now=now, mono=mono,
             sf_spread_entry=sf_entry, s_spread_entry=s_entry, sf_spread_exit=sf_exit,
@@ -347,7 +374,9 @@ class AutoMEngine:
             resumed_mono=self._resumed_for(u), fx=fx, product=book.product,
             hl_bid1=hl.bid if hl is not None else None,
             hl_ask1=hl.ask if hl is not None else None,
-            hl_est_bid=est_bid, hl_est_ask=est_ask)
+            hl_est_bid=est_bid, hl_est_ask=est_ask,
+            hl_bids=hl_bids, hl_asks=hl_asks,
+            hl_sz_decimals=hl_info.sz_decimals if hl_info is not None else None)
 
     # ------------------------------------------------------------ 행동 실행 ---
     def _apply(self, u: Underlying, index: int, block: Block, actions: list[Action],
@@ -399,6 +428,9 @@ class AutoMEngine:
         book = self._book(u)
         s, inst = book.sets_of(reverse)[index], self._counterpart(book)
         assert act.side is not None and act.price is not None
+        if book.hl_first:
+            await self._place_hl_pre(u, index, block, act, reverse)
+            return
         from .auto_m import credit_code_for
 
         stock = book.product == "stock"
@@ -448,6 +480,100 @@ class AutoMEngine:
         self._log.info("[자동M] %s 선주문 %s %s %d @ %g → #%s",
                        u.value, self._tag(u, index, block, reverse), act.side.value, act.qty,
                        act.price, oid)
+
+    async def _place_hl_pre(self, u: Underlying, index: int, block: Block, act: Action,
+                            reverse: bool = False) -> None:
+        """HL선(exec §7D) 선주문 — HL 지정가 **ALO**(post_only), 가격은 판정이 이미 격자에 맞춘 값.
+        ALO 겹침 거부(호가가 그새 움직임)는 연속 거부에 세지 않고 딜레이 뒤 재역산, 그 밖의 거부는
+        결정 29(연속 3회 → 중지)."""
+        s = self._set(u, index, reverse)
+        assert act.side is not None and act.price is not None
+        intent = OrderIntent(venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
+                             side=act.side, qty=act.qty, order_type=OrderType.LIMIT,
+                             price=act.price, source=SOURCE, post_only=True,
+                             tag=self._set_tag(index, block, reverse, self._tag_letter))
+        ref = _OrderRef(u, index, block, "pre", reverse)
+        cloid = self._system.new_hl_cloid()
+        if cloid:
+            self._pending_refs[cloid] = ref  # 응답보다 먼저 온 통보로 식별되면 그 oid로 등록
+        try:
+            oid = await self._system.place(intent, cloid=cloid)
+        except Exception as exc:  # noqa: BLE001 - 거부 → ALO 겹침이면 재역산, 아니면 결정 29
+            if cloid:
+                self._pending_refs.pop(cloid, None)
+            text = str(exc)
+            cross = is_alo_cross_reject(text)
+            self._log.warning("[자동M] %s HL 선주문 %s %s — %s",
+                              u.value, self._tag(u, index, block, reverse),
+                              "ALO 겹침 거부(재역산)" if cross else "실패", exc)
+            self._apply(u, index, block, on_hl_pre_reject(
+                s, block, time.monotonic(), self._settings,
+                reason=reject_reason_text(text), alo_cross=cross), reverse)
+            s.leg(block).last_reject_at = time.strftime("%H:%M:%S")
+            self._trace(u, index, block, s.leg(block), reverse)
+            return
+        if cloid:
+            self._pending_refs.pop(cloid, None)
+        self._register(oid, ref)
+        late = on_pre_ack(s, block, oid, mono=self._mono)
+        if late:
+            self._log.warning("[자동M] %s HL 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → 즉시 "
+                              "취소", u.value, self._tag(u, index, block, reverse), oid)
+            self._apply(u, index, block, late, reverse)
+        self._log.info("[자동M] %s HL 선주문(ALO) %s %s %d @ %g → #%s",
+                       u.value, self._tag(u, index, block, reverse), act.side.value, act.qty,
+                       act.price, oid)
+
+    async def _place_ls_post(self, u: Underlying, index: int, block: Block, act: Action,
+                             reverse: bool = False) -> None:
+        """HL선(exec §7D) 후주문 — LS SF 지정가 **1회**(테이커: 매수는 상대 매도N호가, 매도는 상대
+        매수N호가 — 공통설정 상대호가 콤보), 재호가·재전송 없음(결정 B). 거부·응답 없음(30초)·요청
+        실패는 **세트 중지**(HL은 잡혔는데 LS가 없으니 헤지가 깨짐; CLAUDE.md §7 재전송 금지)."""
+        book = self._book(u)
+        s, inst = book.sets_of(reverse)[index], self._counterpart(book)
+        assert act.side is not None
+        from .auto_m import rel_quote
+
+        sf_q = next((self._system.quotes.get((u, inst, m)) for m in self._markets(book)
+                     if self._system.quotes.get((u, inst, m)) is not None), None)
+        if sf_q is None or not sf_q.bid or not sf_q.ask:
+            self._log.error("[자동M] %s LS 후주문 불가 %s — SF 호가 없음",
+                            u.value, self._tag(u, index, block, reverse))
+            self._apply(u, index, block, on_ls_post_reject(s, block, "SF 호가 없음"), reverse)
+            return
+        if act.side is Side.BUY:
+            levels = sf_q.asks or [(sf_q.ask, sf_q.ask_qty or 1.0)]
+            price = rel_quote(levels, self._settings.rel_buy) or sf_q.ask
+        else:
+            levels = sf_q.bids or [(sf_q.bid, sf_q.bid_qty or 1.0)]
+            price = rel_quote(levels, self._settings.rel_sell) or sf_q.bid
+        intent = OrderIntent(venue=Venue.LS, underlying=u, instrument=inst, side=act.side,
+                             qty=act.qty, order_type=OrderType.LIMIT, price=price,
+                             source=SOURCE,
+                             tag=self._set_tag(index, block, reverse, self._tag_letter))
+        ref = _OrderRef(u, index, block, "post", reverse)
+        try:
+            oid = await self._system.place(intent)
+        except RestTimeoutError as exc:
+            # 응답 없음 = 결과 모름(LS가 접수했을 수 있음) — 재전송 없이 중지, 사람이 미체결·잔고
+            # 확인
+            reason = f"LS 후주문 응답 없음(시간 초과) — 결과 모름, 미체결·잔고 확인: {exc}"
+            self._log.error("[자동M] %s %s → 세트 중지 (%s)", u.value, reason,
+                            self._tag(u, index, block, reverse))
+            self._apply(u, index, block, on_ls_post_reject(
+                s, block, reject_reason_text(reason, limit=140)), reverse)
+            return
+        except Exception as exc:  # noqa: BLE001 - 거부·요청 실패 → 재전송 없이 중지(결정 B)
+            self._log.error("[자동M] %s LS 후주문 실패 %s — %s",
+                            u.value, self._tag(u, index, block, reverse), exc)
+            self._apply(u, index, block, on_ls_post_reject(
+                s, block, reject_reason_text(str(exc))), reverse)
+            return
+        self._register(oid, ref)
+        self._log.info("[자동M] %s LS 후주문 %s %s %d @ %s → #%s (상대호가 %s)",
+                       u.value, self._tag(u, index, block, reverse), act.side.value, act.qty,
+                       f"{price:,.0f}", oid,
+                       self._settings.rel_buy if act.side is Side.BUY else self._settings.rel_sell)
 
     async def _pick_loan_date(self, u: Underlying, qty: int) -> str:
         """상환 선주문에 실을 대출일 — 신용융자 잔고(대출일별 수량) 중 **오래된 것부터** 수량이 되는
@@ -501,6 +627,10 @@ class AutoMEngine:
                           reverse: bool = False) -> None:
         s = self._set(u, index, reverse)
         assert act.side is not None
+        if self._book(u).hl_first:  # HL선(§7D): 후주문은 LS
+            self._fill_perf.pop((u, index, block, reverse), None)
+            await self._place_ls_post(u, index, block, act, reverse)
+            return
         t_task = time.perf_counter()
         t_fill = self._fill_perf.pop((u, index, block, reverse), None)
         # 후주문도 지정가(Gtc)만(사용자 확정 2026-09-04) — 상대 1호가 ± HP 여유로 taker처럼 잡는다.
@@ -626,6 +756,9 @@ class AutoMEngine:
         # 체결 줄을 먼저 찍고 행동(후주문 발주·중지)을 적용한다 — 행동 줄이 체결 줄보다 앞에 찍혀
         # "체결 전에 판단했다"로 읽힌 실측(2026-09-10 10:45:47.536/537)을 막는다.
         tag = self._tag(u, ref.index, ref.block, ref.reverse)
+        if s.hl_first:
+            self._apply_fill_hl_first(ref, s, leg, order, qty, price, mono, tag)
+            return
         # 발주 때 보관한 est와 **지금 호가창으로 다시 계산한 est**를 나란히(사용자 2026-09-15) —
         # 선체결 순간·후체결 순간에 호가창이 발주 때와 얼마나 달라졌는지 바로 보이게.
         est_now = self._current_est(u, leg)
@@ -675,6 +808,51 @@ class AutoMEngine:
         self._apply(u, ref.index, ref.block, acts, ref.reverse)
         self._trace(u, ref.index, ref.block, leg, ref.reverse)
         self._persist()  # RT·체결차·순잔고 바뀜 → core_state.json (실제 저장은 루프 다음 차례)
+
+    def _apply_fill_hl_first(self, ref: _OrderRef, s: AutoMSet, leg: Leg, order: TrackedOrder,
+                             qty: float, price: float, mono: float, tag: str) -> None:
+        """HL선(exec §7D) 체결 반영 — 선주문(HL, 소수 조각)은 10에 찰 때마다 LS 후주문, 후주문(LS)
+        체결로 판이 끝난다. 기준값(환진입가·S현재가·SF이론가)은 LS 체결 시점(결정 C)."""
+        u = ref.underlying
+        if ref.leg == "pre":
+            acts = on_hl_pre_fill(s, ref.block, qty, price, mono)
+            self.ulog(u).info("체결 %s: HL 선주문 #%s %g @ %g (발주 때 SF호가 %s) → 누적 %g/%d, "
+                              "미헤지 조각 %g, LS 대기 %g | %s",
+                              tag, order.order_id, qty, price, self._fmt_est(leg.pre_est),
+                              leg.pre_filled_f, leg.pre_qty, leg.hl_unhedged, leg.post_pending,
+                              self._ledger(s))
+            self._log.info("[자동M] %s HL 선주문 체결 %s #%s %s %g @ %g (누적 %g/%d, 조각 %g)",
+                           u.value, tag, order.order_id, order.intent.side.value, qty, price,
+                           leg.pre_filled_f, leg.pre_qty, leg.hl_unhedged)
+        else:
+            # 환진입가는 HL 다리 방향으로 고른다(진입 −환 = 매수1호가) — 값은 이 시점(LS 체결)
+            fx = self._system.fx_entry_rate(leg.hl_side)
+            if fx is None:
+                self._log.warning("[자동M] %s LS 후주문 체결 %s #%s — 환진입가 없음 → 이 판은 "
+                                  "환평균·Sprd에서 제외", u.value, tag, order.order_id)
+            stock = self._system.stock_last(u)
+            theory = self._system.stock_futures_theory(u, self._counterpart(self._book(u)))
+            acts = on_ls_post_fill(s, ref.block, int(round(qty)), price, fx, mono,
+                                   self._settings, stock_last=stock, sf_theory=theory)
+            acc = leg.acc
+            sprd = acc.sprd()
+            # 발주 때 본 SF 호가 대비 체결가 — 유리하면 +(매수는 더 싸게, 매도는 더 비싸게)
+            est_txt = self._est_vs_fill(leg.pre_est, order.intent.side, price)
+            self.ulog(u).info(
+                "체결 %s: LS 후주문 #%s SF %g @ %s %s 환진입가 %s S현재가 %s SF이론가 %s → RT %d "
+                "LS대기 %g | %s | 누적 HL %g SF %g 환평균 %s HL평균 %s SF평균 %s Sprd %s",
+                tag, order.order_id, qty, f"{price:,.0f}", est_txt, f"{fx:g}" if fx else "없음",
+                stock, f"{theory:,.0f}" if theory else None, s.rt, leg.post_pending,
+                self._ledger(s), acc.hl_qty, acc.sf_qty, acc.fx_avg(), acc.hl_avg(),
+                acc.sf_avg(), f"{sprd * 100:.3f}%" if sprd is not None else "-(판 미완)")
+            self._log.info("[자동M] %s LS 후주문 체결 %s #%s %s %g @ %s %s (누적 %g/%g, "
+                           "LS 대기 %g)",
+                           u.value, tag, order.order_id, order.intent.side.value, qty,
+                           f"{price:,.0f}", est_txt, order.filled_qty, order.intent.qty,
+                           leg.post_pending)
+        self._apply(u, ref.index, ref.block, acts, ref.reverse)
+        self._trace(u, ref.index, ref.block, leg, ref.reverse)
+        self._persist()
 
     def _current_est(self, u: Underlying, leg: Leg) -> float | None:
         """지금 HL 호가창으로 다시 계산한 est(후주문 방향, 이번 선주문 계약수 × 10) — 판정 때와
@@ -762,14 +940,22 @@ class AutoMEngine:
                     on_pre_cancelled(s, ref.block, mono, self._settings)
                     self._forget(oid)
                 elif status == "rejected":
+                    venue = "HL" if s.hl_first else "LS"
                     self._apply(u, ref.index, ref.block,
                                 on_pre_reject(s, ref.block, mono, self._settings,
-                                              reason="LS 거부 통보(접수 뒤 거부)"), ref.reverse)
+                                              reason=f"{venue} 거부 통보(접수 뒤 거부)"),
+                                ref.reverse)
                     s.leg(ref.block).last_reject_at = time.strftime("%H:%M:%S")
                     self._trace(u, ref.index, ref.block, s.leg(ref.block), ref.reverse)
                     self._forget(oid)
                 elif status == "filled":
                     self._forget(oid)
+            elif s.hl_first and status in ("cancelled", "rejected"):
+                # HL선(§7D) 후주문(LS)이 밖에서 취소·거부됨 — 결정 B: 재전송 없이 세트 중지
+                self._apply(u, ref.index, ref.block, on_ls_post_reject(
+                    s, ref.block, f"LS 후주문 #{oid} {status} (체결 {order.filled_qty:g}/"
+                                  f"{order.intent.qty:g})"), ref.reverse)
+                self._forget(oid)
             elif status in ("cancelled", "rejected"):
                 # 후주문이 밖에서 취소(사람·거래소)되거나 거부됨 — 엔진은 후주문을 취소하지 않는다
                 # (사용자 확정 2026-09-07). 미체결분(소수 그대로)만큼 체결차 → 중지.
@@ -800,6 +986,10 @@ class AutoMEngine:
         if ref.leg == "pre":
             if leg.pre_order_id == oid:
                 on_pre_cancelled(s, ref.block, time.monotonic(), self._settings)
+        elif s.hl_first:  # HL선(§7D) LS 후주문이 장부에서 사라짐 — 결정 B: 중지
+            if leg.post_pending > 1e-9:
+                self._apply(u, ref.index, ref.block, on_ls_post_reject(
+                    s, ref.block, f"LS 후주문 #{oid} 장부에서 사라짐"), ref.reverse)
         elif leg.post_pending > 1e-9:
             self._apply(u, ref.index, ref.block, on_post_partial_reject(
                 s, ref.block, leg.post_pending, mono=time.monotonic(),
@@ -891,6 +1081,15 @@ class AutoMEngine:
                 probe.per_qty, probe.target_qty, probe.rt = saved_qty
             monitor = {"fwd": {"en_sf": None, "en_s": stock_monitor_value(sig, Side.SELL),
                                "ex_sf": stock_monitor_value(sig, Side.BUY)}}
+        elif book.hl_first:
+            # exec §7D: "지금 테이커로 잡아도 나오는 Sprd"(HL 1호가·SF 1호가) — 표시만
+            from .auto_m import hl_first_monitor_value
+
+            sig = self.build_signals(u, book, book.sets[0], Block.ENTRY, datetime.now(),
+                                     self._mono, False)
+            monitor = {"fwd": {"en_sf": hl_first_monitor_value(sig, Block.ENTRY), "en_s": None,
+                               "ex_sf": hl_first_monitor_value(sig, Block.EXIT)},
+                       "rev": {"en_sf": None, "en_s": None, "ex_sf": None}}
         fx_used, fx_src = self._system.usdkrw_effective()  # 지금 HL 환산에 쓰는 환율(화면 표시)
         out = [self._set_row(s) for s in book.sets]
         rev_out = [self._set_row(s) for s in book.rev_sets]  # 역방향 3세트(§7A·§7B)
@@ -932,7 +1131,9 @@ class AutoMEngine:
                 "running": leg.running, "status": leg.status.value,
                 "halt_reason": leg.halt_reason, "pre_order_id": leg.pre_order_id,
                 "pre_price": leg.pre_price, "pre_qty": leg.pre_qty,
-                "pre_filled": leg.pre_filled, "post_pending": leg.post_pending,
+                # HL선(§7D)은 선주문 체결이 소수라 원값(pre_filled_f)과 미헤지 조각을 같이
+                "pre_filled": leg.pre_filled_f if s.hl_first else leg.pre_filled,
+                "hl_unhedged": leg.hl_unhedged, "post_pending": leg.post_pending,
                 # 취소 재전송 한도 초과 → 상태줄 "취소실패 #번호 n회"(exec ㅂ3)
                 "cancel_failed": leg.cancel_alarmed, "cancel_tries": leg.cancel_tries,
                 # 마지막 선주문 거부(시각·사유·횟수) → 상태줄(사용자 2026-09-15)
