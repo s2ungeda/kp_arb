@@ -786,8 +786,10 @@ async def test_hl_order_identified_by_cloid_before_place_returns() -> None:
     assert system.order_book.position_qty(SAMSUNG, Instrument.HL_PERP) == -0.2
 
 
-def _failing_hl_system(grace_s: float) -> tuple[LiveSystem, object, str, list[str]]:
-    """발주 응답 유실(통신 오류) + cloid 조회 실패를 흉내 내는 HL 게이트웨이로 시스템 조립."""
+def _failing_hl_system(grace_s: float, hl_frames: list[str] | None = None,
+                       ) -> tuple[LiveSystem, object, str, list[str]]:
+    """발주 응답 유실(통신 오류) + cloid 조회 실패를 흉내 내는 HL 게이트웨이로 시스템 조립.
+    hl_frames = HL WS가 흘려 줄 프레임(기본: open 통보 + 체결)."""
     from kp_arb.gateways.hl_ws import HLWebSocketClient
     from kp_arb.gateways.mock_hl import MockHLGateway
 
@@ -821,7 +823,9 @@ def _failing_hl_system(grace_s: float) -> tuple[LiveSystem, object, str, list[st
         gateway=MockLSGateway(),  # type: ignore[arg-type]
         order_book=OrderBook(), session=SessionService(),
         stock_ws=LSWebSocketClient(FakeConnector([])),
-        hl_gateway=hl_gw, hl_ws=HLWebSocketClient(FakeConnector([hl_fill, open_upd])),
+        hl_gateway=hl_gw,
+        hl_ws=HLWebSocketClient(FakeConnector(hl_frames if hl_frames is not None
+                                              else [hl_fill, open_upd])),
     )
     system.hl_pending_grace_s = grace_s
     return system, hl_gw, CLOID, noted
@@ -853,6 +857,36 @@ async def test_failed_hl_place_adopts_late_cloid_notice_within_grace() -> None:
     assert cloid not in system._hl_failed
     for t in list(system._bg):
         t.cancel()  # 유예 끝 재조회 작업 정리
+    await _aio.sleep(0)
+
+
+async def test_hl_reject_notice_for_failed_cloid_is_not_treated_as_alive() -> None:
+    # 실측 2026-09-22 11:12: ALO 겹침 거부에도 HL은 주문번호를 붙여 badAloPxRejected 통보를 보냈고,
+    # 코어는 유예 목록의 cloid를 "살아 있음"으로 오판 → 경고·에러 알람 + 주문리스트 거부 행 2줄.
+    # 거부 통보는 죽었음의 확정 — 등록·알람 없이 발주 때 기록한 거부 한 줄만 남는다.
+    import asyncio as _aio
+
+    import pytest
+
+    cloid = "0x" + "ef" * 16  # _failing_hl_system의 CLOID
+    reject_upd = json.dumps({"channel": "orderUpdates", "data": [
+        {"order": {"coin": "xyz:SMSN", "side": "B", "limitPx": "205.2", "sz": "1.0",
+                   "oid": 552443504158, "timestamp": 1.0, "origSz": "1.0", "cloid": cloid},
+         "status": "badAloPxRejected", "statusTimestamp": 1.0}]})
+    system, _hl_gw, cloid, noted = _failing_hl_system(grace_s=5.0, hl_frames=[reject_upd])
+    identified: list[tuple[str, str]] = []
+    system.on_hl_identified.append(lambda c, o: identified.append((c, o)))
+    with pytest.raises(ConnectionError):
+        await system.place(_HL_INTENT)
+    assert len(system.rejects) == 1  # 발주 응답의 거부 한 줄
+    await system.start()
+    await system.wait()  # 거부 통보 도착
+    assert system.order_book.order("552443504158") is None  # 살아 있는 주문으로 등록 안 함
+    assert identified == [] and noted == [] and system.error_seq == 0  # 알람·훅 없음
+    assert cloid not in system._hl_failed  # 유예 목록에서 빠짐(재조회도 안 함)
+    assert len(system.rejects) == 1 and len(system.cancels) == 0  # 두 줄째 없음
+    for t in list(system._bg):
+        t.cancel()
     await _aio.sleep(0)
 
 

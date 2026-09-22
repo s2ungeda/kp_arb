@@ -743,6 +743,16 @@ class LiveSystem:
 
         if not upd.cloid or self.order_book.order(upd.oid) is not None:
             return
+        if upd.is_rejected:
+            # 거부 통보(badAloPxRejected 등)는 "죽었음"의 확정 — 살아 있는 주문으로 등록하지 않는다.
+            # 실측 2026-09-22 11:12: ALO 겹침 거부에도 HL이 주문번호를 붙여 통보를 보내, 발주 실패
+            # 유예 목록의 cloid가 "살아 있음"으로 오판돼 경고·에러 알람이 울렸다. 거부내역은 발주
+            # 응답 때 이미 기록됐다(_record_reject).
+            if self._hl_failed.pop(upd.cloid, None) is not None or upd.cloid in self._hl_pending:
+                order_log.logger_for(Venue.HYPERLIQUID).info(
+                    "HL 거부 통보(%s) #%s ← cloid %s — 발주 실패 확정(살아 있는 주문 아님)",
+                    upd.status, upd.oid, upd.cloid)
+            return
         intent = self._hl_pending.get(upd.cloid)
         if intent is not None:
             self._adopt_identified(upd.cloid, upd.oid, intent, late=False, how=upd.status)
