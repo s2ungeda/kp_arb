@@ -117,6 +117,12 @@ meme-core.exe (32bit, asyncio 메인 스레드)
 - 설치 폴더 `C:\meme`(사용자), Res = `C:\meme\Res`. COM 등록은 `reg.bat`(regsvr32 두 DLL) — 개발 PC는
   Claude가 등록, 운영 PC는 관리자 권한으로 `reg.bat`. 32비트 파이썬에서 `XA_Session.XASession` 생성·
   `IsLoadAPI=True` 확인.
+- **실서버 로그인은 설치 폴더가 DLL 탐색 경로에 있어야 한다**(운영 PC 실측 2026-09-28 17:25, 로그인 거부
+  2006 "공동인증 모듈 초기화에 실패"): XA_Session.dll이 공동인증 모듈(`inisafenet_*.dll`·`inipki_*.dll`·
+  `XecureS.dll` 등, `C:\meme`)을 이름으로 LoadLibrary 하는데 코어 exe는 `dist\meme`에서 떠서 못 찾았다.
+  DevCenter는 설치 폴더에서 실행돼 같은 계정으로 로그인됨. 모의 서버는 인증 모듈을 안 써 개발 PC에선 안 드러남.
+  → `xing_com.register_install_dir`(SetDllDirectory + PATH 앞)을 `Win32ComFactory(install_dir)`가 COM 생성
+  전에 부른다(코어·xing_check 공통).
 - **주식 주문 TR 이름이 다르다:** xing Res는 `CSPAT00600/00700/00800`(REST는 …601/701/801). InBlock1
   필드는 REST와 같고 **`MbrNo`(NXT)·`MgntrnCode`·`LoanDt` 있음** → `XingQueryClient`가 요청·응답 블록
   접두를 바꿔 게이트웨이는 REST 이름 그대로.

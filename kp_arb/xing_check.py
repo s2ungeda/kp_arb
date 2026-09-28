@@ -23,7 +23,7 @@ async def _main(seconds: float) -> int:
     res_dir = Path(creds.path) / "Res"
     log.info("xing 점검 시작 — 서버 %s:%d(%s) Res %s", creds.host, creds.port,
              "모의" if creds.server_type else "실서버", res_dir)
-    session = XingSession(Win32ComFactory(), res_dir)
+    session = XingSession(Win32ComFactory(creds.path), res_dir)  # 설치 폴더 → DLL 탐색 경로
     await session.start()
     t0 = time.perf_counter()
     accounts = await session.login(creds.host, creds.port, creds.user_id, creds.password,

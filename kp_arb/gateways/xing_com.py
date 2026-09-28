@@ -432,12 +432,40 @@ class XingSession:
 
 # ------------------------------------------------------- pywin32 구현 ---
 
+def register_install_dir(install_dir: Path | str) -> None:
+    """xingAPI 설치 폴더를 이 프로세스의 DLL 탐색 경로에 넣는다(SetDllDirectory + PATH 앞).
+
+    실서버 로그인은 XA_Session.dll이 설치 폴더의 공동인증 모듈(inisafenet·inipki·XecureS 등)을
+    **이름으로** LoadLibrary 하는데, 그 탐색 순서엔 실행 파일 폴더·시스템·현재 폴더·PATH만 있다.
+    DevCenter는 설치 폴더에서 실행돼 찾지만 코어(dist\\meme 또는 .venv32)는 못 찾아 로그인 거부
+    2006 "공동인증 모듈 초기화에 실패"(운영 PC 실측 2026-09-28 17:25). 모의 서버는 인증 모듈을
+    안 써서 개발 PC에선 드러나지 않았다. 한 번만 부르면 되고 두 번 불러도 무해(PATH 중복 없음).
+    """
+    import os
+
+    path = str(Path(install_dir))
+    if os.name == "nt":
+        import ctypes
+
+        ctypes.windll.kernel32.SetDllDirectoryW(path)
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    if path not in parts:
+        os.environ["PATH"] = os.pathsep.join([path, *parts]) if parts != [""] else path
+
+
 class Win32ComFactory:
-    """실제 xingAPI COM(pywin32). 32비트 파이썬에서만 import된다."""
+    """실제 xingAPI COM(pywin32). 32비트 파이썬에서만 import된다.
+
+    install_dir(xingAPI 설치 폴더)을 주면 COM 객체를 만들기 전에 DLL 탐색 경로에 넣는다
+    (`register_install_dir` — 실서버 공동인증 모듈 로드용)."""
 
     PROG_SESSION = "XA_Session.XASession"
     PROG_QUERY = "XA_DataSet.XAQuery"
     PROG_REAL = "XA_DataSet.XAReal"
+
+    def __init__(self, install_dir: Path | str | None = None) -> None:
+        if install_dir is not None:
+            register_install_dir(install_dir)
 
     def init_thread(self) -> None:
         import pythoncom

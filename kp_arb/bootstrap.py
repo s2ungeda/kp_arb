@@ -1992,7 +1992,9 @@ async def bootstrap_live(
         from .gateways.xing_com import Win32ComFactory, XingSession
 
         xing_creds = XingCredentials.load()
-        xing_session = XingSession(Win32ComFactory(), Path(xing_creds.path) / "Res")
+        # 설치 폴더를 DLL 탐색 경로에(실서버 공동인증 모듈 — 운영 PC 2006 실측 2026-09-28)
+        xing_session = XingSession(Win32ComFactory(xing_creds.path),
+                                   Path(xing_creds.path) / "Res")
         await xing_session.start()
         _t_login = _time_mod.perf_counter()
         xing_accounts = await xing_session.login(
