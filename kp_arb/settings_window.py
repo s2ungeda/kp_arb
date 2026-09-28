@@ -107,7 +107,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(form, text="환율 이자율(%)").grid(row=1, column=0, sticky="w", pady=2)
     e_fx_rate = tk.Entry(form, width=8, justify="right", font=T.FONT_NUM)
     e_fx_rate.grid(row=1, column=1, sticky="w", padx=6, pady=2)
-    tk.Label(form, text="환율이론가", fg=T.C_MUTED).grid(row=1, column=2, sticky="w")
+    tk.Label(form, text="선물 역산현물가", fg=T.C_MUTED).grid(row=1, column=2, sticky="w")
     tk.Label(form, text="주식선물 이자율(%)").grid(row=2, column=0, sticky="w", pady=2)
     e_eq_rate = tk.Entry(form, width=8, justify="right", font=T.FONT_NUM)
     e_eq_rate.grid(row=2, column=1, sticky="w", padx=6, pady=2)
