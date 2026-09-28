@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -92,12 +92,36 @@ def to_blocks(tr_cd: str, body: Mapping[str, Any] | None,
             continue
         known = set(block.fields)
         rows_list = rows if isinstance(rows, list) else [rows]
-        fixed = [_alias_row(tr_cd, name, r, known) for r in rows_list]
+        fixed = [_alias_row(tr_cd, name, r, known, block.fields) for r in rows_list]
         out[name] = fixed if isinstance(rows, list) else fixed[0]
     return out
 
 
-def _alias_row(tr_cd: str, block: str, row: Mapping[str, Any], known: set[str]) -> dict[str, Any]:
+# Res InBlock에는 있는데 본문이 안 준 필드의 기본값 — REST 서버는 비워도 채워 주지만 xing은
+# 고정길이 레코드를 그대로 보내 실서버가 09604 "입력 데이터 포맷이 맞지않습니다"로 거부(운영 PC 실측
+# 2026-09-29 08:42 CSPAQ22200). 값은 LS OpenAPI 포털의 TR별 요청 예시(RecCnt 1, 구분코드 "0" =
+# 전체/기본). "*"는 모든 TR 공통. 본문이 준 값이 우선.
+INPUT_DEFAULTS: dict[str, dict[str, str]] = {
+    "*": {"RecCnt": "1"},
+    "CSPAQ22200": {"MgmtBrnNo": "", "BalCreTp": "0"},
+    "CSPAQ12300": {"BalCreTp": "0", "CmsnAppTpCode": "0", "D2balBaseQryTp": "0",
+                   "UprcTpCode": "0"},
+}
+
+
+def input_defaults(tr_cd: str, block_fields: Sequence[str],
+                   row: Mapping[str, Any]) -> dict[str, Any]:
+    """row에 없고 Res 블록엔 있는 필드에 INPUT_DEFAULTS를 채운 새 dict. 순수."""
+    out = dict(row)
+    defaults = {**INPUT_DEFAULTS.get("*", {}), **INPUT_DEFAULTS.get(tr_cd, {})}
+    for name in block_fields:
+        if name not in out and name in defaults:
+            out[name] = defaults[name]
+    return out
+
+
+def _alias_row(tr_cd: str, block: str, row: Mapping[str, Any], known: set[str],
+               fields: Sequence[str] = ()) -> dict[str, Any]:
     fixed: dict[str, Any] = {}
     for key, value in row.items():
         if key in known:
@@ -108,7 +132,7 @@ def _alias_row(tr_cd: str, block: str, row: Mapping[str, Any], known: set[str]) 
             fixed[alias] = value
         else:
             _log.warning("xing %s %s: Res에 없는 필드 %s 뺌", tr_cd, block, key)
-    return fixed
+    return input_defaults(tr_cd, fields, fixed)
 
 
 class XingQueryClient:
