@@ -855,14 +855,18 @@ def test_stock_entry_uses_top_quote_formula_and_one_to_one_hedge() -> None:
 
 
 def test_stock_sprd_and_halt_limit() -> None:
-    # 주식 Sprd = (환×HL평균 − S현재가)/S현재가 한 항, 중지 한도 = 1회주문수량(주)
+    # 주식 Sprd = (환×HL평균 − S진입가)/S진입가 한 항 — S는 그 판의 주식 평균 체결가(sf_avg,
+    # 사용자 정정 2026-09-28; 옛 S현재가 s_avg는 쓰지 않는다). 중지 한도 = 1회주문수량(주)
     from kp_arb.auto_m import Accum, diff_limit
 
     s = _stock_set()
     assert diff_limit(s) == 10  # 주식선물이면 100
     acc = Accum(hl_qty=4, hl_px_sum=4 * 74.3, fx_sum=4 * 1350.0, fx_qty=4, sf_qty=4,
-                sf_px_sum=4 * 100_000.0, s_px_sum=4 * 100_000.0, ref_qty=4, ratio=1, stock=True)
-    assert abs(acc.sprd() - (74.3 * 1350.0 - 100_000.0) / 100_000.0) < 1e-12
+                sf_px_sum=4 * 100_000.0, s_px_sum=4 * 101_000.0, ref_qty=4, ratio=1, stock=True)
+    assert abs(acc.sprd() - (74.3 * 1350.0 - 100_000.0) / 100_000.0) < 1e-12  # 체결가 기준
+    no_fill = Accum(hl_qty=4, hl_px_sum=4 * 74.3, fx_sum=4 * 1350.0, fx_qty=4,
+                    s_px_sum=4 * 101_000.0, ref_qty=4, ratio=1, stock=True)
+    assert no_fill.sprd() is None  # 주식 체결가가 없으면 계산 불가(현재가로 대체 안 함)
     assert acc.matched_hl() == 4 and acc.matched_sf() == 4
 
 
@@ -876,7 +880,8 @@ def test_stock_post_fill_records_sprd_base_without_sf_theory() -> None:
                  stock_last=255_000.0, sf_theory=None)
     acc = s.entry.acc
     assert acc.ref_qty == 1 and acc.s_avg() == 255_000.0
-    assert abs(acc.sprd() - (1381.9 * 184.6 - 255_000.0) / 255_000.0) < 1e-12
+    # Sprd의 S는 주식 평균 체결가(254,500) — S현재가(255,000)가 아님(사용자 정정 2026-09-28)
+    assert abs(acc.sprd() - (1381.9 * 184.6 - 254_500.0) / 254_500.0) < 1e-12
     assert s.entry.last_round is not None and s.entry.last_round.sprd() == acc.sprd()
     # 주식선물은 종전대로 둘 다 있어야 기록
     sf = _set()

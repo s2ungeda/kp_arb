@@ -120,6 +120,20 @@ def select_usd_futures_months(
     return out
 
 
+def pick_fx_futures(
+    months: list[tuple[str, int]], code: str
+) -> tuple[str, int] | None:
+    """환율 계산에 쓸 원달러선물 월물 — 공통설정에서 고른 코드(DESIGN-settings §3, 2026-09-28).
+
+    고른 코드가 목록에 있으면 그 월물, 없거나(만기로 빠짐) 빈 문자열이면 최근월물([0]).
+    목록이 비면 None. 순수.
+    """
+    for month in months:
+        if month[0] == code:
+            return month
+    return months[0] if months else None
+
+
 def select_usd_futures(
     rows: list[dict[str, object]], now: datetime
 ) -> tuple[str, int] | None:

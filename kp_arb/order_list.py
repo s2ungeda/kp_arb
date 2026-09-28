@@ -300,9 +300,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         send({"cmd": "manual_cancel", "order_id": oid}, "취소")
 
     # 정정(정정가 입력·선택 정정)은 화면에서 뺐다(사용자 2026-09-11: 쓸 일이 거의 없음). 코어 명령
-    # manual_amend는 그대로 있어 필요하면 다시 붙일 수 있다. 취소 버튼만 필터 줄 오른쪽 끝에.
+    # manual_amend는 그대로 있어 필요하면 다시 붙일 수 있다. 취소 버튼은 출처·세트 콤보 바로 옆
+    # (사용자 2026-09-28 — 오른쪽 끝에 두면 창을 넓혔을 때 멀리 밀려 보이지 않았다).
     tk.Button(filt, text="선택 취소", command=do_cancel).grid(
-        row=0, column=len(_COLS) - 2, columnspan=2, sticky="e", padx=(0, 2))
+        row=0, column=11, sticky="w", padx=(4, 2))
 
     # --- 상태바 (row 2, 맨 아래) ---
     status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)

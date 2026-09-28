@@ -167,8 +167,13 @@ def test_settings_global_command_and_persistence(tmp_path: Path) -> None:
         "fx_carry_rate": 0.02, "eq_carry_rate": 0.04,
         "sound_fill": {"enabled": True, "path": "C:/s/fill.wav"},
         "sound_ws": {"enabled": False, "path": "C:/s/ws.wav"},
+        "fx_futures_code": " A756A000 ",  # 환율 계산용 원달러선물 월물(2026-09-28)
     })
     assert res["ok"]
+    assert state.settings.fx_futures_code == "A756A000"
+    # 값을 안 보내면(콤보가 빈 화면) 기존 선택 유지, 빈 문자열이면 최근월물로 되돌림
+    assert apply_command(state, {"cmd": "settings_global"})["ok"]
+    assert state.settings.fx_futures_code == "A756A000"
     assert state.settings.hl_daily_limit_usdc == 5000.0
     assert state.settings.fx_carry_rate == 0.02 and state.settings.eq_carry_rate == 0.04
     assert state.settings.sound_fill.enabled
@@ -181,6 +186,9 @@ def test_settings_global_command_and_persistence(tmp_path: Path) -> None:
     assert restored.settings.sound_fill.enabled
     assert restored.settings.sound_fill.path == "C:/s/fill.wav"
     assert not restored.settings.sound_ws.enabled
+    assert restored.settings.fx_futures_code == "A756A000"
+    assert apply_command(state, {"cmd": "settings_global", "fx_futures_code": ""})["ok"]
+    assert state.settings.fx_futures_code == ""
 
 
 def test_load_state_missing_or_corrupt(tmp_path: Path) -> None:
@@ -208,6 +216,7 @@ async def test_hl_trades_endpoint_returns_newest_first_or_empty() -> None:
         def set_carry_rates(self, fx: float, eq: float) -> None: ...
         def set_fx_fut_window(self, start: str, end: str, start2: str = "",
                               end2: str = "") -> None: ...
+        def set_fx_futures_code(self, code: str) -> None: ...
 
     client = TestClient(TestServer(make_app(CoreState(), system=_Sys())))  # type: ignore[arg-type]
     await client.start_server()

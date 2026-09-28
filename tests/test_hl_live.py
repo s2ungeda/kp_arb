@@ -88,6 +88,21 @@ class StubExchange:
         finally:
             self._exit()
 
+    def bulk_cancel(self, reqs: list[dict[str, Any]]) -> dict[str, Any]:
+        """여러 건 한 요청 — statuses는 건별 "success" 또는 {"error": …}(bulk_fail_oids)."""
+        self._enter()
+        try:
+            self.bulk_calls: list[list[tuple[str, int]]] = getattr(self, "bulk_calls", [])
+            self.bulk_calls.append([(r["coin"], r["oid"]) for r in reqs])
+            fails = getattr(self, "bulk_fail_oids", set())
+            statuses: list[Any] = [
+                {"error": f"Order {r['oid']} was never placed"} if r["oid"] in fails
+                else "success" for r in reqs]
+            return {"status": "ok",
+                    "response": {"type": "cancel", "data": {"statuses": statuses}}}
+        finally:
+            self._exit()
+
     def update_leverage(self, leverage: int, name: str, is_cross: bool) -> dict[str, Any]:
         self.leverage_calls: list[tuple[int, str, bool]] = getattr(self, "leverage_calls", [])
         self.leverage_calls.append((leverage, name, is_cross))
@@ -245,6 +260,22 @@ async def test_cancel_requires_tracked_coin() -> None:
     assert ex.cancels == [("xyz:SMSN", 485478010353)]
     with pytest.raises(HLError):
         await gw.cancel_order("999")  # 미지 주문 — coin을 모름
+
+
+async def test_cancel_orders_bulk_one_request_with_per_order_status() -> None:
+    # 일괄 취소(사용자 2026-09-28): 여러 건을 cancel 액션 하나(cancels 배열)로 — 요청 1번.
+    # 건별 결과는 statuses 순서대로, coin을 모르는 번호는 보내지 않고 사유만 돌려준다.
+    gw, ex, _ = _gw()
+    oid = await gw.place_order(_intent())
+    res = await gw.cancel_orders([oid, "999"])
+    assert ex.bulk_calls == [[("xyz:SMSN", 485478010353)]]  # 한 요청, 미지 주문은 제외
+    assert res[0] is None and res[1] is not None and "999" in res[1]
+    # 건별 거부 — 그 자리에 사유, 요청은 여전히 한 번
+    ex.bulk_fail_oids = {485478010353}
+    res2 = await gw.cancel_orders([oid])
+    assert len(ex.bulk_calls) == 2 and res2[0] is not None and "never placed" in res2[0]
+    assert await gw.cancel_orders([]) == []  # 빈 목록은 요청 없음
+    assert len(ex.bulk_calls) == 2
 
 
 async def test_hl_actions_are_serialized_with_1ms_gap() -> None:

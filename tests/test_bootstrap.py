@@ -499,6 +499,66 @@ def test_fx_price_only_near_month_feeds_theory() -> None:
     assert system.usdkrw_theory is not None    # 최근월물만 이론가 갱신
 
 
+def test_set_fx_futures_code_switches_month_for_theory_and_entry_rate() -> None:
+    # 공통설정 원달러선물 콤보(사용자 2026-09-28): 고른 월물이 역산현물가·환진입가에 쓰인다.
+    # 바꾸는 즉시 저장해 둔 그 월물 값으로 다시 계산하고, 목록에 없는 코드는 최근월물.
+    from datetime import datetime
+
+    system, _, _ = _system([])
+    system._fx_futures = ("175W09", 202609)
+    system._fx_months = [("175W09", 202609), ("175W10", 202610)]
+    system._apply_fx_price("175W09", 1390.0)
+    system._apply_fx_quote("175W09", 1389.9, 1390.1)
+    system._apply_fx_price("175W10", 1392.0)   # 차근은 저장만
+    system._apply_fx_quote("175W10", 1391.9, 1392.1)
+    near_theory = system.usdkrw_theory
+    assert near_theory is not None and system.fx_futures_code() == "175W09"
+    assert system.fx_futures_months() == [("175W09", 202609), ("175W10", 202610)]
+
+    system.set_fx_futures_code("175W10")       # 차근으로 — 틱을 기다리지 않고 바로 반영
+    assert system.fx_futures_code() == "175W10"
+    assert system.usdkrw_futures == 1392.0
+    assert system.usdkrw_theory is not None and system.usdkrw_theory > near_theory
+    inside = datetime(2026, 9, 28, 10, 0)     # 우선시간 안 → 환진입가 = 고른 월물의 역산현물가
+    assert system.fx_entry_rate(inside) == system.usdkrw_theory
+    system._apply_fx_price("175W09", 1300.0)   # 이제 9월물 시세는 역산현물가에 안 먹인다
+    assert system.usdkrw_futures == 1392.0
+
+    system.set_fx_futures_code("175W08")       # 목록에 없는 코드(만기로 빠짐) → 최근월물
+    assert system.fx_futures_code() == "175W09"
+    system.set_fx_futures_code("175W10")
+    system.set_fx_futures_code("")             # 빈 값 = 최근월물
+    assert system.fx_futures_code() == "175W09"
+
+
+def test_live_snapshot_exposes_fx_months_for_settings_combo() -> None:
+    # 공통설정 콤보가 읽는 값(live.fx_futures): 월물 목록(근·차근 순)과 지금 쓰는 월물 코드.
+    # 동시호가 창은 /manual_state의 fx_auction.code로 같은 월물을 본다.
+    from kp_arb.core_server import live_snapshot, manual_snapshot
+    from kp_arb.strategy_core import CoreState
+
+    system, _, _ = _system([])
+    system._fx_futures = ("175W09", 202609)
+    system._fx_months = [("175W09", 202609), ("175W10", 202610)]
+    system.set_fx_futures_code("175W10")
+    fx = live_snapshot(CoreState(), system, None)["fx_futures"]
+    assert fx["months"] == [{"code": "175W09", "ym": 202609}, {"code": "175W10", "ym": 202610}]
+    assert fx["code"] == "175W10"
+    assert manual_snapshot(system)["fx_auction"]["code"] == "175W10"
+
+
+def test_set_fx_futures_code_without_price_is_uncomputable() -> None:
+    # 고른 월물의 시세가 아직 없으면 역산현물가는 없음 — 옛 월물 값이 남아 있으면 안 된다.
+    system, _, _ = _system([])
+    system._fx_futures = ("175W09", 202609)
+    system._fx_months = [("175W09", 202609), ("175W10", 202610)]
+    system._apply_fx_price("175W09", 1390.0)
+    system._apply_fx_quote("175W09", 1389.9, 1390.1)
+    assert system.usdkrw_theory is not None
+    system.set_fx_futures_code("175W10")
+    assert system.usdkrw_theory is None and system.usdkrw_futures is None
+
+
 def test_fx_theory_is_mean_of_last_and_top_quotes_or_none() -> None:
     # 사용자 확정 2026-09-15: 환율이론가 = (현재가 + 매수1호가 + 매도1호가)/3 × (1 + 연이자율 ×
     # 잔존일/365). 셋 중 하나라도 없으면 계산불가(None) → 판정 환율 없음 → 자동M 세트 중지.
@@ -1071,6 +1131,42 @@ def test_usdkrw_effective_priority_by_futures_window() -> None:
     assert system.usdkrw_effective(outside) == (1_498.5, "현물")
     # 07:30 전은 계산하지 않는다
     assert system.usdkrw_effective(datetime(2026, 7, 20, 7, 29, 59)) == (None, "계산불가")
+
+
+async def test_cancel_many_batches_hl_and_updates_local_book() -> None:
+    # 일괄 취소(2026-09-28): HL은 게이트웨이 cancel_orders 한 번에 묶고(요청 한도), 성공 건은 취소
+    # 통보 채널이 없어 장부를 바로 갱신. 실패 건은 사유를 돌려주고 거부내역에 남긴다. 모르는
+    # 번호는 사유만. LS는 한 건씩.
+    from collections.abc import Sequence
+
+    from kp_arb.gateways.mock_hl import MockHLGateway
+
+    class BulkHL(MockHLGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batches: list[list[str]] = []
+
+        async def cancel_orders(self, order_ids: Sequence[str]) -> list[str | None]:
+            self.batches.append(list(order_ids))
+            return [None if oid != "H2" else "Order H2 was never placed" for oid in order_ids]
+
+    hl = BulkHL()
+    system, _, _ = _system([])
+    system._hl = hl
+    for oid in ("H1", "H2", "H3"):
+        system.order_book.track(oid, OrderIntent(
+            venue=Venue.HYPERLIQUID, underlying=SAMSUNG, instrument=Instrument.HL_PERP,
+            side=Side.SELL, qty=1, price=1000.0))
+    res = await system.cancel_many(["H1", "H2", "H3", "NOPE"])
+    assert hl.batches == [["H1", "H2", "H3"]]                    # HL 세 건이 한 요청
+    assert res[0] == ("H1", None) and res[2] == ("H3", None)
+    assert res[1][0] == "H2" and res[1][1] is not None and "never placed" in res[1][1]
+    assert res[3][0] == "NOPE" and res[3][1] is not None
+    assert system.order_book.order("H1") is None or not system.order_book.order("H1").is_open
+    assert system.order_book.order("H3") is None or not system.order_book.order("H3").is_open
+    h2 = system.order_book.order("H2")
+    assert h2 is not None and h2.is_open                         # 실패 건은 장부에 남음
+    assert any(r.get("order_id") == "H2" for r in system.rejects)  # 거부내역에 기록
 
 
 def test_disparity_board_computes_pairs() -> None:

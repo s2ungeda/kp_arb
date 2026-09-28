@@ -234,11 +234,13 @@ class Accum:
         쓸 수 없었음.)"""
         fx, hl, sf = self.fx_avg(), self.hl_avg(), self.sf_avg()
         stock, theory = self.s_avg(), self.theory_avg()
-        if self.stock:  # 주식(exec §7C, 사용자 확정 2026-09-17): 국내 다리가 현물 자체 → HL 항만
-            if None in (fx, hl, stock):
+        if self.stock:  # 주식(exec §7C): 국내 다리가 현물 자체 → HL 항만. 분모·빼는 값은 그 판의
+            # **주식 평균 체결가**(sf_avg — 주식선물의 SF 평균가와 같은 칸; 사용자 정정 2026-09-28,
+            # 옛 "S현재가"는 폐기)
+            if None in (fx, hl, sf):
                 return None
-            assert fx is not None and hl is not None and stock is not None
-            return (fx * hl - stock) / stock
+            assert fx is not None and hl is not None and sf is not None
+            return (fx * hl - sf) / sf
         if None in (fx, hl, sf, stock, theory):
             return None
         assert fx is not None and hl is not None and sf is not None

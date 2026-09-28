@@ -222,18 +222,62 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # 체크박스(세로) + 매수(크게) 버튼 — 둘 다 arow 바닥에 정렬(anchor="s")
     arow = _row()
+    # 체크 열은 버튼 묶음(주문+일괄 취소)과 같은 높이로 늘리고(fill="y"), 체크 4개를 그 안에
+    # **같은 간격**으로 놓는다 — 첫 체크 윗선 = 주문 버튼 윗선, 마지막 체크 아랫선 = 일괄 취소
+    # 아랫선(사용자 2026-09-28). 높이는 그려진 뒤에야 알 수 있어 <Configure> 때 place로 배치한다.
+    # 프레임 자체는 요청 크기가 없으니(place 자식) 행 높이는 버튼 묶음이 정한다.
     checks = tk.Frame(arow)
-    checks.pack(side="left", anchor="s")
+    checks.pack(side="left", fill="y")
+    checks.pack_propagate(False)
     reduce_var = tk.BooleanVar(value=False)
     post_var = tk.BooleanVar(value=False)
     oneclick_var = tk.BooleanVar(value=True)  # 안전 잠금 — 체크돼야만 발송(기본 체크)
-    tk.Checkbutton(checks, text="Rdce", variable=reduce_var).pack(anchor="w")
-    tk.Checkbutton(checks, text="Post", variable=post_var).pack(anchor="w")
-    tk.Checkbutton(checks, text="주문", variable=oneclick_var).pack(anchor="w")
-    btn_order = tk.Button(arow, text="매수주문", width=9,
+    # '일취' — 일괄 취소 안전 잠금(사용자 2026-09-28): 체크돼 있을 때만 [일괄 취소]가 나가고,
+    # 한 번 보내면 다시 꺼진다(실수로 연타해도 두 번째부터는 막힘). 화면 저장에서 제외 — 열 때마다
+    # 꺼진 상태.
+    bulk_var = tk.BooleanVar(value=False)
+    check_boxes = [
+        tk.Checkbutton(checks, text=text, variable=var, pady=0, bd=0, highlightthickness=0)
+        for text, var in (("Rdce", reduce_var), ("Post", post_var),
+                          ("주문", oneclick_var), ("일취", bulk_var))]
+    checks.config(width=max(c.winfo_reqwidth() for c in check_boxes))
+
+    def _spread_checks(_e: object = None) -> None:
+        """체크 열 높이가 정해지면 4개를 위아래 끝에 맞춰 균등 배치(남는 높이를 3등분)."""
+        total = checks.winfo_height()
+        heights = [c.winfo_reqheight() for c in check_boxes]
+        gap = max(0.0, (total - sum(heights)) / (len(check_boxes) - 1))
+        y = 0.0
+        for c, h in zip(check_boxes, heights, strict=True):
+            c.place(x=0, y=round(y))
+            y += h + gap
+
+    checks.bind("<Configure>", _spread_checks)
+    # 주문 버튼 + 바로 아래 [일괄 취소](사용자 2026-09-28): 옛 주문 버튼 높이(ipady 8)의 1/3쯤을
+    # 줄여 그 자리에 취소 버튼을 넣는다. 버튼 크기는 고정, 체크 열과는 바닥 정렬(anchor="s").
+    bcol = tk.Frame(arow)
+    bcol.pack(side="left", anchor="s", padx=(8, 0))
+    btn_order = tk.Button(bcol, text="매수주문", width=9,
                           fg="white", bg="#c00000", activeforeground="white",
                           activebackground="#a00000", font=("Malgun Gothic", 14, "bold"))
-    btn_order.pack(side="left", anchor="s", padx=(8, 0), ipady=8)
+    btn_order.pack(side="top", fill="x", ipady=1)
+
+    def do_cancel_all() -> None:
+        """이 종목 HL 미체결 전부 취소(코어 manual_cancel_all) — 원클릭 체크와 무관(취소는 안전)."""
+        if not bulk_var.get():  # 안전 잠금 — '일취' 체크돼야만 발송
+            set_status("일괄 취소는 '일취' 체크 후 누르세요", err=True)
+            return
+        under = active["underlying"] or UNDER_MAP.get(cb_under.get())
+        if not under:
+            set_status("종목을 먼저 고르세요", err=True)
+            return
+        bulk_var.set(False)  # 한 번 보내면 다시 잠금(연타 방지)
+        send({"cmd": "manual_cancel_all", "underlying": under, "instrument": INSTRUMENT},
+             "일괄 취소")
+
+    btn_cancel_all = tk.Button(bcol, text="일괄 취소", font=("Malgun Gothic", 9),
+                               command=do_cancel_all)
+    btn_cancel_all.pack(side="top", fill="x", pady=(2, 0))
 
     # 중: 오더북 — 숫자 볼드·1축소, 잔량 폭 3자리 확대. (격자선은 렌더 확인 후)
     ttk.Style().configure("Treeview", font=("Malgun Gothic", 10, "bold"), rowheight=22)

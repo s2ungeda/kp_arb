@@ -219,6 +219,8 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
                 parse_hhmm(fut_e2)
             g.fx_fut_start, g.fx_fut_end = fut_s, fut_e
             g.fx_fut_start2, g.fx_fut_end2 = fut_s2, fut_e2
+            # 환율 계산용 원달러선물 월물(2026-09-28) — 키 없으면 기존 값 유지, 빈 문자열 = 최근월물
+            g.fx_futures_code = str(body.get("fx_futures_code", g.fx_futures_code)).strip()
             for name, snd in (("sound_fill", g.sound_fill),
                               ("sound_error", g.sound_error), ("sound_ws", g.sound_ws)):
                 raw = body.get(name)
@@ -290,7 +292,11 @@ def live_snapshot(
             "fx_src": fx_src,
             "position": runtime.virtual_position if runtime is not None else 0,
         }
-    return {"connected": True, "rehearsal": True, "screens": screens}
+    # 공통설정 원달러선물 콤보용(2026-09-28) — 월물 목록(근·차근 순)과 지금 환율 계산에 쓰는 월물
+    fx_futures = {"months": [{"code": c, "ym": ym} for c, ym in system.fx_futures_months()],
+                  "code": system.fx_futures_code()}
+    return {"connected": True, "rehearsal": True, "screens": screens,
+            "fx_futures": fx_futures}
 
 
 # 수동 주문창이 다루는 instrument와, 호가/현재가를 고를 시장 우선순위.
@@ -463,6 +469,9 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
     return {"connected": True, "symbols": symbols, "open_orders": open_orders,
             "fills": fills, "cancels": cancels, "rejects": rejects,
             "fx_auction": {"running": fx_running, "codes": fx_codes,
+                           # 지금 쓰는 월물(공통설정 선택, 2026-09-28) — 동시호가 창 표시용
+                           "code": (system.fx_futures_code()
+                                    if hasattr(system, "fx_futures_code") else None),
                            "hedges": fx_hedges}}
 
 
@@ -716,6 +725,26 @@ async def _manual_command(
             _olog.warning("수동주문 취소 실패: #%s — %s", order_id, exc)  # #3 실패 로그
             return _fail([f"취소 실패: {exc}"])
         return _ok()
+    if cmd == "manual_cancel_all":  # 일반주문창 [일괄 취소] — 그 종목·상품 미체결 전부(2026-09-28)
+        try:
+            underlying = Underlying(str(body["underlying"]))
+            instrument = Instrument(str(body["instrument"]))
+        except (KeyError, ValueError) as exc:
+            return _fail([f"잘못된 일괄 취소 인자: {exc}"])
+        targets = [o.order_id for o in system.order_book.open_orders()
+                   if o.intent.underlying is underlying and o.intent.instrument is instrument]
+        # HL은 cancel 액션 하나에 묶어 한 요청(요청 한도 절약), LS는 한 건씩 — cancel_many가 가른다.
+        # 하나가 실패해도 나머지는 계속(실패는 세어서 보고).
+        results = await system.cancel_many(targets) if targets else []
+        cancelled = sum(1 for _oid, err in results if err is None)
+        failed = [f"#{oid}: {err}" for oid, err in results if err is not None]
+        for item in failed:
+            _olog.warning("일괄 취소 실패: %s", item)
+        _olog.info("일괄 취소 [일반주문창] %s %s — 대상 %d건, 취소 %d건, 실패 %d건",
+                   underlying.value, instrument.value, len(targets), cancelled, len(failed))
+        if failed:
+            return _fail([f"일괄 취소 {cancelled}/{len(targets)}건 — 실패: {'; '.join(failed)}"])
+        return {"ok": True, "cancelled": cancelled, "failed": 0}
     if cmd == "manual_leverage":  # 레버리지·마진모드 변경(주문과 별개, §1-3)
         try:
             underlying = Underlying(str(body["underlying"]))
@@ -1119,6 +1148,7 @@ def make_app(
         system.set_carry_rates(state.settings.fx_carry_rate, state.settings.eq_carry_rate)
         system.set_fx_fut_window(state.settings.fx_fut_start, state.settings.fx_fut_end,
                                   state.settings.fx_fut_start2, state.settings.fx_fut_end2)
+        system.set_fx_futures_code(state.settings.fx_futures_code)
 
     def state_payload() -> dict[str, Any]:
         """/state 본문 — HTTP와 WS `state` 채널(§12.1)이 같은 함수를 쓴다."""
@@ -1183,9 +1213,11 @@ def make_app(
             system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)  # 한도 즉시 반영
             system.set_carry_rates(  # 이자율 즉시 반영(이론가 재계산에 반영)
                 state.settings.fx_carry_rate, state.settings.eq_carry_rate)
-            system.set_fx_fut_window(  # 현물환율 사용시간(2구간) 즉시 반영
+            system.set_fx_fut_window(  # 외환선물 우선시간(2구간) 즉시 반영
                 state.settings.fx_fut_start, state.settings.fx_fut_end,
                 state.settings.fx_fut_start2, state.settings.fx_fut_end2)
+            # 환율 계산용 원달러선물 월물 즉시 반영(역산현물가 재계산)
+            system.set_fx_futures_code(state.settings.fx_futures_code)
         if payload.get("cmd") == "shutdown" and result.get("ok") and on_shutdown:
             # 응답을 먼저 보내고 잠시 뒤 종료 (화면이 결과를 받을 시간)
             asyncio.get_running_loop().call_later(0.2, on_shutdown)

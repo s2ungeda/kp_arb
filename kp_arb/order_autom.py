@@ -1748,8 +1748,12 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # 호가단위가 바뀌면 판정 기준이 통째로 바뀜). 종목 콤보 잠금은 사용자 2026-09-17 확정
         # (09-08 "항상 열림"은 폐기 — 다른 종목은 다른 창에서 종목을 먼저 고른 뒤 돌린다).
         # 거래소 콤보(주식)는 잠그지 않는다(사용자 2026-09-17) — 고르면 바로 코어에 간다.
+        # 주식 화면은 종목 콤보를 잠그지 않는다(사용자 2026-09-28, exec §7C) — 실행 중에도 다른
+        # 종목 상태를 보러 갈 수 있다('적'·호가단위는 그대로 잠금).
         running = _any_running()
-        for cb in (cb_under, cb_agg, cb_month):
+        lock_under = running and spec.product != "stock"
+        cb_under.config(state="disabled" if lock_under else "readonly")
+        for cb in (cb_agg, cb_month):
             cb.config(state="disabled" if running else "readonly")
         btn_apply.config(state="disabled" if running else "normal")
         if details:  # 진행 중인 세트의 상세(선주문 번호·가격·체결·HL 대기·중지 사유) — 최근 순

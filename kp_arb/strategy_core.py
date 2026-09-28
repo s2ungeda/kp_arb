@@ -166,6 +166,9 @@ class GlobalSettings:
     # 2구간 — 비우면 미사용. 두 구간 중 하나라도 안이면 "안".
     fx_fut_start2: str = ""
     fx_fut_end2: str = ""
+    # 환율 역산현물가·환진입가·동시호가 대응주문에 쓸 원달러선물 월물 코드(DESIGN-settings §3,
+    # 사용자 2026-09-28) — 빈 문자열 = 최근월물.
+    fx_futures_code: str = ""
     sound_fill: SoundSetting = field(default_factory=SoundSetting)   # 주문 체결 시
     sound_error: SoundSetting = field(default_factory=SoundSetting)  # 에러(발주 거부·실패)
     sound_ws: SoundSetting = field(default_factory=SoundSetting)     # WS 끊김
@@ -342,6 +345,9 @@ def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
             except ValueError:
                 continue
             setattr(s, name, val)
+    code = raw.get("fx_futures_code")
+    if isinstance(code, str):
+        s.fx_futures_code = code.strip()
     for name, snd in (("sound_fill", s.sound_fill), ("sound_error", s.sound_error),
                       ("sound_ws", s.sound_ws)):
         rs = raw.get(name)

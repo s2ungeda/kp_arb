@@ -127,6 +127,18 @@ class HLGateway(ABC):
     @abstractmethod
     async def cancel_order(self, order_id: str) -> None: ...
 
+    async def cancel_orders(self, order_ids: Sequence[str]) -> list[str | None]:
+        """여러 건 취소 → 건별 실패 사유(None = 성공). 기본은 한 건씩(cancel_order) — HL 라이브는
+        `cancel` 액션의 cancels 배열로 **한 요청**에 묶는다(요청 한도 절약, 사용자 2026-09-28)."""
+        out: list[str | None] = []
+        for oid in order_ids:
+            try:
+                await self.cancel_order(oid)
+                out.append(None)
+            except Exception as exc:  # noqa: BLE001 - 건별 사유를 그대로 돌려준다
+                out.append(str(exc))
+        return out
+
     async def amend_order(
         self, order_id: str, *, qty: float | None = None, price: float | None = None,
         reduce_only: bool = False, post_only: bool = False,

@@ -106,3 +106,14 @@ def test_select_usd_futures_months_near_and_next() -> None:
     # count=1이면 최근월물 하나만
     assert select_usd_futures_months(rows, datetime(2026, 7, 7, 10, 0), count=1) == [
         ("175W07", 202607)]
+
+
+def test_pick_fx_futures_by_code_or_near() -> None:
+    # 공통설정 원달러선물 콤보(2026-09-28): 고른 코드의 월물, 없거나 빈 값이면 최근월물.
+    from kp_arb.theory import pick_fx_futures
+
+    months = [("175W09", 202609), ("175W10", 202610)]
+    assert pick_fx_futures(months, "175W10") == ("175W10", 202610)
+    assert pick_fx_futures(months, "") == ("175W09", 202609)
+    assert pick_fx_futures(months, "175W08") == ("175W09", 202609)  # 만기로 빠진 코드
+    assert pick_fx_futures([], "175W10") is None

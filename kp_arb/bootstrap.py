@@ -64,6 +64,7 @@ from .theory import (
     in_time_window,
     is_rolled,
     parse_hhmm,
+    pick_fx_futures,
     select_usd_futures_months,
 )
 from .ticks import ceil_to_tick, floor_to_tick, maker_cap, tick_for
@@ -535,6 +536,39 @@ class LiveSystem:
         # 저장된 최근월물 가격으로 즉시 다시 계산한다. (주식선물 이론가는 호출 때 계산하므로 무관)
         self._recompute_fx_theory()
 
+    def set_fx_futures_code(self, code: str) -> None:
+        """환율 계산(역산현물가·환진입가)·동시호가 대응주문에 쓸 원달러선물 월물 반영 — 코어가
+        공통설정에서 주입(DESIGN-settings §3, 사용자 2026-09-28). 빈 문자열·목록에 없는 코드는
+        최근월물.
+
+        월물을 바꾸면 저장해 둔 그 월물의 현재가·1호가로 역산현물가를 바로 다시 계산한다
+        (값이 아직 없으면 없음 — 다음 수신 때 채워진다).
+        """
+        import logging
+
+        picked = pick_fx_futures(self._fx_months, code)
+        log = logging.getLogger("kp_arb.bootstrap")
+        if code and (picked is None or picked[0] != code):
+            log.warning("공통설정 원달러선물 %s 은 월물 목록에 없음(만기 등) — 최근월물 %s 사용",
+                        code, picked[0] if picked is not None else "없음")
+        if picked == self._fx_futures:
+            return
+        log.info("환율 계산 원달러선물 월물 변경: %s → %s",
+                 self._fx_futures[0] if self._fx_futures is not None else "없음",
+                 picked[0] if picked is not None else "없음")
+        self._fx_futures = picked
+        self.usdkrw_futures = (self.fx_futures_price.get(picked[0])
+                               if picked is not None else None)
+        self._recompute_fx_theory()
+
+    def fx_futures_months(self) -> list[tuple[str, int]]:
+        """구독 중인 원달러선물 월물 (코드, 만기YYYYMM) 근·차근 순 — 공통설정 콤보용."""
+        return list(self._fx_months)
+
+    def fx_futures_code(self) -> str | None:
+        """지금 환율 계산·동시호가 대응주문에 쓰는 원달러선물 월물 코드(없으면 None)."""
+        return self._fx_futures[0] if self._fx_futures is not None else None
+
     def _apply_fx_quote(self, code: str, bid: float, ask: float) -> None:
         """원달러선물 1호가 수신 → 저장(환진입가용) + 최근월물이면 환율이론가 재계산(2026-09-15)."""
         self.fx_futures_quote[code] = (bid, ask)
@@ -982,6 +1016,36 @@ class LiveSystem:
                 raise
             self.order_book.on_cancel(order_id)
 
+    async def cancel_many(self, order_ids: Sequence[str]) -> list[tuple[str, str | None]]:
+        """여러 건 취소 → (주문번호, 실패 사유|None) 목록. HL은 게이트웨이 cancel_orders로
+        **한 요청**에 묶고(요청 한도, 사용자 2026-09-28), LS는 한 건씩(cancel). 모르는 번호는
+        사유만. HL 성공 건은 취소 통보 채널이 없어 로컬 장부를 바로 갱신한다(cancel과 같음)."""
+        result: dict[str, str | None] = {}
+        hl_ids: list[str] = []
+        for oid in order_ids:
+            order = self.order_book.order(oid)
+            if order is None:
+                result[oid] = f"unknown order {oid}"
+            elif order.intent.venue is Venue.LS:
+                try:
+                    await self.cancel(oid)
+                    result[oid] = None
+                except Exception as exc:  # noqa: BLE001 - 건별 사유
+                    result[oid] = str(exc)
+            else:
+                hl_ids.append(oid)
+        if hl_ids:
+            assert self._hl is not None
+            errors = await self._hl.cancel_orders(hl_ids)
+            for oid, err in zip(hl_ids, errors, strict=True):
+                result[oid] = err
+                order = self.order_book.order(oid)
+                if err is None:
+                    self.order_book.on_cancel(oid)
+                elif order is not None:
+                    self._record_reject(order.intent, err, kind="취소", order_id=oid)
+        return [(oid, result[oid]) for oid in order_ids]
+
     async def update_leverage(
         self, underlying: Underlying, leverage: int, *, is_cross: bool
     ) -> None:
@@ -1366,7 +1430,6 @@ class LiveSystem:
 
         if self._fx_futures is None:
             return
-        code, _ = self._fx_futures
         log = logging.getLogger("kp_arb.bootstrap")
         failures = 0
         # (옛 2초 대기 삭제 2026-09-14: t2111이 한도 표에 없어 근거 없는 기본 2회에 막혔던 것.
@@ -1378,9 +1441,12 @@ class LiveSystem:
                 await asyncio.sleep(60.0)
                 continue
             try:
-                price = await self._gw.get_fx_futures_price(code)  # 통화선물 주간장 예비 갱신
-                if price is not None:
-                    self._apply_fx_price(code, price)  # code=최근월물
+                # 월물은 돌 때마다 다시 읽는다 — 공통설정에서 도중에 바뀔 수 있다(2026-09-28)
+                picked = self._fx_futures
+                if picked is not None:  # 통화선물 주간장 예비 갱신(고른 월물)
+                    price = await self._gw.get_fx_futures_price(picked[0])
+                    if price is not None:
+                        self._apply_fx_price(picked[0], price)
                 failures = 0
             except Exception:  # noqa: BLE001
                 failures += 1

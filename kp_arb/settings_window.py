@@ -28,6 +28,18 @@ def is_time_text(text: str) -> bool:
     return int(parts[0]) < 24 and all(int(p) < 60 for p in parts[1:])
 
 
+def fx_month_label(code: str, ym: int, index: int) -> str:
+    """원달러선물 콤보 표시 — '최근월물 A756A000 (10월)' / '차근월물 …'(사용자 2026-09-28). 순수."""
+    kind = "최근월물" if index == 0 else "차근월물"
+    return f"{kind} {code} ({ym % 100}월)"
+
+
+def fx_month_code(label: str) -> str:
+    """콤보 표시값 → 월물 코드(둘째 토막). 빈 값이면 빈 문자열. 순수."""
+    parts = label.split()
+    return parts[1] if len(parts) >= 2 else ""
+
+
 def _fmt_amount(v: float) -> str:
     """금액을 3자리 콤마로 — 지수표현(5e+09) 방지. 정수면 소수점 없음."""
     return f"{int(v):,}" if float(v).is_integer() else f"{v:,.2f}"
@@ -37,7 +49,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     """공통설정 창 실행."""
     import threading
     import tkinter as tk
-    from tkinter import filedialog
+    from tkinter import filedialog, ttk
 
     watch_parent_exit()  # 메인이 죽으면 이 창도 종료(고아 방지)
     root = tk.Tk()
@@ -108,16 +120,25 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     e_fx_rate = tk.Entry(form, width=8, justify="right", font=T.FONT_NUM)
     e_fx_rate.grid(row=1, column=1, sticky="w", padx=6, pady=2)
     tk.Label(form, text="선물 역산현물가", fg=T.C_MUTED).grid(row=1, column=2, sticky="w")
-    tk.Label(form, text="주식선물 이자율(%)").grid(row=2, column=0, sticky="w", pady=2)
+    # 환율 계산·동시호가 대응주문에 쓸 원달러선물 월물(사용자 2026-09-28) — 항목은 코어가 받아 온
+    # 근·차근 월물. 만기일엔 사용자가 미리 차근으로 바꿔 둔다(코어는 월물을 스스로 안 바꿈).
+    tk.Label(form, text="원달러선물").grid(row=2, column=0, sticky="w", pady=2)
+    fx_row = tk.Frame(form)
+    fx_row.grid(row=2, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    cb_fx = ttk.Combobox(fx_row, values=[], width=24, state="readonly")
+    cb_fx.pack(side="left")
+    tk.Label(fx_row, text="역산현물가·환진입가·동시호가 대응주문 월물",
+             fg=T.C_MUTED).pack(side="left", padx=(8, 0))
+    tk.Label(form, text="주식선물 이자율(%)").grid(row=3, column=0, sticky="w", pady=2)
     e_eq_rate = tk.Entry(form, width=8, justify="right", font=T.FONT_NUM)
-    e_eq_rate.grid(row=2, column=1, sticky="w", padx=6, pady=2)
-    tk.Label(form, text="주식선물 이론가", fg=T.C_MUTED).grid(row=2, column=2, sticky="w")
+    e_eq_rate.grid(row=3, column=1, sticky="w", padx=6, pady=2)
+    tk.Label(form, text="주식선물 이론가", fg=T.C_MUTED).grid(row=3, column=2, sticky="w")
 
     # 외환선물 우선시간(exec 결정 47, 2026-09-28) — 이 안은 원달러선물 역산현물가만, 밖은 LS 현물환
     # → 역산현물가. (옛 "현물환율 사용시간"은 뜻이 반대라 키까지 바꿨다.)
-    tk.Label(form, text="외환선물 우선시간").grid(row=3, column=0, sticky="w", pady=2)
+    tk.Label(form, text="외환선물 우선시간").grid(row=4, column=0, sticky="w", pady=2)
     spot_row = tk.Frame(form)
-    spot_row.grid(row=3, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    spot_row.grid(row=4, column=1, columnspan=3, sticky="w", padx=6, pady=2)
     e_spot_s = tk.Entry(spot_row, width=9, justify="center", font=T.FONT_NUM)
     e_spot_s.pack(side="left")
     tk.Label(spot_row, text="~").pack(side="left", padx=4)
@@ -126,9 +147,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(spot_row, text="HH:MM:SS · 안=선물역산, 밖=현물→선물역산",
              fg=T.C_MUTED).pack(side="left", padx=(8, 0))
     # 2구간 — 바로 아랫줄(옆에 붙이면 창 폭이 늘어남). 비우면 미사용, 어느 구간이든 안이면 "안".
-    tk.Label(form, text="  2구간").grid(row=4, column=0, sticky="w", pady=2)
+    tk.Label(form, text="  2구간").grid(row=5, column=0, sticky="w", pady=2)
     spot_row2 = tk.Frame(form)
-    spot_row2.grid(row=4, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    spot_row2.grid(row=5, column=1, columnspan=3, sticky="w", padx=6, pady=2)
     e_spot_s2 = tk.Entry(spot_row2, width=9, justify="center", font=T.FONT_NUM)
     e_spot_s2.pack(side="left")
     tk.Label(spot_row2, text="~").pack(side="left", padx=4)
@@ -137,9 +158,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(spot_row2, text="비우면 미사용", fg=T.C_MUTED).pack(side="left", padx=(8, 0))
 
     # 알람 3줄 — [체크박스] 이벤트명  [wav 경로]  [찾아보기] [듣기]
-    tk.Label(form, text="알람 (wav)").grid(row=5, column=0, sticky="w", pady=(10, 2))
+    tk.Label(form, text="알람 (wav)").grid(row=6, column=0, sticky="w", pady=(10, 2))
     rows: dict[str, dict[str, Any]] = {}
-    for i, (key, name) in enumerate(_ALARMS, start=6):
+    for i, (key, name) in enumerate(_ALARMS, start=7):
         var = tk.BooleanVar(value=False)
         tk.Checkbutton(form, text=name, variable=var, width=10, anchor="w").grid(
             row=i, column=0, sticky="w", pady=1)
@@ -187,6 +208,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             "fx_carry_rate": fx_rate, "eq_carry_rate": eq_rate,
             "fx_fut_start": spot_s, "fx_fut_end": spot_e,
             "fx_fut_start2": spot_s2, "fx_fut_end2": spot_e2}
+        if cb_fx.get():  # 콤보가 비었으면(코어 시세 미접속) 월물 설정은 건드리지 않는다
+            payload["fx_futures_code"] = fx_month_code(cb_fx.get())
         for key, r in rows.items():
             payload[key] = {"enabled": bool(r["var"].get()),
                             "path": r["entry"].get().strip()}
@@ -238,6 +261,18 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 r["var"].set(bool(snd.get("enabled", False)))
                 r["entry"].delete(0, "end")
                 r["entry"].insert(0, str(snd.get("path", "")))
+        # 원달러선물 콤보 — 월물 목록은 시세 접속 뒤에야 오므로 설정값과 따로 채운다. 선택은
+        # 최초 1회만 코어가 지금 쓰는 월물로 맞춘다(그 뒤엔 사용자 선택을 덮지 않음).
+        fx = (data.get("live") or {}).get("fx_futures") or {}
+        months = fx.get("months") or []
+        labels = [fx_month_label(str(m["code"]), int(m["ym"]), i) for i, m in enumerate(months)]
+        if labels and state_box.get("fx_labels") != labels:
+            state_box["fx_labels"] = labels
+            cb_fx.config(values=labels)
+        if labels and not state_box.get("fx_loaded"):
+            state_box["fx_loaded"] = True
+            using = str(fx.get("code") or "")
+            cb_fx.set(next((lb for lb in labels if fx_month_code(lb) == using), labels[0]))
         _reschedule(refresh, 500)
 
     drain_results()

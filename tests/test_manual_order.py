@@ -99,6 +99,17 @@ class _FakeSystem:
             raise self._fail
         self.cancelled.append(order_id)
 
+    async def cancel_many(self, order_ids: list[str]) -> list[tuple[str, str | None]]:
+        """일괄 취소(2026-09-28) — 실제 코어는 HL을 한 요청에 묶는다; 여기선 한 건씩 흉내."""
+        out: list[tuple[str, str | None]] = []
+        for oid in order_ids:
+            try:
+                await self.cancel(oid)
+                out.append((oid, None))
+            except Exception as exc:  # noqa: BLE001
+                out.append((oid, str(exc)))
+        return out
+
     async def amend_price(self, order_id: str, price: float, *,
                           reduce_only: bool = False, post_only: bool = False) -> str:
         self.amended.append((order_id, price, reduce_only, post_only))
@@ -220,6 +231,39 @@ async def test_manual_cancel_calls_system() -> None:
     sys = _fake_system(OrderBook())
     r = await _manual_command(sys, {"cmd": "manual_cancel", "order_id": "X1"})
     assert r["ok"] and sys.cancelled == ["X1"]
+
+
+async def test_manual_cancel_all_cancels_only_that_symbol_and_instrument() -> None:
+    # 일반주문창 [일괄 취소](2026-09-28): 그 종목·상품(HL perp)의 미체결 전부 — 다른 종목·LS 주문은
+    # 건드리지 않는다. 한 건씩 취소해 개수를 돌려준다.
+    ob = OrderBook()
+    ob.track("H1", OrderIntent(venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.HL_PERP, side=Side.SELL, qty=1, price=1000.0))
+    ob.track("H2", OrderIntent(venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.HL_PERP, side=Side.BUY, qty=1, price=900.0))
+    ob.track("H3", OrderIntent(venue=Venue.HYPERLIQUID, underlying=Underlying.SK_HYNIX,
+        instrument=Instrument.HL_PERP, side=Side.BUY, qty=1, price=900.0))
+    ob.track("L1", OrderIntent(venue=Venue.LS, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.KR_STOCK, side=Side.SELL, qty=10, price=80000.0))
+    sys = _fake_system(ob)
+    r = await _manual_command(sys, {"cmd": "manual_cancel_all", "underlying": "samsung",
+                                    "instrument": "hl_perp"})
+    assert r["ok"] and r["cancelled"] == 2 and sorted(sys.cancelled) == ["H1", "H2"]
+    # 대상이 없어도 정상(0건). 잘못된 인자는 거부
+    r0 = await _manual_command(sys, {"cmd": "manual_cancel_all", "underlying": "hyundai",
+                                     "instrument": "hl_perp"})
+    assert r0["ok"] and r0["cancelled"] == 0
+    bad = await _manual_command(sys, {"cmd": "manual_cancel_all", "underlying": "nope",
+                                      "instrument": "hl_perp"})
+    assert not bad["ok"]
+    # 한 건이 실패해도 나머지는 계속 — 실패 건수·사유를 돌려주고 ok=False
+    ob2 = OrderBook()
+    ob2.track("H1", OrderIntent(venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.HL_PERP, side=Side.SELL, qty=1, price=1000.0))
+    failing = _fake_system(ob2, fail=RuntimeError("boom"))
+    rf = await _manual_command(failing, {"cmd": "manual_cancel_all", "underlying": "samsung",
+                                         "instrument": "hl_perp"})
+    assert not rf["ok"] and "boom" in rf["errors"][0] and failing.cancelled == []
 
 
 async def test_manual_amend_calls_system() -> None:

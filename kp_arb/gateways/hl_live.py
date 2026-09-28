@@ -354,6 +354,37 @@ class HLSdkGateway(HLGateway):
         self._check_ok(resp)
         order_log.order_canceled(Venue.HYPERLIQUID, order_id)
 
+    async def cancel_orders(self, order_ids: Sequence[str]) -> list[str | None]:
+        """여러 건을 `cancel` 액션 하나(cancels 배열)로 — SDK bulk_cancel. 응답 statuses가 건별로
+        "success" 또는 {"error": …}. 요청 1번이라 요청 한도에 유리(사용자 2026-09-28).
+        coin을 모르는 주문번호는 보내지 않고 그 자리에 사유를 돌려준다."""
+        out: list[str | None] = [None] * len(order_ids)
+        reqs: list[tuple[int, dict[str, Any]]] = []  # (out 인덱스, SDK 요청)
+        for i, oid in enumerate(order_ids):
+            coin = self._order_coin.get(oid)
+            if coin is None:
+                out[i] = f"unknown order_id {oid} (coin required for cancel)"
+                continue
+            reqs.append((i, {"coin": coin, "oid": int(oid)}))
+        if not reqs:
+            return out
+        resp = await self._exchange_action("cancel", self._ex.bulk_cancel, [r for _i, r in reqs])
+        try:
+            self._check_ok(resp)
+            statuses = list(resp["response"]["data"]["statuses"])
+        except (HLError, KeyError, TypeError) as exc:  # 요청 전체 거부 → 전부 실패
+            for i, _r in reqs:
+                out[i] = str(exc)
+            return out
+        for (i, r), st in zip(reqs, statuses, strict=False):
+            if st == "success":
+                order_log.order_canceled(Venue.HYPERLIQUID, str(r["oid"]))
+            else:
+                out[i] = str(st.get("error", st) if isinstance(st, dict) else st)
+        for i, _r in reqs[len(statuses):]:  # 응답이 짧으면 나머지는 결과 모름
+            out[i] = "no status in cancel response"
+        return out
+
     async def update_leverage(
         self, underlying: Underlying, leverage: int, *, is_cross: bool
     ) -> None:

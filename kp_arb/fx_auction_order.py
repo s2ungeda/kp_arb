@@ -80,10 +80,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(trow, text="~").pack(side="left", padx=2)
     e_cls_e.pack(side="left")
 
-    # 종목: 원달러선물 종목코드(근·차근) 콤보 (col1) — 오른쪽 끝이 기준선
+    # 종목: 코어가 지금 쓰는 원달러선물 종목코드 **표시만**(사용자 2026-09-28) — 월물 선택은
+    # 공통설정 "원달러선물" 콤보(DESIGN-settings §3). 옛 근·차근 콤보는 뺐다.
     _lab("종목", 1)
-    cb_code = ttk.Combobox(form, values=[], width=12, state="readonly")
-    cb_code.grid(row=1, column=1, sticky="w", pady=1)
+    lbl_code = tk.Label(form, text="-", anchor="w", font=T.FONT_NUM, width=12)
+    lbl_code.grid(row=1, column=1, sticky="w", pady=1)
 
     # 현재가 + 틱 (col1, 좁게 — 틱 오른쪽이 콤보 오른쪽에 가깝게)
     _lab("현재가", 2)
@@ -149,9 +150,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         return (state_box["data"] or {}).get("fx_auction") or {}
 
     def _send_settings(label: str) -> None:
-        fx_code = cb_code.get().strip()
+        fx_code = str(_fx_state().get("code") or "").strip()  # 공통설정에서 고른 월물
         if not fx_code:
-            set_status("원달러선물 종목코드 없음 — 코어 연결 확인", err=True)
+            set_status("원달러선물 종목코드 없음 — 코어 연결·공통설정 확인", err=True)
             return
         try:
             payload = {
@@ -224,18 +225,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     def refresh() -> None:
         fx = _fx_state()
-        codes = [str(c) for c in (fx.get("codes") or [])]
-        if codes != state_box.get("_codes"):  # 코드 목록 바뀜 → 콤보 갱신(선택 유지)
-            state_box["_codes"] = codes
-            cur = cb_code.get()
-            cb_code.config(values=codes)
-            want = state_box.pop("_want_code", None)  # 저장값 복원(코드 로드 후 1회)
-            if want in codes:
-                cb_code.set(want)
-            elif cur in codes:
-                cb_code.set(cur)
-            elif codes:
-                cb_code.current(0)
+        code = str(fx.get("code") or "-")  # 코어가 지금 쓰는 월물(공통설정 선택) — 표시만
+        if code != state_box.get("_code"):
+            state_box["_code"] = code
+            lbl_code.config(text=code)
         # 대응 발주 내역(최신 우선) — 바뀔 때만 다시 그림
         hedges = fx.get("hedges") or []
         hsig = tuple((h.get("order_id"), h.get("status")) for h in hedges)
@@ -252,7 +245,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         _apply_running(bool(fx.get("running")))
         _reschedule(refresh, 250)  # 데이터가 0.1초 단위로 오니 그리기도 당김(§12.1)
 
-    # 저장된 입력 복원 (종목코드는 목록 로드 후 refresh에서 복원)
+    # 저장된 입력 복원 (종목코드는 공통설정 값이라 이 창엔 저장하지 않는다, 2026-09-28)
     _saved = win_state.saved_fields("fx_auction_order")
     for e, key in ((e_pre_s, "pre_s"), (e_pre_e, "pre_e"), (e_cls_s, "cls_s"),
                    (e_cls_e, "cls_e"), (e_price, "price"), (e_tick, "tick"),
@@ -260,15 +253,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if _saved.get(key):
             e.delete(0, "end")
             e.insert(0, str(_saved[key]))
-    if _saved.get("code"):
-        state_box["_want_code"] = str(_saved["code"])
 
     def _persist() -> None:
         win_state.save_fields("fx_auction_order", {
             "pre_s": e_pre_s.get(), "pre_e": e_pre_e.get(),
             "cls_s": e_cls_s.get(), "cls_e": e_cls_e.get(),
-            "price": e_price.get(), "tick": e_tick.get(), "ratio": e_ratio.get(),
-            "code": cb_code.get()})
+            "price": e_price.get(), "tick": e_tick.get(), "ratio": e_ratio.get()})
         _reschedule(_persist, 2000)
 
     # 창 닫기(X) — 자동주문 화면 공통 규칙(DESIGN-ui §6): 실행 중이면 확인 뒤 정지하고 닫는다.
