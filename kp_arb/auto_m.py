@@ -601,11 +601,12 @@ def _common_gates(
         return "G1 실행 꺼짐", acts
     if leg.status is LegStatus.IDLE:
         leg.status = LegStatus.ARMED
-    # G0 판정 환율 계산불가(사용자 확정 2026-09-15) — 현물환(LS·하나고시)도 없고 원달러선물
-    # 현재가·1호가로 만드는 이론가도 없으면 **세트 중지**(사람이 해제). 값 없이 판정할 수 없다.
+    # G0 판정 환율 계산불가(exec 결정 47, 사용자 확정 2026-09-28) — 우선순위(우선시간 안: 선물
+    # 역산현물가 / 밖: LS 현물환 → 역산현물가, 07:30 전은 계산 안 함)로 값을 못 구하면 **주문만
+    # 안 낸다**: 걸어둔 선주문 취소 + 대기(G2와 같음). 세트는 실행 상태 그대로 — 값이 돌아오면
+    # 재개. (옛 09-15 규칙 "세트 중지·사람이 해제"는 잠깐의 결측에도 재시작이 번거로워 폐기.)
     if sig.fx is None:
-        reason = "판정 환율 계산불가 — 현물환 없음 + 원달러선물 현재가·매수/매도 1호가 미수신"
-        return reason, _halt_set(s, block, reason)
+        return "판정 환율 계산불가 — 주문 안 냄", _cancel_if_resting(leg, mono=sig.mono)
     # 시장 정지(exec §8) — 신규·정정 중단 + 미체결 취소, HL은 손대지 않음
     if sig.market_halted:
         return "시장 정지 — 신규·정정 중단", _cancel_if_resting(leg, mono=sig.mono)

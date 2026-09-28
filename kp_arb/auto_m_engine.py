@@ -104,7 +104,7 @@ class _SystemLike(Protocol):
                              instrument: Instrument = ...) -> float | None: ...
     def stock_last(self, underlying: Underlying) -> float | None: ...
     def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]: ...
-    def fx_entry_rate(self, side: Side) -> float | None: ...
+    def fx_entry_rate(self) -> float | None: ...
     def futures_halted(self) -> bool: ...
     def stock_halted(self) -> bool: ...
     async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str: ...
@@ -781,11 +781,11 @@ class AutoMEngine:
                            u.value, tag, order.order_id, order.intent.side.value, qty,
                            f"{price:,.0f}", est_pair, leg.pre_filled, leg.pre_qty)
         else:
-            # 환진입가: 원달러선물 1호가 → LS 현물환 → 없음(사용자 확정 2026-09-15). 없으면 그
-            # 체결은 환 없이 쌓이고 경고 한 줄.
-            fx = self._system.fx_entry_rate(order.intent.side)
+            # 환진입가(exec 결정 47): 우선시간 안 = 선물 역산현물가 → LS 현물환, 밖 = 그 반대.
+            # 없으면 그 체결은 환 없이 쌓이고 경고 한 줄.
+            fx = self._system.fx_entry_rate()
             if fx is None:
-                self._log.warning("[자동M] %s 후주문 체결 %s #%s — 환진입가 없음(원달러선물 호가·"
+                self._log.warning("[자동M] %s 후주문 체결 %s #%s — 환진입가 없음(선물 역산현물가·"
                                   "LS 현물환 모두 없음) → 이 체결은 환평균·Sprd에서 제외",
                                   u.value, tag, order.order_id)
             # Sprd 기준값(S현재가·SF이론가)은 **이 체결 시점** 값을 판 버퍼에 넣는다(사용자 확정
@@ -832,8 +832,8 @@ class AutoMEngine:
                            u.value, tag, order.order_id, order.intent.side.value, qty, price,
                            leg.pre_filled_f, leg.pre_qty, leg.hl_unhedged)
         else:
-            # 환진입가는 HL 다리 방향으로 고른다(진입 −환 = 매수1호가) — 값은 이 시점(LS 체결)
-            fx = self._system.fx_entry_rate(leg.hl_side)
+            # 환진입가(exec 결정 47, 방향 무관) — 값은 이 시점(LS 체결)
+            fx = self._system.fx_entry_rate()
             if fx is None:
                 self._log.warning("[자동M] %s LS 후주문 체결 %s #%s — 환진입가 없음 → 이 판은 "
                                   "환평균·Sprd에서 제외", u.value, tag, order.order_id)
@@ -1126,7 +1126,7 @@ class AutoMEngine:
         sf_tick = tick_for(Instrument.KR_STOCK_FUTURE, float(sf_ref)) if sf_ref else None
         return {"sets": out, "rev_sets": rev_out, "any_running": book.any_running(),
                 "monitor": monitor, "sf_tick": sf_tick,
-                "fx": {"used": fx_used, "src": fx_src},  # 사용 환율(값, 출처 현물|선물이론)
+                "fx": {"used": fx_used, "src": fx_src},  # 사용 환율(값, 출처 현물|선물역산)
                 "ref_qty": book.ref_qty, "future_month": book.future_month,
                 "market": book.market,  # 주식 거래소(KRX/NXT) — 화면 콤보 복원용
                 "hl_merge_ticks": merge_ticks,

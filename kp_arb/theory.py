@@ -45,9 +45,14 @@ def is_rolled(yyyymm: int, product: str, now: datetime) -> bool:
 
 
 def parse_hhmm(text: str) -> time:
-    """"07:50" 같은 시:분 문자열 → time. 형식이 틀리면 ValueError."""
-    hh, mm = text.split(":")
-    return time(int(hh), int(mm))
+    """"07:50" / "08:45:00" 같은 시:분[:초] 문자열 → time. 형식이 틀리면 ValueError.
+    (초는 외환선물 우선시간 입력용 — 사용자 2026-09-28.)"""
+    parts = text.split(":")
+    if len(parts) == 2:
+        return time(int(parts[0]), int(parts[1]))
+    if len(parts) == 3:
+        return time(int(parts[0]), int(parts[1]), int(parts[2]))
+    raise ValueError(f"시:분[:초] 형식이 아님: {text!r}")
 
 
 def in_time_window(now: time, start: time, end: time) -> bool:

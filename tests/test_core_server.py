@@ -123,34 +123,40 @@ def test_state_persists_hl_merge(tmp_path: Path) -> None:
     assert bad.hl_merge == {"samsung": [5, 2]}
 
 
-def test_settings_global_fx_spot_window_user_input() -> None:
-    # 현물환율 사용시간은 공통설정 사용자 입력(2026-09-04) — HH:MM 저장, 형식 오류는 거부.
+def test_settings_global_fx_fut_window_user_input() -> None:
+    # 외환선물 우선시간(exec 결정 47)은 공통설정 사용자 입력 — HH:MM:SS 저장, 형식 오류는 거부.
     state = CoreState()
-    assert (state.settings.fx_spot_start, state.settings.fx_spot_end) == ("07:00", "18:10")
+    assert (state.settings.fx_fut_start, state.settings.fx_fut_end) == ("08:45:00", "15:45:00")
     ok = apply_command(state, {"cmd": "settings_global",
-                               "fx_spot_start": "08:00", "fx_spot_end": "17:30"})
-    assert ok["ok"] and state.settings.fx_spot_start == "08:00"
-    assert state.settings.fx_spot_end == "17:30"
-    bad = apply_command(state, {"cmd": "settings_global", "fx_spot_end": "25:00"})
-    assert not bad["ok"] and state.settings.fx_spot_end == "17:30"  # 거부 시 값 유지
+                               "fx_fut_start": "08:00:00", "fx_fut_end": "17:30:00"})
+    assert ok["ok"] and state.settings.fx_fut_start == "08:00:00"
+    assert state.settings.fx_fut_end == "17:30:00"
+    bad = apply_command(state, {"cmd": "settings_global", "fx_fut_end": "25:00:00"})
+    assert not bad["ok"] and state.settings.fx_fut_end == "17:30:00"  # 거부 시 값 유지
     restored = CoreState()
     _global_settings_from_dict(restored.settings,
-                               {"fx_spot_start": "09:00", "fx_spot_end": "bad"})
-    assert (restored.settings.fx_spot_start, restored.settings.fx_spot_end) == ("09:00", "18:10")
-    # 2구간(사용자 2026-09-16): 둘 다 넣으면 저장, 하나만 넣으면 거부, 둘 다 비우면 미사용
+                               {"fx_fut_start": "09:00:00", "fx_fut_end": "bad"})
+    assert (restored.settings.fx_fut_start, restored.settings.fx_fut_end) == (
+        "09:00:00", "15:45:00")
+    # 옛 키(fx_spot_*, 뜻이 반대)는 무시 → 기본값 유지
+    _global_settings_from_dict(restored.settings,
+                               {"fx_spot_start": "07:00", "fx_spot_end": "18:10"})
+    assert (restored.settings.fx_fut_start, restored.settings.fx_fut_end) == (
+        "09:00:00", "15:45:00")
+    # 2구간: 둘 다 넣으면 저장, 하나만 넣으면 거부, 둘 다 비우면 미사용
     ok2 = apply_command(state, {"cmd": "settings_global",
-                                "fx_spot_start2": "19:00", "fx_spot_end2": "23:00"})
-    assert ok2["ok"] and (state.settings.fx_spot_start2, state.settings.fx_spot_end2) == (
-        "19:00", "23:00")
-    half = apply_command(state, {"cmd": "settings_global", "fx_spot_start2": "19:00",
-                                 "fx_spot_end2": ""})
-    assert not half["ok"] and state.settings.fx_spot_end2 == "23:00"
-    off = apply_command(state, {"cmd": "settings_global", "fx_spot_start2": "",
-                                "fx_spot_end2": ""})
-    assert off["ok"] and state.settings.fx_spot_start2 == "" and state.settings.fx_spot_end2 == ""
+                                "fx_fut_start2": "18:00:00", "fx_fut_end2": "23:00:00"})
+    assert ok2["ok"] and (state.settings.fx_fut_start2, state.settings.fx_fut_end2) == (
+        "18:00:00", "23:00:00")
+    half = apply_command(state, {"cmd": "settings_global", "fx_fut_start2": "19:00:00",
+                                 "fx_fut_end2": ""})
+    assert not half["ok"] and state.settings.fx_fut_end2 == "23:00:00"
+    off = apply_command(state, {"cmd": "settings_global", "fx_fut_start2": "",
+                                "fx_fut_end2": ""})
+    assert off["ok"] and state.settings.fx_fut_start2 == "" and state.settings.fx_fut_end2 == ""
     r2 = CoreState()
-    _global_settings_from_dict(r2.settings, {"fx_spot_start2": "20:00", "fx_spot_end2": "21:00"})
-    assert (r2.settings.fx_spot_start2, r2.settings.fx_spot_end2) == ("20:00", "21:00")
+    _global_settings_from_dict(r2.settings, {"fx_fut_start2": "20:00:00", "fx_fut_end2": "21:00"})
+    assert (r2.settings.fx_fut_start2, r2.settings.fx_fut_end2) == ("20:00:00", "21:00")
 
 
 def test_settings_global_command_and_persistence(tmp_path: Path) -> None:
@@ -200,8 +206,8 @@ async def test_hl_trades_endpoint_returns_newest_first_or_empty() -> None:
         # make_app이 시동 때 주입하는 공통설정 훅 — 여기선 아무것도 안 함
         def set_hl_daily_limit(self, usdc: float) -> None: ...
         def set_carry_rates(self, fx: float, eq: float) -> None: ...
-        def set_fx_spot_window(self, start: str, end: str, start2: str = "",
-                               end2: str = "") -> None: ...
+        def set_fx_fut_window(self, start: str, end: str, start2: str = "",
+                              end2: str = "") -> None: ...
 
     client = TestClient(TestServer(make_app(CoreState(), system=_Sys())))  # type: ignore[arg-type]
     await client.start_server()

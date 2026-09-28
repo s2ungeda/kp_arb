@@ -327,7 +327,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             theory_txt = f"선물역산 {_n(theory)}"
             if src == "현물":
                 spot_txt = f"[{spot_txt}]"
-            elif src == "선물이론":
+            elif src == "선물역산":
                 theory_txt = f"[{theory_txt}]"
             fx_text = f"환율: {spot_txt} · {theory_txt} · 선물원값 {_n(fut, 1)}"
             age = time.time() - state_box["ts"] if state_box["ts"] else -1

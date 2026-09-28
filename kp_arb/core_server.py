@@ -202,23 +202,23 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
                 body.get("hl_daily_limit_usdc", g.hl_daily_limit_usdc))
             g.fx_carry_rate = float(body.get("fx_carry_rate", g.fx_carry_rate))
             g.eq_carry_rate = float(body.get("eq_carry_rate", g.eq_carry_rate))
-            # 현물환율 사용시간(HH:MM~HH:MM) — 형식 틀리면 ValueError → 거부(사용자 입력 2026-09-04)
+            # 외환선물 우선시간(HH:MM:SS~HH:MM:SS, exec 결정 47) — 형식 틀리면 ValueError → 거부
             from .theory import parse_hhmm
 
-            spot_s = str(body.get("fx_spot_start", g.fx_spot_start)).strip()
-            spot_e = str(body.get("fx_spot_end", g.fx_spot_end)).strip()
-            parse_hhmm(spot_s)
-            parse_hhmm(spot_e)
-            # 2구간(사용자 2026-09-16): 둘 다 비면 미사용, 하나만 비면 거부
-            spot_s2 = str(body.get("fx_spot_start2", g.fx_spot_start2)).strip()
-            spot_e2 = str(body.get("fx_spot_end2", g.fx_spot_end2)).strip()
-            if spot_s2 or spot_e2:
-                if not (spot_s2 and spot_e2):
-                    raise ValueError("현물환율 2구간은 시작·끝을 둘 다 넣거나 둘 다 비우기")
-                parse_hhmm(spot_s2)
-                parse_hhmm(spot_e2)
-            g.fx_spot_start, g.fx_spot_end = spot_s, spot_e
-            g.fx_spot_start2, g.fx_spot_end2 = spot_s2, spot_e2
+            fut_s = str(body.get("fx_fut_start", g.fx_fut_start)).strip()
+            fut_e = str(body.get("fx_fut_end", g.fx_fut_end)).strip()
+            parse_hhmm(fut_s)
+            parse_hhmm(fut_e)
+            # 2구간: 둘 다 비면 미사용, 하나만 비면 거부
+            fut_s2 = str(body.get("fx_fut_start2", g.fx_fut_start2)).strip()
+            fut_e2 = str(body.get("fx_fut_end2", g.fx_fut_end2)).strip()
+            if fut_s2 or fut_e2:
+                if not (fut_s2 and fut_e2):
+                    raise ValueError("외환선물 우선시간 2구간은 시작·끝을 둘 다 넣거나 비우기")
+                parse_hhmm(fut_s2)
+                parse_hhmm(fut_e2)
+            g.fx_fut_start, g.fx_fut_end = fut_s, fut_e
+            g.fx_fut_start2, g.fx_fut_end2 = fut_s2, fut_e2
             for name, snd in (("sound_fill", g.sound_fill),
                               ("sound_error", g.sound_error), ("sound_ws", g.sound_ws)):
                 raw = body.get(name)
@@ -862,7 +862,7 @@ def monitor_snapshot(
         "hl_merge": merges,
         "hl_merge_ticks": merge_ticks,
         "fx": {"used": fx_used, "src": fx_src, "futures": system.usdkrw_futures,
-               # 상태줄에 셋을 나란히(엑셀 시세!N11·N12 배치) — 현물 출처(LS/하나고시)도 함께
+               # 상태줄에 셋을 나란히(엑셀 시세!N11·N12 배치) — 현물 출처(LS뿐, 결정 47)도 함께
                "spot": system.usdkrw_spot, "theory": system.usdkrw_theory,
                "spot_src": system.usdkrw_spot_src},
         "phase": system.session.phase_for(Underlying.SAMSUNG).value,
@@ -1117,8 +1117,8 @@ def make_app(
     if system is not None:  # 저장된 공통설정을 시동 시 LiveSystem에 주입
         system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)
         system.set_carry_rates(state.settings.fx_carry_rate, state.settings.eq_carry_rate)
-        system.set_fx_spot_window(state.settings.fx_spot_start, state.settings.fx_spot_end,
-                                  state.settings.fx_spot_start2, state.settings.fx_spot_end2)
+        system.set_fx_fut_window(state.settings.fx_fut_start, state.settings.fx_fut_end,
+                                  state.settings.fx_fut_start2, state.settings.fx_fut_end2)
 
     def state_payload() -> dict[str, Any]:
         """/state 본문 — HTTP와 WS `state` 채널(§12.1)이 같은 함수를 쓴다."""
@@ -1183,9 +1183,9 @@ def make_app(
             system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)  # 한도 즉시 반영
             system.set_carry_rates(  # 이자율 즉시 반영(이론가 재계산에 반영)
                 state.settings.fx_carry_rate, state.settings.eq_carry_rate)
-            system.set_fx_spot_window(  # 현물환율 사용시간(2구간) 즉시 반영
-                state.settings.fx_spot_start, state.settings.fx_spot_end,
-                state.settings.fx_spot_start2, state.settings.fx_spot_end2)
+            system.set_fx_fut_window(  # 현물환율 사용시간(2구간) 즉시 반영
+                state.settings.fx_fut_start, state.settings.fx_fut_end,
+                state.settings.fx_fut_start2, state.settings.fx_fut_end2)
         if payload.get("cmd") == "shutdown" and result.get("ok") and on_shutdown:
             # 응답을 먼저 보내고 잠시 뒤 종료 (화면이 결과를 받을 시간)
             asyncio.get_running_loop().call_later(0.2, on_shutdown)

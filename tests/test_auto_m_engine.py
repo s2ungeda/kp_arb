@@ -67,8 +67,8 @@ class FakeSystem:
     def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]:
         return 1356.0, "현물"
 
-    def fx_entry_rate(self, side: Side) -> float | None:
-        return 1355.9 if side is Side.SELL else 1356.1
+    def fx_entry_rate(self, now: datetime | None = None) -> float | None:
+        return 1356.0  # exec 결정 47: HL 방향 무관 한 값
 
     def futures_halted(self) -> bool:
         return self.halted
@@ -592,7 +592,7 @@ async def test_engine_round_trip_pre_fill_post_fill() -> None:
 
     sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1184.0, ts=0))
     await _settle()
-    assert s.rt == 4 and s.entry.post_pending == 0 and s.entry.acc.fx_avg() == 1355.9
+    assert s.rt == 4 and s.entry.post_pending == 0 and s.entry.acc.fx_avg() == 1356.0
     snap = eng.live_snapshot()[U.value]  # 종목별 스냅샷(2026-09-08)
     live = snap["sets"][0]
     assert live["rt"] == 4 and live["entry"]["status"] == "pre_partial"
@@ -1048,7 +1048,7 @@ async def test_hl_first_engine_round_hl_alo_pre_then_ls_post() -> None:
     assert s.entry.status is LegStatus.SETTLE_DELAY and s.entry.running
     acc = s.entry.acc
     assert acc.hl_qty == 10 and acc.sf_qty == 1 and acc.hl_avg() == 1185.9
-    assert acc.fx_avg() == 1355.9  # 환진입가 = HL 다리(매도) 방향 매수1호가, LS 체결 시점
+    assert acc.fx_avg() == 1356.0  # 환진입가(결정 47, 방향 무관) — LS 체결 시점 값
     assert acc.sprd() is not None
     snap = eng.live_snapshot()
     key = f"{U.value}|sf_hl_first"

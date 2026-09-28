@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, time
 from typing import Any
 
 from . import order_log
@@ -133,7 +133,8 @@ def select_months(
             for u, months in found.items()}
 
 
-FX_SPOT_SILENT_S = 600.0  # 현물환율(CUR) 무수신 → 하나고시 대체 기준(사용자 확정 2026-09-04: 10분)
+# 환율 계산 시작 시각 — 이 전에는 판정용·정산용 환율을 만들지 않는다(exec 결정 47, 2026-09-28).
+FX_CALC_START = time(7, 30)
 
 
 def roll_daily_logs(state: dict[str, str], today: str, *logs: deque[dict[str, Any]]) -> bool:
@@ -203,14 +204,6 @@ def snapshot_failure_note(stage: str) -> str:
     return "잔고·포지션은 갱신, 미체결은 이전 장부 유지(유령 정리 안 함)"
 
 
-def fx_spot_backup_due(last_rx: float, now: float, silent_s: float = FX_SPOT_SILENT_S) -> bool:
-    """하나은행 고시환율로 대체할 때인가 — CUR을 한 번도 못 받았거나(last_rx=0) silent_s 넘게
-    조용할 때만. 마지막 CUR 체결가는 실제 거래가라 잠시 뜸해도 고시환율보다 낫다. 순수 로직."""
-    if last_rx == 0.0:
-        return True
-    return now - last_rx > silent_s
-
-
 def startup_symbol_error(
     expected: Iterable[Underlying],
     futures_symbols: Mapping[Underlying, str],
@@ -264,7 +257,7 @@ class LiveSystem:
         fx_months: list[tuple[str, int]] | None = None,
         carry_rates: CarryRates | None = None,
         fees: FeeRates | None = None,
-        fx_spot_window: tuple[str, str] = ("07:00", "18:10"),
+        fx_fut_window: tuple[str, str] = ("08:45:00", "15:45:00"),
         board_ref_qty: int = 1,
     ) -> None:
         self._gw = gateway
@@ -291,14 +284,15 @@ class LiveSystem:
         # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — WS(FC9/DC0) 실시간 + 예비 조회 갱신.
         self.usdkrw_theory: float | None = None
         self.usdkrw_futures: float | None = None  # 원달러선물 현재가 원값(표시용)
-        # 외환현물(주간 07:00~18:10 HL 환산용 — 엑셀 시세!N6/O6, 2026-08-21) + 사용 시간대
+        # 외환현물(LS CUR — 엑셀 시세!N6/O6, 2026-08-21). 최종 체결가를 유효기간 없이 현재가로
+        # 쓴다(exec 결정 47). 출처는 LS뿐(하나고시 백업 폐지 2026-09-28) — 상태줄 표시용.
         self.usdkrw_spot: float | None = None
-        self._fx_spot_ts = 0.0  # 마지막 LS 현물환율(CUR) 수신 시각 — Naver 백업 억제용
-        self.usdkrw_spot_src: str | None = None  # 현물환율 출처 "LS"|"하나고시" — 상태줄 표시
-        # 현물환 사용 시간대 — 1~2구간(2구간은 공통설정, 사용자 2026-09-16). 어느 구간이든 안이면
-        # 현물환. 원소 = (시작 time, 끝 time)
-        self._fx_spot_windows: list[tuple[Any, Any]] = [
-            (parse_hhmm(fx_spot_window[0]), parse_hhmm(fx_spot_window[1]))]
+        self._fx_spot_ts = 0.0  # 마지막 LS 현물환율(CUR) 수신 시각(로그·진단용)
+        self.usdkrw_spot_src: str | None = None
+        # 외환선물 우선시간 — 1~2구간(공통설정이 시동 때 덮어씀). 어느 구간이든 안이면 "안".
+        # 원소 = (시작 time, 끝 time)
+        self._fx_fut_windows: list[tuple[Any, Any]] = [
+            (parse_hhmm(fx_fut_window[0]), parse_hhmm(fx_fut_window[1]))]
         self._hl = hl_gateway
         self._hl_ws = hl_ws
         # HL cloid → 발주 의도(응답 대기 중). 응답보다 먼저 온 orderUpdates의 cloid로 oid를 식별해
@@ -587,32 +581,31 @@ class LiveSystem:
         """신용융자 (대출일, 수량) 조회 — 주식 신용 세트의 상환 선주문 LoanDt용(2026-09-18)."""
         return await self._gw.get_credit_loans(underlying)
 
-    def fx_entry_rate(self, side: Side) -> float | None:
-        """자동M 환진입가(§10) — 최근월물 원달러선물의 매수1호가(HL 매도, −환) / 매도1호가(HL 매수).
-        호가가 없으면 **LS 현물환(CUR)만**(하나고시 백업값은 쓰지 않음), 그것도 없으면 None
-        (사용자 확정 2026-09-15 — 09-14 순서의 "하나고시 백업 → 선물 직전 체결가"를 뺐다:
-        정산값에 고시환율·체결가 같은 다른 성격의 값을 섞지 않는다)."""
-        code = self._fx_futures[0] if self._fx_futures is not None else None
-        quote = self.fx_futures_quote.get(code) if code is not None else None
-        if quote is not None:
-            return quote[0] if side is Side.SELL else quote[1]
-        if self.usdkrw_spot is not None and self.usdkrw_spot_src == "LS":
-            return self.usdkrw_spot
-        return None
+    def fx_entry_rate(self, now: datetime | None = None) -> float | None:
+        """자동M 정산용 환진입가(§10, exec 결정 47 — 사용자 확정 2026-09-28). HL 방향과 무관하게
+        한 값: 외환선물 우선시간 **안** = 선물 역산현물가 → LS 현물환, **밖** = LS 현물환 → 선물
+        역산현물가. 07:30 전은 계산하지 않음. 둘 다 없으면 None(그 체결은 환 없이 쌓임)."""
+        moment = now if now is not None else datetime.now()
+        if moment.time() < FX_CALC_START:
+            return None
+        first, second = ((self.usdkrw_theory, self.usdkrw_spot)
+                         if self.in_fx_fut_window(moment.time())
+                         else (self.usdkrw_spot, self.usdkrw_theory))
+        return first if first is not None else second
 
-    def set_fx_spot_window(self, start: str, end: str, start2: str = "",
-                           end2: str = "") -> None:
-        """현물환율(CUR) 사용 시간대 반영("HH:MM") — 코어가 공통설정에서 주입(사용자 입력,
-        2026-09-04). 2구간(start2·end2, 사용자 2026-09-16)은 둘 다 있을 때만 추가 — 비우면 1구간.
-        usdkrw_effective·백업 조회가 다음 호출부터 이 창을 쓴다. 형식 오류는 ValueError."""
+    def set_fx_fut_window(self, start: str, end: str, start2: str = "",
+                          end2: str = "") -> None:
+        """외환선물 우선시간 반영("HH:MM:SS") — 코어가 공통설정에서 주입. 2구간(start2·end2)은
+        둘 다 있을 때만 추가 — 비우면 1구간. usdkrw_effective·fx_entry_rate가 다음 호출부터
+        이 창을 쓴다. 형식 오류는 ValueError."""
         windows = [(parse_hhmm(start), parse_hhmm(end))]
         if start2.strip() and end2.strip():
             windows.append((parse_hhmm(start2), parse_hhmm(end2)))
-        self._fx_spot_windows = windows
+        self._fx_fut_windows = windows
 
-    def in_fx_spot_window(self, t: Any) -> bool:
-        """지금 시각이 현물환 사용 시간대(1~2구간) 안인가."""
-        return any(in_time_window(t, s, e) for s, e in self._fx_spot_windows)
+    def in_fx_fut_window(self, t: Any) -> bool:
+        """지금 시각이 외환선물 우선시간(1~2구간) 안인가."""
+        return any(in_time_window(t, s, e) for s, e in self._fx_fut_windows)
 
     def _hl_order_notional(self, intent: OrderIntent) -> float:
         """HL 주문 금액(USDC) = |수량| × 가격. 시장가(가격 없음)는 마크가로 추정."""
@@ -1318,18 +1311,20 @@ class LiveSystem:
                 self._guarded_ws("HL", self._hl_ws.run, self._mark_ws_dead)))
 
     def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]:
-        """판정용 환율(HL 환산)과 출처 — 사용자 확정 2026-09-15.
-        ① 현물환 사용 시간대(공통설정, 기본 07:00~18:10) 안이고 현물환이 있으면 현물환("현물").
-           본선은 LS CUR, 못 받으면 하나고시 백업값(usdkrw_spot_src로 구분, LS가 다시 오면 LS).
-        ② 그 밖(시간대 밖·현물 없음)은 환율이론가("선물이론") = 원달러선물 최근월물
-           (현재가+매수1호가+매도1호가)/3 × 캐리.
-        ③ 이론가도 못 구하면 (None, "계산불가") — 자동M은 실행 중인 세트를 중지한다(exec §4 G0)."""
+        """판정용 환율(HL 환산·실시간 Sprd·역산가)과 출처 — exec 결정 47(사용자 확정 2026-09-28).
+        · 07:30 전: (None, "계산불가") — 계산 자체를 안 한다.
+        · 외환선물 우선시간 **안**: 선물 역산현물가("선물역산")만. 없으면 계산불가(현물이 있어도).
+        · **밖**: LS 현물환("현물") → 선물 역산현물가("선물역산") → 계산불가.
+        계산불가면 자동M은 주문만 안 낸다(세트 중지 아님, exec §4 G0)."""
         moment = now if now is not None else datetime.now()
-        if self.usdkrw_spot is not None and self.in_fx_spot_window(moment.time()):
-            return self.usdkrw_spot, "현물"
-        if self.usdkrw_theory is None:
+        if moment.time() < FX_CALC_START:
             return None, "계산불가"
-        return self.usdkrw_theory, "선물이론"
+        in_window = self.in_fx_fut_window(moment.time())
+        if not in_window and self.usdkrw_spot is not None:
+            return self.usdkrw_spot, "현물"
+        if self.usdkrw_theory is not None:
+            return self.usdkrw_theory, "선물역산"
+        return None, "계산불가"
 
     def _apply_fx_price(self, code: str, price: float) -> None:
         """원달러선물 현재가 수신 → 월물별 저장 + **최근월물만** 환율이론가(현물환산) 갱신.
@@ -1376,34 +1371,16 @@ class LiveSystem:
         failures = 0
         # (옛 2초 대기 삭제 2026-09-14: t2111이 한도 표에 없어 근거 없는 기본 2회에 막혔던 것.
         #  공식 한도 10회를 표에 넣어 시동 초기값(월물 2건) 직후 바로 조회해도 안 걸린다.)
+        # (하나고시 백업 조회는 2026-09-28 폐지 — exec 결정 47: 현물환율은 LS CUR 하나뿐.)
         while True:
             now = datetime.now()
-            in_spot = self.in_fx_spot_window(now.time())
-            if not in_spot and not 8 <= now.hour < 16:  # 세션 밖 — 마지막 값 유지
+            if not 8 <= now.hour < 16:  # 세션 밖 — 마지막 값 유지
                 await asyncio.sleep(60.0)
                 continue
             try:
-                if 8 <= now.hour < 16:  # 통화선물 주간장 — 이론가 예비 갱신
-                    price = await self._gw.get_fx_futures_price(code)
-                    if price is not None:
-                        self._apply_fx_price(code, price)  # code=최근월물
-                # 외환현물 시간대 — 본선은 LS 실시간(CUR). 한 번도 못 받았거나 10분+ 조용할 때만
-                # 네이버 백업. (60초 기준은 개장 전후 1~2분 간격 체결에 계속 걸려 출처가
-                # 널뛰었다 — 2026-09-04 실측.)
-                import time as _t
-                if in_spot and fx_spot_backup_due(self._fx_spot_ts, _t.monotonic()):
-                    from .gateways.fx_spot import fetch_usdkrw_spot
-
-                    spot = await fetch_usdkrw_spot()
-                    if spot is not None:
-                        if self.usdkrw_spot_src != "하나고시":  # 전환 시점만 기록
-                            silent = _t.monotonic() - self._fx_spot_ts
-                            log.warning(
-                                "LS 현물환율(CUR) %s — 하나은행 고시환율로 대체 %.2f",
-                                "미수신(시동 후)" if self._fx_spot_ts == 0.0
-                                else f"{silent:.0f}초 무수신", spot)
-                        self.usdkrw_spot = spot
-                        self.usdkrw_spot_src = "하나고시"  # 네이버 경유 하나은행 고시 매매기준율
+                price = await self._gw.get_fx_futures_price(code)  # 통화선물 주간장 예비 갱신
+                if price is not None:
+                    self._apply_fx_price(code, price)  # code=최근월물
                 failures = 0
             except Exception:  # noqa: BLE001
                 failures += 1
@@ -1653,16 +1630,7 @@ class LiveSystem:
             if price is not None and price > 0:
                 self._apply_fx_price(code, price)
                 fx_filled += 1
-        if self._fx_futures is not None and self.usdkrw_spot is None:  # 라이브 구성일 때만
-            try:
-                from .gateways.fx_spot import fetch_usdkrw_spot
-
-                spot = await fetch_usdkrw_spot()
-            except Exception:  # noqa: BLE001
-                spot = None
-            if spot is not None:
-                self.usdkrw_spot = spot
-                self.usdkrw_spot_src = "하나고시"
+        # (시동 때 하나고시로 현물환율을 채우던 것은 2026-09-28 폐지 — CUR가 올 때까지 "없음".)
         log.info("시동 초기값 채움 — 현재가 %d종, 원달러선물 %d/%d월물, 현물환율 %s "
                  "(현재가 %.1fs, 전체 %.1fs)",
                  len(self.trades), fx_filled, len(self._fx_months),
@@ -2120,7 +2088,7 @@ async def bootstrap_live(
         fx_months=fx_months,
         carry_rates=config.carry_rates,
         fees=config.fees,
-        fx_spot_window=(config.fx_spot_window.start, config.fx_spot_window.end),
+        fx_fut_window=(config.fx_fut_window.start, config.fx_fut_window.end),
         board_ref_qty=config.disparity.ref_qty,
     )
     if use_xing:

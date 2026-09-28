@@ -32,6 +32,17 @@ def test_time_window_over_midnight() -> None:
     assert not in_time_window(time(10, 0), start, end)
 
 
+def test_parse_hhmm_accepts_seconds() -> None:
+    # 외환선물 우선시간은 시:분:초(사용자 2026-09-28) — 옛 시:분도 받는다. 그 밖은 ValueError.
+    assert parse_hhmm("08:45:00") == time(8, 45, 0)
+    assert parse_hhmm("15:45:59") == time(15, 45, 59)
+    assert parse_hhmm("07:30") == time(7, 30)
+    with pytest.raises(ValueError):
+        parse_hhmm("08:45:00:00")
+    with pytest.raises(ValueError):
+        parse_hhmm("0845")
+
+
 def test_expiry_eq_second_thursday() -> None:
     # 2026-07: 첫 목요일 7/2 → 둘째 목요일 7/9.
     assert expiry_date(202607, "EQ") == date(2026, 7, 9)

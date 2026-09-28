@@ -159,13 +159,13 @@ class GlobalSettings:
     hl_daily_limit_usdc: float = 0.0  # HL 당일 체결액 한도(USDC). 0=무제한
     fx_carry_rate: float = 0.010      # 환율이론가 연이자율(기본 1.0%) — 원달러선물→현물 환산
     eq_carry_rate: float = 0.030      # 주식선물 이론가 연이자율(기본 3.0%)
-    # 현물환율(LS CUR) 사용 시간대 "HH:MM" — 이 안은 HL 환산에 현물, 밖은 환율이론가.
-    # config.yaml fx_spot_window가 초기값이었으나 사용자 입력으로 전환(2026-09-04).
-    fx_spot_start: str = "07:00"
-    fx_spot_end: str = "18:10"
-    # 2구간(사용자 2026-09-16) — 비우면 미사용. 두 구간 중 하나라도 안이면 현물환.
-    fx_spot_start2: str = ""
-    fx_spot_end2: str = ""
+    # 외환선물 우선시간 "HH:MM:SS"(exec 결정 47, 2026-09-28) — 이 안은 원달러선물 역산현물가만,
+    # 밖은 LS 현물환 → 역산현물가. 옛 "현물환율 사용시간"(fx_spot_*, 뜻이 반대)은 키를 바꿔 버림.
+    fx_fut_start: str = "08:45:00"
+    fx_fut_end: str = "15:45:00"
+    # 2구간 — 비우면 미사용. 두 구간 중 하나라도 안이면 "안".
+    fx_fut_start2: str = ""
+    fx_fut_end2: str = ""
     sound_fill: SoundSetting = field(default_factory=SoundSetting)   # 주문 체결 시
     sound_error: SoundSetting = field(default_factory=SoundSetting)  # 에러(발주 거부·실패)
     sound_ws: SoundSetting = field(default_factory=SoundSetting)     # WS 끊김
@@ -331,7 +331,7 @@ def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
         s.eq_carry_rate = float(raw.get("eq_carry_rate", s.eq_carry_rate))
     except (TypeError, ValueError):
         pass
-    for name in ("fx_spot_start", "fx_spot_end", "fx_spot_start2", "fx_spot_end2"):
+    for name in ("fx_fut_start", "fx_fut_end", "fx_fut_start2", "fx_fut_end2"):
         val = raw.get(name)  # 형식 틀리면 그 필드만 기본값 유지. 2구간은 빈 문자열 = 미사용
         if isinstance(val, str):
             if val.strip() == "" and name.endswith("2"):

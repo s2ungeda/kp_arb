@@ -297,11 +297,12 @@ class CarryRates(BaseModel):
     fx: float = 0.010             # 원달러선물 → 현물환율 환산 (금리차) — 기본 1.0%
 
 
-class FxSpotWindow(BaseModel):
-    """외환현물 사용 시간대 (DESIGN §6.1 — 창 안은 현물, 밖은 선물이론가로 HL 환산)."""
+class FxFutWindow(BaseModel):
+    """외환선물 우선시간 초기값 (DESIGN §6.1, exec 결정 47 — 창 안은 원달러선물 역산현물가만,
+    밖은 LS 현물환 → 역산현물가). 운영값은 공통설정(core_state)이 시동 때 덮어쓴다."""
 
-    start: str = "07:00"
-    end: str = "18:10"
+    start: str = "08:45:00"
+    end: str = "15:45:00"
 
 
 class FeeRates(BaseModel):
@@ -326,7 +327,7 @@ class AppConfig(BaseModel):
     etf_leverage: float = 2.0
     carry_rates: CarryRates = CarryRates()
     fees: FeeRates = FeeRates()
-    fx_spot_window: FxSpotWindow = FxSpotWindow()
+    fx_fut_window: FxFutWindow = FxFutWindow()
     disparity: DisparityConfig = DisparityConfig()
 
     def etf_symbols(self) -> dict[Underlying, str]:

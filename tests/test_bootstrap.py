@@ -287,22 +287,25 @@ def _system(
     return system, stock_connector, deriv_connector
 
 
-def test_fx_entry_rate_fallback_order() -> None:
-    # 자동M 환진입가(§10 -환/+환): 원달러선물 1호가(HL 매도=매수1호가, HL 매수=매도1호가) → 없으면
-    # LS 현물환(CUR)만 → 없으면 None(사용자 확정 2026-09-15 — 하나고시 백업값·선물 직전 체결가는
-    # 정산에 쓰지 않는다).
+def test_fx_entry_rate_priority_by_futures_window() -> None:
+    # 자동M 정산용 환진입가(§10, exec 결정 47 — 사용자 확정 2026-09-28): HL 방향 무관 한 값.
+    # 외환선물 우선시간(기본 08:45:00~15:45:00) 안 = 선물 역산현물가 → LS 현물환,
+    # 밖 = LS 현물환 → 선물 역산현물가. 07:30 전은 계산 안 함. 둘 다 없으면 None.
+    from datetime import datetime
+
     system, _, _ = _system([], deriv_frames=[])
-    assert system.fx_entry_rate(Side.SELL) is None            # 월물도 값도 없음
-    system._fx_futures = ("A7569000", 202610)
-    system.fx_futures_price["A7569000"] = 1_350.0             # 직전 체결가만 → 값 없음
-    assert system.fx_entry_rate(Side.SELL) is None
-    system.usdkrw_spot, system.usdkrw_spot_src = 1_348.0, "하나고시"  # 백업값 → 값 없음
-    assert system.fx_entry_rate(Side.SELL) is None
-    system.usdkrw_spot, system.usdkrw_spot_src = 1_349.6, "LS"  # LS 현물환이 있으면 그 값
-    assert system.fx_entry_rate(Side.SELL) == 1_349.6 and system.fx_entry_rate(Side.BUY) == 1_349.6
-    system.fx_futures_quote["A7569000"] = (1_349.4, 1_349.5)  # 호가가 있으면 방향별 1호가
-    assert system.fx_entry_rate(Side.SELL) == 1_349.4         # HL 매도 → 매수1호가
-    assert system.fx_entry_rate(Side.BUY) == 1_349.5          # HL 매수 → 매도1호가
+    inside, outside = datetime(2026, 9, 28, 10, 0), datetime(2026, 9, 28, 16, 0)
+    assert system.fx_entry_rate(inside) is None               # 둘 다 없음
+    system.usdkrw_spot, system.usdkrw_spot_src = 1_349.6, "LS"
+    assert system.fx_entry_rate(inside) == 1_349.6            # 안이지만 역산가 없음 → 현물
+    assert system.fx_entry_rate(outside) == 1_349.6
+    system.usdkrw_theory = 1_351.0
+    assert system.fx_entry_rate(inside) == 1_351.0            # 안 → 역산현물가 우선
+    assert system.fx_entry_rate(outside) == 1_349.6           # 밖 → 현물 우선
+    system.usdkrw_spot = None
+    assert system.fx_entry_rate(outside) == 1_351.0           # 밖이지만 현물 없음 → 역산가
+    assert system.fx_entry_rate(datetime(2026, 9, 28, 7, 29, 59)) is None  # 07:30 전
+    assert system.fx_entry_rate(datetime(2026, 9, 28, 7, 30)) == 1_351.0
 
 
 def test_ws_statuses_collects_present_clients() -> None:
@@ -428,35 +431,30 @@ async def test_hl_reconnect_resync_leaves_ls_book_alone() -> None:
     assert ob.order("S1") is None                                        # 주식은 실제 조회 → 정리
 
 
-def test_fx_spot_backup_due_only_when_never_or_long_silent() -> None:
-    # 하나고시 대체는 CUR을 한 번도 못 받았거나 10분 넘게 조용할 때만 — 개장 전후 1~2분 간격
-    # 체결에 60초 기준이 계속 걸려 출처가 널뛰던 것을 고침(2026-09-04 실측).
-    from kp_arb.bootstrap import fx_spot_backup_due
-
-    assert fx_spot_backup_due(0.0, 1000.0) is True          # 시동 후 미수신
-    assert fx_spot_backup_due(1000.0, 1000.0 + 89) is False  # 89초 무수신 — 유지
-    assert fx_spot_backup_due(1000.0, 1000.0 + 599) is False
-    assert fx_spot_backup_due(1000.0, 1000.0 + 601) is True  # 10분 초과 — 대체
-
-
-def test_set_fx_spot_window_changes_effective_rate_source() -> None:
-    # 현물환율 사용시간을 설정창에서 바꾸면 HL 환산 환율 출처 판정이 즉시 그 창을 따른다.
+def test_set_fx_fut_window_changes_effective_rate_source() -> None:
+    # 외환선물 우선시간(exec 결정 47)을 설정창에서 바꾸면 판정 환율 출처가 즉시 그 창을 따른다.
+    # 창 안 = 선물 역산현물가만, 밖 = 현물 우선.
     from datetime import datetime
 
     system, _, _ = _system([])
     system._apply_fx_spot(1386.1)
+    system.usdkrw_theory = 1387.0
     at_9 = datetime(2026, 9, 4, 9, 0)
-    assert system.usdkrw_effective(at_9)[1] == "현물"          # 기본 07:00~18:10 안
-    system.set_fx_spot_window("10:00", "15:00")
-    assert system.usdkrw_effective(at_9)[1] != "현물"          # 새 창 밖 → 이론가
+    assert system.usdkrw_effective(at_9) == (1387.0, "선물역산")  # 기본 08:45:00~15:45:00 안
+    system.set_fx_fut_window("10:00:00", "15:00:00")
+    assert system.usdkrw_effective(at_9) == (1386.1, "현물")      # 새 창 밖 → 현물 우선
     with pytest.raises(ValueError):
-        system.set_fx_spot_window("25:00", "15:00")
-    # 2구간(사용자 2026-09-16): 어느 구간이든 안이면 현물. 비우면 1구간만
-    system.set_fx_spot_window("10:00", "15:00", "08:30", "09:30")
+        system.set_fx_fut_window("25:00:00", "15:00:00")
+    # 2구간: 어느 구간이든 안이면 "안". 비우면 1구간만
+    system.set_fx_fut_window("10:00:00", "15:00:00", "08:30:00", "09:30:00")
+    assert system.usdkrw_effective(at_9)[1] == "선물역산"
+    assert system.usdkrw_effective(datetime(2026, 9, 4, 9, 45))[1] == "현물"
+    system.set_fx_fut_window("10:00:00", "15:00:00", "", "")
     assert system.usdkrw_effective(at_9)[1] == "현물"
-    assert system.usdkrw_effective(datetime(2026, 9, 4, 9, 45))[1] != "현물"
-    system.set_fx_spot_window("10:00", "15:00", "", "")
-    assert system.usdkrw_effective(at_9)[1] != "현물"
+    # 초 단위 경계: 08:45:00부터 "안"
+    system.set_fx_fut_window("08:45:00", "15:45:00")
+    assert system.usdkrw_effective(datetime(2026, 9, 4, 8, 44, 59))[1] == "현물"
+    assert system.usdkrw_effective(datetime(2026, 9, 4, 8, 45, 0))[1] == "선물역산"
 
 
 def test_fx_spot_source_marked_ls() -> None:
@@ -1052,23 +1050,27 @@ async def test_deriv_ws_subscribes_futures_fills_only() -> None:
     types = {json.loads(m)["header"]["tr_type"] for m in deriv_connector.conn.sent}
     assert types == {"1"}  # 계좌 등록
 
-def test_usdkrw_effective_spot_window() -> None:
-    # 주간 창(07:50~18:10) 안이고 외환현물이 있으면 현물, 아니면 선물이론가.
+def test_usdkrw_effective_priority_by_futures_window() -> None:
+    # 판정용 환율(exec 결정 47, 사용자 확정 2026-09-28): 외환선물 우선시간(기본 08:45:00~15:45:00)
+    # 안 = 선물 역산현물가만(현물이 있어도), 밖 = LS 현물환 → 역산현물가. 07:30 전은 계산불가.
     from datetime import datetime
 
     system, _, _ = _system([])
+    inside, outside = datetime(2026, 7, 20, 10, 0), datetime(2026, 7, 20, 16, 0)
+    assert system.usdkrw_effective(inside) == (None, "계산불가")     # 둘 다 없음
     system.usdkrw_theory = 1_500.0
-    day = datetime(2026, 7, 20, 10, 0)
-    assert system.usdkrw_effective(day) == (1_500.0, "선물이론")  # 현물 미수신 → 이론가
+    assert system.usdkrw_effective(inside) == (1_500.0, "선물역산")
+    assert system.usdkrw_effective(outside) == (1_500.0, "선물역산")  # 밖이지만 현물 없음
     system.usdkrw_spot = 1_498.5
-    assert system.usdkrw_effective(datetime(2026, 7, 20, 7, 50)) == (1_498.5, "현물")
-    assert system.usdkrw_effective(day) == (1_498.5, "현물")
-    assert system.usdkrw_effective(datetime(2026, 7, 20, 18, 10)) == (1_500.0, "선물이론")
-    # 이론가도 없으면 계산불가(2026-09-15) — 자동M은 이 값으로 세트를 중지한다
+    assert system.usdkrw_effective(inside) == (1_500.0, "선물역산")   # 안 → 현물이 있어도 역산가
+    assert system.usdkrw_effective(outside) == (1_498.5, "현물")      # 밖 → 현물 우선
+    assert system.usdkrw_effective(datetime(2026, 7, 20, 7, 30)) == (1_498.5, "현물")
+    # 안인데 역산가가 없으면 현물이 있어도 계산불가(사용자 확정: 우선시간 안 2순위 = 매매중단)
     system.usdkrw_theory = None
-    assert system.usdkrw_effective(datetime(2026, 7, 20, 18, 10)) == (None, "계산불가")
-    system.usdkrw_spot, system.usdkrw_spot_src = 1_497.0, "하나고시"  # 창 안이면 백업값도 현물
-    assert system.usdkrw_effective(day) == (1_497.0, "현물")
+    assert system.usdkrw_effective(inside) == (None, "계산불가")
+    assert system.usdkrw_effective(outside) == (1_498.5, "현물")
+    # 07:30 전은 계산하지 않는다
+    assert system.usdkrw_effective(datetime(2026, 7, 20, 7, 29, 59)) == (None, "계산불가")
 
 
 def test_disparity_board_computes_pairs() -> None:

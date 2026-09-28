@@ -52,8 +52,8 @@ FX_SPOT_TR = "CUR"         # 원달러 현물환율 실시간(투자정보)
 # 8자리가 거부됨(8·6 둘을 보내면 거부 1건 뒤 바로 끊김 = 먼저 보낸 8자리; 8자리만 보내도 거부)
 # — 서버 쪽 규격 변경. xing Res(CUR.res)의 base_id 길이는 6이고 xing 모의는 6자리로 오늘 수신됐다.
 # → **후보를 순서대로 하나씩** 등록한다: 6(Res) → 8(옛 문서) → 3(공백 없음). 거부(10009)되면
-#   그 키를 버리고 다음 접속에서 다음 후보를 등록. 전부 거부되면 CUR 없이 연결을 유지(현물환율은
-#   하나고시 백업). 거부 한 키 때문에 주식 시세 전체가 끊기는 일을 막는 게 목적.
+#   그 키를 버리고 다음 접속에서 다음 후보를 등록. 전부 거부되면 CUR 없이 연결을 유지(환율은
+#   선물 역산현물가로, exec 결정 47). 거부 한 키 때문에 주식 시세 전체가 끊기는 일을 막는 게 목적.
 # 2026-09-28 09:30 실측 확정: 6자리가 첫 접속에 정상 응답·CUR 수신(1359.10). 8·3은 규격이 또 바뀔 때
 # 대비한 예비 후보로 둔다.
 FX_SPOT_KEYS = ("USD".ljust(6), "USD".ljust(8), "USD")
@@ -306,7 +306,7 @@ class LSWebSocketClient:
         """CUR 등록 거부 → 지금 키를 버리고 다음 후보를 등록 목록에 넣는다(다음 접속부터 적용).
 
         LS는 키 길이 거부 뒤 연결을 끊으므로(실측 2026-09-28) 재접속 때 새 후보가 나간다.
-        후보가 다 떨어지면 CUR 없이 연결을 유지한다 — 현물환율은 하나고시 백업값으로.
+        후보가 다 떨어지면 CUR 없이 연결을 유지한다 — 환율은 선물 역산현물가로(exec 결정 47).
         """
         import logging
 
@@ -321,7 +321,7 @@ class LSWebSocketClient:
             log.warning("%s CUR 키 %r 거부(%s) → 다음 접속에 후보 %r 등록",
                         self.status.name, bad, header.get("rsp_cd", ""), nxt)
         else:
-            log.warning("%s CUR 키 %r 거부(%s) — 후보 전부 소진, CUR 없이 연결 유지(환율은 백업값)",
+            log.warning("%s CUR 키 %r 거부(%s) — 후보 전부 소진, CUR 없이 연결 유지(환율은 역산가)",
                         self.status.name, bad, header.get("rsp_cd", ""))
 
     def subscribe_trades(self, underlying: Underlying) -> None:

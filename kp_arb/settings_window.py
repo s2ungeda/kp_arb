@@ -20,11 +20,12 @@ _ALARMS: tuple[tuple[str, str], ...] = (
 
 
 def is_time_text(text: str) -> bool:
-    """'HH:MM' 형식 검사(00~23시, 00~59분) — 현물환율 사용시간 입력용. 순수 로직."""
+    """'HH:MM:SS'(또는 'HH:MM') 형식 검사(00~23시, 00~59분·초) — 외환선물 우선시간 입력용.
+    순수 로직. (초 단위는 사용자 2026-09-28.)"""
     parts = text.split(":")
-    if len(parts) != 2 or not all(p.isdigit() and len(p) == 2 for p in parts):
+    if len(parts) not in (2, 3) or not all(p.isdigit() and len(p) == 2 for p in parts):
         return False
-    return int(parts[0]) < 24 and int(parts[1]) < 60
+    return int(parts[0]) < 24 and all(int(p) < 60 for p in parts[1:])
 
 
 def _fmt_amount(v: float) -> str:
@@ -112,26 +113,26 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     e_eq_rate.grid(row=2, column=1, sticky="w", padx=6, pady=2)
     tk.Label(form, text="주식선물 이론가", fg=T.C_MUTED).grid(row=2, column=2, sticky="w")
 
-    # 현물환율(LS CUR) 사용시간 — 이 안은 HL 환산에 현물, 밖은 환율이론가 (사용자 입력, 2026-09-04)
-    tk.Label(form, text="현물환율 사용시간").grid(row=3, column=0, sticky="w", pady=2)
+    # 외환선물 우선시간(exec 결정 47, 2026-09-28) — 이 안은 원달러선물 역산현물가만, 밖은 LS 현물환
+    # → 역산현물가. (옛 "현물환율 사용시간"은 뜻이 반대라 키까지 바꿨다.)
+    tk.Label(form, text="외환선물 우선시간").grid(row=3, column=0, sticky="w", pady=2)
     spot_row = tk.Frame(form)
     spot_row.grid(row=3, column=1, columnspan=3, sticky="w", padx=6, pady=2)
-    e_spot_s = tk.Entry(spot_row, width=6, justify="center", font=T.FONT_NUM)
+    e_spot_s = tk.Entry(spot_row, width=9, justify="center", font=T.FONT_NUM)
     e_spot_s.pack(side="left")
     tk.Label(spot_row, text="~").pack(side="left", padx=4)
-    e_spot_e = tk.Entry(spot_row, width=6, justify="center", font=T.FONT_NUM)
+    e_spot_e = tk.Entry(spot_row, width=9, justify="center", font=T.FONT_NUM)
     e_spot_e.pack(side="left")
-    tk.Label(spot_row, text="HH:MM · 이 시간 밖은 환율이론가", fg=T.C_MUTED).pack(
-        side="left", padx=(8, 0))
-    # 2구간(사용자 2026-09-16) — 바로 아랫줄(옆에 붙이면 창 폭이 늘어남). 비우면 미사용, 둘 중
-    # 어느 구간이든 안이면 현물환.
+    tk.Label(spot_row, text="HH:MM:SS · 안=선물역산, 밖=현물→선물역산",
+             fg=T.C_MUTED).pack(side="left", padx=(8, 0))
+    # 2구간 — 바로 아랫줄(옆에 붙이면 창 폭이 늘어남). 비우면 미사용, 어느 구간이든 안이면 "안".
     tk.Label(form, text="  2구간").grid(row=4, column=0, sticky="w", pady=2)
     spot_row2 = tk.Frame(form)
     spot_row2.grid(row=4, column=1, columnspan=3, sticky="w", padx=6, pady=2)
-    e_spot_s2 = tk.Entry(spot_row2, width=6, justify="center", font=T.FONT_NUM)
+    e_spot_s2 = tk.Entry(spot_row2, width=9, justify="center", font=T.FONT_NUM)
     e_spot_s2.pack(side="left")
     tk.Label(spot_row2, text="~").pack(side="left", padx=4)
-    e_spot_e2 = tk.Entry(spot_row2, width=6, justify="center", font=T.FONT_NUM)
+    e_spot_e2 = tk.Entry(spot_row2, width=9, justify="center", font=T.FONT_NUM)
     e_spot_e2.pack(side="left")
     tk.Label(spot_row2, text="비우면 미사용", fg=T.C_MUTED).pack(side="left", padx=(8, 0))
 
@@ -176,16 +177,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         spot_s, spot_e = e_spot_s.get().strip(), e_spot_e.get().strip()
         spot_s2, spot_e2 = e_spot_s2.get().strip(), e_spot_e2.get().strip()
         if not (is_time_text(spot_s) and is_time_text(spot_e)):
-            set_status("현물환율 사용시간은 HH:MM 형식으로 입력하세요", err=True)
+            set_status("외환선물 우선시간은 HH:MM:SS 형식으로 입력하세요", err=True)
             return
         if (spot_s2 or spot_e2) and not (is_time_text(spot_s2) and is_time_text(spot_e2)):
-            set_status("현물환율 사용시간 2구간은 HH:MM 둘 다 넣거나 둘 다 비우세요", err=True)
+            set_status("외환선물 우선시간 2구간은 HH:MM:SS 둘 다 넣거나 둘 다 비우세요", err=True)
             return
         payload: dict[str, Any] = {
             "cmd": "settings_global", "hl_daily_limit_usdc": limit,
             "fx_carry_rate": fx_rate, "eq_carry_rate": eq_rate,
-            "fx_spot_start": spot_s, "fx_spot_end": spot_e,
-            "fx_spot_start2": spot_s2, "fx_spot_end2": spot_e2}
+            "fx_fut_start": spot_s, "fx_fut_end": spot_e,
+            "fx_fut_start2": spot_s2, "fx_fut_end2": spot_e2}
         for key, r in rows.items():
             payload[key] = {"enabled": bool(r["var"].get()),
                             "path": r["entry"].get().strip()}
@@ -226,10 +227,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             e_fx_rate.insert(0, f"{float(settings.get('fx_carry_rate', 0.010) or 0) * 100:g}")
             e_eq_rate.delete(0, "end")
             e_eq_rate.insert(0, f"{float(settings.get('eq_carry_rate', 0.030) or 0) * 100:g}")
-            for entry, key, default in ((e_spot_s, "fx_spot_start", "07:00"),
-                                        (e_spot_e, "fx_spot_end", "18:10"),
-                                        (e_spot_s2, "fx_spot_start2", ""),
-                                        (e_spot_e2, "fx_spot_end2", "")):
+            for entry, key, default in ((e_spot_s, "fx_fut_start", "08:45:00"),
+                                        (e_spot_e, "fx_fut_end", "15:45:00"),
+                                        (e_spot_s2, "fx_fut_start2", ""),
+                                        (e_spot_e2, "fx_fut_end2", "")):
                 entry.delete(0, "end")
                 entry.insert(0, str(settings.get(key) or default))
             for key, r in rows.items():

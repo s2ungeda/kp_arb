@@ -664,15 +664,24 @@ def test_post_fill_without_fx_is_excluded_from_fx_average() -> None:
     assert old_saved.fx_avg() == 1356.0
 
 
-def test_missing_judgment_fx_halts_the_set() -> None:
-    # 사용자 확정 2026-09-15: 판정 환율(현물환 → 원달러선물 이론가)을 못 구하면 세트를 중지한다
-    # (G0). 값 없이 판정하지 않고, 사람이 해제해야 재개. 실행이 꺼진 다리는 건드리지 않는다.
+def test_missing_judgment_fx_holds_orders_without_halting() -> None:
+    # exec 결정 47(사용자 확정 2026-09-28): 판정 환율을 못 구하면(G0) **주문만 안 낸다** — 세트는
+    # 실행 상태 그대로, 걸어둔 선주문은 취소, 값이 돌아오면 재개. (옛 09-15 "세트 중지·사람이
+    # 해제"는 잠깐의 결측에도 재시작이 번거로워 폐기.)
     s = _set()
     set_running(s, Block.ENTRY, True)
+    assert evaluate(s, Block.ENTRY, _sig(fx=None), SETTINGS, U) == []   # 낼 주문 없음
+    assert s.entry.running and s.entry.status is not LegStatus.HALTED
+    assert s.exit.status is not LegStatus.HALTED
+    # 환율이 돌아오면 같은 판정으로 선주문이 나간다(중지·해제 절차 없음)
+    acts = evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"]
+    assert s.entry.status is LegStatus.PRE_RESTING
+    # 걸어둔 선주문이 있는 채로 환율이 비면 취소(G2와 같은 대기)
+    s.entry.pre_order_id = "77"
     acts = evaluate(s, Block.ENTRY, _sig(fx=None), SETTINGS, U)
-    assert [a.kind for a in acts][:2] == ["halt", "notify"]
-    assert s.entry.status is LegStatus.HALTED and s.exit.status is LegStatus.HALTED
-    assert not s.entry.running and "환율 계산불가" in s.entry.halt_reason
+    assert [a.kind for a in acts] == ["cancel_pre"]
+    assert s.entry.status is not LegStatus.HALTED and s.entry.running
     # 실행이 꺼져 있으면(G1) 환율이 없어도 그냥 대기
     idle = _set()
     assert evaluate(idle, Block.EXIT, _sig(fx=None), SETTINGS, U) == []
