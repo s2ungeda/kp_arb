@@ -118,6 +118,8 @@ class Signals:
     hl_bids: Levels = ()
     hl_asks: Levels = ()
     hl_sz_decimals: int | None = None
+    # HL선 선주문 주문단위(USD) = 화면 호가단위 콤보 값(사용자 2026-09-22) — 없으면 격자 한 칸
+    hl_order_unit: float | None = None
 
 
 # --------------------------------------------------------------- 행동(출력) ---
@@ -563,11 +565,13 @@ def stock_monitor_value(sig: Signals, post_side: Side) -> float | None:
 
 
 def hl_first_monitor_value(sig: Signals, block: Block) -> float | None:
-    """HL선 모니터 수치(exec §7D, 표시만) — "지금 테이커로 잡아도 나오는 Sprd": 진입 = (HL 매수1호가
-    × 환율 − S현재가)/S현재가 − (SF 매도1호가 − 이론가)/이론가, 청산 = HL 매도1호가·SF 매수1호가.
+    """HL선 모니터 수치(exec §7D, 표시만) — 주식선물 화면과 같은 관례(메이커 다리는 자기 1호가,
+    테이커 다리는 상대 호가): 진입 = (HL **매도1호가**(HL 매도 선주문이 서는 자리) × 환율 −
+    S현재가)/S현재가 − (SF 매도1호가(LS가 테이커로 살 값) − 이론가)/이론가, 청산 = HL 매수1호가·SF
+    매수1호가. (처음엔 HL 매수1로 잡아 HL 스프레드가 한 번 더 빠졌음 — 사용자 지적 2026-09-22.)
     입력이 없으면 None. 순수."""
     entry = block is Block.ENTRY
-    hl = sig.hl_bid1 if entry else sig.hl_ask1
+    hl = sig.hl_ask1 if entry else sig.hl_bid1
     sf = ((sig.sf_asks[0][0] if sig.sf_asks else None) if entry
           else (sig.sf_bids[0][0] if sig.sf_bids else None))
     if hl is None or sig.fx is None or not sf or not sig.stock_last or not sig.sf_theory:
@@ -643,6 +647,19 @@ def hl_first_pre_price(
     return hl_round_price(raw, hl_side, sz_decimals, maker=True)
 
 
+def hl_snap_to_unit(price: float, side: Side, unit: float, step: float) -> float:
+    """HL 가격을 주문단위(unit, USD)의 배수로 — 매도 올림 / 매수 내림(메이커: 유리한 쪽). 소수
+    오차는 격자(step) 자릿수로 반올림해 지운다. 순수."""
+    from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+
+    q = Decimal(repr(price)) / Decimal(repr(unit))
+    n = q.to_integral_value(rounding=ROUND_CEILING if side is Side.SELL else ROUND_FLOOR)
+    out = n * Decimal(repr(unit))
+    exp = Decimal(repr(step)).normalize().as_tuple().exponent
+    decimals = max(0, -exp) if isinstance(exp, int) else 0
+    return float(round(out, decimals))
+
+
 class _Hold(Protocol):
     """evaluate의 hold(근거, 행동=None) — 근거를 줄에 남기고 행동을 돌려준다."""
 
@@ -657,6 +674,8 @@ def _evaluate_hl_first(
     최우선호가 기준, HL 격자, ALO 겹침 회피, 허용범위는 HL 호가창 N호가."""
     from .hl_price import hl_price_step
 
+    # G5 S괴리 필터 없음 — 시험 동안은 그대로 두기로(사용자 2026-09-22, 두 번 확인). 진입S 칸은
+    # HL선에서 쓰이지 않는다. 필터가 필요해지면 주식선물의 _passes_signal을 여기서 부르면 된다.
     thr = s.threshold(block)
     if thr is None:
         return hold("G5 기준값 없음", _cancel_if_resting(leg, mono=sig.mono))
@@ -673,26 +692,32 @@ def _evaluate_hl_first(
     step = hl_price_step(raw_price, sig.hl_sz_decimals)
     if step <= 0:
         return hold(f"G6 HL 격자 계산불가 (역산가 {raw_price})")
+    # 주문단위(사용자 2026-09-22): 화면 호가단위 콤보 값으로 매도 올림·매수 내림 — 격자(0.01)마다
+    # 취소·재발주가 나던 것을 SF 주문단위처럼 누른다. 콤보가 격자보다 크지 않으면 격자 그대로
+    unit = sig.hl_order_unit if sig.hl_order_unit and sig.hl_order_unit > step else step
+    price = hl_snap_to_unit(raw_price, side, unit, step)
     # ALO 겹침(결정 E): 매도가 매수1호가 이하 / 매수가 매도1호가 이상이면 HL이 거부 → 한 칸 안쪽
     # (기준값보다 유리한 자리)에 건다
-    price = raw_price
     if side is Side.SELL and price <= sig.hl_bid1 + _EPS:
         price = round(sig.hl_bid1 + step, 8)
     elif side is Side.BUY and price >= sig.hl_ask1 - _EPS:
         price = round(sig.hl_ask1 - step, 8)
-    # 허용범위(G6): 매도 = 역산가 ≤ (HL 매수N호가 + 1칸) × (1 + 범위), 매수는 대칭
+    # 허용범위(G6): 주식선물과 같은 식 — 매도 = 역산가 ≤ (HL 상대 매수N호가 + 1틱) × (1 + 범위),
+    # 매수는 대칭. N·범위는 공통설정 상대호가 콤보·발주범위(사용자 2026-09-22 확인). 1틱은 호가창
+    # 한 칸 = 호가단위 콤보 값(콤보를 0.1로 두면 HL 호가창도 0.1로 뭉쳐 오므로)
     rel = (rel_quote(sig.hl_bids, settings.rel_sell) if side is Side.SELL
            else rel_quote(sig.hl_asks, settings.rel_buy))
     if rel is None:
         return hold("G6 HL 호가창 없음")
-    start = range_start(side, rel, step)
-    limit = limit_price(side, rel, step, settings.pre_range)
-    rng_txt = f"범위 {start:g}~{limit:g}(격자 {step:g})"
+    start = range_start(side, rel, unit)
+    limit = limit_price(side, rel, unit, settings.pre_range)
+    rng_txt = f"범위 {start:g}~{limit:g}(호가단위 {unit:g} 격자 {step:g})"
     if not within_limit(side, price, limit):
         return hold(f"G6 범위 밖 역산가 {price:g} {rng_txt} 상대호가 {rel:g}",
                     _cancel_if_resting(leg, mono=sig.mono))
     sf_disp = (sf_quote - sig.sf_theory) / sig.sf_theory
-    basis = (f"역산가 {price:g}(원값 {raw_price:g}) = S {sig.stock_last:,.0f}×(1+SF괴리 "
+    basis = (f"역산가 {price:g}(원값 {raw_price:g}, 주문단위 {unit:g}) = S {sig.stock_last:,.0f}"
+             f"×(1+SF괴리 "
              f"{sf_disp * 100:.3f}%+{thr * 100:.3f}%)/환율 {sig.fx:,.2f} SF호가 {sf_quote:,.0f} "
              f"이론가 {sig.sf_theory:,.0f} {rng_txt} HL 매수1 {sig.hl_bid1:g} "
              f"매도1 {sig.hl_ask1:g}")

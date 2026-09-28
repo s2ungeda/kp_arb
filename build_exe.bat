@@ -1,12 +1,13 @@
 @echo off
 rem build standalone distribution (no python needed on target PC)
+rem 2026-09-23: 32-bit build (.venv32) so xingAPI COM can live inside the core (DESIGN-ls-xing.md)
 rem output: dist\meme\  -> copy that folder to the target PC
 cd /d "%~dp0"
 rem stop running exes so PyInstaller can overwrite locked files in _internal
 taskkill /F /IM meme-core.exe >nul 2>&1
 taskkill /F /IM meme.exe >nul 2>&1
-".venv\Scripts\python.exe" -m pip install pyinstaller
-".venv\Scripts\python.exe" -m PyInstaller --noconfirm kp_arb.spec
+".venv32\Scripts\python.exe" -m pip install pyinstaller
+".venv32\Scripts\python.exe" -m PyInstaller --noconfirm kp_arb.spec
 if errorlevel 1 (
     echo [ERROR] build failed
     pause

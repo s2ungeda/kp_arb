@@ -126,12 +126,57 @@ async def test_subscribe_fx_spot_registers_cur() -> None:
     await client.run()
     cur = next(json.loads(m) for m in session.sent
                if json.loads(m)["body"]["tr_cd"] == "CUR")
-    # LS 문서 샘플: tr_key "USD"+공백 패딩(Length 8). 4자리 "USD "는 등록만 되고 데이터 없음.
-    assert cur["body"]["tr_key"] == "USD     "
+    # 후보 중 첫 것(6자리 = xing Res base_id 길이) 하나만 등록. 8자리(옛 문서)는 2026-09-28부터
+    # LS가 10009로 거부·연결 끊음 → 거부되면 다음 후보로(아래 fallback 테스트).
+    assert cur["body"]["tr_key"] == "USD   "
     keys = [json.loads(m)["body"]["tr_key"] for m in session.sent
             if json.loads(m)["body"]["tr_cd"] == "CUR"]
-    assert keys == ["USD     ", "USD   "]  # 8자리 + 6자리(base_id 길이) 둘 다
+    assert keys == ["USD   "]
     assert cur["header"]["tr_type"] == "3"    # 시세 등록
+
+
+def _cur_keys(session: FakeConnection) -> list[str]:
+    return [json.loads(m)["body"]["tr_key"] for m in session.sent
+            if json.loads(m)["body"]["tr_cd"] == "CUR"]
+
+
+async def test_fx_spot_key_rejected_falls_back_to_next_candidate() -> None:
+    """CUR 키 거부(10009) → 그 키를 버리고 재접속 때 다음 후보 등록. 다 떨어지면 CUR 없이 유지.
+
+    실측 2026-09-28: LS가 키 길이 거부 뒤 연결을 끊어 재연결이 2초마다 되풀이(480회) — 한 키 때문에
+    주식 시세 전체가 끊기면 안 된다.
+    """
+    reject = json.dumps({"header": {"tr_cd": "CUR", "tr_type": "3", "rsp_cd": "10009",
+                                    "rsp_msg": "tr_key의 길이를 확인해주세요."}})
+    # 거부 뒤 서버가 조용히 닫음(graceful close) → run() 반환 → bootstrap이 같은 client의 run()을
+    # 다시 부른다(_guarded_ws). 여기서는 그 재시작을 run() 반복 호출로 흉내낸다.
+    s1 = FakeConnection([reject])
+    s2 = FakeConnection([reject])
+    s3 = FakeConnection([reject])
+    s4 = FakeConnection([quote_frame()])          # 후보 소진 — CUR 없이 정상 스트림
+    client = LSWebSocketClient(FakeConnector([s1, s2, s3, s4]))
+    client.subscribe_quotes(Underlying.SAMSUNG)
+    client.subscribe_fx_spot()
+    for _ in range(4):
+        await client.run()
+    assert _cur_keys(s1) == ["USD   "]
+    assert _cur_keys(s2) == ["USD     "]
+    assert _cur_keys(s3) == ["USD"]
+    assert _cur_keys(s4) == []                      # 후보 전부 거부 → CUR 등록 안 함
+    assert any(json.loads(m)["body"]["tr_cd"] == "H1_" for m in s4.sent)  # 주식 구독은 유지
+
+
+async def test_fx_spot_key_accepted_stays() -> None:
+    """정상 응답이면 키를 바꾸지 않는다 — 재접속에도 같은 키."""
+    ok = json.dumps({"header": {"tr_cd": "CUR", "tr_type": "3", "rsp_cd": "00000",
+                                "rsp_msg": "정상처리"}})
+    s1 = FakeConnection([ok])
+    s2 = FakeConnection([])
+    client = LSWebSocketClient(FakeConnector([s1, s2]))
+    client.subscribe_fx_spot()
+    await client.run()
+    await client.run()  # 서버 닫힘 → bootstrap 재시작 흉내
+    assert _cur_keys(s1) == ["USD   "] and _cur_keys(s2) == ["USD   "]
 
 
 def test_parse_fx_spot_reads_price_field() -> None:
@@ -391,6 +436,30 @@ async def test_futures_cancel_h01_event() -> None:
     assert events[0].kind == "cancel"
     assert events[0].order_id == "10974"
     assert events[0].org_order_id == "10963"  # 정규화된 원주문
+
+
+async def test_futures_o01_trcode_maps_cancel_and_amend() -> None:
+    # 실측 2026-09-28(xing 모의): 취소하면 O01(ordno=취소주문 1961, orgordno=원주문 1960,
+    # trcode1 FO03) + H01(ordno 0000001961, ordordno "")가 온다 — H01엔 원주문이 없으니
+    # O01/FO03을 취소로 읽는다.
+    # 신규 접수 O01(FO01, orgordno 0)은 그대로 ack(동시호가 대응주문 트리거).
+    new = json.dumps({"header": {"tr_cd": "O01"},
+                      "body": {"ordno": "1960", "orgordno": "0", "trcode1": "FO01"}})
+    cxl = json.dumps({"header": {"tr_cd": "O01"},
+                      "body": {"ordno": "1961", "orgordno": "1960", "trcode1": "FO03"}})
+    h01 = json.dumps({"header": {"tr_cd": "H01"}, "body": {"ordno": "0000001961", "ordordno": ""}})
+    amd = json.dumps({"header": {"tr_cd": "O01"},
+                      "body": {"ordno": "1962", "orgordno": "1960", "trcode1": "FO02"}})
+    session = FakeConnection([new, cxl, h01, amd])
+    client = LSWebSocketClient(FakeConnector([session]))
+    events = []
+    client.on_order_event.append(events.append)
+
+    await client.run()
+
+    assert [(e.kind, e.order_id, e.org_order_id) for e in events] == [
+        ("ack", "1960", None), ("cancel", "1961", "1960"), ("cancel", "1961", None),
+        ("amend", "1962", "1960")]
 
 
 async def test_unknown_tr_is_ignored() -> None:

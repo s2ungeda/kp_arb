@@ -327,6 +327,8 @@ class LiveSystem:
         self._hl_lag = LagMeter()  # HL 체결 수신 지연 집계(10초 창)
         # 배경 상시 태스크(괴리 CSV 등) — wait()가 기다리는 스트리밍 태스크와 분리, stop()이 취소.
         self._aux_tasks: list[asyncio.Task[None]] = []
+        # 안전종료 때 같이 닫을 것(xing COM 세션 등, DESIGN-ls-xing.md) — bootstrap_live가 넣는다
+        self.closers: list[Callable[[], None]] = []
         # HL 포지션 상세(마진·누적펀딩·청산가·레버리지) — clearinghouseState에서 refresh 때 채움.
         self.hl_detail: dict[Underlying, dict[str, Any]] = {}
         # 종목정보(틱·승수·szDecimals·maxLeverage·만기) — 시동 시 1회 조회·보관 (§5.10).
@@ -1912,6 +1914,13 @@ class LiveSystem:
         await asyncio.gather(*self._tasks, *self._aux_tasks, return_exceptions=True)
         self._tasks = []
         self._aux_tasks = []
+        for close in self.closers:  # xing COM 스레드 종료 등
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - 종료 중 오류는 로그만
+                import logging
+
+                logging.getLogger("kp_arb.bootstrap").warning("종료 정리 실패", exc_info=True)
 
 
 async def bootstrap_live(
@@ -1931,16 +1940,42 @@ async def bootstrap_live(
     config = load_config(config_path) if config_path else load_config()
     etf_symbols = config.etf_symbols()
     accounts = LSAccounts.load()
-    token_tx = AiohttpTokenTransport(session, LIVE_BASE_URL)
-    gateway = LSApiGateway.from_accounts(
-        accounts,
-        token_transport=token_tx,
-        rest_transport=AiohttpRestTransport(session),
-        base_url=LIVE_BASE_URL,
-    )
     import logging as _logging
 
     _blog = _logging.getLogger("kp_arb.bootstrap")
+    # LS 접근 방식(DESIGN-ls-xing.md): xing이면 COM 세션 하나(로그인은 여기서 1회, 끊기면
+    # XingRealClient가 ensure_login으로 다시), REST/WS는 만들지 않는다.
+    import time as _time_mod
+    from pathlib import Path
+
+    from .config import LsApi, XingCredentials, ls_api
+
+    use_xing = ls_api() is LsApi.XING
+    xing_session = None
+    xing_creds: XingCredentials | None = None
+    if use_xing:
+        from .gateways.xing import XingGateway
+        from .gateways.xing_com import Win32ComFactory, XingSession
+
+        xing_creds = XingCredentials.load()
+        xing_session = XingSession(Win32ComFactory(), Path(xing_creds.path) / "Res")
+        await xing_session.start()
+        _t_login = _time_mod.perf_counter()
+        xing_accounts = await xing_session.login(
+            xing_creds.host, xing_creds.port, xing_creds.user_id, xing_creds.password,
+            xing_creds.cert_password, xing_creds.server_type)
+        _blog.info("xing 로그인 %.2fs — 계좌 %d개 %s", _time_mod.perf_counter() - _t_login,
+                   len(xing_accounts), [a[:4] + "…" for a in xing_accounts])
+        gateway: LSApiGateway = XingGateway.from_session(
+            xing_session, accounts, res_dir=Path(xing_creds.path) / "Res")
+    else:
+        token_tx = AiohttpTokenTransport(session, LIVE_BASE_URL)
+        gateway = LSApiGateway.from_accounts(
+            accounts,
+            token_transport=token_tx,
+            rest_transport=AiohttpRestTransport(session),
+            base_url=LIVE_BASE_URL,
+        )
     # 주식선물 근·차근 월물 자동 조회(만기 롤오버 대응, §5.11) 후 게이트웨이 재조립.
     # 조회 실패·월물 누락은 아래 startup_symbol_error가 "종목" 로드 실패로 판정한다.
     try:
@@ -1987,15 +2022,24 @@ async def bootstrap_live(
         _blog.info("원달러선물 월물 로드: %s", [c for c, _ in fx_months])
     else:
         _blog.warning("원달러선물 월물 0개 — 환율이론가·FX 대응주문 대상 없음")
-    gateway = LSApiGateway.from_accounts(
-        accounts,
-        token_transport=token_tx,
-        rest_transport=AiohttpRestTransport(session),
-        base_url=LIVE_BASE_URL,
-        futures_symbols=futures_symbols,
-        etf_symbols=etf_symbols,
-        next_futures_symbols=next_futures_symbols,
-    )
+    if use_xing:
+        assert xing_session is not None and xing_creds is not None
+        from .gateways.xing import XingGateway as _XingGateway
+
+        gateway = _XingGateway.from_session(
+            xing_session, accounts, res_dir=Path(xing_creds.path) / "Res",
+            futures_symbols=futures_symbols, etf_symbols=etf_symbols,
+            next_futures_symbols=next_futures_symbols)
+    else:
+        gateway = LSApiGateway.from_accounts(
+            accounts,
+            token_transport=token_tx,
+            rest_transport=AiohttpRestTransport(session),
+            base_url=LIVE_BASE_URL,
+            futures_symbols=futures_symbols,
+            etf_symbols=etf_symbols,
+            next_futures_symbols=next_futures_symbols,
+        )
 
     url = ls_ws_url(current_mode())
 
@@ -2034,12 +2078,38 @@ async def bootstrap_live(
     except ConfigError:
         pass
 
+    if use_xing:
+        # xing 실시간 하나가 주식·선물 계좌 통보·시세를 다 받는다 — 두 자리에 같은 객체(§2.2)
+        from .gateways.xing_ws import XingRealClient
+
+        assert xing_session is not None and xing_creds is not None
+        _xs, _xc = xing_session, xing_creds
+
+        async def ensure_login() -> None:
+            """끊기면 2초 간격으로 재로그인 — 자격은 메모리의 XingCredentials(로그에 안 남김)."""
+            while not _xs.logged_in:
+                try:
+                    await _xs.login(_xc.host, _xc.port, _xc.user_id, _xc.password,
+                                    _xc.cert_password, _xc.server_type)
+                except Exception as exc:  # noqa: BLE001 - 재시도(서버 점검 등)
+                    _blog.warning("xing 재로그인 실패 — 2초 뒤 재시도: %s", exc)
+                    await asyncio.sleep(2.0)
+
+        xing_real = XingRealClient(
+            xing_session, ensure_login=ensure_login, etf_symbols=etf_symbols,
+            status=WsStatus(venue="LS", name="LS xing", kind="시세/주문", expects_stream=True),
+            reconnect_backoff_s=2.0)
+        stock_ws: LSWebSocketClient = xing_real
+        deriv_ws: LSWebSocketClient | None = xing_real
+    else:
+        stock_ws = await ws_for(Account.KR_STOCK)
+        deriv_ws = await ws_for(Account.KR_DERIV)
     system = LiveSystem(
         gateway=gateway,
         order_book=OrderBook(),
         session=SessionService(),
-        stock_ws=await ws_for(Account.KR_STOCK),
-        deriv_ws=await ws_for(Account.KR_DERIV),
+        stock_ws=stock_ws,
+        deriv_ws=deriv_ws,
         hl_gateway=hl_gateway,
         hl_ws=hl_ws,
         futures_symbols=futures_symbols,
@@ -2053,6 +2123,10 @@ async def bootstrap_live(
         fx_spot_window=(config.fx_spot_window.start, config.fx_spot_window.end),
         board_ref_qty=config.disparity.ref_qty,
     )
+    if use_xing:
+        assert xing_session is not None
+        system.closers.append(xing_real.stop)      # 실시간 루프 정지
+        system.closers.append(xing_session.close)  # COM 스레드 종료
     # 종목 로드 판정 — 취급 종목(config.symbols)마다 주식선물 근·차근 월물 + 원달러선물 월물이
     # 있어야 한다. 하나라도 빠지면 "종목" 로드 실패 → 시동 초기화가 멈추고 메인창이 팝업
     # (하이닉스 근월물 누락·원달러 월물 0개가 여기 걸린다 — 2026-09-03 사용자 확정, 차근 포함).

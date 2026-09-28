@@ -1056,9 +1056,14 @@ async def test_hl_first_engine_round_hl_alo_pre_then_ls_post() -> None:
     row = snap[key]["sets"][0]["entry"]
     assert row["hl_unhedged"] == 0 and row["pre_filled"] == 0  # 판 끝 — 선주문 정리됨
     mon = snap[key]["monitor"]["fwd"]
-    # 모니터 = (HL 매수1 1184×1356 − 1,600,000)/1,600,000 − (1,605,000−1,605,000)/1,605,000
-    assert abs(mon["en_sf"] - (1184.0 * 1356 - 1_600_000) / 1_600_000) < 1e-9
-    assert mon["en_s"] is None
+    # 진입 모니터 = (HL 매도1 1184.5(HL 매도 선주문이 서는 자리)×1356 − 1,600,000)/1,600,000
+    #   − (SF 매도1 1,605,000 − 이론가 1,605,000)/1,605,000 ; 청산은 HL 매수1·SF 매수1(1,598,000)
+    assert abs(mon["en_sf"] - (1184.5 * 1356 - 1_600_000) / 1_600_000) < 1e-9
+    assert abs(mon["ex_sf"] - ((1184.0 * 1356 - 1_600_000) / 1_600_000
+                               - (1_598_000 - 1_605_000) / 1_605_000)) < 1e-9
+    assert mon["en_s"] == 0.01  # S괴리(FakeSystem s_entry) 표시만
+    rev = snap[key]["monitor"]["rev"]
+    assert rev["en_sf"] == mon["ex_sf"] and rev["ex_sf"] == mon["en_sf"]  # 역방향은 다리 반대
 
 
 async def test_hl_first_engine_ls_post_timeout_halts_and_alo_cross_reject_retries() -> None:

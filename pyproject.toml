@@ -11,6 +11,9 @@ dependencies = [
     "python-dotenv>=1.0",
     "websockets>=12",
     "hyperliquid-python-sdk>=0.24",
+    # eth-account 0.11+는 ckzg(이더리움 블롭 증명 C 확장, HL 서명엔 안 쓰임)를 끌어오는데 32비트 휠이 없다.
+    # 코어를 32비트(xingAPI COM 동거)로 돌리기 위해 고정 — 0.10에서 HL 서명이 64비트와 동일함을 실측(2026-09-23)
+    "eth-account>=0.10,<0.11",
     "pyyaml>=6",
 ]
 

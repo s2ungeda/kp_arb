@@ -55,7 +55,7 @@ from .domain.enums import Block, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import InstrumentInfo, OrderIntent, Quote
 from .gateways.ls import OrderGoneError
 from .gateways.ls_rest import RestTimeoutError
-from .hl_merge import merge_tick_options
+from .hl_merge import merge_tick_options, merge_tick_size
 from .hl_price import hl_round_price
 from .logs import attach_daily_file
 from .ticks import tick_for
@@ -362,9 +362,15 @@ class AutoMEngine:
         hl_info = self._system.instruments.get((u, Instrument.HL_PERP))
         hl_bids: tuple[tuple[float, float], ...] = ()
         hl_asks: tuple[tuple[float, float], ...] = ()
+        hl_unit: float | None = None
         if hl is not None and hl.bid and hl.ask:
             hl_bids = tuple(hl.bids or [(hl.bid, hl.bid_qty or 1.0)])
             hl_asks = tuple(hl.asks or [(hl.ask, hl.ask_qty or 1.0)])
+            # HL선 선주문 주문단위 = 화면 호가단위 콤보(코어 머지 상태)의 틱 크기(사용자 2026-09-22)
+            active_fn = getattr(self._system, "hl_merge_active", None)
+            active = active_fn(u) if callable(active_fn) else None
+            hl_unit = merge_tick_size(hl.ask or hl.bid, active[0] if active else None,
+                                      active[1] if active else None)
         return Signals(
             now=now, mono=mono,
             sf_spread_entry=sf_entry, s_spread_entry=s_entry, sf_spread_exit=sf_exit,
@@ -376,7 +382,8 @@ class AutoMEngine:
             hl_ask1=hl.ask if hl is not None else None,
             hl_est_bid=est_bid, hl_est_ask=est_ask,
             hl_bids=hl_bids, hl_asks=hl_asks,
-            hl_sz_decimals=hl_info.sz_decimals if hl_info is not None else None)
+            hl_sz_decimals=hl_info.sz_decimals if hl_info is not None else None,
+            hl_order_unit=hl_unit)
 
     # ------------------------------------------------------------ 행동 실행 ---
     def _apply(self, u: Underlying, index: int, block: Block, actions: list[Action],
@@ -1087,9 +1094,13 @@ class AutoMEngine:
 
             sig = self.build_signals(u, book, book.sets[0], Block.ENTRY, datetime.now(),
                                      self._mono, False)
-            monitor = {"fwd": {"en_sf": hl_first_monitor_value(sig, Block.ENTRY), "en_s": None,
-                               "ex_sf": hl_first_monitor_value(sig, Block.EXIT)},
-                       "rev": {"en_sf": None, "en_s": None, "ex_sf": None}}
+            # 진입S 칸은 주식선물 화면과 같은 S괴리(HL 매수호가창 est×환율 대비 S현재가, 기준수량)
+            # — 표시만, 판정엔 안 쓴다(사용자 2026-09-22: "-"로 두니 S괴리가 안 보인다)
+            en_v, ex_v = (hl_first_monitor_value(sig, Block.ENTRY),
+                          hl_first_monitor_value(sig, Block.EXIT))
+            # 역방향은 다리가 반대라 진입 = 정방향 청산 식(HL 매도1·SF 매수1), 청산 = 정방향 진입 식
+            monitor = {"fwd": {"en_sf": en_v, "en_s": sig.s_spread_entry, "ex_sf": ex_v},
+                       "rev": {"en_sf": ex_v, "en_s": sig.s_spread_exit, "ex_sf": en_v}}
         fx_used, fx_src = self._system.usdkrw_effective()  # 지금 HL 환산에 쓰는 환율(화면 표시)
         out = [self._set_row(s) for s in book.sets]
         rev_out = [self._set_row(s) for s in book.rev_sets]  # 역방향 3세트(§7A·§7B)

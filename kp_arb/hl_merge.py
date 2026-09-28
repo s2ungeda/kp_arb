@@ -21,6 +21,18 @@ def _fmt_tick(v: float) -> str:
     return f"{v:,.4f}".rstrip("0").rstrip(".")
 
 
+def merge_tick_size(price: float, n_sig_figs: int | None, mantissa: int | None) -> float:
+    """화면 호가단위 콤보에서 고른 (nSigFigs, mantissa)의 실제 틱 크기(USD) — HL선 선주문의
+    **주문단위**(exec §7D, 사용자 2026-09-22: 취소·재발주가 잦아 격자 대신 콤보 단위로 맞춤).
+    모르는 조합·가격 없음이면 기준틱(유효숫자 5자리 한 칸)."""
+    if price <= 0:
+        return 0.0
+    base = 10.0 ** (math.floor(math.log10(abs(price))) - 4)
+    mult = next((m for m, nsf, mant in _MERGE_LEVELS if (nsf, mant) == (n_sig_figs, mantissa)),
+                1)
+    return base * mult
+
+
 def merge_tick_options(price: float) -> list[tuple[str, int | None, int | None]]:
     """활성 종목 가격 기준 호가단위 옵션 — [(틱표시, nSigFigs, mantissa), ...].
 

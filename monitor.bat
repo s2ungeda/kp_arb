@@ -1,4 +1,4 @@
 @echo off
-rem market monitor window (runs with .venv python)
+rem market monitor window (runs with .venv32 python, 32-bit)
 cd /d "%~dp0"
-".venv\Scripts\python.exe" -m kp_arb.monitor
+".venv32\Scripts\python.exe" -m kp_arb.monitor

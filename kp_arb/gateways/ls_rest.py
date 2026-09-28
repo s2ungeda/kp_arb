@@ -101,6 +101,17 @@ class RestResponse(BaseModel):
     body: dict[str, Any] = {}
 
 
+class TrRequester(Protocol):
+    """TR 요청 계약 — LSApiGateway가 계좌별로 하나씩 든다. REST(LSRestClient)와 xingAPI
+    (XingQueryClient, DESIGN-ls-xing.md §2)가 같은 모양: ``{TR}InBlock`` 본문 → ``rsp_cd``·
+    ``{TR}OutBlockN``이 든 RestResponse. 게이트웨이의 본문 만들기·응답 파싱은 전송과 무관."""
+
+    async def request(
+        self, tr_cd: str, body: dict[str, Any] | None = None, *,
+        path: str = "/", method: str = "POST", tr_cont: str = "N",
+    ) -> RestResponse: ...
+
+
 class RestTransport(Protocol):
     """실제 HTTP 전송 계약. 테스트는 mock, 라이브는 aiohttp 구현(추후 블록)."""
 

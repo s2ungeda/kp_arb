@@ -556,7 +556,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     btn_apply.pack(side="left", padx=(0, 4))
     ent_refqty = tk.Entry(top, width=6, justify="right", validate="key",
                           validatecommand=vcmd_int, font=T.FONT_NUM_LG)
-    ent_refqty.insert(0, "0")
+    # 시작값은 코어 종목 상태의 기본 기준수량(AutoMBook.ref_qty=1)과 같게 — 코어에 이 종목 상태가
+    # 아직 없는 첫 사용(주식·HL선)은 코어 값으로 덮이지 않아, 0인 채 '적'을 누르면 기준수량 0이 가서
+    # 모니터 수치가 숨겨졌다(실측 2026-09-22 HL선 첫 '적').
+    ent_refqty.insert(0, "1")
     ent_refqty.pack(side="left", padx=(0, 6))
     ref_sent["bg"] = ent_refqty.cget("bg")  # 깜빡임 뒤 되돌릴 평소 배경(중첩 호출에도 안전)
     ent_refqty.bind("<Return>", lambda _e: send_ref_qty())

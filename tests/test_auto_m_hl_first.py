@@ -248,6 +248,42 @@ def test_replace_on_price_change_and_exit_direction() -> None:
     assert acts[0].kind == "place_pre" and acts[0].price == 1297.2
 
 
+def test_order_unit_from_tick_combo_snaps_price_and_damps_replace() -> None:
+    # 사용자 2026-09-22: 취소·재발주가 격자(0.1)마다 나서 HL 선주문 주문단위 = 화면 호가단위 콤보.
+    # 역산가 1297.2 → 단위 0.5면 매도 올림 1297.5, 매수(청산)는 내림. 범위의 1틱도 그 단위.
+    from kp_arb.auto_m import hl_snap_to_unit
+    from kp_arb.hl_merge import merge_tick_size
+
+    assert hl_snap_to_unit(1297.2, Side.SELL, 0.5, 0.1) == 1297.5
+    assert hl_snap_to_unit(1297.5, Side.SELL, 0.5, 0.1) == 1297.5  # 이미 배수면 그대로
+    assert hl_snap_to_unit(1292.58, Side.BUY, 0.5, 0.1) == 1292.5
+    assert hl_snap_to_unit(207.31, Side.SELL, 0.05, 0.01) == 207.35  # 삼성 200달러대 격자 0.01
+    # 콤보 → 틱 크기: 1297달러대 기준틱 0.1, (5,2)=0.2, (5,5)=0.5, (4,None)=1, 모르면 기준틱
+    assert merge_tick_size(1297.2, None, None) == 0.1
+    assert abs(merge_tick_size(1297.2, 5, 5) - 0.5) < 1e-12
+    assert merge_tick_size(1297.2, 4, None) == 1.0
+    assert merge_tick_size(207.3, 5, 5) == 0.05
+
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    acts = evaluate(s, Block.ENTRY, _sig(hl_order_unit=0.5), SETTINGS, U)
+    assert acts[0].kind == "place_pre" and acts[0].price == 1297.5
+    assert "주문단위 0.5" in s.entry.block_reason and "호가단위 0.5" in s.entry.block_reason
+    on_pre_ack(s, Block.ENTRY, "hl-1")
+    # S현재가가 조금 움직여 원값이 1297.3 → 같은 단위 칸(1297.5) → 재발주 없음
+    acts = evaluate(s, Block.ENTRY, _sig(mono=101.0, hl_order_unit=0.5,
+                                         stock_last=1_775_100.0), SETTINGS, U)
+    assert acts == [] and s.entry.block_reason.startswith("유지 역산가 1297.5")
+    # 단위 칸을 넘으면(원값 1297.9 → 1298.0) 취소 → 재발주
+    acts = evaluate(s, Block.ENTRY, _sig(mono=102.0, hl_order_unit=0.5,
+                                         stock_last=1_776_000.0), SETTINGS, U)
+    assert [a.kind for a in acts] == ["cancel_pre"]
+    # 콤보 단위가 격자보다 작거나 없으면 격자 그대로(1297.2)
+    s2 = _set()
+    set_running(s2, Block.ENTRY, True)
+    assert evaluate(s2, Block.ENTRY, _sig(hl_order_unit=0.01), SETTINGS, U)[0].price == 1297.2
+
+
 def test_book_propagates_product_to_legs_and_restore() -> None:
     from kp_arb.auto_m import book_key, parse_book_key
 

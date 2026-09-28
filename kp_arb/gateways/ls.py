@@ -33,6 +33,7 @@ from .ls_rest import (
     RestError,
     RestResponse,
     RestTransport,
+    TrRequester,
 )
 
 LIVE_BASE_URL = "https://openapi.ls-sec.co.kr:8080"
@@ -110,7 +111,7 @@ class LSApiGateway(LSGateway):
 
     def __init__(
         self,
-        rest_by_account: Mapping[Account, LSRestClient],
+        rest_by_account: Mapping[Account, TrRequester],  # REST 또는 xing(전송만 다름)
         *,
         accounts: LSAccounts | None = None,
         futures_symbols: Mapping[Underlying, str] | None = None,
@@ -165,7 +166,7 @@ class LSApiGateway(LSGateway):
                    futures_symbols=futures_symbols, etf_symbols=etf_symbols,
                    next_futures_symbols=next_futures_symbols)
 
-    def _rest_for(self, account: Account) -> LSRestClient:
+    def _rest_for(self, account: Account) -> TrRequester:
         return self._rest_by_account[account]
 
     def _account_fields(self, account: Account) -> dict[str, Any]:

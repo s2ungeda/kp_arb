@@ -24,18 +24,24 @@ KEYRING_SERVICE = "kp-arb"
 
 # 전체 비밀 이름 목록 (메인 화면 '키 등록' 창·secrets_cli 공용)
 SECRET_NAMES: tuple[tuple[str, str], ...] = (
-    ("LS_STOCK_APPKEY", "LS 주식계좌 AppKey"),
-    ("LS_STOCK_APPSECRET", "LS 주식계좌 AppSecret"),
+    # xingAPI 로그인(DESIGN-ls-xing.md §3, 2026-09-23) — 한 로그인이 주식·선물·FX 계좌를 다 본다.
+    # 계좌번호·비밀번호는 아래 LS_*_ACCT/ACCT_PW를 그대로 쓴다. AppKey/AppSecret는 OpenAPI(REST)
+    # 전용이라 xing 전환 뒤엔 비워 둬도 된다(전환 스위치 KP_LS_API가 openapi일 때만 필요).
+    ("LS_XING_ID", "LS xingAPI 로그인 아이디"),
+    ("LS_XING_PW", "LS xingAPI 로그인 비밀번호"),
+    ("LS_XING_CERT_PW", "LS 공인인증서 비밀번호 (xingAPI)"),
     ("LS_STOCK_ACCT", "LS 주식계좌 번호"),
     ("LS_STOCK_ACCT_PW", "LS 주식계좌 비밀번호"),
-    ("LS_DERIV_APPKEY", "LS 선물계좌 AppKey"),
-    ("LS_DERIV_APPSECRET", "LS 선물계좌 AppSecret"),
     ("LS_DERIV_ACCT", "LS 선물계좌 번호"),
     ("LS_DERIV_ACCT_PW", "LS 선물계좌 비밀번호"),
-    ("LS_FX_APPKEY", "LS 원달러선물(환헤지) AppKey (선택)"),
-    ("LS_FX_APPSECRET", "LS 원달러선물(환헤지) AppSecret (선택)"),
     ("LS_FX_ACCT", "LS 원달러선물(환헤지) 계좌번호 (선택)"),
     ("LS_FX_ACCT_PW", "LS 원달러선물(환헤지) 비밀번호 (선택)"),
+    ("LS_STOCK_APPKEY", "LS 주식계좌 AppKey (OpenAPI 전용)"),
+    ("LS_STOCK_APPSECRET", "LS 주식계좌 AppSecret (OpenAPI 전용)"),
+    ("LS_DERIV_APPKEY", "LS 선물계좌 AppKey (OpenAPI 전용)"),
+    ("LS_DERIV_APPSECRET", "LS 선물계좌 AppSecret (OpenAPI 전용)"),
+    ("LS_FX_APPKEY", "LS 원달러선물 AppKey (OpenAPI 전용, 선택)"),
+    ("LS_FX_APPSECRET", "LS 원달러선물 AppSecret (OpenAPI 전용, 선택)"),
     ("HL_AGENT_KEY", "HL 에이전트 키"),
     ("HL_ACCOUNT_ADDRESS", "HL 메인 주소"),
     ("KP_TELEGRAM_TOKEN", "텔레그램 봇 토큰 (알림, 선택)"),
@@ -69,6 +75,77 @@ class SecretProvider(Protocol):
     """비밀 조회 계약. 없으면 None."""
 
     def get(self, name: str) -> str | None: ...
+
+
+class LsApi(StrEnum):
+    """LS 접근 방식(DESIGN-ls-xing.md §0) — 검증 끝날 때까지 기본은 OpenAPI(REST/WS)."""
+
+    OPENAPI = "openapi"
+    XING = "xing"
+
+
+def ls_api() -> LsApi:
+    """``KP_LS_API`` 환경변수(.env) → 자격증명관리자 → 기본 openapi. 값이 틀리면 ConfigError."""
+    raw = os.environ.get("KP_LS_API")
+    if not raw:
+        raw = KeyringSecrets().get("KP_LS_API") or LsApi.OPENAPI.value
+    try:
+        return LsApi(raw.strip().lower())
+    except ValueError as exc:
+        raise ConfigError(f"invalid KP_LS_API {raw!r} (openapi|xing)") from exc
+
+
+XING_DEFAULT_PATH = r"C:\meme"  # 설치 폴더(사용자 2026-09-23) — Res 하위. KP_XING_PATH로 바꿈
+XING_DEFAULT_PORT = 20001
+
+
+@dataclass
+class XingCredentials:
+    """xingAPI 로그인 자격 — repr 마스킹. 서버 호스트는 [OPEN](DevCenter 로그인 창 값)."""
+
+    user_id: str
+    password: str
+    cert_password: str
+    host: str
+    port: int = XING_DEFAULT_PORT
+    server_type: int = 0  # 0 실서버 / 1 모의서버(XA_SIMUL_SERVER)
+    path: str = XING_DEFAULT_PATH
+
+    def __repr__(self) -> str:
+        return (f"XingCredentials(user_id={self.user_id!r}, host={self.host!r}, "
+                f"port={self.port}, server_type={self.server_type}, path={self.path!r}, "
+                "password=***, cert_password=***)")
+
+    @classmethod
+    def load(cls, secrets: SecretProvider | None = None) -> XingCredentials:
+        """keyring/env에서 로드. 없으면 ConfigError(시동 실패 사유로 팝업)."""
+        provider = secrets if secrets is not None else default_secrets()
+
+        def req(name: str) -> str:
+            value = provider.get(name)
+            if not value:
+                raise ConfigError(f"missing secret {name}")
+            return value
+
+        host = os.environ.get("KP_XING_HOST") or provider.get("KP_XING_HOST") or ""
+        if not host:
+            raise ConfigError("missing KP_XING_HOST (xingAPI 서버 주소 — DevCenter 로그인 창 값)")
+        port_raw = os.environ.get("KP_XING_PORT") or provider.get("KP_XING_PORT") or ""
+        server_raw = (os.environ.get("KP_XING_SERVER") or provider.get("KP_XING_SERVER")
+                      or "real").strip().lower()
+        demo = server_raw in ("demo", "simul", "paper")
+        # 공인인증서 비밀번호는 실서버만 — 모의투자 서버는 인증서 없이 로그인(사용자 2026-09-23)
+        cert = provider.get("LS_XING_CERT_PW") or ""
+        if not demo and not cert:
+            raise ConfigError("missing secret LS_XING_CERT_PW (실서버 로그인에 필요)")
+        return cls(
+            user_id=req("LS_XING_ID"), password=req("LS_XING_PW"),
+            cert_password=cert, host=host,
+            port=int(port_raw) if port_raw else XING_DEFAULT_PORT,
+            server_type=1 if demo else 0,
+            path=os.environ.get("KP_XING_PATH") or provider.get("KP_XING_PATH")
+            or XING_DEFAULT_PATH,
+        )
 
 
 class EnvSecrets:

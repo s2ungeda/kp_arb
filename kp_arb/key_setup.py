@@ -45,6 +45,20 @@ def main() -> None:
     if os.environ.get("KP_MODE"):
         tk.Label(mode_row, text=f"(.env KP_MODE={os.environ['KP_MODE']} 가 우선)",
                  fg="gray40").pack(side="left", padx=(8, 0))
+    # LS 접근 방식(DESIGN-ls-xing.md) — openapi(REST/WS, 기본) | xing(xingAPI COM, 32비트 코어).
+    # .env의 KP_LS_API가 있으면 그게 우선. xing이면 위 xingAPI 아이디·비밀번호·인증서 비번이 필요
+    api_row = tk.Frame(root)
+    api_row.grid(row=len(SECRET_NAMES) + 2, column=0, columnspan=3,
+                 sticky="w", padx=8, pady=(2, 0))
+    tk.Label(api_row, text="LS 접근").pack(side="left", padx=(0, 8))
+    api_var = tk.StringVar(value=provider.get("KP_LS_API") or "openapi")
+    tk.Radiobutton(api_row, text="OpenAPI(REST)", variable=api_var,
+                   value="openapi").pack(side="left")
+    tk.Radiobutton(api_row, text="xingAPI — 위 xing 로그인 3개 필요", variable=api_var,
+                   value="xing").pack(side="left", padx=(8, 0))
+    if os.environ.get("KP_LS_API"):
+        tk.Label(api_row, text=f"(.env KP_LS_API={os.environ['KP_LS_API']} 가 우선)",
+                 fg="gray40").pack(side="left", padx=(8, 0))
 
     entries: dict[str, tk.Entry] = {}
     status_labels: dict[str, tk.Label] = {}
@@ -61,7 +75,7 @@ def main() -> None:
         status_labels[name] = status
 
     bottom = tk.Frame(root)
-    bottom.grid(row=len(SECRET_NAMES) + 2, column=0, columnspan=3, pady=(6, 8))
+    bottom.grid(row=len(SECRET_NAMES) + 3, column=0, columnspan=3, pady=(6, 8))
     show_var = tk.BooleanVar(value=False)
 
     def toggle_show() -> None:
@@ -85,7 +99,9 @@ def main() -> None:
             status_labels[name].config(text="등록됨", fg="dark green")
             saved += 1
         keyring.set_password(KEYRING_SERVICE, "KP_MODE", mode_var.get())
-        result.config(text=f"키 {saved}건 + 모드({mode_var.get()}) 저장 — 재시작 후 적용")
+        keyring.set_password(KEYRING_SERVICE, "KP_LS_API", api_var.get())
+        result.config(text=f"키 {saved}건 + 모드({mode_var.get()}) + LS 접근({api_var.get()}) "
+                           "저장 — 재시작 후 적용")
 
     tk.Button(bottom, text="저장", width=10, command=save).pack(side="left", padx=4)
     tk.Button(bottom, text="닫기", width=10, command=root.destroy).pack(side="left", padx=4)

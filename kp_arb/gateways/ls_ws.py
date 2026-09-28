@@ -47,7 +47,16 @@ FX_SPOT_TR = "CUR"         # 원달러 현물환율 실시간(투자정보)
 # 4자리 "USD "로 보내면 등록은 '정상처리'되지만 어떤 종목에도 안 맞아 데이터가 안 온다
 # (2026-09-03 실측: 낮 내내 미수신 → 하나고시 백업만 사용). 8자리(규격)+6자리(base_id 길이)
 # 둘 다 등록해 어느 쪽이든 받고, 실측으로 확정되면 하나로 줄인다(중복 수신은 같은 값이라 무해).
-FX_SPOT_KEYS = ("USD".ljust(8), "USD".ljust(6))
+# 2026-09-28 실측: LS가 CUR 키를 10009 "tr_key의 길이를 확인"으로 거부하고 **연결까지 끊어**
+# 주식 WS가 2~4초마다 재연결을 되풀이(오전 480회). 09-22까지 8자리로 잘 받았는데 오늘 첫 시동부터
+# 8자리가 거부됨(8·6 둘을 보내면 거부 1건 뒤 바로 끊김 = 먼저 보낸 8자리; 8자리만 보내도 거부)
+# — 서버 쪽 규격 변경. xing Res(CUR.res)의 base_id 길이는 6이고 xing 모의는 6자리로 오늘 수신됐다.
+# → **후보를 순서대로 하나씩** 등록한다: 6(Res) → 8(옛 문서) → 3(공백 없음). 거부(10009)되면
+#   그 키를 버리고 다음 접속에서 다음 후보를 등록. 전부 거부되면 CUR 없이 연결을 유지(현물환율은
+#   하나고시 백업). 거부 한 키 때문에 주식 시세 전체가 끊기는 일을 막는 게 목적.
+# 2026-09-28 09:30 실측 확정: 6자리가 첫 접속에 정상 응답·CUR 수신(1359.10). 8·3은 규격이 또 바뀔 때
+# 대비한 예비 후보로 둔다.
+FX_SPOT_KEYS = ("USD".ljust(6), "USD".ljust(8), "USD")
 EXPECTED_TRS: tuple[str, ...] = ("YS3", "NYS", "UYS", "YJC")  # 예상체결: KRX/NXT/통합/선물
 # NXT 시세는 전용 TR(NH1/NS3)이 아니라 **통합 TR(UH1/US3/UYS)**로 온다(RTD 실측 이관).
 # 통합 TR의 tr_key는 "U"+6자리코드+공백3(총 10자). 모의(29443)는 U/N계열 미중계 —
@@ -58,6 +67,9 @@ ORDER_EVENT_TRS: dict[str, str] = {
     "SC0": "ack", "SC2": "amend", "SC3": "cancel", "SC4": "reject",  # 주식
     "O01": "ack", "H01": "cancel",                                    # 선물(H01=정정취소 공용)
 }
+# 선물 접수 통보(O01) trcode1 → 사건 종류(실측 2026-09-28 xing 모의: 신규 FO01 / 취소 FO03,
+# 정정은 같은 체계의 FO02로 봄 — 미실측). 없는 값은 접수(ack)
+_O01_KIND_BY_TRCODE: dict[str, str] = {"FO01": "ack", "FO02": "amend", "FO03": "cancel"}
 STOCK_FILL_TRS: tuple[str, ...] = ("SC0", "SC1", "SC2", "SC3", "SC4")     # 주식계좌 토큰 WS
 FUTURES_FILL_TRS: tuple[str, ...] = ("O01", "C01", "H01")                  # 선물옵션계좌 토큰 WS
 ACCOUNT_TRS: tuple[str, ...] = STOCK_FILL_TRS + FUTURES_FILL_TRS
@@ -226,6 +238,8 @@ class LSWebSocketClient:
         self._reconnect_backoff_s = reconnect_backoff_s
         self._subs: list[tuple[str, str, str]] = []  # (tr_cd, tr_key, tr_type) 희망 구독 상태
         self._ack_ok = 0  # 이번 접속에서 정상 처리된 구독 응답 수 — 전부 오면 한 줄 요약
+        # CUR 키 후보(FX_SPOT_KEYS) — 거부되면 앞에서부터 버리고 다음 후보로(2026-09-28)
+        self._fx_spot_candidates: list[str] = list(FX_SPOT_KEYS)
         self._conn: WSConnection | None = None
         self.on_quote: list[Callable[[Quote], None]] = []
         self.on_trade: list[Callable[[TradeTick], None]] = []          # 체결(현재가)
@@ -279,12 +293,36 @@ class LSWebSocketClient:
         self._add(FX_NIGHT_TRADE_TR, code)  # 야간 DC0 — 같은 코드로 등록, 시간대별로 오는 쪽이 옴
 
     def subscribe_fx_spot(self) -> None:
-        """원달러 현물환율(CUR) 실시간 구독 → on_fx_spot. tr_key='USD'+공백 패딩(문서 샘플).
+        """원달러 현물환율(CUR) 실시간 구독 → on_fx_spot. tr_key='USD'+공백 패딩(길이 후보 순서).
 
         주간 HL 환산에 쓰는 현물환율을 LS 실시간으로 받는다(엑셀 시세!N11 LS현물CUR).
+        키는 후보(FX_SPOT_KEYS) 중 **첫 것 하나만** 등록하고, LS가 거부하면 `_drop_fx_spot_key`가
+        다음 후보로 바꾼다.
         """
-        for key in FX_SPOT_KEYS:
-            self._add(FX_SPOT_TR, key)
+        if self._fx_spot_candidates:
+            self._add(FX_SPOT_TR, self._fx_spot_candidates[0])
+
+    def _drop_fx_spot_key(self, header: dict[str, Any]) -> None:
+        """CUR 등록 거부 → 지금 키를 버리고 다음 후보를 등록 목록에 넣는다(다음 접속부터 적용).
+
+        LS는 키 길이 거부 뒤 연결을 끊으므로(실측 2026-09-28) 재접속 때 새 후보가 나간다.
+        후보가 다 떨어지면 CUR 없이 연결을 유지한다 — 현물환율은 하나고시 백업값으로.
+        """
+        import logging
+
+        log = logging.getLogger("kp_arb.ls_ws")
+        if not self._fx_spot_candidates:
+            return
+        bad = self._fx_spot_candidates.pop(0)
+        self._subs = [s for s in self._subs if not (s[0] == FX_SPOT_TR and s[1] == bad)]
+        if self._fx_spot_candidates:
+            nxt = self._fx_spot_candidates[0]
+            self._add(FX_SPOT_TR, nxt)
+            log.warning("%s CUR 키 %r 거부(%s) → 다음 접속에 후보 %r 등록",
+                        self.status.name, bad, header.get("rsp_cd", ""), nxt)
+        else:
+            log.warning("%s CUR 키 %r 거부(%s) — 후보 전부 소진, CUR 없이 연결 유지(환율은 백업값)",
+                        self.status.name, bad, header.get("rsp_cd", ""))
 
     def subscribe_trades(self, underlying: Underlying) -> None:
         """주식·ETF 체결(현재가)·예상체결 구독 — KRX(S3_/YS3) + 통합(US3/UYS, NXT 포함)."""
@@ -412,6 +450,8 @@ class LSWebSocketClient:
             log = logging.getLogger("kp_arb.ls_ws")
             if rsp_cd and rsp_cd != "00000":
                 log.warning("%s 구독 응답 거부 %s: %s", self.status.name, tr_cd, header)
+                if tr_cd == FX_SPOT_TR:
+                    self._drop_fx_spot_key(header)
             else:
                 # 정상 응답은 건별로 DEBUG만(응답에 종목키가 없어 44줄이 똑같이 보임 —
                 # 사용자 2026-09-07). 전부 오면 INFO 한 줄 요약. 요약이 없으면 응답 누락.
@@ -669,8 +709,15 @@ class LSWebSocketClient:
         body = msg["body"]
         # 원주문 필드: 주식(SC*)=orgordno / 선물(H01)=ordordno.
         org = _norm_ordno(body.get("orgordno") or body.get("ordordno") or "")
+        kind = ORDER_EVENT_TRS[tr_cd]
+        if tr_cd == "O01":
+            # 선물 접수 통보의 trcode1 = 주문 종류(FO01 신규·FO02 정정·FO03 취소). xing(모의 실측
+            # 2026-09-28)은 취소 통보 H01의 ordordno가 비어 원주문을 못 찾고, 취소 접수 O01(FO03,
+            # orgordno=원주문)이 원주문을 가리킨다 → 그 O01을 취소/정정 사건으로 읽는다. REST에선
+            # H01도 같이 와 취소가 두 번 반영되지만 장부·취소내역은 중복을 무시한다.
+            kind = _O01_KIND_BY_TRCODE.get(str(body.get("trcode1", "")).strip(), kind)
         return OrderEvent(
-            kind=ORDER_EVENT_TRS[tr_cd],
+            kind=kind,
             order_id=_norm_ordno(body.get("ordno", "")),
             org_order_id=org if org not in ("", "0") else None,
             body=body,
