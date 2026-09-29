@@ -1165,6 +1165,7 @@ def make_app(
             system.hl_daily_filled_today() if system is not None else 0.0)
         # 시동 실패 — 코어 조립 실패(boot_errors) + 순차 로드 실패(종목/종목정보/잔고/포지션/
         # 주문) + WS 채널 죽음. 있으면 메인창이 "…재접속하세요" 팝업 후 종료.
+        payload["pid"] = os.getpid()  # 메인이 코어를 Job Object에 묶는 데 씀(2겹, 2026-09-29)
         payload["load_errors"] = boot_errors + (
             [system.startup_load_error]
             if system is not None and system.startup_load_error else [])
@@ -1418,6 +1419,16 @@ async def _serve() -> None:
         site = web.TCPSite(runner, HOST, DEFAULT_PORT)
         await site.start()
         log.info("코어 시동: http://%s:%s (안전종료는 메인 화면에서)", HOST, DEFAULT_PORT)
+        # 3겹(2026-09-29): 메인이 사라지면 코어 스스로 안전종료, 10초 안에 안 끝나면 os._exit.
+        # 별도 스레드라 코어 본체(이벤트 루프·COM 스레드)가 막혀도 강제 종료까지는 간다.
+        from .parent_watch import start_parent_watch
+
+        _loop = asyncio.get_running_loop()
+
+        def _request_stop() -> None:
+            _loop.call_soon_threadsafe(stop.set)
+
+        start_parent_watch(_request_stop)
         await stop.wait()
         if autom_engine is not None:
             # 안전종료 1단계 — 자동M 전 종목 정지 + 미체결 선주문 취소가 **끝날 때까지**(최대 3초)

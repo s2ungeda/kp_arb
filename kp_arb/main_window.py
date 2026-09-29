@@ -114,6 +114,50 @@ def ensure_core_down(wait_s: float = 6.0) -> str:
     return f"코어 응답 없음 — 강제 종료 {n}개"
 
 
+_CORE_JOB: dict[str, Any] = {"handle": None, "bound": set()}
+
+
+def bind_core_to_job(pid: int | None) -> bool:
+    """코어 프로세스를 메인의 Job Object(KILL_ON_JOB_CLOSE)에 묶는다 — 2겹(2026-09-29 사고).
+
+    메인 프로세스가 정상 종료·크래시·작업관리자 종료 어느 쪽으로 끝나든 OS가 job을 닫으며 코어를
+    즉시 끝낸다. 메인이 띄운 코어뿐 아니라 이미 떠 있던 코어(이전 메인이 띄움)도 /state의 pid로
+    묶는다(adopt). pywin32 없음·권한 오류면 False(1·3겹만으로 동작).
+    """
+    if not pid or sys.platform != "win32" or pid in _CORE_JOB["bound"]:
+        return False
+    from .core_client import screen_log
+
+    try:
+        import win32api
+        import win32con
+        import win32job
+
+        if _CORE_JOB["handle"] is None:
+            job = win32job.CreateJobObject(None, "")
+            kind = win32job.JobObjectExtendedLimitInformation
+            info = win32job.QueryInformationJobObject(job, kind)
+            info["BasicLimitInformation"]["LimitFlags"] |= (
+                win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+            win32job.SetInformationJobObject(job, kind, info)
+            _CORE_JOB["handle"] = job
+        handle = win32api.OpenProcess(
+            win32con.PROCESS_SET_QUOTA | win32con.PROCESS_TERMINATE, False, pid)
+        try:
+            win32job.AssignProcessToJobObject(_CORE_JOB["handle"], handle)
+        finally:
+            win32api.CloseHandle(handle)
+        _CORE_JOB["bound"].add(pid)
+        screen_log().info("코어 pid %d를 메인 Job Object에 묶음 — 메인이 사라지면 OS가 코어 종료",
+                          pid)
+        return True
+    except Exception as exc:  # noqa: BLE001 - 묶기 실패는 로그만(1·3겹은 그대로 동작)
+        screen_log().warning("코어 pid %s Job Object 묶기 실패 — %s: %s", pid,
+                             type(exc).__name__, exc)
+        _CORE_JOB["bound"].add(pid)  # 같은 pid로 반복 시도하지 않음
+        return False
+
+
 def _auto_running() -> bool:
     """실행 중(running) 세트가 하나라도 있는가 — 종료 확인창 판단용."""
     state = core_request("/state")
@@ -244,7 +288,9 @@ def launch_module(module: str, *args: str, console: bool = False,
 
     콘솔 숨김(CREATE_NO_WINDOW — cmd 창 안 뜸)이 기본. 코어도 콘솔 없이 띄우고 로그는
     파일(logs/core_날짜.log)로만 남긴다. 자식 화면엔 메인 PID를 넘겨(KP_PARENT_PID)
-    메인이 죽으면 스스로 닫히게 한다 — 단 코어는 독립 유지(watch_parent=False).
+    메인이 죽으면 스스로 닫히게 한다. 코어도 KP_PARENT_PID를 받아 메인이 사라지면 **스스로
+    안전종료**하고(parent_watch, 3겹), 여기서 Job Object에 묶여 OS가 같이 끝낸다(2겹) —
+    2026-09-29 사고 뒤 "코어 독립 유지"는 폐기.
     """
     flags = 0
     if sys.platform == "win32":
@@ -256,7 +302,10 @@ def launch_module(module: str, *args: str, console: bool = False,
            if watch_parent else None)
     if slot is not None:  # 같은 종류 창 인스턴스 구분 — win_state 키에 붙는다
         env = {**(env if env is not None else os.environ), "KP_WIN_SLOT": str(slot)}
-    return subprocess.Popen(launch_command(module, args), creationflags=flags, env=env)
+    proc = subprocess.Popen(launch_command(module, args), creationflags=flags, env=env)
+    if module == "kp_arb.core_server":
+        bind_core_to_job(proc.pid)  # 2겹: 메인이 어떻게 사라지든 OS가 코어를 같이 끝낸다
+    return proc
 
 
 def main() -> None:
@@ -321,7 +370,7 @@ def main() -> None:
         action = _restart_step(restart, alive, after=RESTART_AFTER,
                                cooldown=RESTART_COOLDOWN, max_restarts=MAX_RESTARTS)
         if action == "restart":
-            launch_module("kp_arb.core_server", console=False, watch_parent=False)
+            launch_module("kp_arb.core_server", console=False, watch_parent=True)
             _alert("코어 미접속 감지 — 자동 재기동", "error")
         elif action == "give_up":
             _alert("코어 자동 재기동 반복 실패 — 중단. 수동 점검 필요", "error")
@@ -385,6 +434,7 @@ def main() -> None:
             if alive:
                 alive_box["ws"] = (data or {}).get("ws") or []
                 alive_box["load_errors"] = (data or {}).get("load_errors") or []
+                bind_core_to_job((data or {}).get("pid"))  # 이미 떠 있던 코어도 묶는다(한 번만)
             # 조회 실패면 WS 표를 비우지 않는다(사용자 2026-09-29: LS·HL 줄이 사라져 "끊겼나" 오판).
             # 코어 미접속은 위 상태줄("코어: 미접속")이 보여 준다.
             check_sounds(data)  # 알람(체결·에러·WS끊김)
@@ -553,7 +603,7 @@ def main() -> None:
         restart["intentional"] = False  # 사용자가 다시 켬 — 자동 재기동 재개
         restart["gave_up"] = False
         restart["cooldown"] = RESTART_COOLDOWN  # 부팅 유예
-        launch_module("kp_arb.core_server", console=False, watch_parent=False)
+        launch_module("kp_arb.core_server", console=False, watch_parent=True)
         status.config(text="코어 시작 중 ...")
 
     def stop_core() -> None:
@@ -687,7 +737,7 @@ def main() -> None:
 
     # --- 코어는 메인과 함께 시작 (사용자 확정 2026-07-24) ---
     if not core_alive():
-        launch_module("kp_arb.core_server", console=False, watch_parent=False)
+        launch_module("kp_arb.core_server", console=False, watch_parent=True)
         status.config(text="코어 시작 중 ...")
         _slog().info("코어 실행 — 메인 시작 후 %.1fs", time.perf_counter() - t_main0)
     root.after_idle(lambda: _slog().info(
