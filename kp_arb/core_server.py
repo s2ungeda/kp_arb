@@ -755,8 +755,14 @@ async def _manual_command(
             instrument = Instrument(str(body["instrument"]))
         except (KeyError, ValueError) as exc:
             return _fail([f"잘못된 일괄 취소 인자: {exc}"])
+        side_raw = str(body.get("side") or "")  # 매수/매도 한쪽만(일반주문창 라디오, 2026-09-29)
+        try:
+            side = Side(side_raw) if side_raw else None
+        except ValueError:
+            return _fail([f"잘못된 side: {side_raw}"])
         targets = [o.order_id for o in system.order_book.open_orders()
-                   if o.intent.underlying is underlying and o.intent.instrument is instrument]
+                   if o.intent.underlying is underlying and o.intent.instrument is instrument
+                   and (side is None or o.intent.side is side)]
         # HL은 cancel 액션 하나에 묶어 한 요청(요청 한도 절약), LS는 한 건씩 — cancel_many가 가른다.
         # 하나가 실패해도 나머지는 계속(실패는 세어서 보고).
         results = await system.cancel_many(targets) if targets else []

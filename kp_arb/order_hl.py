@@ -272,8 +272,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             set_status("종목을 먼저 고르세요", err=True)
             return
         bulk_var.set(False)  # 한 번 보내면 다시 잠금(연타 방지)
-        send({"cmd": "manual_cancel_all", "underlying": under, "instrument": INSTRUMENT},
-             "일괄 취소")
+        side = side_var.get()  # 라디오(매수/매도) 쪽만 취소(사용자 2026-09-29)
+        send({"cmd": "manual_cancel_all", "underlying": under, "instrument": INSTRUMENT,
+              "side": side}, f"{'매수' if side == 'buy' else '매도'} 일괄 취소")
 
     btn_cancel_all = tk.Button(bcol, text="일괄 취소", font=("Malgun Gothic", 9),
                                command=do_cancel_all)
@@ -649,6 +650,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         btn_order.config(text=f"{name}\n{'매수' if buy else '매도'}주문",
                          bg="#c00000" if buy else "#0000c0",
                          activebackground="#a00000" if buy else "#000090")
+        btn_cancel_all.config(text=f"{'매수' if buy else '매도'} 일괄 취소")  # 라디오 쪽만 취소
 
     def _on_side_change(*_: Any) -> None:
         refresh_side()

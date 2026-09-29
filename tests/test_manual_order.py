@@ -266,6 +266,22 @@ async def test_manual_cancel_all_cancels_only_that_symbol_and_instrument() -> No
     assert not rf["ok"] and "boom" in rf["errors"][0] and failing.cancelled == []
 
 
+async def test_manual_cancel_all_filters_by_side_when_given() -> None:
+    # 일반주문창 라디오(매수/매도) 쪽만 일괄 취소(사용자 2026-09-29). side 없으면 양쪽 전부.
+    ob = OrderBook()
+    ob.track("S1", OrderIntent(venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.HL_PERP, side=Side.SELL, qty=1, price=1000.0))
+    ob.track("B1", OrderIntent(venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+        instrument=Instrument.HL_PERP, side=Side.BUY, qty=1, price=900.0))
+    sys = _fake_system(ob)
+    r = await _manual_command(sys, {"cmd": "manual_cancel_all", "underlying": "samsung",
+                                    "instrument": "hl_perp", "side": "sell"})
+    assert r["ok"] and r["cancelled"] == 1 and sys.cancelled == ["S1"]
+    bad = await _manual_command(sys, {"cmd": "manual_cancel_all", "underlying": "samsung",
+                                      "instrument": "hl_perp", "side": "short"})
+    assert not bad["ok"]
+
+
 def test_manual_snapshot_carries_one_page_per_kind() -> None:
     # 스냅샷 = 한 화면 분량(사용자 2026-09-29): 체결·취소·거부 각 최신 200건만. 그 이전은 /history.
     # HL선 재역산 취소 7,000건+로 통째 스냅샷이 MB급 → 메인 채널 1MiB 끊김·코어 부하였음.
