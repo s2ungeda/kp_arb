@@ -462,7 +462,7 @@ def main() -> None:
     ws_frame = tk.LabelFrame(root, text="WS 세션")
     ws_frame.pack(fill="x", padx=8, pady=(0, 8))
     # 끊김 누적(WsStatus.disconnects)은 열을 늘리지 않고 이름 옆에 'LS xing(4)'처럼 붙인다
-    # (사용자 2026-09-29: 창 폭 유지). 0이면 안 붙임.
+    # (사용자 2026-09-29: 창 폭 유지, 0이어도 '(0)'으로 보이게).
     ws_tree = ttk.Treeview(ws_frame, columns=("no", "venue", "name", "state", "rx"),
                            show="headings", height=4, selectmode="none")
     for col, title, wid, anc in (("no", "No", 32, "center"), ("venue", "거래소", 48, "center"),
@@ -488,8 +488,7 @@ def main() -> None:
         ws_tree.delete(*ws_tree.get_children())
         for i, r in enumerate(rows, 1):
             up = bool(r.get("connected"))
-            drops = int(r.get("disconnects") or 0)
-            name = f"{r.get('name')}({drops})" if drops else str(r.get("name"))
+            name = f"{r.get('name')}({int(r.get('disconnects') or 0)})"  # 0도 표시(사용자)
             ws_tree.insert("", "end", tags=("up" if up else "down",), values=(
                 i, r.get("venue"), name, "연결" if up else "끊김",
                 f"{r.get('rx_count', 0):,}"))
