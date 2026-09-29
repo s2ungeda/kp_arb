@@ -1530,6 +1530,14 @@ class LiveSystem:
         """HL 현재 적용 호가단위 머지(nSigFigs, mantissa) — 스냅샷용. HL WS 없으면 None."""
         return None if self._hl_ws is None else self._hl_ws.l2_aggregation(u)
 
+    def ls_feed_ok(self) -> bool:
+        """LS 채널(주식·선물 WS 또는 xing 세션)이 연결 상태인가 — 자동M G0-1(2026-09-29 운영 사고:
+        xing COM 스레드가 멈춰 LS 조회·주문·실시간이 전부 섰는데 HL선이 계속 발주). 끊김·COM 정지
+        (xing_ws 심장박동 감시가 끊김으로 표시)면 False. 무데이터 유휴는 보지 않는다(점심·한산 구간
+        오판 방지) — 연결 여부만."""
+        clients = [c for c in (self._stock_ws, self._deriv_ws) if c is not None]
+        return bool(clients) and all(c.status.connected for c in clients)
+
     def ws_statuses(self) -> list[WsStatus]:
         """살아있는 WS 채널들의 현황(메인창 표·주문 안전차단 Phase 8-6용).
 

@@ -123,6 +123,7 @@ class XingRealClient(LSWebSocketClient):
             return
         self._running = True
         stats = asyncio.create_task(self._stats_loop()) if self._stats_every_s > 0 else None
+        health = asyncio.create_task(self._health_loop())
         try:
             while not self._stopped:
                 await self._ensure_login()
@@ -138,8 +139,31 @@ class XingRealClient(LSWebSocketClient):
                 if self._reconnect_backoff_s > 0 and not self._stopped:
                     await asyncio.sleep(self._reconnect_backoff_s)
         finally:
+            health.cancel()
             if stats is not None:
                 stats.cancel()
+
+    async def _health_loop(self, every_s: float = 1.0) -> None:
+        """COM 스레드 심장박동 감시 — 멈추면 이 채널을 '끊김'으로(주문 안전차단·자동M 대기가
+        걸리게), 다시 돌면 '연결'로. 운영 실측 2026-09-29 14:55: 스레드가 멈춰 LS 조회·주문·실시간이
+        전부 섰는데 세션은 '연결'로 보여 HL선이 헤지 없는 HL 주문을 계속 냈다."""
+        probe = getattr(self._session, "thread_stalled", None)
+        if probe is None:  # 가짜 세션(테스트) — 감시 없음
+            return
+        stalled = False
+        while not self._stopped:
+            await asyncio.sleep(every_s)
+            now_stalled = bool(probe())
+            if now_stalled and not stalled:
+                log.error("%s xing COM 스레드 정지 감지(심장박동 끊김) — 채널 끊김 표시, "
+                          "자동M 주문 중단", self.status.name)
+                if self.status.connected:
+                    self.status.on_disconnect()
+            elif stalled and not now_stalled:
+                log.warning("%s xing COM 스레드 회복 — 채널 연결 표시", self.status.name)
+                if not self.status.connected:
+                    self.status.on_connect()
+            stalled = now_stalled
 
     async def _stats_loop(self) -> None:
         """stats_every_s마다 그 사이 TR별 수신 건수를 INFO로, 장중(08:30~15:50) 0건이면 WARNING.

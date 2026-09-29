@@ -70,6 +70,50 @@ def core_alive() -> bool:
     return core_request("/state") is not None
 
 
+def force_kill_core() -> int:
+    """코어 프로세스 강제 종료 — 안전종료 명령이 안 먹을 때의 마지막 수단(운영 사고 2026-09-29: 코어
+    HTTP가 막혀 종료 명령이 안 닿아 메인을 닫아도 자동M이 계속 발주, 사용자가 작업관리자로 종료).
+    배포판은 meme-core.exe 이미지로, 개발은 명령줄에 kp_arb.core_server가 든 파이썬 프로세스로.
+    죽인 프로세스 수를 돌려준다(0 = 없었음/실패)."""
+    import subprocess
+    import sys
+
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        if getattr(sys, "frozen", False):
+            r = subprocess.run(["taskkill", "/F", "/IM", "meme-core.exe"], capture_output=True,
+                               creationflags=flags, timeout=10)
+            return 1 if r.returncode == 0 else 0
+        ps = ("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "
+              f"'*kp_arb.core_server*' -and $_.ProcessId -ne {os.getpid()} }} | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }")
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True,
+                             text=True, creationflags=flags, timeout=15)
+        return len(out.stdout.split())
+    except Exception:  # noqa: BLE001 - 강제 종료 자체의 실패는 로그로만
+        from .core_client import screen_log
+
+        screen_log().exception("코어 강제 종료 실패")
+        return 0
+
+
+def ensure_core_down(wait_s: float = 6.0) -> str:
+    """안전종료 명령 → wait_s 안에 코어가 내려가지 않으면 강제 종료. 결과 문구를 돌려준다."""
+    import time
+
+    from .core_client import screen_log
+
+    core_request("/command", {"cmd": "shutdown"}, timeout=5.0)  # 코어 안전종료(정지·취소 후)
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        if not core_alive():
+            return "코어 안전종료 확인"
+        time.sleep(0.5)
+    n = force_kill_core()
+    screen_log().error("코어가 %.0f초 안에 안 내려감 — 강제 종료 %d개", wait_s, n)
+    return f"코어 응답 없음 — 강제 종료 {n}개"
+
+
 def _auto_running() -> bool:
     """실행 중(running) 세트가 하나라도 있는가 — 종료 확인창 판단용."""
     state = core_request("/state")
@@ -329,15 +373,20 @@ def main() -> None:
 
     def poll_core() -> None:
         while True:
-            data = core_request("/state")  # 코어 생존 + WS 세션 현황 한 번에
+            # 5초 — /state가 커지고 코어가 바쁘면 1초를 넘긴다(운영 2026-09-29 14:55 "Cannot write
+            # to closing transport" 반복 = 메인이 1초 만에 끊은 흔적). 실패해도 표는 마지막 값 유지.
+            data = core_request("/state", timeout=5.0)  # 코어 생존 + WS 세션 현황 한 번에
             alive = data is not None
             alive_box["alive"] = alive
             if alive and not timing["core_seen"]:
                 timing["core_seen"] = True
                 _slog().info("코어 첫 연결 확인 — 메인 시작 후 %.1fs (프로세스 시작 후 %.1fs)",
                              time.perf_counter() - t_main0, since_start())
-            alive_box["ws"] = (data or {}).get("ws") or []
-            alive_box["load_errors"] = (data or {}).get("load_errors") or []
+            if alive:
+                alive_box["ws"] = (data or {}).get("ws") or []
+                alive_box["load_errors"] = (data or {}).get("load_errors") or []
+            # 조회 실패면 WS 표를 비우지 않는다(사용자 2026-09-29: LS·HL 줄이 사라져 "끊겼나" 오판).
+            # 코어 미접속은 위 상태줄("코어: 미접속")이 보여 준다.
             check_sounds(data)  # 알람(체결·에러·WS끊김)
             if not closing["flag"]:  # 종료 중엔 재기동·저장 안 함
                 maybe_restart_core(alive)
@@ -509,13 +558,17 @@ def main() -> None:
 
     def stop_core() -> None:
         restart["intentional"] = True  # 안전종료 — 자동 재기동하지 않음
-        result = core_request("/command", {"cmd": "shutdown"})
-        if result is None:
+        if not core_alive():
             status.config(text="코어 미접속 — 종료할 대상 없음")
-        elif result.get("ok"):
-            status.config(text="안전종료 요청됨 — 자동 정지 후 종료")
-        else:
-            status.config(text="종료 거부 — " + "; ".join(result.get("errors", [])))
+            return
+        status.config(text="안전종료 요청됨 — 자동 정지 후 종료(안 내려가면 강제 종료)")
+
+        def _run() -> None:  # 화면 스레드에서 기다리지 않는다(창이 얼지 않게)
+            text = ensure_core_down()
+            _slog().info("코어 종료 — %s", text)
+            root.after(0, lambda: status.config(text=text))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def restore_layout() -> None:
         """화면 구성 되돌리기 — ui_state 세대(최대 5)를 골라 그 화면들을 다시 연다."""
@@ -678,7 +731,12 @@ def main() -> None:
             return
         save_ui_state()  # 닫기 직전 화면 목록 저장 — 다음 실행 때 다시 열림
         closing["flag"] = True
-        core_request("/command", {"cmd": "shutdown"})  # 코어 안전종료(정지·취소 후)
+        restart["intentional"] = True  # 자동 재기동 금지
+        # 메인 종료 = 전부 멈춤. 안전종료가 확인되지 않으면 강제 종료(2026-09-29 사고: 코어 HTTP가
+        # 막혀 종료 명령이 안 닿아 메인을 닫아도 자동M이 계속 발주).
+        status.config(text="코어 종료 중 …")
+        root.update_idletasks()
+        _slog().info("메인 종료 — %s", ensure_core_down())
         for _tok, _slot, proc in launched:
             if proc.poll() is None:
                 proc.terminate()

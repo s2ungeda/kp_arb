@@ -688,6 +688,22 @@ def test_missing_judgment_fx_holds_orders_without_halting() -> None:
     assert idle.exit.status is not LegStatus.HALTED
 
 
+def test_ls_feed_down_holds_orders_and_cancels_resting() -> None:
+    # G0-1(운영 사고 2026-09-29 14:55): xing COM 스레드가 멈춰 LS가 전부 섰는데 HL선이 HL 선주문을
+    # 계속 냈다 → LS 피드가 끊김/정지면 주문 안 냄 + 걸어둔 선주문 취소, 세트는 실행 유지, 회복하면
+    # 재개.
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    assert evaluate(s, Block.ENTRY, _sig(ls_feed_ok=False), SETTINGS, U) == []
+    assert s.entry.running and s.entry.status is not LegStatus.HALTED
+    acts = evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)       # 회복 → 선주문
+    assert [a.kind for a in acts] == ["place_pre"]
+    s.entry.pre_order_id = "77"
+    acts = evaluate(s, Block.ENTRY, _sig(ls_feed_ok=False), SETTINGS, U)
+    assert [a.kind for a in acts] == ["cancel_pre"]             # 걸어둔 선주문은 걷는다
+    assert s.entry.running and s.entry.status is not LegStatus.HALTED
+
+
 def test_price_offset_must_be_multiple_of_market_tick() -> None:
     # 사용자 2026-09-15: 잘못 넣으면(삼성 호가단위 500에 시작호가 100) 저장 때 바로 경고창.
     # 코어 스냅샷 sf_tick(지금 가격대 호가단위)이 있을 때만 검사, 없으면 G6이 잡는다.

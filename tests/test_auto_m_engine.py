@@ -73,6 +73,9 @@ class FakeSystem:
     def futures_halted(self) -> bool:
         return self.halted
 
+    def ls_feed_ok(self) -> bool:
+        return getattr(self, "feed_ok", True)  # G0-1: LS 채널 연결(테스트 기본 True)
+
     def stock_halted(self) -> bool:  # 주식 엔진용(exec §7C)
         return self.halted
 

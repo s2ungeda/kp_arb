@@ -118,6 +118,8 @@ class Signals:
     hl_bids: Levels = ()
     hl_asks: Levels = ()
     hl_sz_decimals: int | None = None
+    # LS 피드(시세·통보·조회 채널)가 살아 있나 — 끊김·정지면 주문 안 냄(G0-1, 2026-09-29 운영 사고)
+    ls_feed_ok: bool = True
     # HL선 선주문 주문단위(USD) = 화면 호가단위 콤보 값(사용자 2026-09-22) — 없으면 격자 한 칸
     hl_order_unit: float | None = None
 
@@ -609,6 +611,10 @@ def _common_gates(
     # 재개. (옛 09-15 규칙 "세트 중지·사람이 해제"는 잠깐의 결측에도 재시작이 번거로워 폐기.)
     if sig.fx is None:
         return "판정 환율 계산불가 — 주문 안 냄", _cancel_if_resting(leg, mono=sig.mono)
+    # G0-1 LS 피드 정지·끊김(운영 사고 2026-09-29 14:55: xing COM 스레드가 멈춰 LS 조회·주문·
+    # 실시간이 전부 섰는데 HL선이 HL 선주문을 계속 내 헤지 없는 HL 체결이 쌓임). 살아나면 재개.
+    if not sig.ls_feed_ok:
+        return "LS 피드 끊김/정지 — 주문 안 냄", _cancel_if_resting(leg, mono=sig.mono)
     # 시장 정지(exec §8) — 신규·정정 중단 + 미체결 취소, HL은 손대지 않음
     if sig.market_halted:
         return "시장 정지 — 신규·정정 중단", _cancel_if_resting(leg, mono=sig.mono)

@@ -33,6 +33,8 @@ log = logging.getLogger("kp_arb.xing")
 LOGIN_OK = "0000"
 QUERY_TIMEOUT_S = 10.0   # 조회(REST와 같은 값)
 ORDER_TIMEOUT_S = 30.0   # 주문(REST ORDER_REQUEST_TIMEOUT_S와 같은 값)
+STUCK_GRACE_S = 5.0      # COM 스레드가 멈춰 _expire가 안 돌 때 asyncio 쪽 2차 시간 초과 여유
+THREAD_STALL_S = 5.0     # COM 스레드 심장박동이 이만큼 끊기면 '정지'로 본다(실시간 상태 끊김 표시)
 LANE_QUERY = "query"
 LANE_ORDER = "order"
 
@@ -124,6 +126,7 @@ class XingSession:
         self._queries: dict[str, Any] = {}          # lane → XAQuery
         self._pending: dict[str, _Pending] = {}     # lane → 진행 중 요청
         self._reals: dict[str, Any] = {}            # tr → XAReal
+        self.last_beat = 0.0  # COM 스레드 루프가 마지막으로 돈 시각(_clock) — 정지 감시용
         self._real_keys: dict[str, set[str]] = {}   # tr → advise된 키
         self._specs: dict[str, ResSpec] = {}
         self._login_future: asyncio.Future[tuple[str, str]] | None = None
@@ -156,6 +159,7 @@ class XingSession:
             assert self._waker is not None
             while not self._stop:
                 self._waker.wait(50)
+                self.last_beat = self._clock()  # 심장박동 — 멈추면 xing_ws 감시가 '끊김'으로 표시
                 try:
                     self._factory.pump()
                     self._expire()
@@ -168,7 +172,15 @@ class XingSession:
             self._factory.uninit_thread()
 
     def _drain(self) -> None:
-        while True:
+        """이번 바퀴에 **지금 들어 있는 명령만** 처리한다(qsize 스냅샷).
+
+        옛 `while True`는 큐가 빌 때까지 돌았는데, 같은 차선에 앞 요청이 진행 중이면 뒤 요청(_do)이
+        "다음 바퀴에"라며 자기를 큐에 다시 넣고 → 이 루프가 그걸 즉시 다시 꺼내 → **무한 회전**.
+        펌프·시간 초과가 영영 안 돌아 응답도 실시간도 멈추고 세션은 '연결'로 보였다(운영 PC 실측
+        2026-09-29 14:55:26 — HL선 두 세트의 LS 후주문이 같은 순간 주문 차선에 들어옴 → LS 전부
+        정지, HL만 살아 헤지 없는 HL 체결 누적). 모의 시험은 전부 순차라 걸리지 않았다.
+        """
+        for _ in range(self._cmds.qsize()):
             try:
                 fn = self._cmds.get_nowait()
             except queue.Empty:
@@ -310,7 +322,14 @@ class XingSession:
                 self._resolve(fut, exc=XingError(f"{tr} 요청 실패 {rc}: {q.GetErrorMessage(rc)}"))
 
         self._call(_do)
-        return await fut
+        # 시간 초과는 COM 스레드의 _expire가 처리하지만, 그 스레드 자체가 멈추면(2026-09-29 운영
+        # 실측) 영원히 기다리게 된다 → asyncio 쪽에서도 여유를 두고 한 번 더 건다(결과 모름).
+        limit = timeout_s + STUCK_GRACE_S
+        try:
+            return await asyncio.wait_for(fut, limit)
+        except TimeoutError as exc:
+            self._pending.pop(lane, None)
+            raise XingTimeout(f"{tr} 응답 없음(COM 스레드 무응답 {limit:.0f}초)") from exc
 
     def _on_query_event(self, lane: str, kind: str, *args: Any) -> None:
         """XAQuery 이벤트(COM 스레드): ('message', sys_err, code, msg) / ('data', tr)."""
@@ -344,6 +363,11 @@ class XingSession:
             else:
                 out[block.name] = {f: str(q.GetFieldData(block.name, f, 0)) for f in block.fields}
         return out
+
+    def thread_stalled(self, max_gap_s: float = THREAD_STALL_S) -> bool:
+        """COM 스레드 루프가 max_gap_s 넘게 안 돌았나(아무 스레드에서 호출). 시작 전(0)은 False.
+        운영 실측 2026-09-29: 스레드가 멈춰도 세션은 '연결'로 보여 감지 못 했다."""
+        return self.last_beat > 0 and (self._clock() - self.last_beat) > max_gap_s
 
     def _expire(self) -> None:
         now = self._clock()
