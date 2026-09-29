@@ -276,8 +276,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         send({"cmd": "manual_cancel_all", "underlying": under, "instrument": INSTRUMENT,
               "side": side}, f"{'매수' if side == 'buy' else '매도'} 일괄 취소")
 
-    btn_cancel_all = tk.Button(bcol, text="일괄 취소", font=("Malgun Gothic", 9),
-                               command=do_cancel_all)
+    btn_cancel_all = tk.Button(bcol, text="매수 일괄 취소", font=("Malgun Gothic", 9, "bold"),
+                               fg="white", bg="#c00000", activeforeground="white",
+                               activebackground="#a00000", command=do_cancel_all)
     btn_cancel_all.pack(side="top", fill="x", pady=(2, 0))
 
     # 중: 오더북 — 숫자 볼드·1축소, 잔량 폭 3자리 확대. (격자선은 렌더 확인 후)
@@ -650,7 +651,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         btn_order.config(text=f"{name}\n{'매수' if buy else '매도'}주문",
                          bg="#c00000" if buy else "#0000c0",
                          activebackground="#a00000" if buy else "#000090")
-        btn_cancel_all.config(text=f"{'매수' if buy else '매도'} 일괄 취소")  # 라디오 쪽만 취소
+        btn_cancel_all.config(text=f"{'매수' if buy else '매도'} 일괄 취소",  # 라디오 쪽만 취소
+                              bg="#c00000" if buy else "#0000c0",       # 색도 주문 버튼과 같이
+                              activebackground="#a00000" if buy else "#000090")
 
     def _on_side_change(*_: Any) -> None:
         refresh_side()
