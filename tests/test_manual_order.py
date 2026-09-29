@@ -266,6 +266,24 @@ async def test_manual_cancel_all_cancels_only_that_symbol_and_instrument() -> No
     assert not rf["ok"] and "boom" in rf["errors"][0] and failing.cancelled == []
 
 
+def test_manual_snapshot_caps_cancels_but_keeps_days_fills() -> None:
+    # 스냅샷 행 상한(2026-09-29): 취소는 최신 500건, 체결·거부는 당일 전부(안전장치 3,000).
+    # HL선 재역산 취소 7,000건+로 스냅샷이 MB급 → 메인 채널 1MiB 끊김·코어 부하.
+    from collections import deque
+
+    from kp_arb.core_server import SNAPSHOT_CANCELS_MAX, SNAPSHOT_ROWS_MAX
+
+    sys = _fake_system(OrderBook())
+    sys.cancels = deque({"order_id": str(i)} for i in range(SNAPSHOT_CANCELS_MAX + 250))
+    sys.fills = deque({"order_id": str(i)} for i in range(800))
+    sys.rejects = deque({"order_id": str(i)} for i in range(SNAPSHOT_ROWS_MAX + 5))
+    snap = manual_snapshot(sys)
+    assert len(snap["cancels"]) == SNAPSHOT_CANCELS_MAX
+    assert snap["cancels"][0]["order_id"] == "0"          # 최신 우선 순서 유지(앞이 최신)
+    assert len(snap["fills"]) == 800                       # 당일 전부
+    assert len(snap["rejects"]) == SNAPSHOT_ROWS_MAX
+
+
 async def test_manual_amend_calls_system() -> None:
     sys = _fake_system(OrderBook())
     r = await _manual_command(

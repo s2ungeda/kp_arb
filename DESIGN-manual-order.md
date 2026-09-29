@@ -268,6 +268,7 @@ HL 웹이나 다른 데서 거래하면 이 화면에 안 잡힌다.
 - `manual_amend` {order_id, price} → `amend_price`(LS 전용, 잔량 기준 정정). **HL이면 거부**("HL은 정정 미지원 — 취소 후 신규", 코어에서 차단).
 - `manual_cancel` {order_id} → `cancel`.
 - `manual_cancel_all` {underlying, instrument} (2026-09-28) → 그 종목·상품의 미체결 **전부** 취소(`LiveSystem.cancel_many`). **HL은 `cancel` 액션의 cancels 배열로 한 요청**(SDK `bulk_cancel`, 응답 statuses가 건별 "success"/{error}; 요청 한도 절약 — 사용자 2026-09-28), LS는 한 건씩. 실패는 건너뛰고 세어서 보고 `{cancelled, failed}`. 화면: 일반주문창 **주문 버튼 아래 [일괄 취소]**(주문 버튼 높이를 1/3 줄여 그 자리에). **안전 잠금 '일취' 체크박스**(왼쪽 체크 열 맨 아래): 체크돼 있을 때만 발송, 보내면 다시 꺼짐, 화면 저장에서 제외(열 때마다 꺼진 상태). 원클릭 '주문' 체크와는 별개.
+- **스냅샷 행 상한(2026-09-29):** `/manual_state`·메인 채널 manual 스냅샷의 **취소는 최신 500건**(`SNAPSHOT_CANCELS_MAX`), 체결·거부는 당일 전부(안전장치 3,000건, `SNAPSHOT_ROWS_MAX`). 근거: HL선이 역산가 변경으로 하루 7,000건+ 취소 → 스냅샷 MB급 → 메인 채널 1MiB 상한에 끊김·코어 부하(운영 2026-09-29). 09-16 "당일치 전부"는 체결에 대한 것으로 유지. 코어 안 보관은 당일 전부이며 자동M 취소 흐름은 종목 로그에 다 남는다.
 - `manual_hl_merge` {underlying, n_sig_figs, mantissa} → `set_hl_aggregation`(HL 호가단위 머지, WS 재구독). 같은 단위면 재구독 생략(호가창이 잠깐 비는 것 방지). 종목별 선택은 코어 상태(`hl_merge`)에 저장돼 **코어 재시동 때 다시 적용**되고, 시세·일반주문·자동M 콤보는 모두 코어 적용값을 따른다(단일 진실=코어, 2026-09-07).
 - `manual_refresh` {} → `refresh_snapshot`(잔고/포지션 재조회 → OrderBook 재동기, '적' 버튼·HTS 외부거래 반영).
 - **[신규]** `manual_leverage` {underlying, is_cross, leverage} → `updateLeverage`. **주문과 별개** (§1-3).

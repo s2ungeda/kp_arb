@@ -81,6 +81,9 @@ def _base_dir() -> Path:
 
 # 입력값 저장 파일 (§6.2-0 상태 저장) — gitignore, 명령마다 갱신
 STATE_PATH = _base_dir() / "core_state.json"
+# 화면 스냅샷(/manual_state·메인 채널)에 싣는 행 상한(2026-09-29, manual_snapshot 주석 참조)
+SNAPSHOT_CANCELS_MAX = 500   # 취소 — HL선 재역산 취소가 하루 7,000건+
+SNAPSHOT_ROWS_MAX = 3000     # 체결·거부 — 사실상 당일 전부(안전장치)
 
 
 def snapshot(state: CoreState) -> dict[str, Any]:
@@ -457,11 +460,15 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
             if account is not None:
                 entry["balance"] = ob.balance(account)
             symbols[f"{u.value}|{inst.value}"] = entry
-    # 체결·취소는 코어가 든 **당일치 전부**(사용자 확정 2026-09-16 — 옛 50건 상한으로 주문리스트에
-    # 09:08 이전 체결이 안 보였음). 화면이 설정 필터로 거른다.
-    fills = list(getattr(system, "fills", []))  # 최신 우선(코어 보관)
-    cancels = list(getattr(system, "cancels", []))
-    rejects = list(getattr(system, "rejects", []))  # 거부내역(주문리스트 '거부' 행, 2026-09-18)
+    # 체결·거부는 코어가 든 **당일치 전부**(사용자 확정 2026-09-16 — 옛 50건 상한으로 주문리스트에
+    # 09:08 이전 체결이 안 보였음). 화면이 설정 필터로 거른다. 단 **취소는 최신
+    # SNAPSHOT_CANCELS_MAX건**(2026-09-29): HL선이 역산가 변경으로 하루 7,000건 넘게 취소해 스냅샷이
+    # MB급이 되자 메인 채널이 1MiB 상한에 끊기고, 변경마다 통째로 다시 보내는 코어가 바빠졌다.
+    # 체결·거부는 하루 수백 건이라 그대로 두되 상한(SNAPSHOT_ROWS_MAX)만 안전장치로. 코어 안
+    # 보관(deque)은 여전히 당일 전부.
+    fills = list(getattr(system, "fills", []))[:SNAPSHOT_ROWS_MAX]  # 최신 우선(코어 보관)
+    cancels = list(getattr(system, "cancels", []))[:SNAPSHOT_CANCELS_MAX]
+    rejects = list(getattr(system, "rejects", []))[:SNAPSHOT_ROWS_MAX]  # 거부내역('거부' 행)
     # 원달러선물 동시호가 대응(§9.1) — 화면 콤보 코드·실행상태·발주내역.
     fx_codes = system.fx_futures_codes() if hasattr(system, "fx_futures_codes") else []
     fx_running = getattr(getattr(system, "fx_auction", None), "running", False)
