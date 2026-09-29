@@ -123,6 +123,14 @@ meme-core.exe (32bit, asyncio 메인 스레드)
   DevCenter는 설치 폴더에서 실행돼 같은 계정으로 로그인됨. 모의 서버는 인증 모듈을 안 써 개발 PC에선 안 드러남.
   → `xing_com.register_install_dir`(SetDllDirectory + PATH 앞)을 `Win32ComFactory(install_dir)`가 COM 생성
   전에 부른다(코어·xing_check 공통).
+- **실서버는 조회 TR 입력 필드를 엄격히 본다**(운영 PC 실측 2026-09-29 08:42, CSPAQ22200 거부 09604 "입력 데이터
+  포맷"): REST 서버가 채워 주던 빈 필드(RecCnt·BalCreTp 등)를 xing은 그대로 보낸다. `xing.INPUT_DEFAULTS`가 Res
+  InBlock에 있는데 본문이 안 준 필드를 LS 포털 요청 예시 값으로 채운다(공통 RecCnt "1", CSPAQ22200/12300 구분코드
+  "0"). 모의는 빈 필드를 받아 줘 개발 PC에선 안 드러남.
+- **전수 점검 명령** `meme-core.exe xingcheck [초]`(배포판 `xing_check.bat`) / 개발 `python -m kp_arb.xing_check`:
+  로그인 → 마스터·월물 → 조회 TR 10건(코어와 같은 본문) → 요청 한도 → 실시간 전부 등록·N초 수신 건수를 항목별
+  OK/FAIL 표로. 발주 없음. **빌드 전 개발 PC(모의)에서, 배포 뒤 운영 PC에서 코어보다 먼저 돌린다.** 실서버 첫 시동
+  (09-29 08:57)은 로그인 0.8s·시동 로드 3.3s·실시간 59건 등록으로 전 구간 정상.
 - **주식 주문 TR 이름이 다르다:** xing Res는 `CSPAT00600/00700/00800`(REST는 …601/701/801). InBlock1
   필드는 REST와 같고 **`MbrNo`(NXT)·`MgntrnCode`·`LoanDt` 있음** → `XingQueryClient`가 요청·응답 블록
   접두를 바꿔 게이트웨이는 REST 이름 그대로.

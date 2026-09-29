@@ -28,6 +28,12 @@ rem auto-M latency/slippage report from logs (today, or pass YYYYMMDD) -> logs\r
     echo "%%~dp0meme-core.exe" report %%*
     echo pause
 ) > "dist\meme\report.bat"
+(
+    echo @echo off
+    echo cd /d "%%~dp0"
+    echo "%%~dp0meme-core.exe" xingcheck %%*
+    echo pause
+) > "dist\meme\xing_check.bat"
 echo.
 echo build complete: dist\meme\
 echo copy that folder to the target PC and run meme.exe (edit .env if needed)

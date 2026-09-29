@@ -31,6 +31,10 @@ def main() -> None:
         from kp_arb.report_latency import main as report
 
         raise SystemExit(report(sys.argv[1:]))
+    elif arg == "xingcheck":  # xing 전수 점검(로그인·조회·실시간, 주문 없음) — xing_check.bat
+        from kp_arb.xing_check import main as xing_check
+
+        raise SystemExit(xing_check(sys.argv[2:]))
     elif arg == "monitor":
         from kp_arb.monitor import main as run
         run()
