@@ -1532,10 +1532,19 @@ class LiveSystem:
     def ws_statuses(self) -> list[WsStatus]:
         """살아있는 WS 채널들의 현황(메인창 표·주문 안전차단 Phase 8-6용).
 
-        LS 주식·LS 선물·HL 순. 없는 채널(키 미설정 등)은 건너뛴다.
+        LS 주식·LS 선물·HL 순. 없는 채널(키 미설정 등)은 건너뛴다. xing은 소켓이 하나라 주식·선물
+        자리에 같은 객체가 들어가므로 **같은 객체는 한 줄만**(운영 PC 실측 2026-09-29: 'LS xing'이
+        수신 건수까지 같은 채 두 줄로 보임).
         """
         clients = [self._stock_ws, self._deriv_ws, self._hl_ws]
-        return [c.status for c in clients if c is not None]
+        seen: set[int] = set()
+        out: list[WsStatus] = []
+        for c in clients:
+            if c is None or id(c) in seen:
+                continue
+            seen.add(id(c))
+            out.append(c.status)
+        return out
 
     def pair_signal(
         self, u: Underlying, instrument: Instrument,

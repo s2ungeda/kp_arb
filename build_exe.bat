@@ -15,7 +15,9 @@ if errorlevel 1 (
 )
 copy /Y config.yaml "dist\meme\" >nul
 rem ship config .env template (no secrets; secrets go to keyring via keys.bat)
-copy /Y .env.example "dist\meme\.env" >nul
+rem .env is NOT shipped (it would overwrite the target PC's settings when unzipped over the old folder).
+rem Ship .env.example only; on a fresh install copy it to .env and edit.
+copy /Y .env.example "dist\meme\.env.example" >nul
 rem key registration shortcut for the target PC (double-click)
 (
     echo @echo off

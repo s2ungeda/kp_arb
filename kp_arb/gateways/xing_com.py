@@ -156,10 +156,15 @@ class XingSession:
             assert self._waker is not None
             while not self._stop:
                 self._waker.wait(50)
-                self._factory.pump()
+                try:
+                    self._factory.pump()
+                    self._expire()
+                except Exception:  # noqa: BLE001 - 펌프 한 번의 오류로 COM 스레드가 조용히 죽지 않게
+                    log.exception("xing COM 펌프 오류 — 계속")
                 self._drain()
-                self._expire()
         finally:
+            # 여기 오면 실시간·조회가 전부 멈춘다 — 조용히 끝나지 않게 반드시 남긴다
+            log.warning("xing COM 스레드 종료(stop=%s)", self._stop)
             self._factory.uninit_thread()
 
     def _drain(self) -> None:

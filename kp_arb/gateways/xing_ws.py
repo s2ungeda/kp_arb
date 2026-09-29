@@ -65,6 +65,22 @@ class _NoConnector:
         raise RuntimeError("xing 실시간은 WS 연결을 쓰지 않는다")
 
 
+def format_real_stats(delta: dict[str, int], top: int = 12) -> str:
+    """1분 수신 통계 한 줄 — 총 건수 + 많은 TR부터 top개. 순수.
+    (운영 PC 실측 2026-09-29: 메인창 수신 카운터가 멈춘 듯한데 로그에 시세는 안 찍혀 판별 불가 →
+    TR별로 남긴다.)"""
+    total = sum(delta.values())
+    items = sorted(((tr, n) for tr, n in delta.items() if n), key=lambda x: -x[1])[:top]
+    body = ", ".join(f"{tr} {n}" for tr, n in items) or "없음"
+    return f"총 {total}건 — {body}"
+
+
+def in_market_hours(t: time.struct_time) -> bool:
+    """08:30~15:50(국내 정규장 전후) — 0건 경고를 낼 시간대. 순수."""
+    hm = t.tm_hour * 60 + t.tm_min
+    return 8 * 60 + 30 <= hm < 15 * 60 + 50
+
+
 class XingRealClient(LSWebSocketClient):
     """XAReal 기반 실시간 — 콜백·파서·구독 등록은 LSWebSocketClient 그대로."""
 
@@ -75,6 +91,7 @@ class XingRealClient(LSWebSocketClient):
         status: WsStatus | None = None,
         clock: Callable[[], float] | None = None,
         reconnect_backoff_s: float = 2.0,
+        stats_every_s: float = 60.0,
     ) -> None:
         super().__init__(_NoConnector(), etf_symbols=etf_symbols, clock=clock,
                          status=status or WsStatus(venue="LS", name="LS xing", kind="시세/주문",
@@ -84,6 +101,9 @@ class XingRealClient(LSWebSocketClient):
         self._ensure_login = ensure_login
         self._down = asyncio.Event()  # 세션 끊김 신호
         self._stopped = False
+        # TR별 수신 건수 — stats_every_s마다 그 사이 증가분을 로그(장중 0건이면 경고)
+        self._real_counts: dict[str, int] = {}
+        self._stats_every_s = stats_every_s
         self._running = False  # run()이 이미 도는 중 — 두 번째 run()은 대기만(아래)
         self._stop_event = asyncio.Event()
         session.on_real.append(self._on_real)
@@ -102,19 +122,41 @@ class XingRealClient(LSWebSocketClient):
             await self._stop_event.wait()
             return
         self._running = True
+        stats = asyncio.create_task(self._stats_loop()) if self._stats_every_s > 0 else None
+        try:
+            while not self._stopped:
+                await self._ensure_login()
+                self._down.clear()
+                self.status.on_connect()
+                await self._advise_all()
+                if self.status.connects > 1:  # 재로그인(최초 아님) → 재동기 훅(부모와 같은 규칙)
+                    for on_reconnect in self.on_reconnect:
+                        on_reconnect()
+                await self._down.wait()
+                if self.status.connected:
+                    self.status.on_disconnect()
+                if self._reconnect_backoff_s > 0 and not self._stopped:
+                    await asyncio.sleep(self._reconnect_backoff_s)
+        finally:
+            if stats is not None:
+                stats.cancel()
+
+    async def _stats_loop(self) -> None:
+        """stats_every_s마다 그 사이 TR별 수신 건수를 INFO로, 장중(08:30~15:50) 0건이면 WARNING.
+        (운영 PC 실측 2026-09-29: 카운터 정지 의심인데 로그로 판별 불가.)"""
+        last: dict[str, int] = {}
         while not self._stopped:
-            await self._ensure_login()
-            self._down.clear()
-            self.status.on_connect()
-            await self._advise_all()
-            if self.status.connects > 1:  # 재로그인(최초 아님) → 재동기 훅(부모와 같은 규칙)
-                for on_reconnect in self.on_reconnect:
-                    on_reconnect()
-            await self._down.wait()
-            if self.status.connected:
-                self.status.on_disconnect()
-            if self._reconnect_backoff_s > 0 and not self._stopped:
-                await asyncio.sleep(self._reconnect_backoff_s)
+            await asyncio.sleep(self._stats_every_s)
+            now = dict(self._real_counts)
+            delta = {tr: n - last.get(tr, 0) for tr, n in now.items()}
+            last = now
+            text = format_real_stats(delta)
+            if sum(delta.values()) == 0 and in_market_hours(time.localtime()):
+                log.warning("%s 실시간 %.0f초 수신 0건(장중) — 등록 %d건, 세션 %s",
+                            self.status.name, self._stats_every_s, len(self._subs),
+                            "연결" if self.status.connected else "끊김")
+            else:
+                log.info("%s 실시간 %.0f초 수신 %s", self.status.name, self._stats_every_s, text)
 
     def stop(self) -> None:
         self._stopped = True
@@ -134,6 +176,7 @@ class XingRealClient(LSWebSocketClient):
 
     def _on_real(self, tr: str, _key: str, fields: dict[str, str]) -> None:
         self.status.on_message(self._clock())
+        self._real_counts[tr] = self._real_counts.get(tr, 0) + 1
         try:
             self._dispatch(frame_from_real(tr, fields))
         except Exception:  # noqa: BLE001 - 한 건 문제로 스트림을 죽이지 않음

@@ -1169,6 +1169,15 @@ async def test_cancel_many_batches_hl_and_updates_local_book() -> None:
     assert any(r.get("order_id") == "H2" for r in system.rejects)  # 거부내역에 기록
 
 
+def test_ws_statuses_dedupes_shared_xing_client() -> None:
+    # xing은 소켓 하나 — 주식·선물 자리에 같은 객체. 메인창 WS 표에 한 줄만(운영 PC 실측 2026-09-29:
+    # 'LS xing'이 수신 건수까지 같은 채 두 줄로 보임).
+    system, _, _ = _system([], deriv_frames=[])
+    assert len(system.ws_statuses()) == 2          # 주식·선물이 다른 객체면 두 줄(OpenAPI)
+    system._deriv_ws = system._stock_ws
+    assert len(system.ws_statuses()) == 1          # 같은 객체면 한 줄(xing)
+
+
 def test_disparity_board_computes_pairs() -> None:
     # DESIGN §6.1: HL 환산 disp vs 국내(SF/ETF) disp → 진입/청산 스프레드.
     from kp_arb.domain.enums import SessionPhase
