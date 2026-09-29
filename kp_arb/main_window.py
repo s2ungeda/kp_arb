@@ -379,7 +379,11 @@ def main() -> None:
         mw = alive_box["main_ws"]  # 현황판 표시용(연결·수신·끊김) — 화면은 읽기만
         while not closing["flag"]:
             try:
-                with connect(CORE_WS_URL, open_timeout=3.0, close_timeout=1.0) as ws:
+                # max_size=None: websockets 기본 1MiB 상한 — manual 스냅샷(당일 체결·취소 전부)이
+                # 오후에 1MiB를 넘자 첫 프레임에서 1009로 끊고 2초마다 재접속(운영 PC 실측
+                # 2026-09-29 13:39부터 1,553회). 코어는 로컬이라 상한 없이 받는다.
+                with connect(CORE_WS_URL, open_timeout=3.0, close_timeout=1.0,
+                             max_size=None) as ws:
                     ws.send('{"subscribe":["manual","state","trades"]}')
                     mw["connected"] = True
                     if fails:
