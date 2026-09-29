@@ -319,7 +319,8 @@ class LiveSystem:
         self.hl_funding_prev: dict[Underlying, float] = {}  # 직전 확정 펀딩률(REST 조회)
         # HL 공개 체결 최근 30건(종목별, 오래된 것부터) — HL 체결 창(사용자 2026-09-15)
         self.hl_trades: dict[Underlying, deque[dict[str, Any]]] = {}
-        self._hl_lag = LagMeter()  # HL 체결 수신 지연 집계(10초 창)
+        # HL 체결 수신 지연 집계 — 10분 창(사용자 2026-09-29: 10초마다 찍히면 로그가 넘침)
+        self._hl_lag = LagMeter(window_s=600.0)
         # 배경 상시 태스크(괴리 CSV 등) — wait()가 기다리는 스트리밍 태스크와 분리, stop()이 취소.
         self._aux_tasks: list[asyncio.Task[None]] = []
         # 안전종료 때 같이 닫을 것(xing COM 세션 등, DESIGN-ls-xing.md) — bootstrap_live가 넣는다
@@ -1112,7 +1113,7 @@ class LiveSystem:
                         n, avg, mx = summary
                         lvl = _lg.WARNING if mx > 300 else _lg.INFO
                         _lg.getLogger("kp_arb.bootstrap").log(
-                            lvl, "HL 체결 수신 지연 — 10초 %d건 평균 %.0fms 최대 %.0fms "
+                            lvl, "HL 체결 수신 지연 — 10분 %d건 평균 %.0fms 최대 %.0fms "
                             "(거래소 체결시각 대비, PC 시계 오차 포함)", n, avg, mx)
             for handler in self.on_trade:
                 handler(tick)
