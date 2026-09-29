@@ -461,13 +461,13 @@ def main() -> None:
 
     ws_frame = tk.LabelFrame(root, text="WS 세션")
     ws_frame.pack(fill="x", padx=8, pady=(0, 8))
-    # 끊김 열(사용자 2026-09-29): 코어가 세는 채널별 끊김 누적(WsStatus.disconnects) — 재접속 반복을
-    # 표에서 바로 본다(그 전엔 /state에만 실리고 표엔 없었음).
-    ws_tree = ttk.Treeview(ws_frame, columns=("no", "venue", "name", "state", "rx", "drops"),
+    # 끊김 누적(WsStatus.disconnects)은 열을 늘리지 않고 이름 옆에 'LS xing(4)'처럼 붙인다
+    # (사용자 2026-09-29: 창 폭 유지). 0이면 안 붙임.
+    ws_tree = ttk.Treeview(ws_frame, columns=("no", "venue", "name", "state", "rx"),
                            show="headings", height=4, selectmode="none")
     for col, title, wid, anc in (("no", "No", 32, "center"), ("venue", "거래소", 48, "center"),
                                  ("name", "이름", 96, "w"), ("state", "상태", 54, "center"),
-                                 ("rx", "수신", 84, "e"), ("drops", "끊김", 44, "e")):
+                                 ("rx", "수신", 84, "e")):
         ws_tree.heading(col, text=title)
         ws_tree.column(col, width=wid, anchor=cast(Any, anc), stretch=False)
     ws_tree.tag_configure("up", foreground="dark green")
@@ -478,7 +478,7 @@ def main() -> None:
     def render_ws() -> None:
         mw = alive_box["main_ws"]
         rows = list(alive_box.get("ws") or []) + [{  # 마지막 줄: 코어↔메인 실시간 채널
-            "venue": "코어", "name": "메인 채널(/ws)", "connected": mw["connected"],
+            "venue": "코어", "name": "메인 채널", "connected": mw["connected"],
             "rx_count": mw["rx"], "disconnects": mw["disconnects"]}]
         sig = tuple((r.get("name"), r.get("connected"), r.get("rx_count"),
                      r.get("disconnects")) for r in rows)
@@ -488,9 +488,11 @@ def main() -> None:
         ws_tree.delete(*ws_tree.get_children())
         for i, r in enumerate(rows, 1):
             up = bool(r.get("connected"))
+            drops = int(r.get("disconnects") or 0)
+            name = f"{r.get('name')}({drops})" if drops else str(r.get("name"))
             ws_tree.insert("", "end", tags=("up" if up else "down",), values=(
-                i, r.get("venue"), r.get("name"), "연결" if up else "끊김",
-                f"{r.get('rx_count', 0):,}", f"{r.get('disconnects', 0):,}"))
+                i, r.get("venue"), name, "연결" if up else "끊김",
+                f"{r.get('rx_count', 0):,}"))
 
     def start_core() -> None:
         if core_alive():
