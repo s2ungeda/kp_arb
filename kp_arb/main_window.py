@@ -461,11 +461,13 @@ def main() -> None:
 
     ws_frame = tk.LabelFrame(root, text="WS 세션")
     ws_frame.pack(fill="x", padx=8, pady=(0, 8))
-    ws_tree = ttk.Treeview(ws_frame, columns=("no", "venue", "name", "state", "rx"),
+    # 끊김 열(사용자 2026-09-29): 코어가 세는 채널별 끊김 누적(WsStatus.disconnects) — 재접속 반복을
+    # 표에서 바로 본다(그 전엔 /state에만 실리고 표엔 없었음).
+    ws_tree = ttk.Treeview(ws_frame, columns=("no", "venue", "name", "state", "rx", "drops"),
                            show="headings", height=4, selectmode="none")
     for col, title, wid, anc in (("no", "No", 32, "center"), ("venue", "거래소", 48, "center"),
                                  ("name", "이름", 96, "w"), ("state", "상태", 54, "center"),
-                                 ("rx", "수신", 84, "e")):
+                                 ("rx", "수신", 84, "e"), ("drops", "끊김", 44, "e")):
         ws_tree.heading(col, text=title)
         ws_tree.column(col, width=wid, anchor=cast(Any, anc), stretch=False)
     ws_tree.tag_configure("up", foreground="dark green")
@@ -488,7 +490,7 @@ def main() -> None:
             up = bool(r.get("connected"))
             ws_tree.insert("", "end", tags=("up" if up else "down",), values=(
                 i, r.get("venue"), r.get("name"), "연결" if up else "끊김",
-                f"{r.get('rx_count', 0):,}"))
+                f"{r.get('rx_count', 0):,}", f"{r.get('disconnects', 0):,}"))
 
     def start_core() -> None:
         if core_alive():
