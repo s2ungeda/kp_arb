@@ -266,22 +266,36 @@ async def test_manual_cancel_all_cancels_only_that_symbol_and_instrument() -> No
     assert not rf["ok"] and "boom" in rf["errors"][0] and failing.cancelled == []
 
 
-def test_manual_snapshot_caps_cancels_but_keeps_days_fills() -> None:
-    # 스냅샷 행 상한(2026-09-29): 취소는 최신 500건, 체결·거부는 당일 전부(안전장치 3,000).
-    # HL선 재역산 취소 7,000건+로 스냅샷이 MB급 → 메인 채널 1MiB 끊김·코어 부하.
+def test_manual_snapshot_carries_one_page_per_kind() -> None:
+    # 스냅샷 = 한 화면 분량(사용자 2026-09-29): 체결·취소·거부 각 최신 200건만. 그 이전은 /history.
+    # HL선 재역산 취소 7,000건+로 통째 스냅샷이 MB급 → 메인 채널 1MiB 끊김·코어 부하였음.
     from collections import deque
 
-    from kp_arb.core_server import SNAPSHOT_CANCELS_MAX, SNAPSHOT_ROWS_MAX
+    from kp_arb.core_server import SNAPSHOT_PAGE
 
     sys = _fake_system(OrderBook())
-    sys.cancels = deque({"order_id": str(i)} for i in range(SNAPSHOT_CANCELS_MAX + 250))
-    sys.fills = deque({"order_id": str(i)} for i in range(800))
-    sys.rejects = deque({"order_id": str(i)} for i in range(SNAPSHOT_ROWS_MAX + 5))
+    sys.cancels = deque({"seq": 9000 - i, "order_id": str(i)} for i in range(SNAPSHOT_PAGE + 250))
+    sys.fills = deque({"seq": 5000 - i, "order_id": str(i)} for i in range(50))
+    sys.rejects = deque({"seq": 100 - i, "order_id": str(i)} for i in range(SNAPSHOT_PAGE + 5))
     snap = manual_snapshot(sys)
-    assert len(snap["cancels"]) == SNAPSHOT_CANCELS_MAX
+    assert len(snap["cancels"]) == SNAPSHOT_PAGE
     assert snap["cancels"][0]["order_id"] == "0"          # 최신 우선 순서 유지(앞이 최신)
-    assert len(snap["fills"]) == 800                       # 당일 전부
-    assert len(snap["rejects"]) == SNAPSHOT_ROWS_MAX
+    assert len(snap["fills"]) == 50                        # 200건 미만이면 전부
+    assert len(snap["rejects"]) == SNAPSHOT_PAGE
+
+
+def test_history_rows_pages_older_than_seq() -> None:
+    # /history: seq < before인 행을 최신부터 limit개. before 없으면 앞부터. seq 없는 옛 행은 건너뜀.
+    from kp_arb.core_server import HISTORY_LIMIT_MAX, history_rows
+
+    rows = [{"seq": s, "order_id": str(s)} for s in range(1000, 0, -1)] + [{"order_id": "old"}]
+    page = history_rows(rows, 801, 200)
+    assert [r["seq"] for r in page][:3] == [800, 799, 798] and len(page) == 200
+    assert page[-1]["seq"] == 601
+    assert history_rows(rows, None, 3) == rows[:3]           # before 없음 → 최신부터
+    assert history_rows(rows, 3, 200) == [{"seq": 2, "order_id": "2"}, {"seq": 1, "order_id": "1"}]
+    assert history_rows(rows, 1, 200) == []                  # 더 오래된 게 없음
+    assert len(history_rows(rows, None, 5000)) == min(1000, HISTORY_LIMIT_MAX)  # 상한
 
 
 async def test_manual_amend_calls_system() -> None:

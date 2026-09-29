@@ -194,6 +194,14 @@ class LagMeter:
         return out
 
 
+def _bump_row_seq(obj: Any) -> int:
+    """체결·취소·거부 행 일련번호(전체 공용, 최신일수록 큼) — obj의 `_row_seq`를 1 올려 돌려준다.
+    테스트가 SimpleNamespace를 self로 쓰는 경로도 있어 속성이 없으면 0에서 시작."""
+    seq = int(getattr(obj, "_row_seq", 0)) + 1
+    obj._row_seq = seq
+    return seq
+
+
 def snapshot_failure_note(stage: str) -> str:
     """계좌 스냅샷(잔고→포지션→미체결 순차 조회)이 ``stage``에서 실패했을 때 장부에 무엇이
     남고 무엇이 안 바뀌는지 한 줄로. 로그 문구용 순수 함수 — "이 계좌 없이 계속"처럼
@@ -353,6 +361,8 @@ class LiveSystem:
         # 거부내역(주문리스트 '거부' 행, 사용자 2026-09-18) — 발주 거부(LS REST·HL)·취소 거부·
         # 응답 없음. 당일치 전부(fills·cancels와 같이 날짜 바뀌면 비움)
         self.rejects: deque[dict[str, Any]] = deque()
+        # 체결·취소·거부 행 일련번호(전체 공용) — 화면 '이전 N건' 조회 기준(2026-09-29)
+        self._row_seq = 0
         # 종목 VI 상태(vi_gubun, "0" = 해제) — LS 실시간 VI_(exec §8, 체결쏴 주식 정지)
         self.vi_state: dict[Underlying, str] = {}
         self._daylog_state: dict[str, str] = {}  # roll_daily_logs — 보관분의 날짜
@@ -443,6 +453,7 @@ class LiveSystem:
                         self.fills, getattr(self, "cancels", deque()),
                         getattr(self, "rejects", deque()))
         self.fills.appendleft({
+            "seq": _bump_row_seq(self),             # 행 일련번호('이전 N건' 조회 기준)
             "time": _t.strftime("%H:%M:%S"),        # 체결시각
             "order_id": order.order_id,             # 주문번호(주문리스트 표시)
             "accept_time": order.placed_at,         # 접수시각(원주문)
@@ -476,6 +487,7 @@ class LiveSystem:
             seen.clear()  # 날짜가 바뀌어 보관분을 비웠으면 중복 방지 기록도 같이
         seen.add(order.order_id)
         self.cancels.appendleft({
+            "seq": _bump_row_seq(self),             # 행 일련번호('이전 N건' 조회 기준)
             "time": _t.strftime("%H:%M:%S"),        # 취소시각(현재 열엔 미표시)
             "order_id": order.order_id,             # 주문번호
             "status": order.status.value,           # cancelled/rejected — 화면 상태 칸(취소/거부)
@@ -499,6 +511,7 @@ class LiveSystem:
                         self.rejects)
         text = " ".join(str(reason).split())
         self.rejects.appendleft({
+            "seq": _bump_row_seq(self),             # 행 일련번호('이전 N건' 조회 기준)
             "time": _t.strftime("%H:%M:%S"),        # 거부 시각(주문리스트 접수시각 칸에)
             "kind": kind,                            # 발주 / 취소 / 응답없음
             "order_id": order_id,                    # 취소 거부면 원주문번호, 발주 거부는 없음

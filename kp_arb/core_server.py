@@ -25,7 +25,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -81,9 +81,10 @@ def _base_dir() -> Path:
 
 # 입력값 저장 파일 (§6.2-0 상태 저장) — gitignore, 명령마다 갱신
 STATE_PATH = _base_dir() / "core_state.json"
-# 화면 스냅샷(/manual_state·메인 채널)에 싣는 행 상한(2026-09-29, manual_snapshot 주석 참조)
-SNAPSHOT_CANCELS_MAX = 500   # 취소 — HL선 재역산 취소가 하루 7,000건+
-SNAPSHOT_ROWS_MAX = 3000     # 체결·거부 — 사실상 당일 전부(안전장치)
+# 화면 스냅샷(/manual_state·메인 채널)에 싣는 체결·취소·거부 행 수 = 한 화면 분량(사용자 2026-09-29:
+# "한 화면 개수를 정하고 '이전' 버튼으로 이전 데이터를 가져오는 방식"). 그 이전은 GET /history.
+SNAPSHOT_PAGE = 200
+HISTORY_LIMIT_MAX = 1000
 
 
 def snapshot(state: CoreState) -> dict[str, Any]:
@@ -380,6 +381,24 @@ def hl_trades_snapshot(system: LiveSystem | None) -> dict[str, Any]:
     return {"trades": {u.value: hl_trade_rows(rows) for u, rows in system.hl_trades.items()}}
 
 
+def history_rows(rows: Sequence[dict[str, Any]], before: int | None,
+                 limit: int) -> list[dict[str, Any]]:
+    """'이전 N건' — 최신 우선 목록(rows)에서 seq < before인 행을 최신부터 limit개. before가
+    None/0이면 맨 앞부터. seq가 없는 옛 행은 건너뛴다. 순수(사용자 2026-09-29 페이지 방식)."""
+    limit = max(1, min(int(limit), HISTORY_LIMIT_MAX))
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        seq = r.get("seq")
+        if not isinstance(seq, int):
+            continue
+        if before and seq >= before:
+            continue
+        out.append(r)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
     """수동 주문창용 스냅샷 — 취급 종목별 호가·포지션·매도가능·잔고 + 전체 미체결.
 
@@ -460,15 +479,13 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
             if account is not None:
                 entry["balance"] = ob.balance(account)
             symbols[f"{u.value}|{inst.value}"] = entry
-    # 체결·거부는 코어가 든 **당일치 전부**(사용자 확정 2026-09-16 — 옛 50건 상한으로 주문리스트에
-    # 09:08 이전 체결이 안 보였음). 화면이 설정 필터로 거른다. 단 **취소는 최신
-    # SNAPSHOT_CANCELS_MAX건**(2026-09-29): HL선이 역산가 변경으로 하루 7,000건 넘게 취소해 스냅샷이
-    # MB급이 되자 메인 채널이 1MiB 상한에 끊기고, 변경마다 통째로 다시 보내는 코어가 바빠졌다.
-    # 체결·거부는 하루 수백 건이라 그대로 두되 상한(SNAPSHOT_ROWS_MAX)만 안전장치로. 코어 안
-    # 보관(deque)은 여전히 당일 전부.
-    fills = list(getattr(system, "fills", []))[:SNAPSHOT_ROWS_MAX]  # 최신 우선(코어 보관)
-    cancels = list(getattr(system, "cancels", []))[:SNAPSHOT_CANCELS_MAX]
-    rejects = list(getattr(system, "rejects", []))[:SNAPSHOT_ROWS_MAX]  # 거부내역('거부' 행)
+    # 체결·취소·거부는 **최신 SNAPSHOT_PAGE건(한 화면 분량)**만 싣는다(사용자 2026-09-29). 코어 안
+    # 보관(deque)은 당일 전부이고, 그 이전 행은 화면이 [이전 N건] 버튼으로 GET /history를 부른다.
+    # (09-16 "당일치 전부"를 통째로 밀던 방식은 HL선 재역산 취소 7,000건+로 스냅샷이 MB급이 되어
+    # 메인 채널이 1MiB 상한에 끊기고 코어가 바빠져 폐기.)
+    fills = list(getattr(system, "fills", []))[:SNAPSHOT_PAGE]  # 최신 우선(코어 보관)
+    cancels = list(getattr(system, "cancels", []))[:SNAPSHOT_PAGE]
+    rejects = list(getattr(system, "rejects", []))[:SNAPSHOT_PAGE]  # 거부내역('거부' 행)
     # 원달러선물 동시호가 대응(§9.1) — 화면 콤보 코드·실행상태·발주내역.
     fx_codes = system.fx_futures_codes() if hasattr(system, "fx_futures_codes") else []
     fx_running = getattr(getattr(system, "fx_auction", None), "running", False)
@@ -1265,7 +1282,23 @@ def make_app(
                                  dumps=_dumps)
 
     app = web.Application()
+    async def get_history(request: web.Request) -> web.Response:
+        # 주문리스트 [이전 N건](사용자 2026-09-29): 스냅샷엔 최신 SNAPSHOT_PAGE건만 실리고, 그 이전
+        # 행은 여기로. kind=fills|cancels|rejects, before=<seq>(그보다 오래된 것), limit(기본 PAGE).
+        kind = str(request.query.get("kind", ""))
+        if system is None or kind not in ("fills", "cancels", "rejects"):
+            return web.json_response({"kind": kind, "rows": []}, dumps=_dumps)
+        try:
+            before = int(request.query.get("before", "0") or 0)
+            limit = int(request.query.get("limit", str(SNAPSHOT_PAGE)) or SNAPSHOT_PAGE)
+        except ValueError:
+            return web.json_response({"kind": kind, "rows": [], "error": "before/limit 정수"},
+                                     dumps=_dumps)
+        rows = history_rows(list(getattr(system, kind, [])), before or None, limit)
+        return web.json_response({"kind": kind, "rows": rows}, dumps=_dumps)
+
     app.router.add_get("/state", get_state)
+    app.router.add_get("/history", get_history)
     app.router.add_get("/manual_state", get_manual_state)
     if hub is not None:  # 실시간 채널(DESIGN §12.1) — 메인창이 붙는 WebSocket
         app.router.add_get("/ws", hub.handle)

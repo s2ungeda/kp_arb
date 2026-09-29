@@ -161,6 +161,47 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # --- 상태 폴링: /manual_state → state_box (화면은 읽기만) ---
     state_box: dict[str, Any] = {"data": None}
+    # '이전 N건'(사용자 2026-09-29): 스냅샷은 최신 200건만 → 그 이전 행은 코어 /history에서 가져와
+    # 여기(older)에 이어 붙인다. [최신]으로 비움. 화면 스레드는 네트워크를 안 부른다(뒷단 스레드).
+    older: dict[str, list[dict[str, Any]]] = {"fills": [], "cancels": [], "rejects": []}
+    older_q: queue.Queue[tuple[str, list[dict[str, Any]] | None]] = queue.Queue()
+
+    def _kind_rows(kind: str) -> list[dict[str, Any]]:
+        live = list((state_box["data"] or {}).get(kind) or [])
+        if not older[kind]:
+            return live
+        seen = {r.get("seq") for r in live if r.get("seq") is not None}
+        return live + [r for r in older[kind] if r.get("seq") not in seen]
+
+    def fetch_older() -> None:
+        """세 종류 각각 '지금 보이는 가장 오래된 seq'보다 이전 200건을 코어에서 가져온다."""
+        def _run() -> None:
+            for kind in ("fills", "cancels", "rejects"):
+                rows = _kind_rows(kind)
+                seqs = [int(r["seq"]) for r in rows if isinstance(r.get("seq"), int)]
+                before = min(seqs) if seqs else 0
+                got = core_request(f"/history?kind={kind}&before={before}", timeout=10.0)
+                older_q.put((kind, list(got.get("rows") or []) if got else None))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _drain_older() -> None:
+        try:
+            while True:
+                kind, rows = older_q.get_nowait()
+                if rows is None:
+                    set_status("이전 내역 조회 실패 — 코어 미접속", err=True)
+                    continue
+                older[kind].extend(rows)
+                set_status(f"이전 내역 {kind} {len(rows)}건 추가(누적 체결 {len(older['fills'])}·"
+                           f"취소 {len(older['cancels'])}·거부 {len(older['rejects'])})")
+        except queue.Empty:
+            pass
+
+    def reset_older() -> None:
+        for kind in older:
+            older[kind].clear()
+        set_status("최신 내역만 표시")
 
     def poller() -> None:
         # 실시간(DESIGN §12.1): 메인이 기록하는 공유메모리를 0.1초마다 읽고, 없거나 낡으면
@@ -304,6 +345,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # (사용자 2026-09-28 — 오른쪽 끝에 두면 창을 넓혔을 때 멀리 밀려 보이지 않았다).
     tk.Button(filt, text="선택 취소", command=do_cancel).grid(
         row=0, column=11, sticky="w", padx=(4, 2))
+    # '이전 200건'/'최신'(사용자 2026-09-29) — 스냅샷은 최신 200건만, 이전은 눌러서 가져온다
+    pager = tk.Frame(filt)  # 두 버튼을 붙여 둔다(그리드 칸이 표 컬럼 폭을 따라 벌어지지 않게)
+    pager.grid(row=0, column=12, columnspan=2, sticky="w", padx=(6, 2))
+    tk.Button(pager, text="이전 200건", command=fetch_older).pack(side="left")
+    tk.Button(pager, text="최신", command=reset_older).pack(side="left", padx=(4, 0))
 
     # --- 상태바 (row 2, 맨 아래) ---
     status = tk.Label(root, text="-", anchor="w", relief="groove", width=1)
@@ -353,6 +399,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     def refresh() -> None:
         try:
+            _drain_older()  # [이전 200건] 결과 합치기(뒷단 스레드 → 큐)
             _update_staleness()
             _render()
         except Exception:  # noqa: BLE001 - 갱신 오류로 창이 죽지 않게
@@ -393,7 +440,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              _src_label(o.get("source")), str(o.get("tag") or ""),
                              str(o.get("order_id")), "")))
         if show_fills.get():
-            for i, f in enumerate(data.get("fills") or []):
+            for i, f in enumerate(_kind_rows("fills")):
                 if not keep(f):
                     continue
                 buy = f.get("side") == "buy"
@@ -409,7 +456,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              str(f.get("order_id", "")), "")))
         # 취소내역 — status rejected(접수 뒤 거부 통보)는 '거부' 유형, 나머지는 '취소' 유형
         unchecked = 0
-        for i, c in enumerate(data.get("cancels") or []):
+        for i, c in enumerate(_kind_rows("cancels")):
             rejected = str(c.get("status") or "") == "rejected"
             if not (show_rejects.get() if rejected else show_cancels.get()):
                 unchecked += 1
@@ -430,7 +477,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                          "접수 뒤 거부 통보" if rejected else "")))
         if show_rejects.get():
             # 거부내역(2026-09-18) — 발주 거부(REST·HL)·취소 거부·응답 없음. 주문번호는 취소 거부만.
-            for i, r in enumerate(data.get("rejects") or []):
+            for i, r in enumerate(_kind_rows("rejects")):
                 if not keep(r):
                     continue
                 buy = r.get("side") == "buy"
@@ -446,10 +493,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              _src_label(r.get("source")), str(r.get("tag") or ""),
                              str(r.get("order_id", "")), str(r.get("reason") or ""))))
         else:
-            unchecked += len(data.get("rejects") or [])
+            unchecked += len(_kind_rows("rejects"))
         # 유형 체크를 끈 종류도 "숨김"에 넣는다 — 주문 체크를 끄고 잊으면 미체결이 안 보인다.
         unchecked += ((0 if show_orders.get() else len(data.get("open_orders") or []))
-                      + (0 if show_fills.get() else len(data.get("fills") or [])))
+                      + (0 if show_fills.get() else len(_kind_rows("fills"))))
         state_box["_hidden"] = (total - len(out)) + unchecked
         return out
 
