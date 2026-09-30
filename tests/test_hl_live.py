@@ -278,9 +278,73 @@ async def test_cancel_orders_bulk_one_request_with_per_order_status() -> None:
     assert len(ex.bulk_calls) == 2
 
 
+def test_nonce_clock_never_repeats_even_within_same_ms() -> None:
+    # 벽시계가 같은 ms에 머물러도(또는 뒤로 가도) 번호는 겹치지 않고 커지기만 한다.
+    from kp_arb.gateways.hl_live import NonceClock
+
+    now = {"ms": 1_000}
+    clock = NonceClock(now_ms=lambda: now["ms"])
+    assert [clock.next() for _ in range(3)] == [1_000, 1_001, 1_002]
+    now["ms"] = 900  # 시계가 뒤로 감(시간 동기화)
+    assert clock.next() == 1_003
+    now["ms"] = 5_000  # 시계가 앞서면 시계를 따른다
+    assert clock.next() == 5_000
+
+
+def test_nonce_clock_is_unique_across_threads() -> None:
+    import threading
+
+    from kp_arb.gateways.hl_live import NonceClock
+
+    clock = NonceClock(now_ms=lambda: 1_000)  # 전부 같은 ms — 가장 불리한 경우
+    got: list[int] = []
+
+    def work() -> None:
+        for _ in range(200):
+            got.append(clock.next())
+
+    threads = [threading.Thread(target=work) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(got) == 1_600 and len(set(got)) == 1_600
+
+
+def test_install_nonce_clock_replaces_sdk_timestamp() -> None:
+    # SDK(0.24.0)는 주문·취소·정정·레버리지마다 hyperliquid.exchange.get_timestamp_ms()로 nonce를
+    # 찍는다 — 그 자리에 발급기를 끼운다. 네트워크 호출 없음(모듈 속성만 확인하고 되돌린다).
+    import hyperliquid.exchange as sdk_exchange
+
+    from kp_arb.gateways.hl_live import NonceClock, install_nonce_clock
+
+    original = sdk_exchange.get_timestamp_ms
+    try:
+        assert install_nonce_clock(NonceClock(now_ms=lambda: 7_000))
+        assert [sdk_exchange.get_timestamp_ms() for _ in range(3)] == [7_000, 7_001, 7_002]
+    finally:
+        sdk_exchange.get_timestamp_ms = original
+
+
+async def test_hl_actions_sent_back_to_back_with_nonce_clock() -> None:
+    # 사용자 2026-09-30: 앞 주문의 응답을 기다리지 않고 바로 이어 보낸다(운영 09-29 HL선 — 두
+    # 세트의 진입·청산 네 건이 줄을 서 마지막 주문이 약 1.5초 묵은 가격으로 나감).
+    import asyncio
+
+    from kp_arb.gateways.hl_live import NonceClock
+
+    ex, inf = StubExchange(), StubInfo()
+    gw = HLSdkGateway(ex, inf, account_address=ADDR, nonce_clock=NonceClock())
+    first = await gw.place_order(_intent())
+    await asyncio.gather(gw.place_order(_intent()), gw.place_order(_intent(Side.BUY)),
+                         gw.place_order(_intent()), gw.cancel_order(first))
+    assert ex.max_in_flight >= 2          # 응답 전에 다음 요청이 나갔다
+    assert len(ex.orders) == 4 and ex.cancels == [("xyz:SMSN", int(first))]
+
+
 async def test_hl_actions_are_serialized_with_1ms_gap() -> None:
-    # 실측 2026-09-10: 같은 ms에 두 후주문 → SDK nonce(벽시계 ms) 겹침 → "duplicate nonce" 거부.
-    # nonce 액션은 한 번에 하나만, 직전과 1ms 이상 떨어뜨려 보낸다.
+    # 옛 방식(번호 발급기를 SDK에 못 붙였을 때만) — 실측 2026-09-10: 같은 ms에 두 후주문 → SDK
+    # nonce(벽시계 ms) 겹침 → "duplicate nonce" 거부. 한 번에 하나만, 직전과 1ms 이상 떨어뜨린다.
     import asyncio
 
     gw, ex, _ = _gw()

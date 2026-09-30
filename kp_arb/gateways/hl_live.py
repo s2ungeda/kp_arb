@@ -9,16 +9,21 @@
 
 SDK는 동기(requests) — asyncio에서는 ``asyncio.to_thread``로 감싼다.
 **nonce(실측 2026-09-10):** SDK는 주문·취소·정정·레버리지 액션마다 nonce를 벽시계 밀리초로
-스스로 찍고 호출자가 정할 수 없다. 같은 ms에 두 액션이 시작되면 ``Invalid nonce: duplicate nonce``로
-뒤의 것이 거부된다 → ``_exchange_action``이 이런 액션을 잠금으로 한 번에 하나만, 직전과 1ms 이상
-떨어뜨려 보내고, nonce 거부(주문이 안 들어간 거부)만 2회 재전송한다.
+스스로 찍는다. 같은 ms에 두 액션이 시작되면 ``Invalid nonce: duplicate nonce``로 뒤의 것이 거부된다.
+**연속 전송(사용자 2026-09-30):** SDK가 부르는 시각 함수를 겹치지 않는 번호 발급기(``NonceClock``)로
+바꿔 끼우고(``install_nonce_clock``), 앞 요청의 응답을 기다리지 않고 바로 다음 요청을 보낸다 —
+HL은 번호가 겹치지만 않으면 받는다(도착 순서 무관, docs/hl-trading-rules.md §1.5). 옛 방식(잠금으로
+한 번에 하나 + 1ms 간격)은 발급기를 못 붙였을 때만 쓴다. nonce 거부(주문이 안 들어간 거부)만 2회
+재전송하는 것은 그대로.
 비밀: ``HL_AGENT_KEY``(에이전트 프라이빗 키)·``HL_ACCOUNT_ADDRESS``(메인 주소) — keyring/env.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -33,6 +38,39 @@ from .ls import OrderGoneError
 
 HL_DEX = "xyz"
 NONCE_RETRIES = 2  # nonce 충돌 거부 재전송 횟수(주문 미접수 거부라 중복 주문 없음)
+
+
+class NonceClock:
+    """겹치지 않는 요청 번호(nonce, ms) 발급기 — 벽시계 ms, 직전 값 이하면 직전 + 1. 스레드 안전.
+
+    HL 규칙(공식 문서 Nonces and API wallets): 서명자별로 가장 큰 100개를 기억하고, 새 번호는 그중
+    가장 작은 값보다 크고 쓴 적이 없으면 받는다 — 순서대로 도착할 필요가 없다. 그래서 번호만 안
+    겹치면 앞 요청의 응답을 기다릴 이유가 없다.
+    """
+
+    def __init__(self, now_ms: Callable[[], int] | None = None) -> None:
+        self._now_ms = now_ms or (lambda: int(time.time() * 1000))
+        self._lock = threading.Lock()
+        self._last = 0
+
+    def next(self) -> int:
+        with self._lock:
+            self._last = max(self._now_ms(), self._last + 1)
+            return self._last
+
+
+def install_nonce_clock(clock: NonceClock) -> bool:
+    """SDK가 액션마다 부르는 시각 함수(``hyperliquid.exchange.get_timestamp_ms``)를 발급기로 바꾼다.
+
+    SDK에 그 이름이 없으면(SDK가 바뀜) 아무것도 안 하고 False — 호출부는 옛 방식(한 번에 하나)으로
+    남는다. SDK 0.24.0에서 확인: 주문·취소·정정·레버리지 모두 이 함수로 nonce를 찍는다.
+    """
+    import hyperliquid.exchange as sdk_exchange
+
+    if not callable(getattr(sdk_exchange, "get_timestamp_ms", None)):
+        return False
+    sdk_exchange.get_timestamp_ms = clock.next
+    return True
 
 
 def _safe_float(v: Any) -> float | None:
@@ -91,8 +129,11 @@ class HLSdkGateway(HLGateway):
         *,
         account_address: str,
         symbols: Mapping[Underlying, str] | None = None,
+        nonce_clock: NonceClock | None = None,
     ) -> None:
         self._ex = exchange
+        # 번호 발급기가 SDK에 붙어 있으면(install_nonce_clock) 연속 전송, 없으면 옛 방식(직렬)
+        self._nonce_clock = nonce_clock
         self._info = info
         self._address = account_address
         self._symbols: dict[Underlying, str] = dict(symbols or HL_SYMBOLS)
@@ -103,9 +144,11 @@ class HLSdkGateway(HLGateway):
         self._order_ctx: dict[str, tuple[str, bool, float, float]] = {}
         # 발주 응답이 즉시체결(filled)이면 (체결수량, 평균가) — place() 직후 꺼내 OrderBook에
         # 반영한다(userFills 놓쳐도 미체결로 안 남게). pop_place_fill로 1회 소비.
+        # 연속 전송으로 발주가 겹쳐 돌아도 안전: place_order는 응답을 받은 뒤 이 값을 넣고 **기다림
+        # 없이** 돌아가고, 호출부(LiveSystem.place)가 바로 꺼낸다 — 그 사이에 다른 발주가 못 낀다.
         self._last_place_fill: tuple[float, float] | None = None
-        # nonce를 쓰는 액션(주문·취소·정정·레버리지)은 한 번에 하나만, 직전과 1ms 이상 간격으로
-        # 보낸다(실측 2026-09-10: 같은 ms에 두 후주문 → "duplicate nonce" 거부 → 체결차 중지 오탐).
+        # 옛 방식(번호 발급기 없음)용: nonce 액션을 한 번에 하나만, 직전과 1ms 이상 간격으로
+        # (실측 2026-09-10: 같은 ms에 두 후주문 → "duplicate nonce" 거부 → 체결차 중지 오탐).
         self._action_lock = asyncio.Lock()
         self._last_action_ms = 0
         self.connected = False
@@ -134,7 +177,14 @@ class HLSdkGateway(HLGateway):
             account_address=address, perp_dexs=[HL_DEX],
         )
         info = Info(constants.MAINNET_API_URL, skip_ws=True)
-        return cls(exchange, info, account_address=address, symbols=symbols)
+        clock = NonceClock()
+        installed = install_nonce_clock(clock)
+        if not installed:
+            logging.getLogger("kp_arb.hl").warning(
+                "HL 번호 발급기를 SDK에 못 붙임(SDK 변경?) — "
+                "주문을 한 번에 하나씩 보내는 옛 방식으로 동작")
+        return cls(exchange, info, account_address=address, symbols=symbols,
+                   nonce_clock=clock if installed else None)
 
     async def connect(self) -> None:
         # 연결 검증: xyz dex 계정 상태 1회 조회.
@@ -145,27 +195,34 @@ class HLSdkGateway(HLGateway):
 
     async def _exchange_action(self, what: str, fn: Callable[..., Any],
                                *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """nonce가 붙는 SDK 액션 한 건 — 직렬화 + 1ms 간격 + nonce 거부 재전송.
+        """nonce가 붙는 SDK 액션 한 건 — 연속 전송 + nonce 거부 재전송.
 
-        SDK가 스레드 안에서 nonce(벽시계 ms)를 찍으므로, 잠금을 응답까지 쥐어 두 액션의 시작 시각이
-        겹치지 않게 하고, 직전 액션과 같은 ms면 1ms 기다린다. 그래도 서버가 nonce 거부를 주면(주문은
-        안 들어간 상태) 새 nonce로 최대 NONCE_RETRIES회 다시 보낸다. 그 밖의 거부·예외는 그대로
-        돌려준다(호출부의 _check_ok/_parse_oid가 처리).
+        서버가 nonce 거부를 주면(주문은 안 들어간 상태) 새 nonce로 최대 NONCE_RETRIES회 다시
+        보낸다. 그 밖의 거부·예외는 그대로 돌려준다(호출부의 _check_ok/_parse_oid가 처리).
         """
         log = order_log.logger_for(Venue.HYPERLIQUID)
-        async with self._action_lock:
-            for attempt in range(NONCE_RETRIES + 1):
-                now_ms = int(time.time() * 1000)
-                while now_ms <= self._last_action_ms:
-                    await asyncio.sleep(0.001)
-                    now_ms = int(time.time() * 1000)
-                self._last_action_ms = now_ms
-                resp = await asyncio.to_thread(fn, *args, **kwargs)
-                if not _is_nonce_reject(resp) or attempt == NONCE_RETRIES:
-                    return resp  # type: ignore[no-any-return]
-                log.warning("HL nonce 충돌 재전송 %d/%d (%s) — %s",
-                            attempt + 1, NONCE_RETRIES, what, resp.get("response"))
+        for attempt in range(NONCE_RETRIES + 1):
+            resp = await self._send_action(fn, *args, **kwargs)
+            if not _is_nonce_reject(resp) or attempt == NONCE_RETRIES:
+                return resp  # type: ignore[no-any-return]
+            log.warning("HL nonce 충돌 재전송 %d/%d (%s) — %s",
+                        attempt + 1, NONCE_RETRIES, what, resp.get("response"))
         return resp  # type: ignore[no-any-return]  # (도달 안 함 — mypy용)
+
+    async def _send_action(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """SDK 호출 한 번. 번호 발급기가 붙어 있으면 **앞 요청의 응답을 기다리지 않고** 바로 보낸다
+        (사용자 2026-09-30: 세트가 여럿일 때 1세트 주문이 먼저 나가고 2세트가 바로 뒤따르게 —
+        전엔 앞 요청 왕복 약 0.5초를 통째로 기다려 네 번째 주문이 1.5초 묵은 가격으로 나갔다).
+        없으면 옛 방식: 잠금을 응답까지 쥐고, 직전 액션과 같은 ms면 1ms 기다린다."""
+        if self._nonce_clock is not None:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        async with self._action_lock:
+            now_ms = int(time.time() * 1000)
+            while now_ms <= self._last_action_ms:
+                await asyncio.sleep(0.001)
+                now_ms = int(time.time() * 1000)
+            self._last_action_ms = now_ms
+            return await asyncio.to_thread(fn, *args, **kwargs)
 
     def new_cloid(self) -> str | None:
         """클라이언트 주문번호 — 공식 "128 bit hex string"(0x + 32자리). 앞 6바이트는 시각(ms),
