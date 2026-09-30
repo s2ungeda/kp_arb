@@ -97,6 +97,26 @@ def test_parse_rounds_skips_halted_partial_round_and_reads_stock_and_hl_first() 
         _sf_formula(1358.0, 201.5, 274_750, 275_000, 274_976) * 100, 4))
 
 
+def test_parse_rounds_reads_reverse_rounds_with_negative_rt() -> None:
+    # 역방향은 RT가 0 또는 음수(§7A) — 전엔 RT를 부호 없는 숫자로만 읽어 역방향 판이 통째로 빠졌다.
+    # 줄은 엔진 로그 형식 그대로(HL선 역방향 진입: HL 매수 선주문 → LS SF 매도 후주문).
+    pre = ("2026-09-30 10:00:00,100 INFO 체결 HL선 역방향 1세트 진입: HL 선주문 #O1 10 @ 1183.6 "
+           "(발주 때 SF호가 1.598e+06) → 누적 10/10, 미헤지 조각 0, LS 대기 1 | 장부 SF 0 HL 10 "
+           "체결차 10")
+    post = ("2026-09-30 10:00:00,900 INFO 체결 HL선 역방향 1세트 진입: LS 후주문 #O2 SF 1 "
+            "@ 1,598,000 기준est 1.598e+06 차이 +0(+0.000%) 환진입가 1356 S현재가 1600000.0 "
+            "SF이론가 1,605,000 → RT -1 LS대기 0 | 장부 SF -1 HL 10 체결차 0 | 누적 HL 10 SF 1 "
+            "환평균 1356.0 HL평균 1183.6 SF평균 1598000.0 Sprd 0.746%")
+    rows = parse_rounds([pre, post], underlying="sk_hynix", product="sf_hl_first")
+    assert len(rows) == 1
+    r = rows[0]
+    assert (r["방향"], r["다리"], r["RT"]) == ("역방향", "진입", -1)
+    assert r["선주문평균가"] == 1183.6 and r["후주문평균가"] == 1_598_000.0
+    assert r["판Sprd(%)"] == pytest.approx(round(
+        _sf_formula(1356.0, 1183.6, 1_600_000, 1_598_000, 1_605_000) * 100, 4))
+    assert r["누적Sprd(%)"] == 0.746
+
+
 def test_collect_reads_three_products_by_filename_and_writes_csv(tmp_path: Path) -> None:
     (tmp_path / "autom_samsung_20260928.log").write_text(
         "\n".join([SF_PRE, SF_POST_PARTIAL, SF_POST_REST]), encoding="utf-8")

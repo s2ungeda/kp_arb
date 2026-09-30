@@ -39,7 +39,7 @@ from .domain.models import InstrumentInfo, OrderIntent, Position, Quote
 from .engine import ArbEngine
 from .etf_theory import EtfTheoryInputs, theory_after, theory_regular
 from .fx_auction import FxAuctionController, FxAuctionSettings, HedgeAction
-from .gateways.base import HLGateway
+from .gateways.base import HLGateway, PlaceResult
 from .gateways.hl import Mark
 from .gateways.hl_ws import HLWebSocketClient, OrderUpdate
 from .gateways.ls import LSApiGateway, OrderGoneError
@@ -945,13 +945,19 @@ class LiveSystem:
             raise
         if cloid:
             self._hl_pending.pop(cloid, None)
+        # 발주 즉시체결 (수량, 평균가) | None — 응답 직후 바로 꺼낸다(다른 발주가 끼기 전)
+        self._adopt_hl_order(order_id, intent, self._hl.pop_place_fill())
+        return order_id
+
+    def _adopt_hl_order(self, order_id: str, intent: OrderIntent,
+                        place_fill: tuple[float, float] | None) -> None:
+        """접수된 HL 주문을 장부에 등록 — 한 건 발주(place)와 묶음 발주(place_many) 공용."""
         order = self.order_book.order(order_id)
         if order is None:
             order = self.order_book.track(order_id, intent)
         else:  # 응답보다 먼저 온 통보(cloid)로 이미 등록·체결 반영됨 — 그대로 잇는다
             order_log.logger_for(Venue.HYPERLIQUID).info(
                 "HL 발주 응답 #%s — 응답 전 식별로 이미 등록(체결 %g)", order_id, order.filled_qty)
-        place_fill = self._hl.pop_place_fill()  # 발주 즉시체결 (수량, 평균가) | None
         if place_fill is not None:
             sz, px = place_fill
             # 응답 전 식별로 이미 반영된 체결(userFills)은 뺀 차이만 선반영 — 이중 반영 방지
@@ -967,7 +973,58 @@ class LiveSystem:
         # apply_place_fill **뒤**에 replay — track 전에 온 이벤트(체결·취소 등) 반영. 겹친
         # 체결은 provisional_filled가 흡수해 이중 반영 없음(주문 역전 대비, LS·HL 공용).
         self.order_book.replay_pending(order_id)
-        return order_id
+
+    async def place_many(self, intents: Sequence[OrderIntent],
+                         cloids: Sequence[str | None] | None = None) -> list[PlaceResult]:
+        """HL 주문 여러 건을 **한 요청**으로(exec §7D 묶음 전송, 사용자 2026-09-30) → 건별 결과
+        (보낸 순서). 검사·등록·거부내역은 한 건 발주(place)와 같다: HL 일일 한도는 주문마다(같은
+        묶음의 앞 주문 금액을 더해서), 접수된 주문은 장부에 등록, 거부는 거부내역에.
+        예외를 던지지 않는다 — 실패는 결과의 error로 돌려준다."""
+        if self._hl is None:
+            return [PlaceResult(None, error="HL gateway not configured", whole=True)
+                    for _ in intents]
+        out: list[PlaceResult | None] = [None] * len(intents)
+        send_idx: list[int] = []
+        send_cloids: list[str | None] = []
+        filled = self._hl_filled.total(self._today())
+        queued = 0.0  # 이 묶음에서 앞서 통과한 주문 금액
+        for i, intent in enumerate(intents):
+            if intent.venue is not Venue.HYPERLIQUID:
+                out[i] = PlaceResult(None, error="묶음 발주는 HL 주문만")
+                continue
+            notional = self._hl_order_notional(intent)
+            if would_exceed_daily_limit(filled + queued, notional, self.hl_daily_limit_usdc):
+                limit_msg = (f"HL 일일 한도 초과 — 당일 {filled + queued:,.0f} + 주문 "
+                             f"{notional:,.0f} > 한도 {self.hl_daily_limit_usdc:,.0f} USDC")
+                self._record_reject(intent, limit_msg)
+                out[i] = PlaceResult(None, error=limit_msg)
+                continue
+            queued += notional
+            cloid = (cloids[i] if cloids is not None else None) or self._hl.new_cloid()
+            if cloid:
+                self._hl_pending[cloid] = intent
+            send_idx.append(i)
+            send_cloids.append(cloid)
+        if not send_idx:
+            return [r if r is not None else PlaceResult(None, error="no result") for r in out]
+        picked = [intents[i] for i in send_idx]
+        try:
+            results = await self._hl.place_orders(picked, send_cloids)
+        except Exception as exc:  # noqa: BLE001 - 게이트웨이가 통째로 실패 → 전부 결과 모름
+            results = [PlaceResult(None, error=f"{type(exc).__name__}: {exc}", whole=True)
+                       for _ in picked]
+        for i, cloid, res in zip(send_idx, send_cloids, results, strict=True):
+            intent = intents[i]
+            out[i] = res
+            if cloid:
+                self._hl_pending.pop(cloid, None)
+            if res.order_id is None:
+                self._record_reject(intent, res.error or "")
+                if cloid:  # 유예 안에 통보가 오면 살아 있는 주문으로 등록(place와 같음)
+                    self._hold_failed_hl(cloid, intent)
+                continue
+            self._adopt_hl_order(res.order_id, intent, res.fill)
+        return [r if r is not None else PlaceResult(None, error="no result") for r in out]
 
     async def amend_price(
         self, order_id: str, price: float, *,

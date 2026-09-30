@@ -1169,6 +1169,67 @@ async def test_cancel_many_batches_hl_and_updates_local_book() -> None:
     assert any(r.get("order_id") == "H2" for r in system.rejects)  # 거부내역에 기록
 
 
+async def test_place_many_sends_one_request_and_handles_each_result() -> None:
+    # 묶음 발주(exec §7D, 사용자 2026-09-30): HL 주문 여러 건을 게이트웨이 place_orders 한 번에.
+    # 접수 건은 장부에 등록(즉시체결 포함), 거부 건은 거부내역에. 일일 한도는 주문마다(같은 묶음의
+    # 앞 주문 금액을 더해서) — 한도에 걸린 주문은 보내지 않는다.
+    from collections.abc import Sequence
+
+    from kp_arb.gateways.base import PlaceResult
+    from kp_arb.gateways.mock_hl import MockHLGateway
+
+    class BulkHL(MockHLGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batches: list[list[float]] = []
+
+        async def place_orders(self, intents: Sequence[OrderIntent],
+                               cloids: Sequence[str | None] | None = None
+                               ) -> list[PlaceResult]:
+            self.batches.append([float(i.price or 0) for i in intents])
+            out = []
+            for n, intent in enumerate(intents):
+                if intent.price == 1002.0:
+                    out.append(PlaceResult(None, error="HL order not accepted: margin"))
+                elif intent.price == 1003.0:
+                    out.append(PlaceResult(f"B{n}", fill=(0.4, 1003.0)))
+                else:
+                    out.append(PlaceResult(f"B{n}"))
+            return out
+
+    def intent(price: float) -> OrderIntent:
+        return OrderIntent(venue=Venue.HYPERLIQUID, underlying=SAMSUNG,
+                           instrument=Instrument.HL_PERP, side=Side.SELL, qty=1, price=price,
+                           post_only=True)
+
+    hl = BulkHL()
+    system, _, _ = _system([])
+    system._hl = hl
+    res = await system.place_many([intent(1001.0), intent(1002.0), intent(1003.0)])
+    assert hl.batches == [[1001.0, 1002.0, 1003.0]]            # 세 건이 한 요청, 보낸 순서 그대로
+    assert [r.order_id for r in res] == ["B0", None, "B2"]
+    assert res[1].error is not None and "margin" in res[1].error and not res[1].whole
+    b0, b2 = system.order_book.order("B0"), system.order_book.order("B2")
+    assert b0 is not None and b0.is_open and b0.filled_qty == 0
+    assert b2 is not None and abs(b2.filled_qty - 0.4) < 1e-9  # 발주 즉시체결 선반영
+    assert any("margin" in str(r.get("reason", "")) for r in system.rejects)
+    # 일일 한도: 당일 0 + 1001 통과, 다음 1001은 누적 2002 > 한도 1500 → 그 건만 안 보냄
+    system.set_hl_daily_limit(1500.0)
+    res2 = await system.place_many([intent(1001.0), intent(1001.0)])
+    assert hl.batches[-1] == [1001.0]
+    assert res2[0].order_id == "B0" and res2[1].order_id is None
+    assert res2[1].error is not None and "일일 한도" in res2[1].error
+    # 게이트웨이가 통째로 실패 → 전부 결과 모름(whole), 예외는 밖으로 안 나간다
+    async def boom(*_a: object, **_k: object) -> list[PlaceResult]:
+        raise ConnectionError("reset")
+
+    hl.place_orders = boom  # type: ignore[method-assign]
+    system.set_hl_daily_limit(0.0)
+    res3 = await system.place_many([intent(1001.0), intent(1004.0)])
+    assert all(r.order_id is None and r.whole for r in res3)
+    assert res3[0].error is not None and "ConnectionError" in res3[0].error
+
+
 def test_ws_statuses_dedupes_shared_xing_client() -> None:
     # xing은 소켓 하나 — 주식·선물 자리에 같은 객체. 메인창 WS 표에 한 줄만(운영 PC 실측 2026-09-29:
     # 'LS xing'이 수신 건수까지 같은 채 두 줄로 보임).

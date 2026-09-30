@@ -32,7 +32,7 @@ from .. import order_log
 from ..config import ConfigError, SecretProvider, default_secrets
 from ..domain.enums import Instrument, OrderType, Side, Underlying, Venue
 from ..domain.models import OrderIntent, Position
-from .base import HLGateway, placed_at_from_ms, placed_epoch_from_ms
+from .base import HLGateway, PlaceResult, placed_at_from_ms, placed_epoch_from_ms
 from .hl import HLError
 from .ls import OrderGoneError
 
@@ -277,6 +277,133 @@ class HLSdkGateway(HLGateway):
         log.info("HL 발주 왕복 %d ms #%s cloid=%s", int(time.time() * 1000) - sent_ms, oid,
                  cloid or "-")
         return oid
+
+    async def place_orders(self, intents: Sequence[OrderIntent],
+                           cloids: Sequence[str | None] | None = None) -> list[PlaceResult]:
+        """여러 건을 `order` 액션 하나(orders 배열)로 — SDK bulk_orders. 요청 번호·서명 한 번,
+        응답 statuses가 보낸 순서대로 건별 {"resting"|"filled"|"error"}(exec §7D 묶음 전송,
+        사용자 2026-09-30).
+
+        ALO(post_only)와 그 밖(GTC)은 **따로 묶는다** — ALO만 든 묶음을 검증자가 먼저 처리한다
+        (공식 문서 Nonces and API wallets). 섞여 들어오면 두 요청으로 나눠 동시에 보낸다.
+        지정가가 아닌 주문은 보내지 않고 그 자리에 사유를 돌려준다.
+        """
+        out: list[PlaceResult | None] = [None] * len(intents)
+        groups: dict[bool, list[int]] = {True: [], False: []}
+        for i, intent in enumerate(intents):
+            if intent.venue is not Venue.HYPERLIQUID:
+                out[i] = PlaceResult(None, error="HLSdkGateway only handles Hyperliquid orders")
+            elif intent.order_type is not OrderType.LIMIT or intent.price is None:
+                out[i] = PlaceResult(None, error="HL 주문은 지정가(가격 필수)만 — 시장가·IOC 없음")
+            else:
+                groups[bool(intent.post_only)].append(i)
+
+        async def send(indexes: list[int]) -> None:
+            picked = [intents[i] for i in indexes]
+            ids = [cloids[i] if cloids is not None else None for i in indexes]
+            for i, res in zip(indexes, await self._place_group(picked, ids), strict=True):
+                out[i] = res
+
+        await asyncio.gather(*(send(idx) for idx in groups.values() if idx))
+        return [r if r is not None else PlaceResult(None, error="no result", whole=True)
+                for r in out]
+
+    async def _place_group(self, intents: Sequence[OrderIntent],
+                           cloids: Sequence[str | None]) -> list[PlaceResult]:
+        """같은 성격(ALO끼리 또는 GTC끼리)의 주문을 요청 하나로 보내고 건별 결과로 나눈다."""
+        from hyperliquid.utils.types import Cloid
+
+        log = order_log.logger_for(Venue.HYPERLIQUID)
+        reqs: list[dict[str, Any]] = []
+        for intent, cloid in zip(intents, cloids, strict=True):
+            assert intent.price is not None
+            req: dict[str, Any] = {
+                "coin": self._symbol(intent.underlying), "is_buy": intent.side is Side.BUY,
+                "sz": float(intent.qty), "limit_px": float(intent.price),
+                "order_type": {"limit": {"tif": "Alo" if intent.post_only else "Gtc"}},
+                "reduce_only": intent.reduce_only}
+            if cloid:
+                req["cloid"] = Cloid.from_str(cloid)
+            reqs.append(req)
+            order_log.order_requested(intent, price=float(intent.price))
+        self._log_wire_many(reqs)
+        sent_ms = int(time.time() * 1000)
+        failure: Exception | None = None
+        resp: Any = None
+        try:
+            resp = await self._exchange_action("orders", self._ex.bulk_orders, reqs)
+        except Exception as exc:  # noqa: BLE001 - 통신 오류·시간 초과 = 결과 모름(아래 cloid 조회)
+            failure = exc
+        took = int(time.time() * 1000) - sent_ms
+        statuses: list[Any] = []
+        whole_error: str | None = None
+        if failure is not None:
+            whole_error = f"{type(failure).__name__}: {failure}"
+        elif not isinstance(resp, dict) or resp.get("status") != "ok":
+            whole_error = f"HL rejected: {resp.get('response') if isinstance(resp, dict) else resp}"
+        else:
+            try:
+                statuses = list(resp["response"]["data"]["statuses"])
+            except (KeyError, TypeError):
+                whole_error = "cannot parse HL order response"
+        out: list[PlaceResult] = []
+        for i, (intent, cloid, req) in enumerate(zip(intents, cloids, reqs, strict=True)):
+            status = statuses[i] if i < len(statuses) else None
+            oid: str | None = None
+            if isinstance(status, dict):
+                oid = next((str(status[k]["oid"]) for k in ("resting", "filled")
+                            if k in status), None)
+            if oid is None and failure is not None and cloid:
+                # 응답을 못 받음 — 자동 재전송 없이 cloid로 접수 여부만 묻는다(§HL cloid ②)
+                found = await self._recover_by_cloid(cloid)
+                if found is not None:
+                    oid, one = found
+                    log.warning("HL 묶음 발주 응답 유실(%s) — orderStatus(cloid %s)로 복구 #%s",
+                                whole_error, cloid, oid)
+                    self._track_placed(oid, intent, req)
+                    order_log.order_placed(intent, oid, one)
+                    out.append(PlaceResult(oid, fill=self._parse_place_fill(one)))
+                    continue
+            if oid is None:
+                if whole_error is not None:
+                    res = PlaceResult(None, error=whole_error, whole=True)
+                elif status is None:
+                    res = PlaceResult(None, error="no status in order response", whole=True)
+                else:
+                    res = PlaceResult(None, error=f"HL order not accepted: {status}")
+                order_log.order_rejected(intent, res.error)
+                out.append(res)
+                continue
+            one = {"status": "ok",
+                   "response": {"type": "order", "data": {"statuses": [status]}}}
+            self._track_placed(oid, intent, req)
+            order_log.order_placed(intent, oid, one)
+            out.append(PlaceResult(oid, fill=self._parse_place_fill(one)))
+        log.info("HL 묶음 발주 왕복 %d ms — %d건 중 접수 %d건", took, len(reqs),
+                 sum(1 for r in out if r.order_id is not None))
+        return out
+
+    def _track_placed(self, oid: str, intent: OrderIntent, req: dict[str, Any]) -> None:
+        """접수된 주문의 취소·정정 문맥(종목·방향·수량·가격)."""
+        self._order_coin[oid] = req["coin"]
+        self._order_ctx[oid] = (req["coin"], bool(req["is_buy"]), float(intent.qty),
+                                float(req["limit_px"]))
+
+    def _log_wire_many(self, reqs: Sequence[dict[str, Any]]) -> None:
+        """묶음 발주의 요청 패킷(action) 기록 — 한 건짜리 _log_wire와 같은 형식, orders 여러 개."""
+        try:
+            from hyperliquid.utils.signing import (
+                order_request_to_order_wire,
+                order_wires_to_order_action,
+            )
+
+            wires = [order_request_to_order_wire(dict(r), self._ex.info.name_to_asset(r["coin"]))
+                     for r in reqs]
+            order_log.logger_for(Venue.HYPERLIQUID).info(
+                "HL 요청패킷(묶음 %d건) %s", len(reqs),
+                json.dumps(order_wires_to_order_action(wires), ensure_ascii=False))
+        except Exception as exc:  # noqa: BLE001 - 로그용
+            order_log.logger_for(Venue.HYPERLIQUID).warning("HL 요청패킷 기록 실패: %s", exc)
 
     async def lookup_by_cloid(self, cloid: str) -> str | None:
         """cloid로 orderStatus 조회 → 들어간 주문이면 oid(발주 실패 유예 끝 재확인, §HL cloid ③)."""

@@ -37,7 +37,8 @@ _RE_PRE = re.compile(
 #   SF이론가 z → RT n HL대기 w ... Sprd s" / HL선: "LS 후주문 #.. SF 1 @ 275,000 ... LS대기 w"
 _RE_POST = re.compile(
     rf"체결 {_TAG}: (?P<ls>LS )?후주문 #\S+ (?:HL|SF) (?P<qty>{_NUM}) @ (?P<px>{_NUM}) .*?"
-    rf"환진입가 (?P<fx>\S+) S현재가 (?P<s>\S+) SF이론가 (?P<th>\S+) → RT (?P<rt>\d+) "
+    # RT는 역방향이면 0 또는 음수(§7A) — 부호를 안 받으면 역방향 판이 통째로 빠진다
+    rf"환진입가 (?P<fx>\S+) S현재가 (?P<s>\S+) SF이론가 (?P<th>\S+) → RT (?P<rt>-?\d+) "
     rf"(?:HL|LS)대기 (?P<wait>{_NUM}) .*?Sprd (?P<sprd>\S+)")
 _RE_HALT = re.compile(rf"행동 {_TAG}: halt\b")
 _RE_FILE = re.compile(

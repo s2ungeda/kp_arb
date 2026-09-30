@@ -22,6 +22,7 @@ from .auto_m import (
     SET_COUNT_REV,
     STOCK_CREDIT_DEFAULT_ROWS,
     STOCK_SET_ROWS,
+    hl_unit_errors,
     price_offset_errors,
 )
 from .ui_fields import (
@@ -81,6 +82,9 @@ class ScreenSpec:
     alt_row_bg: bool = False      # 짝수 세트 행 하늘색 바탕(주식선물 8세트, 사용자 09-16)
     snapshot_rows: int = 0        # 마지막 판 스냅샷 줄 수(4 = Sprd·HP·SF·환, 1 = Sprd만, 0 = 없음)
     market_combo: bool = False    # 거래소 콤보 KRX/NXT — 종목 콤보 왼쪽(주식, 사용자 09-17)
+    # HL선(exec §7D 결정 55): 세트설정의 선주문 주문단위·시작호가를 USD(HL 격자 배수)로 받는다 —
+    # 화면 호가단위 콤보는 다른 창과 공유돼 주문 규칙에 안 쓴다(사용자 2026-09-30)
+    hl_unit_usd: bool = False
 
     def directions_names(self) -> list[tuple[str, str]]:
         """(방향 태그, 표시 이름) 목록 — 스냅샷 블록의 방향 라벨용."""
@@ -100,7 +104,8 @@ SF_SPEC = ScreenSpec(
 # 공통설정(주문가능시간·상대호가·범위)은 주식선물 것을 같이 쓴다(§7D).
 SF_HL_FIRST_SPEC = dc_replace(
     SF_SPEC, product="sf_hl_first", title="체결쏴(자동M)-주식선물(HL선)",
-    product_tag="(주식선물 HL선)", state_key="autoMH", screen_tag="autoMH", log_tag="자동M HL선")
+    product_tag="(주식선물 HL선)", state_key="autoMH", screen_tag="autoMH", log_tag="자동M HL선",
+    hl_unit_usd=True)
 
 # 주식: 정방향만, 기준값 칸은 진입 S(-HP/+S)·청산 S(+HP/-S), 매매결과 +S/-S(주식 평균 체결가).
 # 주문단위 기본값은 주식 호가단위(20만~50만 원 100원, 50만 원 이상 500원)로 — 결정 전 임시.
@@ -168,6 +173,8 @@ def set_payload(index: int, w: dict[str, Any], underlying: str,
         "switch_delay_s": int(w.get("delay") or 0),
         "price_offset": int(w.get("offset") or 0),  # 주문가 시작호가(원, 2026-09-15)
         "pre_tick": int(w.get("tick") or 0),  # 선주문 주문단위(세트별, 2026-09-16; 0=종목 기본)
+        # HL선(결정 55): 선주문 주문단위·시작호가(USD) — 0 = 격자 / 0 기준
+        "hl_unit": float(w.get("hl_unit") or 0.0), "hl_offset": float(w.get("hl_offset") or 0.0),
         "en_sf": pct_to_frac(w.get("en_sf")), "en_s": pct_to_frac(w.get("en_s")),
         "ex_sf": pct_to_frac(w.get("ex_sf")),
         "rt_manual": w.get("rt_manual"), "clear_diff": bool(w.get("clear_diff")),
@@ -279,7 +286,7 @@ _REL_CHOICES_SELL = [f"상대{n}호가 + 1틱" for n in range(1, 6)]
 
 
 _SET_INPUT_KEYS = ("target_qty", "per_qty", "switch_delay_s", "price_offset", "pre_tick",
-                   "en_sf", "en_s", "ex_sf")
+                   "hl_unit", "hl_offset", "en_sf", "en_s", "ex_sf")
 
 
 def set_input_sigs(book: dict[str, Any]) -> dict[tuple[str, int], str]:
@@ -960,7 +967,12 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 # 값 0/빈칸이면 종목 기본값(옛 공통설정 값)을 채워 보여준다
                 ("선주문 주문단위(원)", "tick", vcmd_int),
                 ("선주문 시작호가(원)", "offset", vcmd_int)]
-        if not w.get("tick"):
+        if spec.hl_unit_usd:
+            # HL선(결정 55): 같은 두 칸을 USD로 — 주문단위는 HL 격자 배수(0 = 격자), 시작호가는
+            # 0 이상·주문단위 미만·격자 배수(0 = 0·단위·2단위…). 화면 호가단위 콤보는 표시용
+            rows[-2:] = [("선주문 주문단위(USD)", "hl_unit", vcmd_dec),
+                         ("선주문 시작호가(USD)", "hl_offset", vcmd_dec)]
+        elif not w.get("tick"):
             w["tick"] = int(common["pre_tick"].get(cur_under(), 0))
         if not spec.has_en_sf:  # 주식: 진입SF 칸 없음
             rows = [row for row in rows if row[1] != "en_sf"]
@@ -975,11 +987,23 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 e.insert(0, w[inline_map[key]].get())
             else:  # 목표·1회주문·딜레이·주문단위·시작호가 = 세트 상태값(딜레이·시작호가는 0도 값)
                 val = w.get(key)
-                blank = val is None or (val == 0 and key not in ("delay", "offset"))
+                blank = val is None or (val == 0 and key not in ("delay", "offset", "hl_offset"))
                 commas = spec.qty_commas and key in ("target", "per")
-                e.insert(0, "" if blank else (format_qty(int(val or 0)) if commas else str(val)))
+                text = (format_qty(int(val or 0)) if commas
+                        else f"{val:g}" if isinstance(val, float) else str(val))
+                e.insert(0, "" if blank else text)
             e.grid(row=r, column=1, padx=6, pady=3)
             ents[key] = e
+        base = len(rows)  # 입력 줄 아래 첫 줄
+        if spec.hl_unit_usd:
+            # 주의 문구(사용자 2026-09-30) — 주문단위·시작호가 규칙. 지금 가격대 격자를 알면 같이
+            hl_step = _live_book().get("hl_step")
+            step_txt = f" (지금 {float(hl_step):g})" if isinstance(hl_step, int | float) else ""
+            note = (f"※ 선주문 주문단위는 최소호가단위{step_txt}의 배수 (0이면 최소호가단위)\n"
+                    "※ 선주문 시작호가는 최소호가단위의 배수이고 주문단위보다 작아야 함")
+            tk.Label(win, fg="#a05000", font=T.FONT_LABEL, justify="left", text=note).grid(
+                row=base, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+            base += 1
         # RT 수동 입력·체결차 Clear는 **1회성** — 열 때마다 꺼진 상태로 시작하고 저장하지 않는다
         # (사용자 확정 2026-09-07). 값이 남아 있으면 실행 켤 때마다 RT를 덮어쓰는 사고가 난다.
         rt_var = tk.BooleanVar(value=False)
@@ -988,22 +1012,22 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         rt_ent = tk.Entry(win, width=10, justify="right", validate="key",
                           validatecommand=vcmd_sint if dtag == "rev" else vcmd_int)
         tk.Checkbutton(win, text="RT 진입수량 수동 입력" + (" (0 또는 −)" if dtag == "rev" else ""),
-                       variable=rt_var).grid(row=len(rows), column=0, sticky="w", padx=6)
-        rt_ent.grid(row=len(rows), column=1, padx=6, pady=2)
+                       variable=rt_var).grid(row=base, column=0, sticky="w", padx=6)
+        rt_ent.grid(row=base, column=1, padx=6, pady=2)
         diff_var = tk.BooleanVar(value=False)
         tk.Checkbutton(win, text="체결차 Clear", variable=diff_var).grid(
-            row=len(rows) + 1, column=0, sticky="w", padx=6, pady=(0, 4))
+            row=base + 1, column=0, sticky="w", padx=6, pady=(0, 4))
         # 주식 신용(사용자 2026-09-16): 체크 하나 — 진입은 신용매수, 청산은 신용상환. 세트 상태값
         credit_var = tk.BooleanVar(value=bool(w.get("credit")))
         extra_rows = 0
         if spec.credit_boxes:
             tk.Checkbutton(win, text="신용 (진입 신용매수 · 청산 신용상환)",
                            variable=credit_var).grid(
-                row=len(rows) + 2, column=0, columnspan=2, sticky="w", padx=6)
+                row=base + 2, column=0, columnspan=2, sticky="w", padx=6)
             # 주의(사용자 2026-09-18): 신용 상환은 한 주문에 대출일 하나라 1회주문수량은 1주만
             tk.Label(win, text="※ 신용 세트는 1회주문수량 1주만 (상환은 대출일 하나씩)",
                      fg="#a05000", font=T.FONT_LABEL).grid(
-                row=len(rows) + 3, column=0, columnspan=2, sticky="w", padx=24)
+                row=base + 3, column=0, columnspan=2, sticky="w", padx=24)
             extra_rows = 2
 
         def save() -> None:
@@ -1027,13 +1051,25 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             if ex_sf is None:
                 errs.append("청산을 입력하세요")
             errs += check_risk(dtag, en_sf if spec.has_en_sf else en_s, ex_sf, *_risk_of(dtag))
-            offset = parse_qty(ents["offset"].get())
-            unit = parse_qty(ents["tick"].get()) or int(common["pre_tick"].get(cur_under(), 0))
-            if unit <= 0:
-                errs.append("선주문 주문단위를 입력하세요")
-            sf_tick = _live_book().get("sf_tick")  # 코어가 실은 지금 가격대의 SF 호가단위
-            errs += price_offset_errors(offset, unit,
-                                        int(sf_tick) if isinstance(sf_tick, int) else None)
+            unit = offset = 0
+            hl_unit = hl_offset = 0.0
+            if spec.hl_unit_usd:
+                # HL선(결정 55): USD 주문단위·시작호가 — 지금 가격대 HL 격자(코어 스냅샷 hl_step)의
+                # 배수인지, 시작호가 < 주문단위인지. 격자를 모르면(시세 없음) 배수 검사는 G6이 잡음
+                hl_unit = parse_threshold(ents["hl_unit"].get()) or 0.0
+                hl_offset = parse_threshold(ents["hl_offset"].get()) or 0.0
+                hl_step = _live_book().get("hl_step")
+                errs += hl_unit_errors(hl_unit, hl_offset,
+                                       float(hl_step) if isinstance(hl_step, int | float) else None)
+            else:
+                offset = parse_qty(ents["offset"].get())
+                unit = (parse_qty(ents["tick"].get())
+                        or int(common["pre_tick"].get(cur_under(), 0)))
+                if unit <= 0:
+                    errs.append("선주문 주문단위를 입력하세요")
+                sf_tick = _live_book().get("sf_tick")  # 코어가 실은 지금 가격대의 SF 호가단위
+                errs += price_offset_errors(offset, unit,
+                                            int(sf_tick) if isinstance(sf_tick, int) else None)
             if rt_var.get() and not rt_ent.get().strip():  # 체크만 하고 값 없음 → 확인창
                 errs.append("RT 진입수량 수동 입력이 켜져 있는데 값이 없습니다")
             elif rt_var.get():
@@ -1043,7 +1079,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 return
             w["target"], w["per"] = target, per
             w["delay"] = parse_qty(ents["delay"].get())
-            w["tick"], w["offset"] = unit, offset
+            if spec.hl_unit_usd:
+                w["hl_unit"], w["hl_offset"] = hl_unit, hl_offset
+            else:
+                w["tick"], w["offset"] = unit, offset
             w["en_sf"], w["en_s"], w["ex_sf"] = en_sf, en_s, ex_sf
             w["rt_manual"] = parse_qty(rt_ent.get()) if rt_var.get() else None
             w["clear_diff"] = diff_var.get()
@@ -1057,7 +1096,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             w["clear_diff"] = False
 
         btns = tk.Frame(win)
-        btns.grid(row=len(rows) + 2 + extra_rows, column=0, columnspan=2, pady=(4, 6))
+        btns.grid(row=base + 2 + extra_rows, column=0, columnspan=2, pady=(4, 6))
         tk.Button(btns, text="확인", width=8, command=save).pack(side="left", padx=4)
         tk.Button(btns, text="취소", width=8, command=win.destroy).pack(side="left", padx=4)
         _center(win)
@@ -1255,6 +1294,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         for (dtag, _i), w in sets.items():
             w["target"], w["per"], w["delay"] = 10000, 100, 30  # 상태도 채워 설정창과 일관
             w["tick"] = 3000  # 세트별 선주문 주문단위 표본(세트설정 창)
+            w["hl_unit"], w["hl_offset"] = 0.5, 0.0  # HL선 USD 표본(결정 55)
             w["tg"].config(text="10,000")
             w["per_lbl"].config(text="100")
             w["rt"].config(text="9,999")
@@ -1551,6 +1591,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             w["delay"] = int(raw.get("switch_delay_s") or 0)
             w["offset"] = int(raw.get("price_offset") or 0)
             w["tick"] = int(raw.get("pre_tick") or 0)  # 0 = 종목 기본값(공통설정 값)
+            w["hl_unit"] = float(raw.get("hl_unit") or 0.0)  # HL선 USD 단위(결정 55), 0 = 격자
+            w["hl_offset"] = float(raw.get("hl_offset") or 0.0)
             if "credit" in raw:  # 주식 신용(코어의 종목 상태에 실리면 따라감, 없으면 화면 기본값
             # 유지)
                 w["credit"] = bool(raw["credit"])

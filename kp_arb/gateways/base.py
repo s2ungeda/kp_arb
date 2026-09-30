@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ..domain.enums import Account, Side, Underlying
@@ -55,6 +56,20 @@ def placed_epoch_from_hhmmss(raw: object, now: float | None = None) -> float:
     base = time.localtime(time.time() if now is None else now)
     h, m, s = (int(p) for p in hhmmss.split(":"))
     return time.mktime((base.tm_year, base.tm_mon, base.tm_mday, h, m, s, 0, 0, -1))
+
+
+@dataclass(frozen=True)
+class PlaceResult:
+    """묶음 발주(exec §7D 묶음 전송)의 주문 한 건 결과.
+
+    order_id가 있으면 접수, 없으면 error에 사유. whole=True는 **요청 전체**가 거부됐거나 응답이
+    없었던 경우(주문별 거부가 아님 — 누구 탓인지 알 수 없다). fill은 발주 즉시체결(수량, 평균가).
+    """
+
+    order_id: str | None
+    error: str | None = None
+    whole: bool = False
+    fill: tuple[float, float] | None = None
 
 
 class LSGateway(ABC):
@@ -111,6 +126,21 @@ class HLGateway(ABC):
     async def place_order(self, intent: OrderIntent, cloid: str | None = None) -> str:
         """발주 → 거래소 주문번호(oid). cloid(클라이언트 주문번호, DESIGN §HL cloid)를 주면 주문에
         실어 보낸다 — 응답 전 통보(orderUpdates)로 oid를 식별하고, 응답 유실 시 조회로 복구."""
+
+    async def place_orders(self, intents: Sequence[OrderIntent],
+                           cloids: Sequence[str | None] | None = None) -> list[PlaceResult]:
+        """여러 건 발주 → 건별 결과(보낸 순서). 기본은 한 건씩(place_order) — HL 라이브는 `order`
+        액션의 orders 배열로 **한 요청**에 묶는다(요청 번호·서명 한 번, 사용자 2026-09-30)."""
+        out: list[PlaceResult] = []
+        for i, intent in enumerate(intents):
+            cloid = cloids[i] if cloids is not None else None
+            try:
+                oid = await self.place_order(intent, cloid=cloid)
+            except Exception as exc:  # noqa: BLE001 - 건별 사유를 그대로 돌려준다
+                out.append(PlaceResult(None, error=str(exc)))
+                continue
+            out.append(PlaceResult(oid, fill=self.pop_place_fill()))
+        return out
 
     def new_cloid(self) -> str | None:
         """클라이언트 주문번호 생성 — 지원 안 하면 None(목 등). HLSdkGateway가 구현."""

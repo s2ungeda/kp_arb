@@ -538,6 +538,13 @@ def _autom_set_from_body(target: Any, body: dict[str, Any]) -> None:
         if offset < 0:
             raise ValueError(f"시작호가는 0 이상이어야 함: {offset}")
         target.price_offset = offset
+    # HL선 선주문 주문단위·시작호가(USD, 결정 55) — 0 = 격자 그대로 / 0 기준
+    for key in ("hl_unit", "hl_offset"):
+        if key in body:
+            val = float(body[key] or 0.0)
+            if val < 0:
+                raise ValueError(f"{key}는 0 이상이어야 함: {val}")
+            setattr(target, key, val)
     for key in ("en_sf", "en_s", "ex_sf"):
         if key in body:
             setattr(target, key, _opt_float(body[key]))

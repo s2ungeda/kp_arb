@@ -141,6 +141,45 @@ class FakeSystem:
         self.cancelled.append(order_id)
         self.order_book.on_cancel(order_id)
 
+    async def place_many(self, intents: Any, cloids: Any = None) -> list[Any]:
+        """묶음 발주 흉내(exec §7D) — 요청 하나로 기록하고 건별 결과를 돌려준다.
+        batch_whole_error: 요청 전체 거부 문구 / batch_reject: {묶음 안 순번: 주문별 거부 문구}."""
+        from kp_arb.gateways.base import PlaceResult
+
+        self.batches: list[list[OrderIntent]] = getattr(self, "batches", [])
+        self.batches.append(list(intents))
+        whole = getattr(self, "batch_whole_error", None)
+        if whole:
+            return [PlaceResult(None, error=whole, whole=True) for _ in intents]
+        rejects: dict[int, str] = getattr(self, "batch_reject", {})
+        out: list[Any] = []
+        for i, intent in enumerate(intents):
+            if i in rejects:
+                out.append(PlaceResult(None, error=rejects[i]))
+                continue
+            try:
+                oid = await self.place(intent, cloid=cloids[i] if cloids else None)
+            except Exception as exc:  # noqa: BLE001 - 건별 사유
+                out.append(PlaceResult(None, error=str(exc)))
+                continue
+            out.append(PlaceResult(oid))
+        return out
+
+    async def cancel_many(self, order_ids: Any) -> list[tuple[str, str | None]]:
+        """묶음 취소 흉내 — 요청 하나로 기록, cancel_errors: {주문번호: 실패 문구}."""
+        self.cancel_batches: list[list[str]] = getattr(self, "cancel_batches", [])
+        self.cancel_batches.append(list(order_ids))
+        errors: dict[str, str] = getattr(self, "cancel_errors", {})
+        out: list[tuple[str, str | None]] = []
+        for oid in order_ids:
+            if oid in errors:
+                out.append((oid, errors[oid]))
+                continue
+            self.cancelled.append(oid)
+            self.order_book.on_cancel(oid)
+            out.append((oid, None))
+        return out
+
 
 RUN = {"cmd": "autom_run", "underlying": U.value}  # 종목별 명령(2026-09-08) — 세트·진입/청산은 매번
 
@@ -1067,6 +1106,249 @@ async def test_hl_first_engine_round_hl_alo_pre_then_ls_post() -> None:
     assert mon["en_s"] == 0.01  # S괴리(FakeSystem s_entry) 표시만
     rev = snap[key]["monitor"]["rev"]
     assert rev["en_sf"] == mon["ex_sf"] and rev["ex_sf"] == mon["en_sf"]  # 역방향은 다리 반대
+
+
+async def test_hl_first_engine_reverse_round_entry_then_exit() -> None:
+    # HL선 역방향(exec §7D 역방향, 사용자 2026-09-30). 진입: HL **매수** ALO 10 → 체결 →
+    # LS SF **매도** 1계약 @상대 매수1호가(1,598,000) → RT −1.
+    # 청산: HL 매도 ALO → LS SF 매수 → RT 0.
+    # 진입 역산가 = 1,600,000×(1 + SF괴리(1,598,000 기준 −0.436%) + 0.75%)/1356 = 1183.64 → 내림
+    # 1183.6. 청산 = 1,600,000×(1 + 0 + 0.5%)/1356 = 1185.84 → 올림 1185.9.
+    eng, sys_, state = _hl_first_engine()
+    sys_.s_exit = 0.0  # 역방향 진입 G5(결정 54): 매도호가창 est 기준 S괴리 0 < 진입S 0.75% 통과
+    s = state.autom.book(U, "sf_hl_first").rev_sets[0]
+    s.target_qty, s.per_qty, s.en_sf, s.en_s, s.ex_sf = 10, 1, 0.0075, 0.0075, 0.005
+    body = {"cmd": "autom_run", "underlying": U.value, "set": 0, "block": "entry",
+            "value": True, "product": "sf_hl_first", "direction": "rev"}
+    assert (await _autom_command(eng, state, body))["ok"]
+    eng.tick(datetime(2026, 9, 30, 10, 0, 0), 100.0)
+    await _settle()
+    assert len(sys_.placed) == 1
+    pre = sys_.placed[0]
+    assert pre.venue is Venue.HYPERLIQUID and pre.side is Side.BUY and pre.qty == 10
+    assert pre.price == 1183.6 and pre.post_only and pre.tag == "H역1진"
+    assert state.autom.book(U, "sf_hl_first").sets[0].entry.status is LegStatus.IDLE  # 정방향 무관
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1183.6, ts=0))
+    await _settle()
+    post = sys_.placed[1]
+    assert post.venue is Venue.LS and post.instrument is SF and post.side is Side.SELL
+    assert post.qty == 1 and post.price == 1_598_000.0 and post.tag == "H역1진"
+    assert s.rt == 0 and abs(s.fill_diff - 10) < 1e-9  # HL +10만 잡힌 상태
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=1, price=1_598_000.0, ts=0))
+    await _settle()
+    assert s.rt == -1 and s.sf_net == -1 and abs(s.hl_net - 10) < 1e-9 and s.fill_diff == 0
+    assert s.entry.status is LegStatus.SETTLE_DELAY
+    sprd = s.entry.acc.sprd()
+    assert sprd is not None and sprd <= 0.0075 + 1e-12  # 기준값 이하로 잡힘
+    # 청산 — 들고 있는 1계약. 진입은 끄고(주문 순서를 고정), 전환대기 기준 시각은 비운다(체결
+    # 반영은 실제 시계, tick은 주입 시계라 둘을 빼면 음수가 되어 전환대기로 읽힌다 — 테스트 한정)
+    assert (await _autom_command(eng, state, {**body, "value": False}))["ok"]
+    s.last_entry_fill_mono = None
+    body_x = {**body, "block": "exit"}
+    assert (await _autom_command(eng, state, body_x))["ok"]
+    eng.tick(datetime(2026, 9, 30, 10, 0, 5), 105.0)
+    await _settle()
+    pre_x = sys_.placed[2]
+    assert pre_x.venue is Venue.HYPERLIQUID and pre_x.side is Side.SELL and pre_x.qty == 10
+    assert pre_x.price == 1185.9 and pre_x.post_only and pre_x.tag == "H역1청"
+    sys_.order_book.on_fill(Fill(fill_id="f3", order_id="O3", qty=10, price=1185.9, ts=0))
+    await _settle()
+    post_x = sys_.placed[3]
+    assert post_x.venue is Venue.LS and post_x.side is Side.BUY and post_x.qty == 1
+    assert post_x.price == 1_605_000.0
+    sys_.order_book.on_fill(Fill(fill_id="f4", order_id="O4", qty=1, price=1_605_000.0, ts=0))
+    await _settle()
+    assert s.rt == 0 and s.sf_net == 0 and abs(s.hl_net) < 1e-9 and s.fill_diff == 0
+    snap = eng.live_snapshot()[f"{U.value}|sf_hl_first"]
+    row = snap["rev_sets"][0]
+    assert row["reverse"] and row["rt"] == 0
+    assert row["entry"]["matched_hl"] == 10 and row["exit"]["matched_hl"] == 10
+    # 화면 매매결과 칸이 읽는 값(화면의 합산 함수 그대로) —
+    # 역방향 진입 +HP/-SF/+환, 청산 -HP/+SF/-환
+    from kp_arb.order_autom import latest_round, sum_acc
+
+    en = sum_acc(snap["rev_sets"], "entry")
+    assert en["hl_qty"] == 10 and en["hl_avg"] == 1183.6        # +HP = HL 매수 평균 체결가
+    assert en["sf_avg"] == 1_598_000.0 and en["fx_avg"] == 1356.0  # -SF · +환
+    assert en["sprd"] is not None and abs(en["sprd"] - (
+        (1356 * 1183.6 - 1_600_000) / 1_600_000 - (1_598_000 - 1_605_000) / 1_605_000)) < 1e-12
+    ex = sum_acc(snap["rev_sets"], "exit")
+    assert ex["hl_qty"] == 10 and ex["hl_avg"] == 1185.9 and ex["sf_avg"] == 1_605_000.0
+    assert ex["sprd"] is not None and abs(ex["sprd"] - (1356 * 1185.9 - 1_600_000) / 1_600_000) \
+        < 1e-12                                                  # SF 항 0(체결가 = 이론가)
+    assert sum_acc(snap["sets"], "entry")["hl_qty"] == 0         # 정방향 칸에는 안 섞인다
+    # 마지막 판 블록 — 방향 라벨이 '역방향'으로 잡히고 그 판의 값이 나온다
+    rows_by_dir = {"fwd": snap["sets"], "rev": snap["rev_sets"]}
+    last_en, last_ex = latest_round(rows_by_dir, "entry"), latest_round(rows_by_dir, "exit")
+    assert last_en is not None and last_en[0] == "rev" and last_en[1]["hl_avg"] == 1183.6
+    assert last_ex is not None and last_ex[0] == "rev" and last_ex[1]["sf_avg"] == 1_605_000.0
+
+
+async def test_hl_first_set_unit_usd_via_command_and_snapshot_step() -> None:
+    # 결정 55: 세트설정 명령의 hl_unit/hl_offset(USD)이 선주문 가격에 쓰인다 — 역산가 1185.84 →
+    # 단위 0.5 올림 1186.0. 스냅샷 hl_step(지금 가격대 격자 0.1)은 세트설정 창 검사용. 음수는 거부.
+    eng, sys_, state = _hl_first_engine()
+    res = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value, "set": 0,
+                                            "hl_unit": 0.5, "hl_offset": 0.0,
+                                            "product": "sf_hl_first"})
+    assert res["ok"]
+    s = state.autom.book(U, "sf_hl_first").sets[0]
+    assert s.hl_unit == 0.5 and s.hl_offset == 0.0 and s.pre_tick == 0  # 원 단위 칸은 그대로
+    assert eng.live_snapshot()[f"{U.value}|sf_hl_first"]["hl_step"] == 0.1
+    bad = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value, "set": 0,
+                                            "hl_unit": -0.5, "product": "sf_hl_first"})
+    assert not bad["ok"] and s.hl_unit == 0.5
+    await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": 0,
+                                      "block": "entry", "value": True, "product": "sf_hl_first"})
+    eng.tick(datetime(2026, 9, 30, 10, 0, 0), 100.0)
+    await _settle()
+    assert len(sys_.placed) == 1 and sys_.placed[0].price == 1186.0
+    # 저장·복원에도 실린다
+    from dataclasses import asdict
+
+    from kp_arb.auto_m import AutoMBook, _book_from_dict
+
+    restored = AutoMBook(product="sf_hl_first")
+    _book_from_dict(restored, asdict(state.autom.book(U, "sf_hl_first")))
+    assert restored.sets[0].hl_unit == 0.5
+
+
+async def _hl_first_two_sets() -> tuple[AutoMEngine, FakeSystem, CoreState]:
+    """HL선 1·2세트 진입을 같이 켠 엔진 — 2세트는 기준값 0.6%(역산가 1187.1)."""
+    eng, sys_, state = _hl_first_engine()
+    s2 = state.autom.book(U, "sf_hl_first").sets[1]
+    s2.target_qty, s2.per_qty, s2.en_sf, s2.en_s, s2.ex_sf = 10, 1, 0.006, 0.006, -0.001
+    for idx in (0, 1):
+        body = {"cmd": "autom_run", "underlying": U.value, "set": idx, "block": "entry",
+                "value": True, "product": "sf_hl_first"}
+        assert (await _autom_command(eng, state, body))["ok"]
+    return eng, sys_, state
+
+
+async def test_hl_first_engine_batches_new_orders_and_cancels_per_tick() -> None:
+    # 묶음 전송(exec §7D, 사용자 2026-09-30): 한 바퀴에서 나온 선주문 신규는 요청 하나, 취소도
+    # 요청 하나. 묶음 안 순서 = 판정 순서(1세트가 맨 앞). 접수 결과는 세트마다 따로 돌아간다.
+    eng, sys_, state = await _hl_first_two_sets()
+    eng.tick(datetime(2026, 9, 30, 10, 0, 0), 100.0)
+    await _settle()
+    assert len(sys_.batches) == 1                                  # 신규 두 건이 요청 하나
+    assert [(i.tag, i.price) for i in sys_.batches[0]] == [("H정1진", 1185.9), ("H정2진", 1187.1)]
+    assert all(i.post_only for i in sys_.batches[0])
+    book = state.autom.book(U, "sf_hl_first")
+    s1, s2 = book.sets[0], book.sets[1]
+    assert (s1.entry.pre_order_id, s2.entry.pre_order_id) == ("O1", "O2")
+    assert s1.entry.status is LegStatus.PRE_RESTING and s2.entry.status is LegStatus.PRE_RESTING
+    # 시세가 움직여 두 세트 역산가가 같이 바뀜 → 취소 두 건이 요청 하나
+    sys_.stock_last = lambda _u: 1_610_000.0  # type: ignore[method-assign]
+    eng.tick(datetime(2026, 9, 30, 10, 0, 1), 101.0)
+    await _settle()
+    assert sys_.cancel_batches == [["O1", "O2"]] and len(sys_.batches) == 1
+    assert sys_.cancelled == ["O1", "O2"]
+    assert s1.entry.pre_order_id is None and s2.entry.pre_order_id is None
+
+
+async def test_hl_first_engine_batch_per_order_reject_counts_only_that_set() -> None:
+    # 묶음 안 주문별 거부는 그 세트의 거부로만 센다 — 다른 세트는 정상 접수.
+    eng, sys_, state = await _hl_first_two_sets()
+    sys_.batch_reject = {1: "HL order not accepted: {'error': 'Insufficient margin'}"}
+    eng.tick(datetime(2026, 9, 30, 10, 0, 0), 100.0)
+    await _settle()
+    book = state.autom.book(U, "sf_hl_first")
+    s1, s2 = book.sets[0], book.sets[1]
+    assert s1.entry.pre_order_id == "O1" and s1.entry.reject_streak == 0
+    assert s2.entry.pre_order_id is None and s2.entry.reject_streak == 1
+    assert s2.entry.status is LegStatus.SETTLE_DELAY and "1/3" in s2.entry.last_reject
+
+
+async def test_hl_first_engine_whole_batch_reject_not_counted_then_sent_one_by_one() -> None:
+    # 요청 전체 거부(2건 이상 묶음): 누구 탓인지 몰라 연속 거부에 안 센다(사용자 2026-09-30).
+    # 되풀이를 막으려고 그 세트들의 다음 발주는 한 건씩 따로 — 거기서 거부되면 그 세트 것으로 센다.
+    eng, sys_, state = await _hl_first_two_sets()
+    sys_.batch_whole_error = "HL rejected: Insufficient margin to place order."
+    eng.tick(datetime(2026, 9, 30, 10, 0, 0), 100.0)
+    await _settle()
+    book = state.autom.book(U, "sf_hl_first")
+    s1, s2 = book.sets[0], book.sets[1]
+    assert len(sys_.batches) == 1 and not sys_.placed
+    for s in (s1, s2):
+        assert s.entry.reject_streak == 0 and s.entry.status is LegStatus.SETTLE_DELAY
+        assert "묶음 전체 거부" in s.entry.last_reject
+    assert sys_.error_seq == 0                                     # 중지·알람 없음
+    # 딜레이가 지난 다음 바퀴 — 묶음이 아니라 한 건씩 나간다
+    sys_.batch_whole_error = None
+    from kp_arb.gateways.hl_live import HLError
+
+    orig_place = sys_.place
+
+    async def second_rejected(intent: OrderIntent, *, cloid: str | None = None) -> str:
+        if intent.tag == "H정2진":
+            raise HLError("HL order not accepted: {'error': 'Insufficient margin'}")
+        return await orig_place(intent, cloid=cloid)
+
+    sys_.place = second_rejected  # type: ignore[method-assign]
+    s1.entry.delay_until = s2.entry.delay_until = None
+    eng.tick(datetime(2026, 9, 30, 10, 0, 2), 102.0)
+    await _settle()
+    assert len(sys_.batches) == 1                                  # 새 묶음 없음
+    assert [i.tag for i in sys_.placed] == ["H정1진"]              # 1세트는 접수
+    assert s1.entry.pre_order_id == "O1" and s1.entry.reject_streak == 0
+    assert s2.entry.reject_streak == 1                             # 원인인 세트만 센다
+    # 한 건씩은 그 한 번뿐 — 다음 발주부터 다시 묶음
+    sys_.place = orig_place  # type: ignore[method-assign]
+    s2.entry.delay_until = None
+    eng.tick(datetime(2026, 9, 30, 10, 0, 4), 104.0)
+    await _settle()
+    assert len(sys_.batches) == 2 and [i.tag for i in sys_.batches[1]] == ["H정2진"]
+
+
+async def test_hl_first_engine_single_order_batch_reject_is_counted() -> None:
+    # 한 건짜리 묶음이 통째로 거부되면 그 세트 탓이 분명하다 → 연속 거부로 센다(3회면 중지).
+    eng, sys_, state = _hl_first_engine()
+    body = {"cmd": "autom_run", "underlying": U.value, "set": 0, "block": "entry",
+            "value": True, "product": "sf_hl_first"}
+    await _autom_command(eng, state, body)
+    sys_.batch_whole_error = "ConnectionError: reset"
+    s = state.autom.book(U, "sf_hl_first").sets[0]
+    for n in range(3):
+        s.entry.delay_until = None
+        eng.tick(datetime(2026, 9, 30, 10, 0, n), 100.0 + n)
+        await _settle()
+    assert s.entry.status is LegStatus.HALTED and sys_.error_seq == 1
+    assert len(sys_.batches) == 3 and not sys_.placed
+
+
+async def test_hl_first_engine_batch_cancel_failure_retries_single_later(
+        monkeypatch: Any) -> None:
+    # 묶음 취소의 건별 실패: "이미 체결·취소됨"은 경합이라 그대로 두고(통보가 정리), 그 밖의 실패는
+    # 잠깐 뒤 한 건씩 다시 보낸다(기존 취소 재시도 규칙).
+    import kp_arb.auto_m_engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "CANCEL_RETRY_S", 0.0)
+    eng, sys_, state = await _hl_first_two_sets()
+    eng.tick(datetime(2026, 9, 30, 10, 0, 0), 100.0)
+    await _settle()
+    sys_.cancel_errors = {
+        "O1": "Order was never placed, already canceled, or filled",
+        "O2": "HL rejected: rate limited"}
+    sys_.stock_last = lambda _u: 1_610_000.0  # type: ignore[method-assign]
+    eng.tick(datetime(2026, 9, 30, 10, 0, 1), 101.0)
+    for _ in range(4):
+        await _settle()
+    assert sys_.cancel_batches == [["O1", "O2"]]
+    assert sys_.cancelled == ["O2"]                                # O2만 한 건 취소로 다시
+    assert getattr(sys_, "cancel_calls", 0) == 1
+    book = state.autom.book(U, "sf_hl_first")
+    assert book.sets[0].entry.pre_order_id == "O1"                 # O1은 통보를 기다린다
+    assert book.sets[1].entry.pre_order_id is None
+
+
+def test_is_cancel_gone_reads_hl_and_book_messages() -> None:
+    from kp_arb.auto_m_engine import is_cancel_gone
+
+    assert is_cancel_gone("Order was never placed, already canceled, or filled")
+    assert is_cancel_gone("unknown order O9")
+    assert not is_cancel_gone("HL rejected: rate limited")
+    assert not is_cancel_gone("ConnectionError: reset")
 
 
 async def test_hl_first_engine_ls_post_timeout_halts_and_alo_cross_reject_retries() -> None:

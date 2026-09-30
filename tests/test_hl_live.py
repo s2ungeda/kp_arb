@@ -103,6 +103,27 @@ class StubExchange:
         finally:
             self._exit()
 
+    def bulk_orders(self, reqs: list[dict[str, Any]]) -> dict[str, Any]:
+        """여러 건 한 요청 — statuses는 보낸 순서대로 건별. bulk_status: {가격: 그 주문의 상태}
+        (없으면 resting), bulk_whole_error: 요청 전체 거부 문구, bulk_raise: 통신 오류 흉내."""
+        self.bulk_orders_calls: list[list[dict[str, Any]]] = getattr(
+            self, "bulk_orders_calls", [])
+        self.bulk_orders_calls.append([dict(r) for r in reqs])
+        if getattr(self, "bulk_raise", False):
+            raise ConnectionError("Connection reset by peer")
+        self._enter()
+        try:
+            whole = getattr(self, "bulk_whole_error", None)
+            if whole:
+                return {"status": "err", "response": whole}
+            custom: dict[float, dict[str, Any]] = getattr(self, "bulk_status", {})
+            statuses = [custom.get(r["limit_px"], {"resting": {"oid": 9000 + i}})
+                        for i, r in enumerate(reqs)]
+            return {"status": "ok",
+                    "response": {"type": "order", "data": {"statuses": statuses}}}
+        finally:
+            self._exit()
+
     def update_leverage(self, leverage: int, name: str, is_cross: bool) -> dict[str, Any]:
         self.leverage_calls: list[tuple[int, str, bool]] = getattr(self, "leverage_calls", [])
         self.leverage_calls.append((leverage, name, is_cross))
@@ -276,6 +297,72 @@ async def test_cancel_orders_bulk_one_request_with_per_order_status() -> None:
     assert len(ex.bulk_calls) == 2 and res2[0] is not None and "never placed" in res2[0]
     assert await gw.cancel_orders([]) == []  # 빈 목록은 요청 없음
     assert len(ex.bulk_calls) == 2
+
+
+def _alo(price: float, side: Side = Side.SELL) -> OrderIntent:
+    return OrderIntent(venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+                       instrument=Instrument.HL_PERP, side=side, qty=0.1,
+                       order_type=OrderType.LIMIT, price=price, post_only=True)
+
+
+async def test_place_orders_one_request_and_per_order_results() -> None:
+    # 묶음 발주(exec §7D, 사용자 2026-09-30): ALO 세 건이 요청 하나(orders 배열)로, 결과는 보낸
+    # 순서대로 건별 — 접수·즉시체결·주문별 거부(ALO 겹침)가 한 응답에 섞여 온다.
+    gw, ex, _ = _gw()
+    ex.bulk_status = {
+        181.0: {"filled": {"totalSz": "0.1", "avgPx": "181.2", "oid": 7002}},
+        182.0: {"error": "Post only order would have immediately matched, bbo was 1@2."},
+    }
+    cl = "0x" + "1" * 32
+    res = await gw.place_orders([_alo(180.0), _alo(181.0), _alo(182.0)], [cl, None, None])
+    assert len(ex.bulk_orders_calls) == 1 and not ex.orders      # 요청 하나, 한 건 발주 없음
+    sent = ex.bulk_orders_calls[0]
+    assert [r["limit_px"] for r in sent] == [180.0, 181.0, 182.0]
+    assert all(r["order_type"] == {"limit": {"tif": "Alo"}} for r in sent)
+    assert "cloid" in sent[0] and "cloid" not in sent[1]
+    assert [r.order_id for r in res] == ["9000", "7002", None]
+    assert res[1].fill == (0.1, 181.2) and res[0].fill is None
+    assert res[2].error is not None and "immediately matched" in res[2].error
+    assert not res[2].whole                                       # 주문별 거부
+    await gw.cancel_order("9000")                                 # 접수된 주문은 취소 문맥이 있다
+    assert ex.cancels == [("xyz:SMSN", 9000)]
+
+
+async def test_place_orders_whole_reject_and_lost_response() -> None:
+    # 요청 전체 거부 → 전부 whole(누구 탓인지 모름). 응답 유실은 자동 재전송 없이 cloid로 접수
+    # 여부만 조회 — 들어간 주문은 접수로 잇고, 못 찾은 주문은 결과 모름(whole).
+    gw, ex, _ = _gw()
+    ex.bulk_whole_error = "Insufficient margin to place order."
+    res = await gw.place_orders([_alo(180.0), _alo(181.0)])
+    assert all(r.order_id is None and r.whole for r in res)
+    assert res[0].error is not None and "Insufficient margin" in res[0].error
+    assert len(ex.bulk_orders_calls) == 1                          # 다시 보내지 않는다
+
+    info = StubInfo()
+    info.order_status = {"status": "order", "order": {"order": {"oid": 5150}}}
+    gw2, ex2, _ = _gw(info)
+    ex2.bulk_raise = True
+    cl = "0x" + "2" * 32
+    res2 = await gw2.place_orders([_alo(180.0), _alo(181.0)], [cl, None])
+    assert len(ex2.bulk_orders_calls) == 1                         # 재전송 없음
+    assert res2[0].order_id == "5150"                              # cloid 조회로 접수 확인
+    assert res2[1].order_id is None and res2[1].whole              # cloid 없는 건은 결과 모름
+    assert res2[1].error is not None and "ConnectionError" in res2[1].error
+
+
+async def test_place_orders_splits_alo_and_gtc_and_skips_invalid() -> None:
+    # 공식 문서: ALO만 든 묶음을 검증자가 먼저 처리 → ALO와 GTC는 따로 묶는다. 지정가가 아닌
+    # 주문은 보내지 않고 그 자리에 사유.
+    gw, ex, _ = _gw()
+    gtc = _intent(price=183.0)                                     # post_only 아님
+    bad = _intent(order_type=OrderType.MARKET, price=None)
+    res = await gw.place_orders([_alo(180.0), gtc, bad, _alo(181.0)])
+    tifs = sorted(
+        (call[0]["order_type"]["limit"]["tif"], [r["limit_px"] for r in call])
+        for call in ex.bulk_orders_calls)
+    assert tifs == [("Alo", [180.0, 181.0]), ("Gtc", [183.0])]
+    assert res[2].order_id is None and res[2].error is not None and "지정가" in res[2].error
+    assert all(r.order_id is not None for r in (res[0], res[1], res[3]))
 
 
 def test_nonce_clock_never_repeats_even_within_same_ms() -> None:

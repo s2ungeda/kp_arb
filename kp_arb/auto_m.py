@@ -120,8 +120,6 @@ class Signals:
     hl_sz_decimals: int | None = None
     # LS 피드(시세·통보·조회 채널)가 살아 있나 — 끊김·정지면 주문 안 냄(G0-1, 2026-09-29 운영 사고)
     ls_feed_ok: bool = True
-    # HL선 선주문 주문단위(USD) = 화면 호가단위 콤보 값(사용자 2026-09-22) — 없으면 격자 한 칸
-    hl_order_unit: float | None = None
 
 
 # --------------------------------------------------------------- 행동(출력) ---
@@ -357,6 +355,10 @@ class AutoMSet:
     hl_net: float = 0.0                     # 이 세트가 잡은 HL 순잔고(계약, 매도 −)
     reverse: bool = False                   # 역방향 세트(진입 = SF 매도 + HL 매수)
     product: str = "sf"                     # "sf" 주식선물 | "stock" 주식(exec §7C, 2026-09-17)
+    # HL선(§7D, 결정 55) 선주문 주문단위·시작호가(USD) — HL 격자 배수. 0 = 격자 그대로 / 0 기준.
+    # 원 단위 pre_tick·price_offset은 주식선물·주식용 그대로(HL선에선 안 씀)
+    hl_unit: float = 0.0
+    hl_offset: float = 0.0
     credit: bool = False                    # 주식 신용 세트(결정 40) — 진입 신용매수·청산 신용상환
     entry: Leg = field(default_factory=lambda: Leg(Block.ENTRY))
     exit: Leg = field(default_factory=lambda: Leg(Block.EXIT))
@@ -656,17 +658,48 @@ def hl_first_pre_price(
     return hl_round_price(raw, hl_side, sz_decimals, maker=True)
 
 
-def hl_snap_to_unit(price: float, side: Side, unit: float, step: float) -> float:
-    """HL 가격을 주문단위(unit, USD)의 배수로 — 매도 올림 / 매수 내림(메이커: 유리한 쪽). 소수
-    오차는 격자(step) 자릿수로 반올림해 지운다. 순수."""
+def hl_snap_to_unit(price: float, side: Side, unit: float, step: float,
+                    offset: float = 0.0) -> float:
+    """HL 가격을 주문단위(unit, USD) 격자(offset + k×unit)에 맞춘다 — 매도 올림 / 매수 내림
+    (메이커: 유리한 쪽). 시작호가 offset(세트설정, 결정 55): 0이면 0·unit·2unit…. 소수 오차는
+    격자(step) 자릿수로 반올림해 지운다. 순수."""
     from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-    q = Decimal(repr(price)) / Decimal(repr(unit))
+    q = (Decimal(repr(price)) - Decimal(repr(offset))) / Decimal(repr(unit))
     n = q.to_integral_value(rounding=ROUND_CEILING if side is Side.SELL else ROUND_FLOOR)
-    out = n * Decimal(repr(unit))
+    out = n * Decimal(repr(unit)) + Decimal(repr(offset))
     exp = Decimal(repr(step)).normalize().as_tuple().exponent
     decimals = max(0, -exp) if isinstance(exp, int) else 0
     return float(round(out, decimals))
+
+
+def _is_multiple(value: float, step: float) -> bool:
+    """value가 step의 (거의) 정수배인가 — 소수 격자(0.1·0.01) 비교용."""
+    if step <= 0:
+        return False
+    q = value / step
+    return abs(q - round(q)) < 1e-6
+
+
+def hl_unit_errors(unit: float, offset: float, step: float | None) -> list[str]:
+    """HL선 세트설정 검사(순수, 결정 55) — 주문단위(USD)는 0(격자) 또는 격자의 배수, 시작호가는 0
+    이상·주문단위 미만·격자의 배수. step(지금 가격대 격자)을 모르면(시세 없음) 배수 검사는 건너뛰고
+    판정(G6)이 잡는다. 사용자 2026-09-30: 잘못 넣으면 경고창."""
+    errs: list[str] = []
+    if unit < 0:
+        errs.append("선주문 주문단위(USD)는 0 이상으로 입력하세요 (0 = HL 호가 격자)")
+    if offset < 0:
+        errs.append("선주문 시작호가(USD)는 0 이상으로 입력하세요")
+    if step:
+        if unit > 0 and not _is_multiple(unit, step):
+            errs.append(f"선주문 주문단위 {unit:g}은(는) HL 호가 격자({step:g})의 배수여야 합니다")
+        if offset > 0 and not _is_multiple(offset, step):
+            errs.append(f"선주문 시작호가 {offset:g}은(는) HL 호가 격자({step:g})의 배수여야 "
+                        "합니다")
+    eff = unit if unit > 0 else (step or 0.0)
+    if offset > 0 and eff > 0 and offset >= eff - 1e-9:
+        errs.append(f"선주문 시작호가 {offset:g}은(는) 주문단위({eff:g}) 미만이어야 합니다")
+    return errs
 
 
 class _Hold(Protocol):
@@ -683,11 +716,18 @@ def _evaluate_hl_first(
     최우선호가 기준, HL 격자, ALO 겹침 회피, 허용범위는 HL 호가창 N호가."""
     from .hl_price import hl_price_step
 
-    # G5 S괴리 필터 없음 — 시험 동안은 그대로 두기로(사용자 2026-09-22, 두 번 확인). 진입S 칸은
-    # HL선에서 쓰이지 않는다. 필터가 필요해지면 주식선물의 _passes_signal을 여기서 부르면 된다.
     thr = s.threshold(block)
     if thr is None:
         return hold("G5 기준값 없음", _cancel_if_resting(leg, mono=sig.mono))
+    # G5 S괴리 필터 — 주식선물과 같은 식(§11.3, 사용자 2026-09-30 결정 54: 정·역 모두). 09-22·23의
+    # "시험 동안 필터 없음"은 거둠. 진입: 정방향 S괴리 > 진입S / 역방향 S괴리 < 진입S, 청산은 비교
+    # 없음
+    if block is Block.ENTRY and s.en_s is None:
+        return hold("G5 진입S 기준값 없음", _cancel_if_resting(leg, mono=sig.mono))
+    if not _passes_signal(s, leg, sig):
+        why = (f"G5 미달 S괴리 {'>' if s.reverse else '<'} 진입S {s.en_s * 100:.3f}%"
+               if block is Block.ENTRY and s.en_s is not None else "G5 미달")
+        return hold(why, _cancel_if_resting(leg, mono=sig.mono))
     side = leg.pre_side  # HL 다리(정방향 진입 = 매도)
     # LS 후주문을 테이커로 잡을 SF 호가: HL 매도(LS 매수)면 SF 매도1호가, HL 매수면 SF 매수1호가
     sf_quote = ((sig.sf_asks[0][0] if sig.sf_asks else None) if side is Side.SELL
@@ -701,10 +741,15 @@ def _evaluate_hl_first(
     step = hl_price_step(raw_price, sig.hl_sz_decimals)
     if step <= 0:
         return hold(f"G6 HL 격자 계산불가 (역산가 {raw_price})")
-    # 주문단위(사용자 2026-09-22): 화면 호가단위 콤보 값으로 매도 올림·매수 내림 — 격자(0.01)마다
-    # 취소·재발주가 나던 것을 SF 주문단위처럼 누른다. 콤보가 격자보다 크지 않으면 격자 그대로
-    unit = sig.hl_order_unit if sig.hl_order_unit and sig.hl_order_unit > step else step
-    price = hl_snap_to_unit(raw_price, side, unit, step)
+    # 주문단위·시작호가 = 세트설정(USD, 결정 55; 09-22의 화면 콤보는 다른 창과 공유돼 폐기) —
+    # 매도 올림·매수 내림으로 격자(0.1)마다 나던 취소·재발주를 누른다. 0이면 격자 그대로. 격자에
+    # 안 맞으면(가격대가 바뀜 등) 안 낸다 — HL이 격자 밖 가격을 통째로 거부하므로
+    unit = s.hl_unit if s.hl_unit > step + _EPS else step
+    offset = s.hl_offset
+    if hl_unit_errors(unit if s.hl_unit > 0 else 0.0, offset, step):
+        return hold(f"G6 주문단위 {s.hl_unit:g}·시작호가 {offset:g}이 HL 격자 {step:g}에 안 맞음",
+                    _cancel_if_resting(leg, mono=sig.mono))
+    price = hl_snap_to_unit(raw_price, side, unit, step, offset)
     # ALO 겹침(결정 E): 매도가 매수1호가 이하 / 매수가 매도1호가 이상이면 HL이 거부 → 한 칸 안쪽
     # (기준값보다 유리한 자리)에 건다
     if side is Side.SELL and price <= sig.hl_bid1 + _EPS:
@@ -1067,20 +1112,30 @@ def on_ls_post_reject(s: AutoMSet, block: Block, reason: str = "") -> list[Actio
 
 
 def on_hl_pre_reject(s: AutoMSet, block: Block, mono: float, settings: AutoMSettings,
-                     reason: str = "", alo_cross: bool = False) -> list[Action]:
+                     reason: str = "", alo_cross: bool = False,
+                     shared: bool = False) -> list[Action]:
     """HL선 선주문 거부. ALO 겹침(넣는 순간 체결될 가격 — 호가가 그새 움직임)은 정상 거부라
     **연속 거부에 세지 않고** 딜레이 뒤 재역산(사용자 2026-09-22). 그 밖의 거부는 결정 29(연속
-    3회 → 중지)대로."""
-    if not alo_cross:
+    3회 → 중지)대로.
+
+    shared=True: 여러 세트를 묶어 보낸 요청이 **통째로** 거부됐거나 응답이 없었다(exec §7D 묶음
+    전송) — 누구 탓인지 알 수 없으니 연속 거부에 세지 않는다(사용자 2026-09-30). 되풀이는 엔진이
+    막는다(그 세트들의 다음 발주는 한 건씩 따로 → 원인인 주문만 거부로 센다)."""
+    if not alo_cross and not shared:
         return on_pre_reject(s, block, mono, settings, reason)
     leg = s.leg(block)
     leg.replace_pending = False
     leg._clear_pre()
     if leg.status is LegStatus.HALTED:
         return []
-    leg.last_reject = f"ALO 겹침 거부(연속 거부에 안 셈): {reason or '-'}"
     _start_delay(leg, mono, settings)
-    return [Action("notify", reason=f"HL 선주문 ALO 겹침 거부 — 딜레이 뒤 재역산({reason or '-'})")]
+    if alo_cross:
+        leg.last_reject = f"ALO 겹침 거부(연속 거부에 안 셈): {reason or '-'}"
+        return [Action("notify",
+                       reason=f"HL 선주문 ALO 겹침 거부 — 딜레이 뒤 재역산({reason or '-'})")]
+    leg.last_reject = f"묶음 전체 거부(연속 거부에 안 셈, 다음엔 한 건씩): {reason or '-'}"
+    return [Action("notify",
+                   reason=f"HL 선주문 묶음 전체 거부 — 딜레이 뒤 한 건씩 재발주({reason or '-'})")]
 
 
 def on_post_fill(
@@ -1542,6 +1597,8 @@ def _sets_from_dict(targets: list[AutoMSet], sets: object) -> None:
                 target.switch_delay_s = int(rs.get("switch_delay_s", target.switch_delay_s))
                 target.price_offset = int(rs.get("price_offset", target.price_offset) or 0)
                 target.pre_tick = int(rs.get("pre_tick", target.pre_tick) or 0)
+                target.hl_unit = float(rs.get("hl_unit", target.hl_unit) or 0.0)  # HL선(결정 55)
+                target.hl_offset = float(rs.get("hl_offset", target.hl_offset) or 0.0)
                 target.credit = bool(rs.get("credit", target.credit))  # 주식 신용 세트(결정 40)
                 target.en_sf = _opt_float(rs.get("en_sf"))
                 target.en_s = _opt_float(rs.get("en_s"))

@@ -53,10 +53,11 @@ from .auto_m import _halt_set as halt_set
 from .disparity import disp, est_price
 from .domain.enums import Block, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import InstrumentInfo, OrderIntent, Quote
+from .gateways.base import PlaceResult
 from .gateways.ls import OrderGoneError
 from .gateways.ls_rest import RestTimeoutError
-from .hl_merge import merge_tick_options, merge_tick_size
-from .hl_price import hl_round_price
+from .hl_merge import merge_tick_options
+from .hl_price import hl_price_step, hl_round_price
 from .logs import attach_daily_file
 from .ticks import tick_for
 
@@ -85,7 +86,16 @@ def is_alo_cross_reject(exc_text: str) -> bool:
     return "immediately match" in text or "post only" in text
 
 
+def is_cancel_gone(err_text: str) -> bool:
+    """취소 거부가 "이미 체결·취소된 주문"이라서인가 — 실패가 아니라 경합(통보가 정리한다).
+    HL 문구 "Order was never placed, already canceled, or filled", 장부에 없는 번호("unknown
+    order")도 같은 뜻으로 본다."""
+    text = err_text.lower()
+    return ("already canceled" in text or "or filled" in text or "unknown order" in text)
+
+
 TICK_S = 0.1
+CANCEL_RETRY_S = 0.6  # 취소 실패 뒤 다시 보내기까지(기존 _cancel_pre 재시도 간격과 같은 값)
 SOURCE = "자동M"
 
 
@@ -110,6 +120,11 @@ class _SystemLike(Protocol):
     def ls_feed_ok(self) -> bool: ...  # LS 채널 연결(끊김·COM 정지면 False) — G0-1
     async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str: ...
     async def cancel(self, order_id: str) -> None: ...
+    # 묶음 전송(exec §7D, 사용자 2026-09-30) — HL 주문 여러 건을 한 요청으로, 결과는 건별
+    async def place_many(self, intents: Sequence[OrderIntent],
+                         cloids: Sequence[str | None] | None = None) -> list[PlaceResult]: ...
+    async def cancel_many(
+        self, order_ids: Sequence[str]) -> list[tuple[str, str | None]]: ...
     async def query_credit_loans(self, underlying: Underlying) -> Sequence[tuple[str, float]]: ...
     def new_hl_cloid(self) -> str | None: ...
     on_hl_identified: list[Callable[[str, str], None]]  # (cloid, oid) — 응답 전 식별 통지
@@ -122,6 +137,11 @@ class _OrderRef:
     block: Block
     leg: str  # "pre" | "post"
     reverse: bool = False  # 역방향 세트의 주문(§7A·§7B)
+
+
+# 묶음 전송 바구니의 한 칸 — (종목, 세트 번호, 진입|청산, 행동, 역방향?) / 취소는 주문번호·사유
+_PreItem = tuple[Underlying, int, Block, Action, bool]
+_CancelItem = tuple[Underlying, int, Block, str, str, bool]
 
 
 class AutoMEngine:
@@ -172,6 +192,12 @@ class AutoMEngine:
         # 신용융자 (대출일, 수량) 캐시(종목별, 2026-09-18) — 상환 선주문마다 조회하면 CSPAQ12300
         # 초당 한도에 걸린다(재발주 왕복). 20초 재사용, 이 종목의 주식 선주문 체결 뒤엔 다시 조회
         self._loan_cache: dict[Underlying, tuple[float, list[tuple[str, float]]]] = {}
+        # 묶음 전송(exec §7D, 사용자 2026-09-30) — HL선 엔진이 판정 한 바퀴 동안만 모으는 바구니.
+        # 바퀴 밖(체결·통보 처리)에서는 None이라 그 자리에서 한 건씩 나간다.
+        self._tick_pre: list[_PreItem] | None = None
+        self._tick_cancel: list[_CancelItem] | None = None
+        # 묶음이 통째로 거부된 세트 다리 — 다음 발주는 한 건씩 따로(원인인 주문을 가려낸다)
+        self._solo: set[tuple[Underlying, int, Block, bool]] = set()
         self._bg: set[asyncio.Task[None]] = set()
         system.order_book.on_fill_applied.append(self._on_fill_applied)
         system.order_book.on_change.append(self._on_book_change)
@@ -293,21 +319,32 @@ class AutoMEngine:
         elif self._halt_since is not None:
             self._halt_since = None
             self._resumed_mono = mono
-        for u, book in self.screen.books_of(self.product):
-            # 종목 VI(exec §8, 사용자 2026-09-17): 주식은 그 종목 VI 발동 중에도 정지로 본다 —
-            # 단일가 전환이라 호가에 걸어 두는 선주문이 무의미. 해제 뒤 재개 딜레이는 시장 정지와
-            # 같다.
-            vi_on = self.product == "stock" and not halted and self._vi_halted(u)
-            self._track_vi(u, vi_on, mono)
-            for reverse, index, s in book.all_sets():
-                for block in (Block.ENTRY, Block.EXIT):
-                    leg = s.leg(block)
-                    if not leg.running and leg.status is LegStatus.IDLE:
-                        continue
-                    sig = self.build_signals(u, book, s, block, now, mono, halted or vi_on)
-                    self._apply(u, index, block, evaluate(s, block, sig, self._settings, u),
-                                reverse)
-                    self._trace(u, index, block, leg, reverse)
+        if self._hl_first:  # 묶음 전송(§7D): 이 바퀴의 선주문 신규·취소를 모았다가 한 번씩 보낸다
+            self._tick_pre, self._tick_cancel = [], []
+        try:
+            for u, book in self.screen.books_of(self.product):
+                # 종목 VI(exec §8, 사용자 2026-09-17): 주식은 그 종목 VI 발동 중에도 정지로 본다
+                # — 단일가 전환이라 호가에 걸어 두는 선주문이 무의미. 해제 뒤 재개 딜레이는 시장
+                # 정지와 같다.
+                vi_on = self.product == "stock" and not halted and self._vi_halted(u)
+                self._track_vi(u, vi_on, mono)
+                for reverse, index, s in book.all_sets():
+                    for block in (Block.ENTRY, Block.EXIT):
+                        leg = s.leg(block)
+                        if not leg.running and leg.status is LegStatus.IDLE:
+                            continue
+                        sig = self.build_signals(u, book, s, block, now, mono, halted or vi_on)
+                        self._apply(u, index, block,
+                                    evaluate(s, block, sig, self._settings, u), reverse)
+                        self._trace(u, index, block, leg, reverse)
+        finally:
+            # 판정 도중 오류가 나도 이미 상태를 바꾼(선주문대기로 넘긴) 주문은 보낸다
+            pre, cancels = self._tick_pre, self._tick_cancel
+            self._tick_pre = self._tick_cancel = None
+            if pre:
+                self._spawn(self._place_hl_pre_batch(pre))
+            if cancels:
+                self._spawn(self._cancel_pre_batch(cancels))
 
     def _vi_halted(self, u: Underlying) -> bool:
         """코어의 종목 VI 상태(LS 실시간 VI_) — 없는 시스템(테스트·옛 코어)은 False."""
@@ -363,15 +400,11 @@ class AutoMEngine:
         hl_info = self._system.instruments.get((u, Instrument.HL_PERP))
         hl_bids: tuple[tuple[float, float], ...] = ()
         hl_asks: tuple[tuple[float, float], ...] = ()
-        hl_unit: float | None = None
         if hl is not None and hl.bid and hl.ask:
             hl_bids = tuple(hl.bids or [(hl.bid, hl.bid_qty or 1.0)])
             hl_asks = tuple(hl.asks or [(hl.ask, hl.ask_qty or 1.0)])
-            # HL선 선주문 주문단위 = 화면 호가단위 콤보(코어 머지 상태)의 틱 크기(사용자 2026-09-22)
-            active_fn = getattr(self._system, "hl_merge_active", None)
-            active = active_fn(u) if callable(active_fn) else None
-            hl_unit = merge_tick_size(hl.ask or hl.bid, active[0] if active else None,
-                                      active[1] if active else None)
+        # HL선 선주문 주문단위·시작호가는 세트설정 값(AutoMSet.hl_unit/hl_offset, 결정 55) — 09-22의
+        # 화면 호가단위 콤보는 다른 창과 공유돼 주문 규칙에 쓰지 않는다(표시용으로만)
         return Signals(
             now=now, mono=mono,
             sf_spread_entry=sf_entry, s_spread_entry=s_entry, sf_spread_exit=sf_exit,
@@ -384,7 +417,6 @@ class AutoMEngine:
             hl_est_bid=est_bid, hl_est_ask=est_ask,
             hl_bids=hl_bids, hl_asks=hl_asks,
             hl_sz_decimals=hl_info.sz_decimals if hl_info is not None else None,
-            hl_order_unit=hl_unit,
             ls_feed_ok=self._system.ls_feed_ok())
 
     # ------------------------------------------------------------ 행동 실행 ---
@@ -397,9 +429,19 @@ class AutoMEngine:
                                   act.kind, act.side.value if act.side else "",
                                   act.qty or "", act.price or "", act.reason or act.order_id or "")
             if act.kind == "place_pre":
-                self._spawn(self._place_pre(u, index, block, act, reverse))
+                key = (u, index, block, reverse)
+                if self._tick_pre is not None and key not in self._solo:
+                    self._tick_pre.append((u, index, block, act, reverse))  # 바퀴 끝에 묶음으로
+                else:
+                    self._solo.discard(key)  # 한 건씩 보내는 것은 이번 한 번
+                    self._spawn(self._place_pre(u, index, block, act, reverse))
             elif act.kind == "cancel_pre" and act.order_id:
-                self._spawn(self._cancel_pre(u, index, block, act.order_id, act.reason, reverse))
+                if self._tick_cancel is not None:
+                    self._tick_cancel.append(
+                        (u, index, block, act.order_id, act.reason, reverse))
+                else:
+                    self._spawn(self._cancel_pre(u, index, block, act.order_id, act.reason,
+                                                 reverse))
             elif act.kind == "place_post":
                 self._spawn(self._place_post(u, index, block, act, reverse))
             elif act.kind == "halt":
@@ -532,6 +574,101 @@ class AutoMEngine:
         self._log.info("[자동M] %s HL 선주문(ALO) %s %s %d @ %g → #%s",
                        u.value, self._tag(u, index, block, reverse), act.side.value, act.qty,
                        act.price, oid)
+
+    async def _place_hl_pre_batch(self, items: list[_PreItem]) -> None:
+        """HL선 선주문 묶음(exec §7D 묶음 전송) — 한 바퀴에서 나온 ALO 선주문을 요청 하나로 보내고
+        결과를 주문별로 나눠 세트에 돌려준다. 묶음 안 순서 = 판정 순서(1세트가 맨 앞).
+
+        주문별 거부는 한 건 발주와 같이 처리(ALO 겹침은 안 세고, 그 밖은 결정 29). 2건 이상의
+        묶음이 **통째로** 거부되거나 응답이 없으면 누구 탓인지 알 수 없어 연속 거부에 세지 않고,
+        그 세트들의 다음 발주를 한 건씩 따로 보내게 표시한다."""
+        intents: list[OrderIntent] = []
+        refs: list[_OrderRef] = []
+        cloids: list[str | None] = []
+        for u, index, block, act, reverse in items:
+            assert act.side is not None and act.price is not None
+            intents.append(OrderIntent(
+                venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
+                side=act.side, qty=act.qty, order_type=OrderType.LIMIT, price=act.price,
+                source=SOURCE, post_only=True,
+                tag=self._set_tag(index, block, reverse, self._tag_letter)))
+            ref = _OrderRef(u, index, block, "pre", reverse)
+            refs.append(ref)
+            cloid = self._system.new_hl_cloid()
+            cloids.append(cloid)
+            if cloid:
+                self._pending_refs[cloid] = ref  # 응답보다 먼저 온 통보로 식별되면 그 oid로
+        try:
+            results = await self._system.place_many(intents, cloids)
+        except Exception as exc:  # noqa: BLE001 - 요청 자체가 실패 → 전부 결과 모름
+            results = [PlaceResult(None, error=f"{type(exc).__name__}: {exc}", whole=True)
+                       for _ in items]
+        many = len(items) > 1
+        self._log.info("[자동M] HL 선주문 묶음 %d건 → 접수 %d건", len(items),
+                       sum(1 for r in results if r.order_id is not None))
+        for (u, index, block, act, reverse), ref, cloid, res in zip(
+                items, refs, cloids, results, strict=True):
+            s = self._set(u, index, reverse)
+            tag = self._tag(u, index, block, reverse)
+            if cloid:
+                self._pending_refs.pop(cloid, None)
+            if res.order_id is None:
+                text = res.error or ""
+                cross = is_alo_cross_reject(text)
+                shared = res.whole and many and not cross
+                if shared:
+                    self._solo.add((u, index, block, reverse))
+                kind = ("ALO 겹침 거부(재역산)" if cross
+                        else "묶음 전체 거부(다음엔 한 건씩)" if shared else "실패")
+                self._log.warning("[자동M] %s HL 선주문 %s %s — %s", u.value, tag, kind, text)
+                self._apply(u, index, block, on_hl_pre_reject(
+                    s, block, time.monotonic(), self._settings,
+                    reason=reject_reason_text(text), alo_cross=cross, shared=shared), reverse)
+                s.leg(block).last_reject_at = time.strftime("%H:%M:%S")
+                self._trace(u, index, block, s.leg(block), reverse)
+                continue
+            self._register(res.order_id, ref)
+            late = on_pre_ack(s, block, res.order_id, mono=self._mono)
+            if late:
+                self._log.warning("[자동M] %s HL 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → "
+                                  "즉시 취소", u.value, tag, res.order_id)
+                self._apply(u, index, block, late, reverse)
+            assert act.side is not None and act.price is not None
+            self._log.info("[자동M] %s HL 선주문(ALO) %s %s %d @ %g → #%s",
+                           u.value, tag, act.side.value, act.qty, act.price, res.order_id)
+
+    async def _cancel_pre_batch(self, items: list[_CancelItem]) -> None:
+        """HL선 선주문 취소 묶음(exec §7D 묶음 전송) — 한 바퀴에서 나온 취소를 요청 하나로.
+        "이미 체결·취소됨"은 실패가 아니라 경합(통보가 정리). 그 밖의 실패는 잠깐 뒤 한 건씩
+        다시 보낸다(기존 취소 재시도 규칙 — 3회, 그래도 실패면 표시를 되돌려 다음 판정에서)."""
+        for u, index, block, order_id, reason, reverse in items:
+            self._log.info("[자동M] %s 선주문 취소 %s #%s %s",
+                           u.value, self._tag(u, index, block, reverse), order_id, reason)
+        ids = [it[3] for it in items]
+        try:
+            results = await self._system.cancel_many(ids)
+        except Exception as exc:  # noqa: BLE001 - 요청 자체가 실패 → 전부 실패로
+            results = [(oid, f"{type(exc).__name__}: {exc}") for oid in ids]
+        errors = dict(results)
+        for u, index, block, order_id, reason, reverse in items:
+            err = errors.get(order_id)
+            if err is None:
+                continue
+            if is_cancel_gone(err):
+                self._log.info("[자동M] 취소 불필요 #%s — 이미 체결/취소됨(통보로 정리): %s",
+                               order_id, err)
+                continue
+            self._log.warning("[자동M] 묶음 취소 실패 #%s — %.1f초 뒤 한 건씩 다시: %s",
+                              order_id, CANCEL_RETRY_S, err)
+            self._spawn(self._cancel_pre_later(u, index, block, order_id, reason, reverse))
+
+    async def _cancel_pre_later(self, u: Underlying, index: int, block: Block,
+                                order_id: str, reason: str, reverse: bool) -> None:
+        """묶음 취소에서 실패한 한 건 — 잠깐 쉬고, 아직 그 주문이 걸려 있으면 한 건 취소로."""
+        await asyncio.sleep(CANCEL_RETRY_S)
+        if self._set(u, index, reverse).leg(block).pre_order_id != order_id:
+            return  # 그새 체결·취소로 정리됨
+        await self._cancel_pre(u, index, block, order_id, reason, reverse)
 
     async def _place_ls_post(self, u: Underlying, index: int, block: Block, act: Action,
                              reverse: bool = False) -> None:
@@ -740,8 +877,9 @@ class AutoMEngine:
             self._register(oid, ref)
             self._persist()
             return
-        self._log.info("[자동M] %s 후주문 #%s 응답 전 식별(cloid %s) → 세트 연결",
-                       ref.underlying.value, oid, cloid)
+        # HL선(§7D)은 HL 주문이 선주문이다 — 전엔 다리와 무관하게 "후주문"이라 찍혔다(운영 09-28)
+        self._log.info("[자동M] %s %s #%s 응답 전 식별(cloid %s) → 세트 연결",
+                       ref.underlying.value, "선주문" if ref.leg == "pre" else "후주문", oid, cloid)
         self._register(oid, ref)
 
     def _on_fill_applied(self, order: TrackedOrder, qty: float, price: float,
@@ -1126,8 +1264,13 @@ class AutoMEngine:
             sf_ref = next((trades.get((u, inst, m)) for m in markets
                            if trades.get((u, inst, m))), None)
         sf_tick = tick_for(Instrument.KR_STOCK_FUTURE, float(sf_ref)) if sf_ref else None
+        # HL 가격 격자(지금 가격대) — HL선 세트설정 주문단위·시작호가(USD) 검사용(결정 55).
+        # 시세 없으면 None(화면은 배수 검사를 건너뛴다)
+        hl_info = self._system.instruments.get((u, Instrument.HL_PERP))
+        hl_step = (hl_price_step(float(ref), hl_info.sz_decimals if hl_info else None)
+                   if ref else None) or None
         return {"sets": out, "rev_sets": rev_out, "any_running": book.any_running(),
-                "monitor": monitor, "sf_tick": sf_tick,
+                "monitor": monitor, "sf_tick": sf_tick, "hl_step": hl_step,
                 "fx": {"used": fx_used, "src": fx_src},  # 사용 환율(값, 출처 현물|선물역산)
                 "ref_qty": book.ref_qty, "future_month": book.future_month,
                 "market": book.market,  # 주식 거래소(KRX/NXT) — 화면 콤보 복원용
