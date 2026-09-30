@@ -58,3 +58,15 @@ def test_none_values_skipped() -> None:
     assert check_risk("fwd", None, None, EN, EX, GAP) == []
     # 청산만 있고 진입 없으면 gap 검증 안 함
     assert check_risk("fwd", None, -0.1, EN, EX, GAP) == []
+
+
+def test_s_auction_bg_green_only_during_stock_auction() -> None:
+    # 사용자 2026-09-30(exec 결정 57): 진입S 모니터 칸은 주식 동시호가 중 초록, 끝나면 다시 빨강.
+    # 코어 /state의 phase 'pre_open'(장전 동시호가)만 지금 인식 — 장마감 동시호가 코드는 실측 뒤
+    # 추가.
+    from kp_arb.order_autom import C_AUCTION, C_S_NORMAL, s_auction_bg
+
+    assert s_auction_bg("pre_open") == C_AUCTION
+    assert s_auction_bg("regular") == C_S_NORMAL
+    assert s_auction_bg("dead") == C_S_NORMAL
+    assert s_auction_bg(None) == C_S_NORMAL

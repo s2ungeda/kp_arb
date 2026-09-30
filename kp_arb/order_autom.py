@@ -205,6 +205,16 @@ def settings_payload(common: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+C_AUCTION = "#2e8b57"  # 진입S 칸 바탕 — 주식 동시호가 중(초록, 사용자 2026-09-30)
+C_S_NORMAL = "#c00000"  # 평소 진입S 칸 바탕(ui_theme.C_BUY와 같은 값 — 순수 함수라 여기 둠)
+
+
+def s_auction_bg(phase: object) -> str:
+    """진입S 모니터 칸 바탕색 — 주식시장이 동시호가(코어 /state phase 'pre_open')면 초록, 아니면
+    평소 빨강(매수 색). 순수. (exec 결정 57: 동시호가엔 S괴리를 판정에 안 쓴다 — 그 표시)"""
+    return C_AUCTION if str(phase or "") == "pre_open" else C_S_NORMAL
+
+
 def fx_caption(used: object, src: object) -> str:
     """정방향 모니터 옆 환율 표시 — '환율 1,349.60 (현물)'. 값이 없으면 '환율 -'. 순수 로직."""
     if not isinstance(used, int | float) or used <= 0:
@@ -1442,6 +1452,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # 원본(_load_inputs_from_core)
         refresh_windows_bar()
 
+    if preview and os.environ.get("KP_PREVIEW_AUCTION"):  # 미리보기: 동시호가 표시(진입S 초록)
+        for d in dirs:
+            if f"{d}_en_s" in mon:
+                mon[f"{d}_en_s"].config(bg=s_auction_bg("pre_open"))
     if preview and os.environ.get("KP_PREVIEW_BG"):  # 미리보기 캡처용 바탕색(이름 또는 #rrggbb)
         if os.environ["KP_PREVIEW_BG"] in _BG_CHOICES:
             cb_bg.set(os.environ["KP_PREVIEW_BG"])
@@ -1729,6 +1743,15 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         monitor = _live_book().get("monitor") or {}
         fx = _live_book().get("fx") or {}
         mon["fx"].config(text=fx_caption(fx.get("used"), fx.get("src")))
+
+        def _paint_auction(bg: str) -> None:
+            if state_box.get("_s_bg") == bg:
+                return
+            state_box["_s_bg"] = bg
+            for dtag in dirs:
+                lbl = mon.get(f"{dtag}_en_s")
+                if lbl is not None:
+                    lbl.config(bg=bg)
         # 표시 여부는 화면 입력칸이 아니라 **코어가 실제로 쓰는 기준수량**으로 판단 —
         # 입력칸을 지우는 중에도 수치가 사라지지 않게(사용자 2026-09-07).
         core_ref = int(_live_book().get("ref_qty") or 0)
@@ -1742,6 +1765,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 text = (f"{float(v) * 100:.2f}"
                         if applied and isinstance(v, int | float) else "-")
                 mon[f"{dtag}_{skey}"].config(text=text)
+        # 진입S 칸 바탕: 주식 동시호가 중이면 초록(사용자 2026-09-30, exec 결정 57) — 그 시간엔
+        # 현물이 예상체결가라 S괴리를 판정에 안 쓴다는 표시. 끝나면 다시 빨강. 코어 /state의 장운영
+        # 단계로.
+        _paint_auction(s_auction_bg(data.get("phase")))
         # 매매결과 누적(정·역 각각) — 진입 = entry 누적, 청산 = exit 누적(세트 합산). 칸 이름은
         # 방향별 배치표(_ACC_ROWS_*)에서: 정방향 진입 -HP/+SF/-환, 역방향 진입 +HP/-SF/+환 …
         for dtag, acc_rows in spec.acc_rows.items():

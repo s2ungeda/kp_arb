@@ -120,6 +120,9 @@ class Signals:
     hl_sz_decimals: int | None = None
     # LS 피드(시세·통보·조회 채널)가 살아 있나 — 끊김·정지면 주문 안 냄(G0-1, 2026-09-29 운영 사고)
     ls_feed_ok: bool = True
+    # 주식시장 동시호가 중(결정 57, 사용자 2026-09-30) — 현물이 예상체결가로 움직여 S괴리가
+    # 이상하므로 주식선물·HL선의 G5 S괴리 필터를 건너뛴다(정·역방향). 기준값은 여전히 있어야 한다
+    stock_auction: bool = False
 
 
 # --------------------------------------------------------------- 행동(출력) ---
@@ -552,6 +555,10 @@ def _passes_signal(s: AutoMSet, leg: Leg, sig: Signals) -> bool:
     if leg.block is Block.ENTRY:
         if s.en_sf is None or s.en_s is None:
             return False
+        if sig.stock_auction:
+            # 주식 동시호가(결정 57): 현물 현재가가 예상체결가라 S괴리를 믿을 수 없다 → 비교 생략,
+            # 기준값(역산가)만으로 낸다. 정·역방향 같음
+            return True
         if s.reverse:  # 역방향 진입(§7A G5): 매도호가창 est 기준 S괴리 < +HP/-S
             return sig.s_spread_exit is not None and sig.s_spread_exit < s.en_s
         return sig.s_spread_entry is not None and sig.s_spread_entry > s.en_s
@@ -774,7 +781,9 @@ def _evaluate_hl_first(
              f"×(1+SF괴리 "
              f"{sf_disp * 100:.3f}%+{thr * 100:.3f}%)/환율 {sig.fx:,.2f} SF호가 {sf_quote:,.0f} "
              f"이론가 {sig.sf_theory:,.0f} {rng_txt} HL 매수1 {sig.hl_bid1:g} "
-             f"매도1 {sig.hl_ask1:g}")
+             f"매도1 {sig.hl_ask1:g}"
+             + (" [주식 동시호가: S괴리 필터 생략]" if sig.stock_auction and block is Block.ENTRY
+                else ""))
     hl_qty = qty * s.hl_ratio  # 선주문은 HL 계약(SF 계약 × 10)
     if leg.pre_order_id is None and leg.status is LegStatus.ARMED:
         if qty < 1:
@@ -881,7 +890,9 @@ def evaluate(
     basis = (f"{formula} "
              f"주문단위 {tick} 시작호가 {s.price_offset} {rng_txt} 매수1 {won(bid1)} "
              f"매도1 {won(ask1)} 환율 {fx_txt} "
-             f"HL 매수1 {usd(sig.hl_bid1)} 매도1 {usd(sig.hl_ask1)} est {usd(hl_est)}")
+             f"HL 매수1 {usd(sig.hl_bid1)} 매도1 {usd(sig.hl_ask1)} est {usd(hl_est)}"
+             + (" [주식 동시호가: S괴리 필터 생략]" if sig.stock_auction and block is Block.ENTRY
+                else ""))
     # 통과 — 없으면 발주, 있고 역산가가 바뀌었으면 재발주 규칙(취소→후주문 확인→딜레이→신규)
     if leg.pre_order_id is None and leg.status is LegStatus.ARMED:
         if qty < 1:

@@ -79,6 +79,9 @@ class FakeSystem:
     def stock_halted(self) -> bool:  # 주식 엔진용(exec §7C)
         return self.halted
 
+    def stock_auction(self) -> bool:  # 주식 동시호가(결정 57) — 테스트 기본 False
+        return getattr(self, "auction", False)
+
     def stock_vi(self, underlying: Underlying) -> bool:  # 종목 VI(exec §8) — 주식 엔진용
         return underlying in self.vi
 

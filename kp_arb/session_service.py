@@ -12,6 +12,7 @@ LS 장운영데이터(JIF 실시간 + 휴장일)를 소비해 underlying별 inst
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .domain.enums import Instrument, SessionPhase, Underlying
@@ -31,8 +32,15 @@ _JSTATUS_PHASE: dict[str, SessionPhase] = {
     "24": SessionPhase.PRE_OPEN,  # 장개시 5분전 (실측)
     "25": SessionPhase.PRE_OPEN,  # 장개시 10분전
     "21": SessionPhase.REGULAR,   # 장시작
+    # 장마감 동시호가 개시 — 실측 2026-09-30 15:19:59 코스피(1)·코스닥(2) 동시 수신(1분 전
+    # 15:18:59엔 30). 동시호가(단일가)라는 뜻에서 장전과 같은 단계로 둔다: 주식 거래 가능·레퍼런스
+    # 아님·is_auction, 체결쏴 S괴리 필터 생략(결정 57). 15:30엔 41(장마감)이 와 DEAD로.
+    "31": SessionPhase.PRE_OPEN,
     "41": SessionPhase.DEAD,      # 장마감
 }
+# 주식(1,2) 예고 코드 — 단계를 바꾸지 않는다(정보). 30 = 장마감 동시호가 1분 전(실측 2026-09-30
+# 15:18:59)
+_STOCK_INFO: dict[str, str] = {"30": "장마감동시호가 1분전"}
 
 # 정지 발동/해제 코드 — jangubun별로 같은 번호도 뜻이 다르다(JIF 코드표, DESIGN-auto-m-exec §8).
 # 주식(1,2): 값=정지 사유. 62/70(해제,호가접수개시)은 회복 동시호가라 접속매매 불가 → 정지 유지,
@@ -88,6 +96,8 @@ def classify_jstatus(jangubun: str, jstatus: str) -> tuple[str, SessionPhase | s
             return ("halt", _STOCK_HALT[j])
         if j in _STOCK_RESUME:
             return ("resume", None)
+        if j in _STOCK_INFO:
+            return ("info", _STOCK_INFO[j])
     elif g == FUTURES_MARKET:
         if j in _FUT_HALT:
             return ("halt", _FUT_HALT[j])
@@ -134,7 +144,15 @@ class SessionService:
         market = str(status.body.get("jangubun", ""))
         if not market:
             return
-        kind, reason = classify_jstatus(market, str(status.body.get("jstatus", "")))
+        jstatus = str(status.body.get("jstatus", ""))
+        kind, reason = classify_jstatus(market, jstatus)
+        # 원문 그대로 남긴다(하루 수십 건) — 코드표에 없는 값(장마감 동시호가·시간외 등)을 실측으로
+        # 채우기 위해(사용자 2026-09-30: 주식 동시호가 시간 인식). 미지 코드는 경고.
+        logging.getLogger("kp_arb.session").log(
+            logging.WARNING if kind == "unknown" else logging.INFO,
+            "JIF 장운영 jangubun=%s jstatus=%s → %s %s%s", market, jstatus, kind,
+            reason.value if isinstance(reason, SessionPhase) else (reason or ""),
+            " (미지 코드 — 보수적으로 DEAD)" if kind == "unknown" else "")
         if kind == "phase" and isinstance(reason, SessionPhase):
             self._market_phase[market] = reason
         elif kind == "halt" and isinstance(reason, str):
@@ -147,6 +165,13 @@ class SessionService:
     def halt_for(self, market: str = STOCK_MARKET) -> str | None:
         """해당 시장의 현재 정지 사유(없으면 None). §8 정지 오버레이."""
         return self._market_halt.get(market)
+
+    def stock_auction(self) -> bool:
+        """주식시장이 동시호가(단일가) 중인가 — 체결쏴 주식선물·HL선의 S괴리 필터를 건너뛰는 근거
+        (exec 결정 57, 사용자 2026-09-30: 동시호가엔 현물이 예상체결가로 움직여 S괴리가 이상함).
+        지금 인식하는 구간은 장전 동시호가(JIF 11·22~25 → PRE_OPEN)뿐 — 장마감 동시호가(15:20~15:30)
+        코드는 실측 뒤 추가(§8 [OPEN])."""
+        return self._market_phase.get(STOCK_MARKET) is SessionPhase.PRE_OPEN
 
     def phase_for_market(self, market: str) -> SessionPhase:
         """시장(jangubun)별 phase. 파생 시장 미수신 시 주식 시장 phase 공용(기존 규칙)."""

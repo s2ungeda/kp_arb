@@ -443,3 +443,19 @@ def test_book_propagates_product_to_legs_and_restore() -> None:
     assert all(st.entry.hl_first and st.exit.hl_first for _r, _i, st in book.all_sets())
     assert book.sets[0].entry.pre_side is Side.SELL and book.rev_sets[0].entry.pre_side is Side.BUY
     assert parse_book_key(book_key(U, PRODUCT_SF_HL_FIRST)) == (U, PRODUCT_SF_HL_FIRST)
+
+
+def test_stock_auction_skips_s_spread_filter_in_hl_first() -> None:
+    # 결정 57: HL선도 같은 S괴리를 쓰므로 주식 동시호가엔 필터를 건너뛴다(정·역방향)
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    assert evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.004), SETTINGS, U) == []
+    acts = evaluate(s, Block.ENTRY, _sig(mono=101.0, s_spread_entry=0.004, stock_auction=True),
+                    SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"]
+    assert "동시호가: S괴리 필터 생략" in s.entry.block_reason
+    r = _rev_set()
+    set_running(r, Block.ENTRY, True)
+    assert evaluate(r, Block.ENTRY, _sig(s_spread_exit=0.005), SETTINGS, U) == []
+    assert evaluate(r, Block.ENTRY, _sig(mono=101.0, s_spread_exit=0.005, stock_auction=True),
+                    SETTINGS, U)[0].kind == "place_pre"

@@ -906,3 +906,35 @@ def test_stock_post_fill_records_sprd_base_without_sf_theory() -> None:
     on_post_fill(sf, Block.ENTRY, 10, 1184.0, 1356.1, mono=101, settings=SETTINGS,
                  stock_last=199_000.0, sf_theory=None)
     assert sf.entry.acc.ref_qty == 0 and sf.entry.acc.sprd() is None
+
+
+def test_stock_auction_skips_s_spread_filter_both_directions() -> None:
+    # 결정 57(사용자 2026-09-30): 주식 동시호가 시간엔 현물 현재가가 예상체결가라 S괴리가 이상하다 →
+    # 주식선물 G5 S괴리 비교를 정·역방향 모두 건너뛴다(기준값은 있어야 함). 동시호가가 아니면
+    # 그대로.
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    assert evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.001), SETTINGS, U) == []  # 평소: 미달
+    assert "G5 미달" in s.entry.block_reason
+    acts = evaluate(s, Block.ENTRY, _sig(mono=101, s_spread_entry=0.001, stock_auction=True),
+                    SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"]  # 동시호가: 통과
+    assert "동시호가: S괴리 필터 생략" in s.entry.block_reason
+    # S괴리 값이 아예 없어도(동시호가엔 est가 비정상) 기준값만 있으면 낸다
+    s2 = _set()
+    set_running(s2, Block.ENTRY, True)
+    assert evaluate(s2, Block.ENTRY, _sig(s_spread_entry=None, stock_auction=True),
+                    SETTINGS, U)[0].kind == "place_pre"
+    # 기준값이 없으면 동시호가여도 안 낸다
+    s3 = _set(en_s=None)
+    set_running(s3, Block.ENTRY, True)
+    assert evaluate(s3, Block.ENTRY, _sig(stock_auction=True), SETTINGS, U) == []
+    # 역방향도 같다
+    r = AutoMSet(target_qty=100, per_qty=10, switch_delay_s=30, en_sf=0.005, en_s=0.005,
+                 ex_sf=-0.001, reverse=True)
+    set_running(r, Block.ENTRY, True)
+    assert evaluate(r, Block.ENTRY, _sig(s_spread_exit=0.02, hl_disp_ask=-0.02),
+                    SETTINGS, U) == []
+    acts = evaluate(r, Block.ENTRY, _sig(mono=101, s_spread_exit=0.02, hl_disp_ask=-0.02,
+                                         stock_auction=True), SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"] and acts[0].side is Side.SELL

@@ -117,6 +117,7 @@ class _SystemLike(Protocol):
     def fx_entry_rate(self) -> float | None: ...
     def futures_halted(self) -> bool: ...
     def stock_halted(self) -> bool: ...
+    def stock_auction(self) -> bool: ...  # 주식 동시호가 중 — S괴리 필터 생략(결정 57)
     def ls_feed_ok(self) -> bool: ...  # LS 채널 연결(끊김·COM 정지면 False) — G0-1
     async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str: ...
     async def cancel(self, order_id: str) -> None: ...
@@ -421,7 +422,8 @@ class AutoMEngine:
             hl_est_bid=est_bid, hl_est_ask=est_ask,
             hl_bids=hl_bids, hl_asks=hl_asks,
             hl_sz_decimals=hl_info.sz_decimals if hl_info is not None else None,
-            ls_feed_ok=self._system.ls_feed_ok())
+            ls_feed_ok=self._system.ls_feed_ok(),
+            stock_auction=self._system.stock_auction())
 
     # ------------------------------------------------------------ 행동 실행 ---
     def _apply(self, u: Underlying, index: int, block: Block, actions: list[Action],

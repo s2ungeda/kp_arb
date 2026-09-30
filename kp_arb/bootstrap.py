@@ -612,6 +612,10 @@ class LiveSystem:
         """주식시장(1) 정지 오버레이 여부 — 주식 체결쏴 판정용(exec §7C, 사용자 확정 2026-09-17)."""
         return self.session.halt_for(STOCK_MARKET) is not None
 
+    def stock_auction(self) -> bool:
+        """주식시장 동시호가 중인가 — 체결쏴 주식선물·HL선이 S괴리 필터를 건너뛴다(exec 결정 57)."""
+        return self.session.stock_auction()
+
     def stock_vi(self, underlying: Underlying) -> bool:
         """종목 VI 발동 중인가(LS 실시간 VI_, exec §8) — 체결쏴 주식은 그 종목 선주문을 멈춘다."""
         return self.vi_state.get(underlying, "0") not in ("", "0")

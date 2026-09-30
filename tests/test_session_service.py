@@ -225,3 +225,42 @@ def test_sessions_covers_all_underlyings() -> None:
     assert set(all_sessions) == set(Underlying)
     for session_map in all_sessions.values():
         assert reference_instrument(session_map) is Instrument.KR_STOCK
+
+
+def test_stock_auction_flag_follows_preopen_phase() -> None:
+    # 결정 57: 주식시장 phase가 장전 동시호가(PRE_OPEN)면 동시호가 중. 장시작(21)·장마감(41)이면
+    # 아님.
+    # JIF 미수신도 아님(보수적으로 필터를 건다). 선물 시장(5) 코드는 무관.
+    svc = SessionService()
+    assert svc.stock_auction() is False
+    svc.on_market_status(jif("11"))
+    assert svc.stock_auction() is True
+    svc.on_market_status(jif("22"))
+    assert svc.stock_auction() is True
+    svc.on_market_status(jif("21"))
+    assert svc.stock_auction() is False
+    svc.on_market_status(jif("11", jangubun="5"))
+    assert svc.stock_auction() is False
+    svc.on_market_status(jif("41"))
+    assert svc.stock_auction() is False
+
+
+def test_close_auction_code_31_is_auction_and_30_is_info() -> None:
+    # 실측 2026-09-30(개발 코어 JIF 원문 로그): 15:18:59 코스피·코스닥 jstatus 30, 15:19:59
+    # jstatus 31. 31 = 장마감 동시호가 개시 → 장전과 같은 동시호가 단계(stock_auction True), 30 =
+    # 1분 전 예고(단계 유지). 15:30의 41(장마감)로 끝난다.
+    assert classify_jstatus("1", "31") == ("phase", SessionPhase.PRE_OPEN)
+    assert classify_jstatus("2", "31") == ("phase", SessionPhase.PRE_OPEN)
+    assert classify_jstatus("1", "30") == ("info", "장마감동시호가 1분전")
+    svc = SessionService()
+    svc.on_market_status(jif("21"))               # 정규장
+    assert svc.stock_auction() is False
+    svc.on_market_status(jif("30"))               # 1분 전 예고 — 아직 정규장
+    assert svc.stock_auction() is False
+    assert svc.phase_for_market("1") is SessionPhase.REGULAR
+    svc.on_market_status(jif("31"))               # 15:20 장마감 동시호가 개시
+    assert svc.stock_auction() is True
+    assert svc.is_tradeable("1")                  # 주문은 낼 수 있다(단일가 접수)
+    svc.on_market_status(jif("41"))               # 15:30 장마감
+    assert svc.stock_auction() is False
+    assert svc.phase_for_market("1") is SessionPhase.DEAD
