@@ -68,8 +68,15 @@ ORDER_EVENT_TRS: dict[str, str] = {
     "O01": "ack", "H01": "cancel",                                    # 선물(H01=정정취소 공용)
 }
 # 선물 접수 통보(O01) trcode1 → 사건 종류(실측 2026-09-28 xing 모의: 신규 FO01 / 취소 FO03,
-# 정정은 같은 체계의 FO02로 봄 — 미실측). 없는 값은 접수(ack)
-_O01_KIND_BY_TRCODE: dict[str, str] = {"FO01": "ack", "FO02": "amend", "FO03": "cancel"}
+# 정정은 같은 체계의 FO02로 봄 — 미실측). 없는 값은 접수(ack).
+# FO03은 취소 **접수**(cancel_ack)일 뿐 확정이 아니다 — 운영 실측 2026-09-30 09:32:48 #3908: 체결
+# (48.277)이 먼저 났는데 취소 접수 O01(48.790)을 취소 확정으로 읽어 선주문을 정리해 버렸고, 뒤이은
+# 체결 통보(48.801)는 주인 없는 체결이 되어 HL 헤지가 나가지 않았다(SF 매도 1계약 노출). 확정은 H01.
+_O01_KIND_BY_TRCODE: dict[str, str] = {"FO01": "ack", "FO02": "amend", "FO03": "cancel_ack"}
+# 선물 정정·취소 확정 통보(H01) 거부 코드 — "0000"(또는 없음)이면 확정, 그 밖은 거부(실측
+# 2026-09-30: 체결 뒤 도착한 취소는 trcode TTRODP11321·rejcode 0804·qty 0으로 왔다. 정상 확정은
+# TTRODP11301·rejcode 0000·qty 1)
+_H01_OK_REJCODES: frozenset[str] = frozenset({"", "0000"})
 STOCK_FILL_TRS: tuple[str, ...] = ("SC0", "SC1", "SC2", "SC3", "SC4")     # 주식계좌 토큰 WS
 FUTURES_FILL_TRS: tuple[str, ...] = ("O01", "C01", "H01")                  # 선물옵션계좌 토큰 WS
 ACCOUNT_TRS: tuple[str, ...] = STOCK_FILL_TRS + FUTURES_FILL_TRS
@@ -133,6 +140,13 @@ def _norm_ordno(raw: object) -> str:
         return text
 
 
+def _to_float(text: str) -> float | None:
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 class Fill(BaseModel):
     """체결 이벤트(DESIGN.md §10 fills). 추후 StateStore에서 재사용 가능."""
 
@@ -152,9 +166,13 @@ class MarketStatus(BaseModel):
 
 
 class OrderEvent(BaseModel):
-    """주문 이벤트(SC0 접수 / SC2 정정 / SC3 취소 / SC4 거부). OrderBook 상태 전이용."""
+    """주문 이벤트(SC0 접수 / SC2 정정 / SC3 취소 / SC4 거부). OrderBook 상태 전이용.
 
-    kind: str            # "ack" | "amend" | "cancel" | "reject"
+    선물(O01/H01)은 접수와 확정이 나뉜다: 취소 접수 = ``cancel_ack``(상태 변화 없음), 확정 =
+    ``cancel``, 확정 거부 = ``cancel_reject``(원주문이 이미 체결·취소됨 — 상태 변화 없음).
+    """
+
+    kind: str            # "ack" | "amend" | "cancel" | "reject" | "cancel_ack" | "cancel_reject"
     order_id: str        # ordno
     org_order_id: str | None = None  # 정정/취소 통보의 원주문(orgordno)
     body: dict[str, Any] = {}
@@ -241,6 +259,9 @@ class LSWebSocketClient:
         # CUR 키 후보(FX_SPOT_KEYS) — 거부되면 앞에서부터 버리고 다음 후보로(2026-09-28)
         self._fx_spot_candidates: list[str] = list(FX_SPOT_KEYS)
         self._conn: WSConnection | None = None
+        # 선물 취소·정정 주문번호 → 원주문번호(O01 FO02/FO03의 orgordno). 뒤에 오는 확정 통보
+        # H01에는 원주문 칸(ordordno)이 비어 있어(xing 실측 2026-09-28) 여기서 찾는다
+        self._org_by_cancel: dict[str, str] = {}
         self.on_quote: list[Callable[[Quote], None]] = []
         self.on_trade: list[Callable[[TradeTick], None]] = []          # 체결(현재가)
         self.on_expected: list[Callable[[ExpectedPrice], None]] = []   # 예상체결가
@@ -709,19 +730,40 @@ class LSWebSocketClient:
         body = msg["body"]
         # 원주문 필드: 주식(SC*)=orgordno / 선물(H01)=ordordno.
         org = _norm_ordno(body.get("orgordno") or body.get("ordordno") or "")
+        ordno = _norm_ordno(body.get("ordno", ""))
         kind = ORDER_EVENT_TRS[tr_cd]
         if tr_cd == "O01":
-            # 선물 접수 통보의 trcode1 = 주문 종류(FO01 신규·FO02 정정·FO03 취소). xing(모의 실측
-            # 2026-09-28)은 취소 통보 H01의 ordordno가 비어 원주문을 못 찾고, 취소 접수 O01(FO03,
-            # orgordno=원주문)이 원주문을 가리킨다 → 그 O01을 취소/정정 사건으로 읽는다. REST에선
-            # H01도 같이 와 취소가 두 번 반영되지만 장부·취소내역은 중복을 무시한다.
+            # 선물 접수 통보의 trcode1 = 주문 종류(FO01 신규·FO02 정정·FO03 취소). 취소·정정 접수는
+            # 아직 확정이 아니다(취소보다 체결이 먼저면 뒤에 거부가 온다 — 실측 2026-09-30 #3908).
+            # 확정 통보 H01엔 원주문 칸이 비어 있어(xing 실측 09-28) 여기서 (취소주문 → 원주문)을
+            # 기억해 둔다.
             kind = _O01_KIND_BY_TRCODE.get(str(body.get("trcode1", "")).strip(), kind)
+            if kind in ("cancel_ack", "amend") and org not in ("", "0") and ordno:
+                self._remember_cancel(ordno, org)
+        elif tr_cd == "H01":
+            # 정정·취소 확정 통보 — rejcode 0000·수량>0이면 확정, 아니면 거부(원주문은 그대로 —
+            # 이미 체결·취소됐다는 뜻. 체결 통보 C01이 정리한다). 원주문은 ordordno, 비어 있으면
+            # 취소 접수 때 기억한 것.
+            if org in ("", "0"):
+                org = self._org_by_cancel.get(ordno, "")
+            rej = str(body.get("rejcode", "")).strip()
+            qty_raw = str(body.get("qty", "")).strip()
+            qty_zero = qty_raw != "" and _to_float(qty_raw) == 0.0
+            if rej not in _H01_OK_REJCODES or qty_zero:
+                kind = "cancel_reject"
         return OrderEvent(
             kind=kind,
-            order_id=_norm_ordno(body.get("ordno", "")),
+            order_id=ordno,
             org_order_id=org if org not in ("", "0") else None,
             body=body,
         )
+
+    _CANCEL_MAP_CAP = 4000  # 하루 취소 수천 건(운영 09-29 7,000건) — 오래된 것부터 버림
+
+    def _remember_cancel(self, cancel_no: str, org_no: str) -> None:
+        if len(self._org_by_cancel) >= self._CANCEL_MAP_CAP:
+            del self._org_by_cancel[next(iter(self._org_by_cancel))]
+        self._org_by_cancel[cancel_no] = org_no
 
     def _parse_status(self, msg: dict[str, Any]) -> MarketStatus:
         return MarketStatus(tr_key=msg.get("header", {}).get("tr_key", ""), body=msg["body"])

@@ -198,6 +198,10 @@ class AutoMEngine:
         self._tick_cancel: list[_CancelItem] | None = None
         # 묶음이 통째로 거부된 세트 다리 — 다음 발주는 한 건씩 따로(원인인 주문을 가려낸다)
         self._solo: set[tuple[Underlying, int, Block, bool]] = set()
+        # 취소 확정으로 정리한 LS 선주문 → (세트, 시각). 그 뒤 체결이 오면(취소보다 체결이 먼저였던
+        # 경합, 운영 실측 2026-09-30 #3908) 주인 없는 체결로 버리지 않고 그 세트에 헤지를 낸다
+        # (결정 56)
+        self._late_refs: dict[str, tuple[_OrderRef, float]] = {}
         self._bg: set[asyncio.Task[None]] = set()
         system.order_book.on_fill_applied.append(self._on_fill_applied)
         system.order_book.on_change.append(self._on_book_change)
@@ -886,6 +890,10 @@ class AutoMEngine:
                          _fill_id: str) -> None:
         ref = self._orders.get(order.order_id)
         if ref is None:
+            late = self._late_refs.pop(order.order_id, None)
+            if late is not None:  # 취소로 정리한 선주문의 늦은 체결(결정 56) → 헤지
+                self._apply_late_pre_fill(late[0], order, qty, price)
+                return
             if order.intent.source == SOURCE:  # 우리 주문인데 아직 등록 전 — 등록 때 되돌려 반영
                 self._orphan_fills.setdefault(order.order_id, []).append((order, qty, price))
             return
@@ -1086,6 +1094,8 @@ class AutoMEngine:
                 if status == "cancelled":
                     on_pre_cancelled(s, ref.block, mono, self._settings)
                     self._forget(oid)
+                    if not s.hl_first:  # LS 선주문 — 늦은 체결이 오면 헤지를 내기 위해 잠시 기억
+                        self._remember_late(oid, ref, mono)
                 elif status == "rejected":
                     venue = "HL" if s.hl_first else "LS"
                     self._apply(u, ref.index, ref.block,
@@ -1148,6 +1158,34 @@ class AutoMEngine:
     def _forget(self, oid: str) -> None:
         self._orders.pop(oid, None)
         self._seen_status.pop(oid, None)
+
+    LATE_FILL_GRACE_S = 120.0  # 취소로 정리한 선주문의 늦은 체결을 받아 주는 시간
+
+    def _remember_late(self, oid: str, ref: _OrderRef, mono: float) -> None:
+        cutoff = mono - self.LATE_FILL_GRACE_S
+        for k in [k for k, (_r, at) in self._late_refs.items() if at < cutoff]:
+            del self._late_refs[k]
+        self._late_refs[oid] = (ref, mono)
+
+    def _apply_late_pre_fill(self, ref: _OrderRef, order: TrackedOrder, qty: float,
+                             price: float) -> None:
+        """취소 확정으로 정리한 선주문의 체결이 뒤늦게 옴(결정 56) — 취소보다 체결이 먼저였던 경합.
+        장부·RT·후주문 대기에 반영하고 **헤지(후주문)를 낸다**. 선주문 칸·진행 상태는 건드리지
+        않는다(그새 새 선주문이 걸려 있을 수 있음)."""
+        u = ref.underlying
+        s = self._set(u, ref.index, ref.reverse)
+        leg = s.leg(ref.block)
+        tag = self._tag(u, ref.index, ref.block, ref.reverse)
+        acts = on_pre_fill(s, ref.block, int(round(qty)), price, time.monotonic(), late=True)
+        self._log.warning("[자동M] %s 취소로 정리한 선주문 #%s 체결 %s %g @ %s — 취소보다 체결이 "
+                          "먼저였음 → 헤지 후주문 %g (%s)", u.value, order.order_id,
+                          order.intent.side.value, qty, f"{price:,.0f}", qty * s.hl_ratio, tag)
+        self.ulog(u).warning("체결 %s: 취소로 정리한 선주문 #%s %g @ %g (늦은 체결, 경합) → 헤지 "
+                             "후주문 %g, HL 대기 %g | %s", tag, order.order_id, qty, price,
+                             qty * s.hl_ratio, leg.post_pending, self._ledger(s))
+        self._apply(u, ref.index, ref.block, acts, ref.reverse)
+        self._trace(u, ref.index, ref.block, leg, ref.reverse)
+        self._persist()
 
     # ---------------------------------------------------------------- 명령 ---
     def set_running(self, u: Underlying, index: int, block: Block, value: bool,

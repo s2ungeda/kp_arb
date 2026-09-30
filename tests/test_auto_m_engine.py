@@ -521,6 +521,38 @@ async def test_cancel_crossed_by_fill_is_not_retried() -> None:
     await _settle()
 
 
+async def test_late_fill_after_cancel_confirmation_still_hedges() -> None:
+    # 운영 실측 2026-09-30 09:32:48 #3908(결정 56): 취소 확정으로 정리한 선주문의 체결이 뒤늦게
+    # 도착(취소보다 체결이 먼저였던 경합) → 옛 코드는 주인 없는 체결로 버려 HL 헤지가 빠졌다(SF 매도
+    # 1계약 노출). 이제 장부·RT·후주문 대기에 반영하고 헤지 후주문을 낸다. 그새 걸린 새 선주문은
+    # 그대로.
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    sys_.order_book.on_cancel("O1")               # 취소 확정(밖에서 취소) → 엔진이 선주문 정리
+    await _settle()
+    assert s.entry.pre_order_id is None and s.entry.status is LegStatus.ARMED
+    eng.tick(datetime(2026, 9, 4, 10, 0, 2), 102.0)  # 다음 바퀴 → 새 선주문 O2
+    await _settle()
+    assert s.entry.pre_order_id == "O2" and len(sys_.placed) == 2
+    # 정리한 O1의 체결이 뒤늦게 온다(체결 → 취소 접수 → 취소 거부 순서였던 것)
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
+    await _settle()
+    assert len(sys_.placed) == 3
+    post = sys_.placed[2]
+    assert post.instrument is Instrument.HL_PERP and post.side is Side.SELL and post.qty == 10
+    assert s.sf_net == 1 and s.rt == 1 and abs(s.fill_diff - 10) < 1e-9  # 장부 반영, HL 대기 10
+    assert s.entry.pre_order_id == "O2" and s.entry.pre_filled == 0       # 새 선주문은 그대로
+    assert s.entry.status is LegStatus.PRE_RESTING
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O3", qty=10, price=1184.0, ts=0))
+    await _settle()
+    assert s.fill_diff == 0 and abs(s.hl_net + 10) < 1e-9                # 헤지 완성
+    assert s.entry.pre_order_id == "O2"                                  # 새 선주문 계속 대기
+
+
 async def test_cancel_alarm_raises_error_seq_and_snapshot_flags_it() -> None:
     # exec ㅂ3: 취소 재전송이 한도를 넘으면 에러 알람(error_seq) + 스냅샷 cancel_failed(상태줄).
     eng, sys_, state = _engine()

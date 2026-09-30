@@ -966,11 +966,17 @@ def on_pre_reject(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
 
 
 def on_pre_fill(
-    s: AutoMSet, block: Block, qty: int, price: float, mono: float,
+    s: AutoMSet, block: Block, qty: int, price: float, mono: float, late: bool = False,
 ) -> list[Action]:
-    """선주문 체결(일부/전부) → 체결분 × 10 후주문 즉시(exec ㄴ6·ㄴ7). 누적 SF 갱신."""
+    """선주문 체결(일부/전부) → 체결분 × 10 후주문 즉시(exec ㄴ6·ㄴ7). 누적 SF 갱신.
+
+    late=True: **취소 확정으로 정리한 뒤** 도착한 그 선주문의 체결(취소보다 체결이 먼저였던 경합,
+    결정 56) — 장부·판 버퍼·후주문 대기·RT는 똑같이 반영해 헤지를 내되, 선주문 칸(pre_*)·진행
+    상태는 건드리지 않는다(그새 새 선주문이 걸려 있을 수 있다).
+    """
     leg = s.leg(block)
-    leg.pre_filled += qty
+    if not late:
+        leg.pre_filled += qty
     leg.reject_streak = 0  # 체결됐으면 거부 연속은 끊김
     # 선주문 체결은 판 버퍼(pending)에 보관 — 매매결과(acc)는 후주문 전량 체결 확인 뒤 합친다
     leg.pending.sf_qty += qty
@@ -978,8 +984,8 @@ def on_pre_fill(
     leg.post_pending += float(qty * s.hl_ratio)
     s.sf_net += qty if leg.sf_side is Side.BUY else -qty
     _apply_rt(s, block, qty)
-    if leg.status is LegStatus.HALTED:
-        # 중지 뒤 뒤늦은 선주문 체결(결정 19: 헤지는 낸다) — 중지 표시는 유지, 판 끝은 _finish_round
+    if late or leg.status is LegStatus.HALTED:
+        # 늦은 체결·중지 뒤 체결(결정 19: 헤지는 낸다) — 상태 표시는 유지, 판 끝은 _finish_round
         pass
     elif leg.pre_filled >= leg.pre_qty and leg.pre_qty > 0:
         leg.status = LegStatus.POST_PENDING

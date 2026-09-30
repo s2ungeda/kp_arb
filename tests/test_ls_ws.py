@@ -440,14 +440,17 @@ async def test_futures_cancel_h01_event() -> None:
 
 async def test_futures_o01_trcode_maps_cancel_and_amend() -> None:
     # 실측 2026-09-28(xing 모의): 취소하면 O01(ordno=취소주문 1961, orgordno=원주문 1960,
-    # trcode1 FO03) + H01(ordno 0000001961, ordordno "")가 온다 — H01엔 원주문이 없으니
-    # O01/FO03을 취소로 읽는다.
+    # trcode1 FO03) + H01(ordno 0000001961, ordordno "")가 온다. **정정 2026-09-30(결정 56):**
+    # O01/FO03은 취소 **접수**(cancel_ack, 상태 변화 없음)이고 확정은 H01 — 원주문은 H01에 없으니
+    # 접수 때 기억한 (취소주문 → 원주문)으로 채운다. rejcode 0000·qty>0 = 확정(cancel).
     # 신규 접수 O01(FO01, orgordno 0)은 그대로 ack(동시호가 대응주문 트리거).
     new = json.dumps({"header": {"tr_cd": "O01"},
                       "body": {"ordno": "1960", "orgordno": "0", "trcode1": "FO01"}})
     cxl = json.dumps({"header": {"tr_cd": "O01"},
                       "body": {"ordno": "1961", "orgordno": "1960", "trcode1": "FO03"}})
-    h01 = json.dumps({"header": {"tr_cd": "H01"}, "body": {"ordno": "0000001961", "ordordno": ""}})
+    h01 = json.dumps({"header": {"tr_cd": "H01"},
+                      "body": {"ordno": "0000001961", "ordordno": "", "trcode": "TTRODP11301",
+                               "rejcode": "0000", "qty": "1"}})
     amd = json.dumps({"header": {"tr_cd": "O01"},
                       "body": {"ordno": "1962", "orgordno": "1960", "trcode1": "FO02"}})
     session = FakeConnection([new, cxl, h01, amd])
@@ -458,8 +461,47 @@ async def test_futures_o01_trcode_maps_cancel_and_amend() -> None:
     await client.run()
 
     assert [(e.kind, e.order_id, e.org_order_id) for e in events] == [
-        ("ack", "1960", None), ("cancel", "1961", "1960"), ("cancel", "1961", None),
+        ("ack", "1960", None), ("cancel_ack", "1961", "1960"), ("cancel", "1961", "1960"),
         ("amend", "1962", "1960")]
+
+
+async def test_futures_cancel_rejected_after_fill_is_not_a_cancel() -> None:
+    # 운영 실측 2026-09-30 09:32:48 #3908(하이닉스 선물 매도 1): 체결(48.277) → 취소 접수 O01 FO03
+    # (48.790, 취소주문 3909) → 체결 통보 C01(48.801) → H01 TTRODP11321 rejcode 0804 qty 0(48.801,
+    # 취소 거부). 옛 코드는 O01/FO03을 취소 확정으로 읽어 선주문을 정리해 버렸고 뒤의 체결은 주인
+    # 없는 체결이 되어 HL 헤지가 빠졌다. 이제 O01/FO03 = 접수(상태 변화 없음), H01 거부 =
+    # cancel_reject.
+    frames = [
+        {"header": {"tr_cd": "O01"},
+         "body": {"ordno": "3908", "orgordno": "0", "trcode1": "FO01"}},
+        {"header": {"tr_cd": "O01"},
+         "body": {"ordno": "3909", "orgordno": "3908", "trcode1": "FO03"}},
+        {"header": {"tr_cd": "H01"}, "body": {"ordno": "0000003909", "ordordno": "",
+                                              "trcode": "TTRODP11321", "rejcode": "0804",
+                                              "qty": "0", "qty2": "1"}},
+    ]
+    session = FakeConnection([json.dumps(f) for f in frames])
+    client = LSWebSocketClient(FakeConnector([session]))
+    events = []
+    client.on_order_event.append(events.append)
+
+    await client.run()
+
+    assert [(e.kind, e.order_id, e.org_order_id) for e in events] == [
+        ("ack", "3908", None), ("cancel_ack", "3909", "3908"), ("cancel_reject", "3909", "3908")]
+    # 장부는 접수·거부 통보로 상태를 바꾸지 않는다 — 원주문은 그대로 열려 있고 체결 통보가 정리한다
+    from kp_arb.domain.enums import Instrument, Side, Underlying, Venue
+    from kp_arb.domain.models import OrderIntent
+    from kp_arb.order_book import OrderBook
+
+    book = OrderBook()
+    book.track("3908", OrderIntent(venue=Venue.LS, underlying=Underlying.SK_HYNIX,
+                                   instrument=Instrument.KR_STOCK_FUTURE, side=Side.SELL, qty=1,
+                                   price=1_821_000.0))
+    for e in events:
+        book.on_order_event(e)
+    order = book.order("3908")
+    assert order is not None and order.is_open and order.status.value == "accepted"
 
 
 async def test_unknown_tr_is_ignored() -> None:

@@ -1205,6 +1205,13 @@ class LiveSystem:
             order = self.order_book.on_order_event(event)
             if event.kind in ("cancel", "reject") and order is not None:
                 self._record_cancel(order)  # LS 취소·거부 통보 → 취소내역(주문 리스트 '취소' 행)
+            elif event.kind == "cancel_reject":
+                # 취소가 거부됨 = 원주문이 그새 체결(또는 이미 취소)됐다 — 상태는 체결 통보가 정리.
+                # 운영 실측 2026-09-30 #3908: 이걸 취소 확정으로 읽어 헤지가 빠졌었다
+                order_log.logger_for(Venue.LS).warning(
+                    "취소 거부 통보 #%s (원주문 #%s) — 원주문은 그대로(이미 체결·취소), "
+                    "체결 통보로 정리. rejcode=%s", event.order_id, event.org_order_id or "-",
+                    event.body.get("rejcode", "-"))
             # [임시 진단] fx-auction 감시 흐름 확인 — 선물 접수 수신·판정 근거를 한 줄로.
             if event.kind == "ack" and str(event.body.get("trcode1", "")).startswith("FO"):
                 import logging as _lg
