@@ -1295,7 +1295,8 @@ def _finish_round(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
                                                 f"그 체결 뒤 판정"
                                                 + (f" — {shortfall}" if shortfall else "")))
     elif _over_limit(s, diff):
-        return _halt_set(s, block, f"체결차 {diff:g} ≥ 한도 {limit:g}(1회주문수량 {s.per_qty}×10)"
+        return _halt_set(s, block,
+                         f"체결차 {diff:g} ≥ 한도 {limit:g}(1회주문수량 {s.per_qty}×{s.hl_ratio})"
                          + (f" — {shortfall}" if shortfall else ""))
     elif abs(diff) >= _EPS or shortfall:
         acts.append(Action("notify", reason=f"체결차 {diff:g} (한도 {limit:g} 미만, 계속)"
@@ -1377,8 +1378,8 @@ def halt_if_unhedged(s: AutoMSet, block: Block, diff: float) -> list[Action]:
     s.fill_diff = round(diff, 6)  # HL 소수 계약 그대로(0.412 등) — 정수로 깎으면 체결차가 사라진다
     if not set_post_done(s) or leg.status is LegStatus.HALTED or not _over_limit(s, diff):
         return []
-    return _halt_set(s, block,
-                     f"체결차 {diff:g} ≥ 한도 {diff_limit(s):g}(1회주문수량 {s.per_qty}×10)")
+    return _halt_set(s, block, f"체결차 {diff:g} ≥ 한도 {diff_limit(s):g}"
+                               f"(1회주문수량 {s.per_qty}×{s.hl_ratio})")
 
 
 def set_running(s: AutoMSet, block: Block, value: bool) -> list[Action]:

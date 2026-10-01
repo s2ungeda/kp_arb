@@ -941,6 +941,12 @@ def test_stock_sprd_and_halt_limit() -> None:
                     s_px_sum=4 * 101_000.0, ref_qty=4, ratio=1, stock=True)
     assert no_fill.sprd() is None  # 주식 체결가가 없으면 계산 불가(현재가로 대체 안 함)
     assert acc.matched_hl() == 4 and acc.matched_sf() == 4
+    # 중지 사유 문구의 배수도 상품 비율로(주식 ×1) — 전엔 주식도 "×10"으로 찍혔다(개발 로그 10-01)
+    set_running(s, Block.ENTRY, True)
+    s.sf_net, s.entry.post_pending = 10, 10.0  # 주식 10주 체결, HL 후주문 10이 통째로 거부됨
+    acts = on_post_reject(s, Block.ENTRY, "HL 거부", qty=10.0, mono=100.0, settings=SETTINGS)
+    assert "halt" in [a.kind for a in acts]
+    assert f"(1회주문수량 {s.per_qty}×1)" in s.entry.halt_reason
 
 
 def test_stock_post_fill_records_sprd_base_without_sf_theory() -> None:

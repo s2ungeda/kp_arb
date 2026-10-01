@@ -1355,9 +1355,19 @@ class AutoMEngine:
         실측 2026-09-08: 0.3초만 기다리고 닫아 취소가 LS 한도에 걸린 선주문이 그대로 남았다.
         """
         self.stop_all()
+        deadline = time.monotonic() + timeout_s
         if self._bg:
             await asyncio.wait(list(self._bg), timeout=timeout_s)
-        left = [oid for oid, ref in self._orders.items() if ref.leg == "pre"]
+
+        def pending() -> list[str]:
+            return [oid for oid, ref in self._orders.items() if ref.leg == "pre"]
+
+        # 취소 요청이 접수된 뒤 확정 통보가 오기까지도 기다린다(같은 시간 한도 안에서) — 통보는 요청
+        # 응답보다 조금 늦게 온다(모의 실측 2026-10-01: 중앙 50ms). 안 기다리면 취소된 주문을 "확인
+        # 못 함"으로 경고한다(같은 날 종료 3회 모두).
+        while pending() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        left = pending()
         if left:
             self._log.warning("[자동M] 종료 — 취소 확인 못 한 선주문 %s (LS에서 확인 필요)", left)
         if self._persist_pending:  # 예약만 된 저장이 루프 종료로 사라지지 않게 지금 쓴다

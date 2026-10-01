@@ -1598,7 +1598,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             ref_sent["qty"] = ref
         state_box["_sets_sigs"] = set_input_sigs(book)
         _load_set_inputs(rows, "fwd")
-        _load_set_inputs(book.get("rev_sets") or [], "rev")
+        if "rev" in rows_by:  # 주식 화면은 역방향이 없다 — 채우려다 KeyError(화면 로그 09-29~)
+            _load_set_inputs(book.get("rev_sets") or [], "rev")
 
     def _load_set_inputs(rows: list[Any], dtag: str, skip_focused: bool = False,
                          only: set[int] | None = None) -> None:

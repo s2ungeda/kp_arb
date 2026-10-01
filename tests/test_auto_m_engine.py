@@ -149,7 +149,12 @@ class FakeSystem:
             self.cancel_fail_times = fails - 1
             raise RuntimeError("per-second limit 10 for CFOAT00300 exceeded")
         self.cancelled.append(order_id)
-        self.order_book.on_cancel(order_id)
+        confirm_delay = getattr(self, "cancel_confirm_delay", None)
+        if confirm_delay is None:
+            self.order_book.on_cancel(order_id)
+        elif confirm_delay >= 0:  # 확정 통보가 요청 응답보다 늦게 옴(음수 = 끝내 안 옴)
+            asyncio.get_running_loop().call_later(
+                confirm_delay, self.order_book.on_cancel, order_id)
 
     async def place_many(self, intents: Any, cloids: Any = None) -> list[Any]:
         """묶음 발주 흉내(exec §7D) — 요청 하나로 기록하고 건별 결과를 돌려준다.
@@ -438,6 +443,35 @@ async def test_shutdown_waits_for_cancel_and_retries_rate_limit() -> None:
     assert sys_.cancelled == ["O1"]
     assert not state.autom.any_running()
     assert state.autom.book(U).sets[0].entry.pre_order_id is None  # 취소 확인까지 반영됨
+
+
+async def test_shutdown_waits_for_late_cancel_confirmation(caplog: Any) -> None:
+    # 개발 PC 실측 2026-10-01: 종료 때 취소 요청은 접수됐는데 확정 통보(약 50ms 뒤)를 기다리지 않고
+    # 닫아 "취소 확인 못 한 선주문" 경고가 매번 났다(실제로는 취소됨). 같은 시간 한도 안에서 확정
+    # 통보까지 기다린다. 끝내 안 오면 한도에서 멈추고 경고를 남긴다.
+    import logging
+
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    sys_.cancel_confirm_delay = 0.15              # 확정 통보가 요청 응답보다 늦게 온다
+    with caplog.at_level(logging.WARNING, logger="kp_arb.autom"):
+        await eng.shutdown(timeout_s=3.0)
+    assert sys_.cancelled == ["O1"] and s.entry.pre_order_id is None
+    assert "취소 확인 못 한 선주문" not in caplog.text
+    # 확정 통보가 끝내 안 오면 시간 한도에서 멈추고 경고
+    eng2, sys2, state2 = _engine()
+    eng2.set_running(U, 0, Block.ENTRY, True)
+    eng2.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    sys2.cancel_confirm_delay = -1.0
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kp_arb.autom"):
+        await eng2.shutdown(timeout_s=0.3)
+    assert sys2.cancelled == ["O1"] and "취소 확인 못 한 선주문" in caplog.text
 
 
 async def test_stop_during_placement_cancels_on_ack() -> None:
