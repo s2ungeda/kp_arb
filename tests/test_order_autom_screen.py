@@ -63,6 +63,10 @@ def test_settings_payload_shape() -> None:
     common["risk"].update({"rev_en": 0.4, "rev_ex": 0.05, "rev_gap": 0.2})
     p2 = settings_payload(common)
     assert (p2["risk_rev_en"], p2["risk_rev_ex"], p2["risk_rev_gap"]) == (0.004, 0.0005, 0.002)
+    # HL 체결 수신도 판정 계기로(사용자 2026-10-01, 결정 63) — 기본 해제, 옛 화면 상태엔 키가 없다
+    assert p["hl_trade_trigger"] is False
+    common["hl_trade_trigger"] = True
+    assert settings_payload(common)["hl_trade_trigger"] is True
 
 
 def test_set_input_sigs_change_only_for_the_edited_set() -> None:

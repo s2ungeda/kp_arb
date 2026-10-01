@@ -26,7 +26,6 @@ from .theory import in_time_window
 from .ticks import ceil_to_tick, floor_to_tick, tick_for
 
 HL_PER_SF = 10  # SF 1계약 = HL 10계약 (§1)
-CANCEL_CONFIRM_S = 3.0   # 취소 보낸 뒤 확인(취소·체결·거부) 기다리는 시간 — 지나면 재전송(exec ㅂ3)
 CANCEL_ALARM_TRIES = 3   # 취소 전송이 이 횟수를 넘으면 에러 알람 + "취소실패" 표시(exec ㅂ3)
 # 상품(exec §7C·§7D): 주식선물(선 LS·후 HL) / 주식(선 LS 현물·후 HL) / 주식선물 HL선(선 HL ALO·
 # 후 LS, 시험 2026-09-22 — 선주문이 HL이라 수량은 HL 10 단위, 체결이 10에 찰 때마다 LS 1계약)
@@ -77,6 +76,9 @@ class AutoMSettings:
     # 잔량은 선주문 딜레이만큼 기다린 뒤 취소 → 체결차 → 중지.
     hl_margin_buy: float = 0.01
     hl_margin_sell: float = 0.01
+    # HL 공개 체결 수신도 판정 계기로 쓸지(exec §4 판정 계기, 사용자 2026-10-01 결정 63). 기본 해제.
+    # 판정 값은 HL 호가창뿐이라 켜도 계기만 늘어난다.
+    hl_trade_trigger: bool = False
 
     def post_price(self, side: Side, hl_bid: float, hl_ask: float) -> float:
         """후주문 지정가 — 상대 1호가에 여유를 얹어 taker로 잡히게."""
@@ -86,6 +88,13 @@ class AutoMSettings:
 
     def in_window(self, now: dtime) -> bool:
         return any(in_time_window(now, parse_hms(s), parse_hms(e)) for s, e in self.windows)
+
+    def next_edge_s(self, now: datetime) -> float | None:
+        """오늘 남은 주문가능시간 경계(시작·끝) 중 가장 가까운 것까지 남은 초 — 엔진이 그 시각에
+        타이머로 판정한다(exec §4 판정 계기). 오늘 남은 경계가 없으면 None."""
+        ahead = [(datetime.combine(now.date(), parse_hms(t)) - now).total_seconds()
+                 for window in self.windows for t in window]
+        return min((s for s in ahead if s > 0), default=None)
 
 
 @dataclass(frozen=True)
@@ -120,6 +129,8 @@ class Signals:
     hl_sz_decimals: int | None = None
     # LS 피드(시세·통보·조회 채널)가 살아 있나 — 끊김·정지면 주문 안 냄(G0-1, 2026-09-29 운영 사고)
     ls_feed_ok: bool = True
+    # HL 채널도 같은 관문(사용자 2026-10-01 결정 60: 어느 한쪽이라도 끊기면 선주문 취소 후 대기)
+    hl_feed_ok: bool = True
     # 주식시장 동시호가 중(결정 57, 사용자 2026-09-30) — 현물이 예상체결가로 움직여 S괴리가
     # 이상하므로 주식선물·HL선의 G5 S괴리 필터를 건너뛴다(정·역방향). 기준값은 여전히 있어야 한다
     stock_auction: bool = False
@@ -280,9 +291,8 @@ class Leg:
     delay_until: float | None = None
     replace_pending: bool = False   # 역산가 바뀜 → 취소 보냄, 취소 확인 대기
     cancel_sent: bool = False       # 관문(G2·G5·G6) 취소를 이미 보냄 — 확인 올 때까지 재전송 안 함
-    cancel_sent_mono: float | None = None  # 마지막 취소 전송 시각 — 3초 확인 없으면 재전송(ㅂ3)
-    cancel_tries: int = 0           # 이번 선주문에 취소를 보낸 횟수(재전송 포함)
-    cancel_alarmed: bool = False    # 취소 재전송 한도 초과 알람을 이미 냈음 → 상태줄 "취소실패"
+    cancel_tries: int = 0           # 이번 선주문에 취소를 보낸 횟수(거부 뒤 다시 보낸 것 포함)
+    cancel_alarmed: bool = False    # 취소 거부가 되풀이돼 알람을 이미 냈음 → 상태줄 "취소실패"
     await_post_then_delay: bool = False  # 취소 확인됨, 병행 후주문 체결 확인 뒤 딜레이
     reject_streak: int = 0          # 선주문 연속 거부 횟수 — 접수 뒤 체결·취소가 있으면 0으로
     # 마지막 선주문 거부 — 화면 상태줄에 "거부(n/3): 사유"로(사용자 2026-09-15: 거부났는지·사유를
@@ -325,7 +335,6 @@ class Leg:
         self.pre_qty = self.pre_filled = 0
         self.pre_filled_f = 0.0
         self.cancel_sent = False
-        self.cancel_sent_mono = None
         self.cancel_tries = 0
         self.cancel_alarmed = False
         # 선주문이 끝났으면(체결·취소·거부) 재발주 취소 대기도 끝 — 역산가 변경으로 취소를 보냈는데
@@ -470,6 +479,16 @@ def within_limit(side: Side, price: float, limit: float) -> bool:
     return price >= limit if side is Side.BUY else price <= limit
 
 
+def maker_start(side: Side, price: float, start: float, unit: int, offset: int = 0) -> float:
+    """범위 시작(상대N호가 ∓ 1틱)은 주문가의 **안쪽 경계**(결정 58, 사용자 2026-09-30) — 역산가가
+    상대호가를 넘어 들어오면 범위 시작으로 되돌려 항상 메이커로 선다. 매도는 start 이상, 매수는
+    start 이하. 되돌린 자리도 세트의 주문단위 격자(offset + k×unit)에 맞춘다(결정 66, 사용자
+    2026-10-01) — 매도는 start 위쪽 첫 격자, 매수는 아래쪽 첫 격자. 그 자리는 역산가보다 유리해
+    Sprd ≥ 기준값이 그대로 보장된다. 순수."""
+    inside = price < start if side is Side.SELL else price > start
+    return snap_to_unit(side, start, unit, offset) if inside else price
+
+
 _EPS = 1e-9  # HL 소수 계약 비교용(0.588 같은 체결이 오므로 "== 0" 대신 사용)
 _ROUND_SEQ = itertools.count(1)  # 끝난 판 순번 — 방향 안에서 가장 최근 판(스냅샷) 고르기
 
@@ -500,7 +519,7 @@ def fill_diff(sf_net_contracts: int, hl_net_contracts: float,
 
 # ---------------------------------------------------------------- 상태변화 ---
 
-def _cancel_if_resting(leg: Leg, force: bool = False, mono: float | None = None) -> list[Action]:
+def _cancel_if_resting(leg: Leg, force: bool = False) -> list[Action]:
     """걸어둔 선주문이 있으면 취소 요청(취소 확인은 on_pre_cancelled).
 
     전부 체결된 선주문(pre_filled ≥ pre_qty)은 취소할 잔량이 없다 — 보내면 LS가 거부한다
@@ -508,30 +527,23 @@ def _cancel_if_resting(leg: Leg, force: bool = False, mono: float | None = None)
     force=True(실행 끔·정지·종료): 재발주 취소 대기(replace_pending)·이미 보냄(cancel_sent)
     표시와 무관하게 다시 보낸다 — 앞 취소가 LS 한도에 걸려 실패했을 수 있다(실측 2026-09-08:
     종료 때 취소를 건너뛰어 선주문이 LS에 남음).
-    확인 타임아웃(exec ㅂ3, 2026-09-09): 보낸 지 CANCEL_CONFIRM_S가 지나도 확인이 없으면 "보냄"
-    표시를 풀고 다시 보낸다 — 표시가 영원히 남아 주문이 LS에 걸린 채 방치되는 것을 막는다.
-    재전송이 CANCEL_ALARM_TRIES를 넘으면 한 번 alarm(에러 소리 + 상태줄 "취소실패")을 낸다.
+    보낸 뒤에는 **시간으로 다시 보내지 않는다**(exec ㅂ3, 사용자 2026-10-01 결정 61) — 통보(취소
+    확정·체결·거부)가 올 때까지 기다린다. 다시 보내는 것은 취소 요청이 거부돼 표시가 되돌려진
+    때(on_pre_cancel_failed)와 force뿐이고, 그렇게 보낸 횟수가 CANCEL_ALARM_TRIES를 넘으면 한 번
+    alarm(에러 소리 + 상태줄 "취소실패")을 낸다.
     """
     if force:
         leg.replace_pending = False
     resting = leg.pre_order_id is not None and not leg.replace_pending
     if not resting or (leg.pre_qty > 0 and leg.pre_filled >= leg.pre_qty):
         return []
-    if leg.cancel_sent and leg.cancel_sent_mono is None and mono is not None:
-        leg.cancel_sent_mono = mono  # 시각 없이 보낸 취소(접수 때 등)는 지금부터 확인을 기다린다
-    timed_out = (leg.cancel_sent and mono is not None and leg.cancel_sent_mono is not None
-                 and mono - leg.cancel_sent_mono >= CANCEL_CONFIRM_S)
-    if not (force or not leg.cancel_sent or timed_out):
+    if leg.cancel_sent and not force:
         return []
-    # 한 번만 보낸다 — 관문에 막힌 채 매 틱 재전송하면 취소 확인이 오기 전 같은 요청이 여러 번
+    # 한 번만 보낸다 — 관문에 막힌 채 판정마다 재전송하면 취소 확인이 오기 전 같은 요청이 여러 번
     # 나간다(실측 2026-09-08: 0.2초에 3번). 확인(취소/거부/체결)이 오면 _clear_pre가 되돌린다.
     leg.cancel_sent = True
-    leg.cancel_sent_mono = mono
     leg.cancel_tries += 1
-    reason = ""
-    if timed_out:
-        reason = f"취소 확인 없음 {CANCEL_CONFIRM_S:g}초 → 재전송 {leg.cancel_tries}회"
-    acts = [Action("cancel_pre", order_id=leg.pre_order_id, reason=reason)]
+    acts = [Action("cancel_pre", order_id=leg.pre_order_id)]
     if leg.cancel_tries > CANCEL_ALARM_TRIES and not leg.cancel_alarmed:
         leg.cancel_alarmed = True
         acts.append(Action("alarm", order_id=leg.pre_order_id,
@@ -598,17 +610,35 @@ def _switch_wait(s: AutoMSet, leg: Leg, mono: float) -> bool:
     return last is not None and mono - last < s.switch_delay_s
 
 
+def wake_times(s: AutoMSet, settings: AutoMSettings, resumed_mono: float | None) -> list[float]:
+    """세트에서 시세 없이 시간만으로 풀리는 조건이 끝나는 시각들(단조 시계) — 판정은 시세가 올 때만
+    하므로(사용자 2026-10-01, 결정 59) 엔진이 이 시각에 타이머로 판정한다: 선주문 딜레이 끝 ·
+    전환대기 끝(G3) · 재개 딜레이 끝. 판정 대상이 아닌 다리(실행 꺼짐 + 대기)는 뺀다."""
+    out: list[float] = []
+    for leg in (s.entry, s.exit):
+        if not leg.running and leg.status is LegStatus.IDLE:
+            continue
+        if leg.status is LegStatus.SETTLE_DELAY and leg.delay_until is not None:
+            out.append(leg.delay_until)
+        last = s.last_exit_fill_mono if leg.block is Block.ENTRY else s.last_entry_fill_mono
+        if last is not None and s.switch_delay_s > 0:
+            out.append(last + s.switch_delay_s)
+        if resumed_mono is not None:
+            out.append(resumed_mono + settings.resume_delay_s)
+    return out
+
+
 def _common_gates(
     s: AutoMSet, leg: Leg, block: Block, sig: Signals, settings: AutoMSettings,
 ) -> int | tuple[str, list[Action]]:
     """G1~G4 + 상태 대기(exec §4) — 상품 공통. 통과하면 이번에 낼 계약수(int), 막히면 (근거,
     행동)."""
     if leg.status is LegStatus.HALTED:
-        # 중지 뒤에도 걸린 선주문의 취소 확인은 지켜본다(안 오면 재전송, exec ㅂ3)
-        return "중지", _cancel_if_resting(leg, mono=sig.mono)
+        # 중지 뒤에도 걸린 선주문이 남아 있으면 취소를 보낸다(이미 보냈으면 통보를 기다림, exec ㅂ3)
+        return "중지", _cancel_if_resting(leg)
     # G1 실행 꺼짐 → 미체결 취소, 대기
     if not leg.running:
-        acts = _cancel_if_resting(leg, mono=sig.mono)
+        acts = _cancel_if_resting(leg)
         if post_done(leg) and leg.pre_order_id is None:
             leg.status = LegStatus.IDLE
         return "G1 실행 꺼짐", acts
@@ -619,14 +649,17 @@ def _common_gates(
     # 안 낸다**: 걸어둔 선주문 취소 + 대기(G2와 같음). 세트는 실행 상태 그대로 — 값이 돌아오면
     # 재개. (옛 09-15 규칙 "세트 중지·사람이 해제"는 잠깐의 결측에도 재시작이 번거로워 폐기.)
     if sig.fx is None:
-        return "판정 환율 계산불가 — 주문 안 냄", _cancel_if_resting(leg, mono=sig.mono)
+        return "판정 환율 계산불가 — 주문 안 냄", _cancel_if_resting(leg)
     # G0-1 LS 피드 정지·끊김(운영 사고 2026-09-29 14:55: xing COM 스레드가 멈춰 LS 조회·주문·
     # 실시간이 전부 섰는데 HL선이 HL 선주문을 계속 내 헤지 없는 HL 체결이 쌓임). 살아나면 재개.
+    # HL 채널도 같다(사용자 2026-10-01, 결정 60) — 어느 한쪽이라도 끊기면 선주문 취소 후 대기.
     if not sig.ls_feed_ok:
-        return "LS 피드 끊김/정지 — 주문 안 냄", _cancel_if_resting(leg, mono=sig.mono)
+        return "LS 피드 끊김/정지 — 주문 안 냄", _cancel_if_resting(leg)
+    if not sig.hl_feed_ok:
+        return "HL 피드 끊김 — 주문 안 냄", _cancel_if_resting(leg)
     # 시장 정지(exec §8) — 신규·정정 중단 + 미체결 취소, HL은 손대지 않음
     if sig.market_halted:
-        return "시장 정지 — 신규·정정 중단", _cancel_if_resting(leg, mono=sig.mono)
+        return "시장 정지 — 신규·정정 중단", _cancel_if_resting(leg)
     if sig.resumed_mono is not None and sig.mono - sig.resumed_mono < settings.resume_delay_s:
         return f"재개 딜레이 {settings.resume_delay_s}초", []
     # 사건 대기 중인 상태는 시세로 바꾸지 않는다
@@ -640,7 +673,7 @@ def _common_gates(
     # G2 주문가능시간
     if not settings.in_window(sig.now.time()):
         # 근거에 현재 시각을 넣지 않는다 — 매초 "바뀐 근거"가 되어 초당 한 줄씩 쌓임(실측 09-07)
-        return "G2 주문가능시간 밖", _cancel_if_resting(leg, mono=sig.mono)
+        return "G2 주문가능시간 밖", _cancel_if_resting(leg)
     # G3 전환대기 · G4 여유 계약수 — 새로 내지 않음(걸어둔 것은 유지)
     if _switch_wait(s, leg, sig.mono):
         return f"G3 전환대기 {s.switch_delay_s}초", []
@@ -725,16 +758,16 @@ def _evaluate_hl_first(
 
     thr = s.threshold(block)
     if thr is None:
-        return hold("G5 기준값 없음", _cancel_if_resting(leg, mono=sig.mono))
+        return hold("G5 기준값 없음", _cancel_if_resting(leg))
     # G5 S괴리 필터 — 주식선물과 같은 식(§11.3, 사용자 2026-09-30 결정 54: 정·역 모두). 09-22·23의
     # "시험 동안 필터 없음"은 거둠. 진입: 정방향 S괴리 > 진입S / 역방향 S괴리 < 진입S, 청산은 비교
     # 없음
     if block is Block.ENTRY and s.en_s is None:
-        return hold("G5 진입S 기준값 없음", _cancel_if_resting(leg, mono=sig.mono))
+        return hold("G5 진입S 기준값 없음", _cancel_if_resting(leg))
     if not _passes_signal(s, leg, sig):
         why = (f"G5 미달 S괴리 {'>' if s.reverse else '<'} 진입S {s.en_s * 100:.3f}%"
                if block is Block.ENTRY and s.en_s is not None else "G5 미달")
-        return hold(why, _cancel_if_resting(leg, mono=sig.mono))
+        return hold(why, _cancel_if_resting(leg))
     side = leg.pre_side  # HL 다리(정방향 진입 = 매도)
     # LS 후주문을 테이커로 잡을 SF 호가: HL 매도(LS 매수)면 SF 매도1호가, HL 매수면 SF 매수1호가
     sf_quote = ((sig.sf_asks[0][0] if sig.sf_asks else None) if side is Side.SELL
@@ -755,7 +788,7 @@ def _evaluate_hl_first(
     offset = s.hl_offset
     if hl_unit_errors(unit if s.hl_unit > 0 else 0.0, offset, step):
         return hold(f"G6 주문단위 {s.hl_unit:g}·시작호가 {offset:g}이 HL 격자 {step:g}에 안 맞음",
-                    _cancel_if_resting(leg, mono=sig.mono))
+                    _cancel_if_resting(leg))
     price = hl_snap_to_unit(raw_price, side, unit, step, offset)
     # ALO 겹침(결정 E): 매도가 매수1호가 이하 / 매수가 매도1호가 이상이면 HL이 거부 → 한 칸 안쪽
     # (기준값보다 유리한 자리)에 건다
@@ -775,7 +808,7 @@ def _evaluate_hl_first(
     rng_txt = f"범위 {start:g}~{limit:g}(호가단위 {unit:g} 격자 {step:g})"
     if not within_limit(side, price, limit):
         return hold(f"G6 범위 밖 역산가 {price:g} {rng_txt} 상대호가 {rel:g}",
-                    _cancel_if_resting(leg, mono=sig.mono))
+                    _cancel_if_resting(leg))
     sf_disp = (sf_quote - sig.sf_theory) / sig.sf_theory
     basis = (f"역산가 {price:g}(원값 {raw_price:g}, 주문단위 {unit:g}) = S {sig.stock_last:,.0f}"
              f"×(1+SF괴리 "
@@ -834,7 +867,7 @@ def evaluate(
                    else f"G5 미달 S괴리 < 진입S {pct(s.en_s)}")
         else:
             why = "G5 청산 기준값 없음"
-        return hold(why, _cancel_if_resting(leg, mono=sig.mono))
+        return hold(why, _cancel_if_resting(leg))
     # G6 역산가 → 허용범위
     thr = s.threshold(block)
     # HL est 호가창은 후주문 방향으로: HL 매도(정방향 진입·역방향 청산) = 매수호가창, HL 매수 =
@@ -865,19 +898,26 @@ def evaluate(
     # 한계의 "상대N호가 ∓ 1틱"에서 1틱은 **시세(호가창)의 호가단위** = 한 호가 옆(사용자 확정
     # 2026-09-08). 선주문 주문단위(settings.pre_tick)는 역산가를 주문 단위로 맞추는 데만 쓴다.
     mkt_tick = tick_for(mkt_inst, rel)  # 주식선물/주식 호가단위(상품별)
+    start = range_start(side, rel, mkt_tick)
+    limit = limit_price(side, rel, mkt_tick, settings.pre_range)
+    # 범위 = 범위 시작(상대N호가 ∓ 1틱)부터 한계까지 — 둘 다 로그에(사용자 2026-09-11)
+    rng_txt = f"범위 {start:,.0f}~{limit:,.0f}(호가단위 {mkt_tick})"
+    # 범위 시작 안쪽으로는 들어가지 않는다(결정 58) — 상대호가를 넘는 역산가는 시작 자리로 되돌려
+    # 메이커로 건다(운영 09-30 14:33 삼성: 역산가 270,000 = 매수1호가 → 270,500에 걸어야 함).
+    # 되돌린 자리도 세트의 주문단위 격자에 맞춘다(결정 66) — 아래 호가단위·한계 검사는 그 값으로.
+    raw_price = price
+    price = maker_start(side, price, start, tick, s.price_offset)
+    maker_txt = f" 메이커 보정 {raw_price:,.0f}→{price:,.0f}" if price != raw_price else ""
     # 주문단위·시작호가가 시세 호가단위에 안 맞으면(예: 하이닉스 1,000 호가에 시작호가 500)
     # LS가 거부하므로 내지 않는다(2026-09-15). 상태줄에 사유가 보인다.
     if round(price) % mkt_tick != 0:
         return hold(f"G6 주문가 {price:,.0f}이 시세 호가단위 {mkt_tick}에 안 맞음 "
                     f"(주문단위 {tick} 시작호가 {s.price_offset:,})",
-                    _cancel_if_resting(leg, mono=sig.mono))
-    start = range_start(side, rel, mkt_tick)
-    limit = limit_price(side, rel, mkt_tick, settings.pre_range)
-    # 범위 = 범위 시작(상대N호가 ∓ 1틱)부터 한계까지 — 둘 다 로그에(사용자 2026-09-11)
-    rng_txt = f"범위 {start:,.0f}~{limit:,.0f}(호가단위 {mkt_tick})"
+                    _cancel_if_resting(leg))
     if not within_limit(side, price, limit):
-        return hold(f"G6 범위 밖 역산가 {price:,.0f} {rng_txt} 상대호가 {rel:,.0f}",
-                    _cancel_if_resting(leg, mono=sig.mono))
+        return hold(f"G6 범위 밖 역산가 {raw_price:,.0f}{maker_txt} {rng_txt} 상대호가 {rel:,.0f}",
+                    _cancel_if_resting(leg))
+    formula += maker_txt
     # 발주 근거엔 그때의 SF 1호가·환율도 남긴다(사용자 2026-09-11) — 나중에 역산을 되짚을 수 있게
     bid1 = sig.sf_bids[0][0] if sig.sf_bids else None
     ask1 = sig.sf_asks[0][0] if sig.sf_asks else None
@@ -921,8 +961,7 @@ def _start_delay(leg: Leg, mono: float, settings: AutoMSettings) -> None:
     leg.status = LegStatus.SETTLE_DELAY
 
 
-def on_pre_ack(s: AutoMSet, block: Block, order_id: str,
-               mono: float | None = None) -> list[Action]:
+def on_pre_ack(s: AutoMSet, block: Block, order_id: str) -> list[Action]:
     """선주문 접수 — 주문번호 보관(취소·체결 매칭용).
 
     발주 요청과 접수 응답 사이에 실행이 꺼지거나(끔·정지·종료) 중지되면 취소할 번호가 없어
@@ -933,7 +972,7 @@ def on_pre_ack(s: AutoMSet, block: Block, order_id: str,
     leg.pre_order_id = order_id
     leg.last_reject = leg.last_reject_at = ""  # 접수됐으면 앞선 거부 표시는 끝
     if not leg.running or leg.status in (LegStatus.IDLE, LegStatus.HALTED):
-        return _cancel_if_resting(leg, force=True, mono=mono)
+        return _cancel_if_resting(leg, force=True)
     return []
 
 
@@ -1342,8 +1381,7 @@ def halt_if_unhedged(s: AutoMSet, block: Block, diff: float) -> list[Action]:
                      f"체결차 {diff:g} ≥ 한도 {diff_limit(s):g}(1회주문수량 {s.per_qty}×10)")
 
 
-def set_running(s: AutoMSet, block: Block, value: bool,
-                mono: float | None = None) -> list[Action]:
+def set_running(s: AutoMSet, block: Block, value: bool) -> list[Action]:
     """실행 켬/끔(exec ㅂ2) — 끄면 미체결 선주문 취소(체결 포지션 유지). 중지 상태는 끄기만 허용."""
     leg = s.leg(block)
     leg.running = value
@@ -1354,8 +1392,8 @@ def set_running(s: AutoMSet, block: Block, value: bool,
         # 연속 3회"가 남아 있었음. 전엔 다음 접수 때만 지워져 새 주문이 안 나가는 줄은 영영 남았다)
         leg.last_reject = leg.last_reject_at = ""
         return []
-    # 끔·정지·종료 — 취소 대기 표시와 무관하게 취소(mono는 확인 타임아웃 기준 시각)
-    acts = _cancel_if_resting(leg, force=True, mono=mono)
+    # 끔·정지·종료 — 취소 대기 표시와 무관하게 취소
+    acts = _cancel_if_resting(leg, force=True)
     if leg.pre_order_id is None and post_done(leg) and leg.status is not LegStatus.HALTED:
         leg.status = LegStatus.IDLE
     return acts
@@ -1695,6 +1733,7 @@ def autom_from_dict(screen: AutoMScreen, raw: object, legacy_underlying: str = "
             s.rel_sell = int(st.get("rel_sell", s.rel_sell))
             s.hl_margin_buy = float(st.get("hl_margin_buy", s.hl_margin_buy))
             s.hl_margin_sell = float(st.get("hl_margin_sell", s.hl_margin_sell))
+            s.hl_trade_trigger = bool(st.get("hl_trade_trigger", s.hl_trade_trigger))
         except (TypeError, ValueError):
             pass
     for key in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap",

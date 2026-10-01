@@ -499,6 +499,26 @@ def test_fx_price_only_near_month_feeds_theory() -> None:
     assert system.usdkrw_theory is not None    # 최근월물만 이론가 갱신
 
 
+def test_fx_reception_notifies_on_fx_except_futures_quote() -> None:
+    # 자동M 판정 계기(exec §4, 사용자 2026-10-01): 환율은 현물환율 수신과 원달러선물 **체결** 수신만
+    # 알린다. 원달러선물 호가는 값 계산에만 쓰고 알리지 않는다. 차근월물 체결도 판정 환율에 안
+    # 쓰이므로 알리지 않는다.
+    system, _, _ = _system([])
+    system._fx_futures = ("175W07", 202607)
+    system._fx_months = [("175W07", 202607), ("175W08", 202608)]
+    calls: list[str] = []
+    system.on_fx.append(lambda: calls.append("fx"))
+
+    system._apply_fx_quote("175W07", 1529.0, 1531.0)  # 호가 → 알림 없음
+    assert calls == [] and system.fx_futures_quote["175W07"] == (1529.0, 1531.0)
+    system._apply_fx_price("175W08", 1600.0)          # 차근월물 체결 → 알림 없음
+    assert calls == []
+    system._apply_fx_price("175W07", 1530.0)          # 최근월물 체결 → 알림
+    assert calls == ["fx"]
+    system._apply_fx_spot(1386.1)                     # 현물환율 → 알림
+    assert calls == ["fx", "fx"]
+
+
 def test_set_fx_futures_code_switches_month_for_theory_and_entry_rate() -> None:
     # 공통설정 원달러선물 콤보(사용자 2026-09-28): 고른 월물이 역산현물가·환진입가에 쓰인다.
     # 바꾸는 즉시 저장해 둔 그 월물 값으로 다시 계산하고, 목록에 없는 코드는 최근월물.

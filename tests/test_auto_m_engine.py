@@ -76,6 +76,9 @@ class FakeSystem:
     def ls_feed_ok(self) -> bool:
         return getattr(self, "feed_ok", True)  # G0-1: LS 채널 연결(테스트 기본 True)
 
+    def hl_feed_ok(self) -> bool:
+        return getattr(self, "hl_ok", True)  # G0-1: HL 채널 연결(결정 60, 테스트 기본 True)
+
     def stock_halted(self) -> bool:  # 주식 엔진용(exec §7C)
         return self.halted
 
@@ -137,6 +140,10 @@ class FakeSystem:
             from kp_arb.gateways.ls import OrderGoneError
 
             raise OrderGoneError("CFOAT00300 rejected (03416): 정정취소가능수량이 없습니다.")
+        if getattr(self, "cancel_timeout", False):  # 취소 요청 응답 없음 흉내(결과 모름)
+            from kp_arb.gateways.ls_rest import RestTimeoutError
+
+            raise RestTimeoutError("xing CFOAT00300 응답 없음: TimeoutError")
         fails = getattr(self, "cancel_fail_times", 0)  # LS 초당 한도 흉내 — 처음 n번 실패
         if fails > 0:
             self.cancel_fail_times = fails - 1
@@ -556,26 +563,229 @@ async def test_late_fill_after_cancel_confirmation_still_hedges() -> None:
     assert s.entry.pre_order_id == "O2"                                  # 새 선주문 계속 대기
 
 
-async def test_cancel_alarm_raises_error_seq_and_snapshot_flags_it() -> None:
-    # exec ㅂ3: 취소 재전송이 한도를 넘으면 에러 알람(error_seq) + 스냅샷 cancel_failed(상태줄).
+async def test_cancel_alarm_raises_error_seq_and_snapshot_flags_it(monkeypatch: Any) -> None:
+    # exec ㅂ3(결정 61): 취소 요청이 **거부**되기를 되풀이해(LS 초당 한도 등) 보낸 횟수가 한도를
+    # 넘으면 에러 알람(error_seq) + 스냅샷 cancel_failed(상태줄). 거부는 받은 데이터 — 주문이 아직
+    # 걸려 있다는 뜻이라 다음 판정에서 다시 보낸다.
+    monkeypatch.setattr("kp_arb.auto_m_engine.CANCEL_RETRY_S", 0.0)
     eng, sys_, state = _engine()
     eng.set_running(U, 0, Block.ENTRY, True)
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
     s = state.autom.book(U).sets[0]
-    sys_.cancel_fail_times = 100                  # 취소 요청이 계속 실패(확인도 안 옴)
+    sys_.cancel_fail_times = 100                  # 취소 요청이 계속 거부됨
     eng.set_running(U, 0, Block.ENTRY, False)     # 1회
     before = sys_.error_seq
     mono = 100.0
-    for _ in range(3):                            # 3초마다 재전송 → 4회째에 알람
-        mono += 3.0
+    for _ in range(3):                            # 3번 거부 → 표시 되돌림 → 다음 판정에서 다시
+        for _ in range(8):
+            await asyncio.sleep(0)
+        assert not s.entry.cancel_sent
+        mono += 1.0
         eng.tick(datetime(2026, 9, 4, 10, 0, 0), mono)
-    assert s.entry.cancel_tries == 4 and s.entry.cancel_alarmed
+    assert s.entry.cancel_tries == 4 and s.entry.cancel_alarmed  # 4회째에 알람
     assert sys_.error_seq == before + 1
     row = eng.live_snapshot()[U.value]["sets"][0]["entry"]
     assert row["cancel_failed"] is True and row["cancel_tries"] == 4
     for task in list(eng._bg):
         task.cancel()
+    await _settle()
+
+
+async def test_cancel_without_confirmation_or_response_is_never_resent() -> None:
+    # 사용자 2026-10-01(결정 61): "취소확인은 데이터 올 때까지 기다림". ① 취소 요청은 받아들여졌는데
+    # 확정 통보가 안 옴 → 시간이 지나도 다시 보내지 않는다(옛 3초 재전송 폐기). ② 취소 요청에 응답이
+    # 없음(시간 초과) = 결과 모름 → 다시 보내지 않고(옛 코드는 0.6초 뒤 재전송) 표시도 그대로 둔다.
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    sys_.cancel_timeout = True
+    sys_.s_entry = -0.5                           # S괴리 미달(G5) → 걸린 선주문 취소
+    eng.tick(datetime(2026, 9, 4, 10, 0, 1), 101.0)
+    await asyncio.sleep(0.05)
+    assert sys_.cancel_calls == 1 and s.entry.cancel_sent
+    for mono in (104.0, 110.0, 400.0):            # 3초·그 뒤로도 재전송 없음
+        eng.tick(datetime(2026, 9, 4, 10, 0, 2), mono)
+        await asyncio.sleep(0.02)
+    assert sys_.cancel_calls == 1 and s.entry.cancel_tries == 1
+    assert s.entry.pre_order_id == "O1" and not s.entry.cancel_alarmed
+    sys_.order_book.on_cancel("O1")               # 뒤늦게 온 취소 확정 통보가 정리한다
+    await _settle()
+    assert s.entry.pre_order_id is None
+
+
+def _count_ticks(eng: AutoMEngine) -> list[set[Underlying] | None]:
+    """엔진 tick 호출을 기록(only 인자) — 판정이 언제·어느 종목에 돌았는지 본다."""
+    calls: list[set[Underlying] | None] = []
+    real = eng.tick
+
+    def spy(now: datetime, mono: float, only: set[Underlying] | None = None) -> None:
+        calls.append(None if only is None else set(only))
+        real(now, mono, only)
+
+    eng.tick = spy  # type: ignore[method-assign]
+    return calls
+
+
+async def test_pump_evaluates_only_on_market_data_of_that_underlying() -> None:
+    # 사용자 2026-10-01(결정 59): 판정은 그 종목 판정에 쓰는 시세가 들어온 때만. 시세가 없으면
+    # 판정도 없다(옛 0.1초 주기 폐지).
+    eng, sys_, state = _engine()
+    other = Underlying.SAMSUNG
+    state.autom.book(other)                       # 다른 종목 상태도 있음
+    eng.set_running(U, 0, Block.ENTRY, True)
+    calls = _count_ticks(eng)
+    now = datetime(2026, 9, 4, 10, 0, 0)
+    eng.pump(now, 100.0)                          # 첫 차례 — 전 종목 한 번(시동)
+    await _settle()
+    assert calls == [None] and len(sys_.placed) == 1
+    eng.pump(now, 100.2)
+    eng.pump(now, 100.4)
+    assert calls == [None]                        # 시세가 안 왔다 → 판정 없음
+    hl = sys_.quotes[(U, Instrument.HL_PERP, "hl")]
+    eng._on_market(hl)                            # HL 호가 수신 → 그 종목만
+    eng._on_market(hl)                            # 몰려 와도 한 번
+    eng.pump(now, 100.5)
+    assert calls == [None, {U}]
+    eng._on_market(sys_.quotes[(U, SF, "krx")])   # LS 주식선물 호가
+    eng.pump(now, 100.6)
+    assert calls[-1] == {U} and len(calls) == 3
+    # 판정에 안 쓰는 시세(차근월물 호가 — 이 종목 상태는 최근월물)는 계기가 아니다
+    eng._on_market(Quote(underlying=U, instrument=Instrument.KR_STOCK_FUTURE_NEXT,
+                         bid=1.0, ask=2.0, ts=0))
+    eng.pump(now, 100.7)
+    assert len(calls) == 3
+    # 주식 체결(현재가)·예상체결은 계기, 주식선물 체결은 아님
+    from kp_arb.gateways.ls_ws import TradeTick
+
+    eng._on_tick(TradeTick(underlying=U, instrument=SF, price=1.0, ts=0, market="krx"))
+    eng.pump(now, 100.8)
+    assert len(calls) == 3
+    eng._on_tick(TradeTick(underlying=U, instrument=Instrument.KR_STOCK, price=1.0, ts=0,
+                                 market="krx"))
+    eng.pump(now, 100.9)
+    assert calls[-1] == {U} and len(calls) == 4
+    eng._on_fx()                                  # 환율 수신 → 전 종목
+    eng.pump(now, 100.95)
+    assert calls[-1] is None and len(calls) == 5
+    # HL 공개 체결은 공통설정 "HL 체결 수신 때도 판정"을 켰을 때만 계기(결정 63, 기본 해제)
+    hl_trade = TradeTick(underlying=U, instrument=Instrument.HL_PERP, price=1184.0, ts=0,
+                         market="hl")
+    assert state.autom.settings.hl_trade_trigger is False
+    eng._on_tick(hl_trade)
+    eng.pump(now, 100.96)
+    assert len(calls) == 5
+    state.autom.settings.hl_trade_trigger = True
+    eng._on_tick(hl_trade)
+    eng.pump(now, 100.97)
+    assert calls[-1] == {U} and len(calls) == 6
+
+
+async def test_pump_runs_timers_for_delay_and_window_edges() -> None:
+    # 결정 59: 시간으로 풀리는 조건은 타이머로 — 선주문 딜레이가 끝나면 시세 없이도 그 종목을 판정해
+    # 다음 선주문을 내고, 주문가능시간 끝을 넘으면 걸린 선주문을 취소한다.
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    now = datetime(2026, 9, 4, 10, 0, 0)
+    eng.pump(now, 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    # 한 판을 끝낸다(선주문 10 체결 → 후주문 O2 100 체결) → 선주문 딜레이 1초
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    await _settle()
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=100, price=1184.0, ts=0))
+    await _settle()
+    assert s.entry.status is LegStatus.SETTLE_DELAY and s.entry.delay_until is not None
+    due = s.entry.delay_until
+    calls = _count_ticks(eng)
+    eng.pump(now, due - 0.4)
+    assert calls == []                            # 아직 딜레이 중 — 판정 없음
+    assert abs(eng._sleep_s(now, due - 0.4) - 0.4) < 1e-6  # 다음에 깨어날 때 = 딜레이 끝
+    eng.pump(now, due + 0.01)                     # 딜레이 끝 → 타이머가 그 종목 판정
+    await _settle()
+    assert calls == [{U}] and s.entry.pre_order_id == "O3"
+    eng.pump(now, due + 0.3)
+    assert calls == [{U}]                         # 한 번만
+    # 주문가능시간(09:00~15:20) 끝 — 경계까지 남은 시간에 깨어나고, 넘으면 전 종목 판정 → 취소
+    near = datetime(2026, 9, 4, 15, 19, 59, 800_000)
+    eng._watch_at = due + 0.3                     # 감시 타이머(1초)보다 경계가 먼저
+    assert abs(eng._sleep_s(near, due + 0.3) - 0.2) < 1e-6
+    eng.pump(near, due + 0.3)
+    assert calls == [{U}]
+    eng.pump(datetime(2026, 9, 4, 15, 20, 0), due + 0.5)
+    await _settle()
+    assert calls == [{U}, None] and sys_.cancelled == ["O3"]
+
+
+async def test_watch_timer_cancels_resting_orders_when_either_feed_drops() -> None:
+    # 사용자 2026-10-01(결정 60): LS·HL 어느 한쪽이라도 끊기면 나가 있는 선주문 취소 후 대기 —
+    # 시세가 끊겨 판정 계기가 없어도 감시 타이머(1초)가 판정을 돌린다. 회복하면 그대로 재개.
+    from kp_arb.auto_m_engine import FEED_WATCH_S
+
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    now = datetime(2026, 9, 4, 10, 0, 0)
+    eng.pump(now, 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    calls = _count_ticks(eng)
+    sys_.hl_ok = False                            # HL 채널 끊김 — 시세는 안 온다
+    eng.pump(now, 100.0 + FEED_WATCH_S / 2)
+    assert calls == []                            # 아직 감시 시각 전
+    eng.pump(now, 100.0 + FEED_WATCH_S)           # 감시 → 상태 바뀜 → 전 종목 판정 → 취소
+    await _settle()
+    assert calls == [None] and sys_.cancelled == ["O1"]
+    assert "HL 피드 끊김" in s.entry.block_reason and s.entry.running
+    eng.pump(now, 100.0 + 2 * FEED_WATCH_S)       # 끊겨 있는 동안은 감시 때마다 판정
+    assert calls == [None, None] and len(sys_.placed) == 1
+    sys_.hl_ok = True                             # 회복 → 감시가 알아채고 재개(딜레이는 이미 지남)
+    eng.pump(now, 100.0 + 3 * FEED_WATCH_S)
+    await _settle()
+    assert len(sys_.placed) == 2 and s.entry.pre_order_id == "O2"
+    eng.pump(now, 100.0 + 4 * FEED_WATCH_S)       # 정상이고 바뀐 것 없음 → 판정 없음
+    assert len(calls) == 3
+    sys_.feed_ok = False                          # LS 쪽이 끊겨도 같다
+    eng.pump(now, 100.0 + 5 * FEED_WATCH_S)
+    await _settle()
+    assert sys_.cancelled == ["O1", "O2"]
+
+
+async def test_run_loop_wakes_on_market_data_and_does_not_spin() -> None:
+    # 루프 종료성·헛돌기 확인: 시세가 없으면 감시 간격으로만 깨어나고, 시세 수신이 오면 바로 판정.
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    pumps = 0
+    real_pump = eng.pump
+
+    def counting(now: datetime, mono: float) -> None:
+        nonlocal pumps
+        pumps += 1
+        real_pump(now, mono)
+
+    eng.pump = counting  # type: ignore[method-assign]
+    task = asyncio.create_task(eng.run())
+    await asyncio.sleep(0.15)
+    assert pumps <= 3                             # 시세 없음 — 헛돌지 않는다
+    s = state.autom.book(U).sets[0]
+    sys_.order_book.on_cancel(s.entry.pre_order_id or "")  # 시동 판정으로 걸린 선주문을 밖에서 취소
+    state.autom.settings.pre_delay_ms = 0
+    s.entry.delay_until = 0.0
+    before = len(sys_.placed)
+    eng._on_market(sys_.quotes[(U, Instrument.HL_PERP, "hl")])  # 시세 수신 → 루프가 깨어 판정
+    await asyncio.sleep(0.05)
+    assert len(sys_.placed) == before + 1
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    for bg in list(eng._bg):
+        bg.cancel()
     await _settle()
 
 
@@ -924,6 +1134,12 @@ async def test_stock_product_commands_route_to_stock_book() -> None:
                                             "pre_delay_ms": 777, "risk_fwd_en": 0.002})
     assert res["ok"] and state.autom.settings_stock.pre_delay_ms == 777
     assert state.autom.settings.pre_delay_ms != 777 and state.autom.risk_stock_en == 0.002
+    # HL 체결 판정 계기(결정 63)도 상품별 — 주식 설정만 켜면 주식선물 설정은 해제 그대로
+    assert state.autom.settings_stock.hl_trade_trigger is False
+    res = await _autom_command(eng, state, {"cmd": "autom_settings", "product": "stock",
+                                            "hl_trade_trigger": True})
+    assert res["ok"] and state.autom.settings_stock.hl_trade_trigger is True
+    assert state.autom.settings.hl_trade_trigger is False
     bad = await _autom_command(eng, state, {"cmd": "autom_set", "underlying": U.value,
                                             "set": 0, "product": "etf"})
     assert not bad["ok"]
@@ -952,7 +1168,8 @@ def _stock_engine() -> tuple[AutoMEngine, FakeSystem, CoreState]:
 
 async def test_stock_engine_round_one_share_one_contract() -> None:
     # 주식 엔진(product="stock", exec §7C): 수치 = (100,751 − 100,000)/100,000 = 0.75% > 0.5% 통과,
-    # 주문가 = 100,751/1.005 = 100,250 → 주문단위 100 내림 100,200 → 주식 매수 선주문(KR_STOCK).
+    # 주문가 = 100,751/1.005 = 100,250 → 주문단위 100 내림 100,200 → 매도1호가(100,100)를 넘으므로
+    # 범위 시작 100,000(매도1 − 1틱)으로 되돌려 메이커로(결정 58) → 주식 매수 선주문(KR_STOCK).
     # 체결 4주 → HL 매도 후주문 4계약(1:1) → 체결 → RT 4, 체결차 0. 꼬리표는 "주정1진".
     eng, sys_, state = _stock_engine()
     await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": 0,
@@ -962,9 +1179,9 @@ async def test_stock_engine_round_one_share_one_contract() -> None:
     assert len(sys_.placed) == 1
     pre = sys_.placed[0]
     assert pre.instrument is Instrument.KR_STOCK and pre.side is Side.BUY
-    assert pre.qty == 10 and pre.price == 100_200.0 and pre.tag == "주정1진"
+    assert pre.qty == 10 and pre.price == 100_000.0 and pre.tag == "주정1진"
     assert pre.credit_code == "000" and pre.market == "krx"  # 일반 세트·KRX
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=100_200.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=100_000.0, ts=0))
     await _settle()
     post = sys_.placed[1]
     assert post.instrument is Instrument.HL_PERP and post.side is Side.SELL and post.qty == 4

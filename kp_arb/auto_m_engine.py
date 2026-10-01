@@ -48,6 +48,7 @@ from .auto_m import (
     order_qty,
     release_halt,
     set_running,
+    wake_times,
 )
 from .auto_m import _halt_set as halt_set
 from .disparity import disp, est_price
@@ -94,8 +95,10 @@ def is_cancel_gone(err_text: str) -> bool:
     return ("already canceled" in text or "or filled" in text or "unknown order" in text)
 
 
-TICK_S = 0.1
-CANCEL_RETRY_S = 0.6  # 취소 실패 뒤 다시 보내기까지(기존 _cancel_pre 재시도 간격과 같은 값)
+# 감시 타이머 간격 — 채널 연결·시장 정지·VI 상태가 바뀌었는지 보고, 끊겨 있는 동안은 이 간격으로
+# 판정을 돌린다(exec §4 판정 계기, 결정 60). 값은 Claude가 고름(사용자 확인 필요).
+FEED_WATCH_S = 1.0
+CANCEL_RETRY_S = 0.6  # 취소가 거부된 뒤 다시 보내기까지(한 건 취소·묶음 취소 공통, exec ㅂ3)
 SOURCE = "자동M"
 
 
@@ -119,6 +122,7 @@ class _SystemLike(Protocol):
     def stock_halted(self) -> bool: ...
     def stock_auction(self) -> bool: ...  # 주식 동시호가 중 — S괴리 필터 생략(결정 57)
     def ls_feed_ok(self) -> bool: ...  # LS 채널 연결(끊김·COM 정지면 False) — G0-1
+    def hl_feed_ok(self) -> bool: ...  # HL 채널 연결 — G0-1(결정 60)
     async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str: ...
     async def cancel(self, order_id: str) -> None: ...
     # 묶음 전송(exec §7D, 사용자 2026-09-30) — HL 주문 여러 건을 한 요청으로, 결과는 건별
@@ -203,10 +207,25 @@ class AutoMEngine:
         # 경합, 운영 실측 2026-09-30 #3908) 주인 없는 체결로 버리지 않고 그 세트에 헤지를 낸다
         # (결정 56)
         self._late_refs: dict[str, tuple[_OrderRef, float]] = {}
+        # 판정 계기(exec §4, 사용자 2026-10-01 결정 59) — 판정은 그 종목 시세가 들어온 때만. 시세
+        # 수신이 종목에 표시해 두면 루프(run)가 표시된 종목만 한 바퀴 돈다. 타이머·감시는 pump에서.
+        self._dirty: set[Underlying] = set()
+        self._dirty_all = False
+        self._wake: asyncio.Event | None = None  # run()이 만든다(루프 밖 동기 테스트는 None)
+        self._last_pump = float("-inf")  # 앞 차례 시각 — 그 뒤로 찬 타이머를 고른다
+        self._watch_at = float("-inf")   # 마지막 감시 시각
+        self._watch_state: tuple[Any, ...] | None = None
+        self._in_window: bool | None = None
         self._bg: set[asyncio.Task[None]] = set()
         system.order_book.on_fill_applied.append(self._on_fill_applied)
         system.order_book.on_change.append(self._on_book_change)
         system.on_hl_identified.append(self._on_hl_identified)
+        # 시세 수신 알림 — 없는 시스템(테스트용 가짜)은 건너뛴다(그쪽은 tick을 직접 부른다)
+        for name, handler in (("on_quote", self._on_market), ("on_trade", self._on_tick),
+                              ("on_expected", self._on_tick), ("on_fx", self._on_fx)):
+            hooks = getattr(system, name, None)
+            if hooks is not None:
+                hooks.append(handler)
         self._log_restored_halts()
 
     def _log_restored_halts(self) -> None:
@@ -305,15 +324,112 @@ class AutoMEngine:
 
     # ------------------------------------------------------------ 판정 루프 ---
     async def run(self) -> None:
+        """판정 루프 — 시세 수신·타이머·감시 중 먼저 오는 것에 깨어 pump 한 차례(exec §4 판정
+        계기). 주기 반복은 없다."""
+        self._wake = asyncio.Event()
         while True:
+            self._wake.clear()
             try:
-                self.tick(datetime.now(), time.monotonic())
-            except Exception:  # noqa: BLE001 - 한 틱의 오류로 죽지 않는다
-                self._log.exception("자동M 판정 틱 오류 — 계속")
-            await asyncio.sleep(TICK_S)
+                self.pump(datetime.now(), time.monotonic())
+                wait_s = self._sleep_s(datetime.now(), time.monotonic())
+            except Exception:  # noqa: BLE001 - 한 차례의 오류로 죽지 않는다
+                self._log.exception("자동M 판정 오류 — 계속")
+                wait_s = FEED_WATCH_S
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=wait_s)
+            except TimeoutError:
+                pass  # 타이머·감시 시각
+            await asyncio.sleep(0)  # 몰려 온 시세는 모아서 한 번에(다른 수신 처리에 차례를 준다)
 
-    def tick(self, now: datetime, mono: float) -> None:
-        """전 종목·세트·진입/청산 1회 판정(now/mono 주입 — 테스트 가능)."""
+    # 판정 계기가 되는 시세(exec §4 표) — 그 종목에 표시하고 루프를 깨운다
+    def _on_market(self, quote: Quote) -> None:
+        """호가 수신 — HL 호가 · LS 주식 호가 · LS 주식선물 호가(이 종목 상태가 고른 월물)."""
+        from .auto_m import book_key
+
+        book = self.screen.books.get(book_key(quote.underlying, self.product))
+        if book is not None and quote.instrument in (
+                Instrument.HL_PERP, Instrument.KR_STOCK, self._counterpart(book)):
+            self._mark(quote.underlying)
+
+    def _on_tick(self, tick: Any) -> None:
+        """LS 주식 체결(현재가)·예상체결 수신 — 이론가·괴리의 기준가가 바뀐다. HL 공개 체결은
+        공통설정 "HL 체결 수신 때도 판정"을 켰을 때만 계기(결정 63, 기본 해제)."""
+        if tick.instrument is Instrument.KR_STOCK or (
+                tick.instrument is Instrument.HL_PERP and self._settings.hl_trade_trigger):
+            self._mark(tick.underlying)
+
+    def _on_fx(self) -> None:
+        """판정 환율 수신(현물환율·원달러선물 체결) — 전 종목."""
+        self._mark(None)
+
+    def _mark(self, u: Underlying | None) -> None:
+        if u is None:
+            self._dirty_all = True
+        else:
+            self._dirty.add(u)
+        self._poke()
+
+    def _poke(self) -> None:
+        """루프를 깨운다 — 표시된 종목 판정, 또는 상태가 바뀐 뒤 타이머를 다시 잡게."""
+        if self._wake is not None:
+            self._wake.set()
+
+    def _watch_snapshot(self) -> tuple[Any, ...]:
+        """감시 타이머가 보는 상태 — 채널 연결(LS·HL)·시장 정지·종목 VI."""
+        halted = (self._system.stock_halted() if self.product == "stock"
+                  else self._system.futures_halted())
+        vi = tuple(self._vi_halted(u) for u, _b in self.screen.books_of(self.product))
+        return (self._system.ls_feed_ok(), self._hl_feed_ok(), halted, vi)
+
+    def _hl_feed_ok(self) -> bool:
+        """코어의 HL 채널 연결 여부 — 없는 시스템(테스트용 가짜)은 True."""
+        fn = getattr(self._system, "hl_feed_ok", None)
+        return bool(fn()) if callable(fn) else True
+
+    def pump(self, now: datetime, mono: float) -> None:
+        """루프 한 차례(now/mono 주입 — 테스트 가능): 시세가 표시한 종목 + 타이머가 찬 종목을 한
+        바퀴 판정. 감시에서 상태가 바뀌었거나 채널이 끊겨 있으면, 또 주문가능시간 경계를 넘었으면
+        전 종목."""
+        due, everything = self._dirty, self._dirty_all
+        self._dirty, self._dirty_all = set(), False
+        if mono - self._watch_at >= FEED_WATCH_S:
+            self._watch_at = mono
+            state = self._watch_snapshot()
+            if state != self._watch_state or not (state[0] and state[1]):
+                everything = True  # 끊겨 있는 동안은 감시 때마다(취소가 실패했으면 다시 보내도록)
+            self._watch_state = state
+        in_window = self._settings.in_window(now.time())
+        if in_window != self._in_window:
+            self._in_window = in_window
+            everything = True
+        if not everything:
+            for u, book in self.screen.books_of(self.product):
+                if u in due:
+                    continue
+                resumed = self._resumed_for(u)
+                # 앞 차례와 같은 시각의 타이머도 다시 본다(시계 눈금이 거칠어 같은 값일 수 있다)
+                if any(self._last_pump <= t <= mono for _r, _i, s in book.all_sets()
+                       for t in wake_times(s, self._settings, resumed)):
+                    due.add(u)
+        self._last_pump = mono
+        if everything or due:
+            self.tick(now, mono, None if everything else due)
+
+    def _sleep_s(self, now: datetime, mono: float) -> float:
+        """다음에 깨어날 때까지 — 감시 시각, 주문가능시간 경계, 세트 타이머 중 가장 이른 것."""
+        waits = [self._watch_at + FEED_WATCH_S - mono]
+        edge = self._settings.next_edge_s(now)
+        if edge is not None:
+            waits.append(edge)
+        for u, book in self.screen.books_of(self.product):
+            resumed = self._resumed_for(u)
+            waits.extend(t - mono for _r, _i, s in book.all_sets()
+                         for t in wake_times(s, self._settings, resumed) if t > mono)
+        return max(0.0, min(waits))
+
+    def tick(self, now: datetime, mono: float, only: set[Underlying] | None = None) -> None:
+        """세트·진입/청산 1회 판정(now/mono 주입 — 테스트 가능). only가 있으면 그 종목들만,
+        없으면 전 종목."""
         self._mono = mono
         # 시장 정지 — 주식선물은 선물시장, 주식은 주식시장 오버레이(사용자 확정 2026-09-17)
         halted = (self._system.stock_halted() if self.product == "stock"
@@ -328,6 +444,8 @@ class AutoMEngine:
             self._tick_pre, self._tick_cancel = [], []
         try:
             for u, book in self.screen.books_of(self.product):
+                if only is not None and u not in only:
+                    continue
                 # 종목 VI(exec §8, 사용자 2026-09-17): 주식은 그 종목 VI 발동 중에도 정지로 본다
                 # — 단일가 전환이라 호가에 걸어 두는 선주문이 무의미. 해제 뒤 재개 딜레이는 시장
                 # 정지와 같다.
@@ -422,7 +540,7 @@ class AutoMEngine:
             hl_est_bid=est_bid, hl_est_ask=est_ask,
             hl_bids=hl_bids, hl_asks=hl_asks,
             hl_sz_decimals=hl_info.sz_decimals if hl_info is not None else None,
-            ls_feed_ok=self._system.ls_feed_ok(),
+            ls_feed_ok=self._system.ls_feed_ok(), hl_feed_ok=self._hl_feed_ok(),
             stock_auction=self._system.stock_auction())
 
     # ------------------------------------------------------------ 행동 실행 ---
@@ -529,7 +647,7 @@ class AutoMEngine:
             self._trace(u, index, block, s.leg(block), reverse)
             return
         self._register(oid, _OrderRef(u, index, block, "pre", reverse))  # 상품은 엔진 단위
-        late = on_pre_ack(s, block, oid, mono=self._mono)  # 발주 중 꺼졌/중지됐으면 취소 행동
+        late = on_pre_ack(s, block, oid)  # 발주 중 꺼졌/중지됐으면 취소 행동
         if late:
             self._log.warning("[자동M] %s 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → 즉시 취소",
                               u.value, self._tag(u, index, block, reverse), oid)
@@ -572,7 +690,7 @@ class AutoMEngine:
         if cloid:
             self._pending_refs.pop(cloid, None)
         self._register(oid, ref)
-        late = on_pre_ack(s, block, oid, mono=self._mono)
+        late = on_pre_ack(s, block, oid)
         if late:
             self._log.warning("[자동M] %s HL 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → 즉시 "
                               "취소", u.value, self._tag(u, index, block, reverse), oid)
@@ -634,7 +752,7 @@ class AutoMEngine:
                 self._trace(u, index, block, s.leg(block), reverse)
                 continue
             self._register(res.order_id, ref)
-            late = on_pre_ack(s, block, res.order_id, mono=self._mono)
+            late = on_pre_ack(s, block, res.order_id)
             if late:
                 self._log.warning("[자동M] %s HL 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → "
                                   "즉시 취소", u.value, tag, res.order_id)
@@ -753,12 +871,19 @@ class AutoMEngine:
                           order_id: str, reason: str, reverse: bool = False) -> None:
         self._log.info("[자동M] %s 선주문 취소 %s #%s %s",
                        u.value, self._tag(u, index, block, reverse), order_id, reason)
-        # LS 초당 한도(CFOAT00300 2회)에 걸리면 잠깐 뒤 다시 — 실측 2026-09-08: 한 번 실패한 채
-        # 두면 "취소 대기" 표시만 남아 재시도도 종료 취소도 안 됐다. 끝내 실패하면 표시를 되돌려
+        # 받은 데이터대로 처리한다(exec ㅂ3, 사용자 2026-10-01 결정 61).
+        # 거부 응답(LS 초당 한도 CFOAT00300 2회 등)이면 잠깐 뒤 다시 — 실측 2026-09-08: 한 번 실패한
+        # 채 두면 "취소 대기" 표시만 남아 재시도도 종료 취소도 안 됐다. 끝내 거부면 표시를 되돌려
         # 다음 판정이 다시 보낸다(이미 체결/취소된 주문의 거부도 통보로 정리된다).
         for attempt in range(3):
             try:
                 await self._system.cancel(order_id)
+                return
+            except RestTimeoutError as exc:
+                # 응답 없음 = 결과 모름(첫 요청이 접수됐을 수 있다) — 다시 보내지 않고 통보를
+                # 기다린다(CLAUDE.md §7). 표시도 되돌리지 않는다.
+                self._log.error("[자동M] 취소 응답 없음 #%s — 재전송 안 함, 통보 대기: %s",
+                                order_id, exc)
                 return
             except OrderGoneError as exc:
                 # 이미 체결/취소된 주문(LS 01433/03416, 장부 잔량 0) — 실패가 아니라 경합.
@@ -770,7 +895,7 @@ class AutoMEngine:
             except Exception as exc:  # noqa: BLE001 - 한도·통신 오류 등
                 self._log.warning("[자동M] 취소 실패 #%s (%d/3) — %s", order_id, attempt + 1, exc)
                 if attempt < 2:
-                    await asyncio.sleep(0.6)
+                    await asyncio.sleep(CANCEL_RETRY_S)
         s = self._set(u, index, reverse)
         if s.leg(block).pre_order_id == order_id:
             on_pre_cancel_failed(s, block)
@@ -1049,6 +1174,8 @@ class AutoMEngine:
         call_soon은 예약 순서대로 돌므로 먼저 예약된 후주문 태스크의 첫 스텝(전송까지)이 앞선다.
         루프 밖(동기 테스트)이면 그 자리에서 저장.
         """
+        # 체결·통보·명령으로 상태가 바뀌었다 — 판정 루프가 타이머(딜레이 끝 등)를 다시 잡게 깨운다
+        self._poke()
         if self._save is None or self._persist_pending:
             return
         try:
@@ -1197,7 +1324,7 @@ class AutoMEngine:
             "명령 %s: 실행 %s | 목표 %d 1회 %d 전환 %ds 진입SF %s 진입S %s 청산 %s RT %d",
             self._tag(u, index, block, reverse), "켬" if value else "끔", s.target_qty,
             s.per_qty, s.switch_delay_s, s.en_sf, s.en_s, s.ex_sf, s.rt)
-        self._apply(u, index, block, set_running(s, block, value, mono=self._mono), reverse)
+        self._apply(u, index, block, set_running(s, block, value), reverse)
         self._trace(u, index, block, s.leg(block), reverse)
 
     def release(self, u: Underlying, index: int, block: Block,

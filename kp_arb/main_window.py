@@ -29,12 +29,26 @@ _SCREEN_NAMES = {
     # 바로쏴(자동T) 화면은 2026-09-16 삭제 — 체결쏴 T 모드로 대체 예정
     "kp_arb.order_autom": "체결쏴",
     "kp_arb.order_autom_stock": "체결쏴(주식)",  # 화면만 연결(코어 주식 종목 상태 전, 2026-09-16)
-    "kp_arb.order_autom_hl_first": "체결쏴(HL선)",  # 주식선물 HL선 시험(exec §7D, 2026-09-22)
+    # 주식선물 HL선(exec §7D) — 시험 중지로 메뉴에서 뺌(2026-10-01, _RETIRED_SCREENS). 모듈은 남김
+    "kp_arb.order_autom_hl_first": "체결쏴(HL선)",
     "kp_arb.monitor": "시세 모니터", "kp_arb.fx_monitor": "FX 노출 감시",
     "kp_arb.order_hl": "HL 일반주문", "kp_arb.order_list": "주문 리스트",
     "kp_arb.fx_auction_order": "원달러선물 동시호가", "kp_arb.settings_window": "공통설정",
     "kp_arb.hl_trades": "HL 체결",
 }
+
+# 메뉴에서 뺀 화면(모듈은 남겨 둠) — 지난 화면 구성 복원에서도 다시 띄우지 않는다.
+# HL선: 시험 중지(사용자 2026-10-01, exec 결정 62)
+_RETIRED_SCREENS = frozenset({"kp_arb.order_autom_hl_first"})
+
+
+def restorable_screens(saved: dict[str, Any]) -> list[str]:
+    """저장된 화면 목록(ui_state의 screens — "모듈 [인자…]") 중 다시 띄울 것. 메뉴에서 뺀 화면과
+    모양이 틀린 항목은 버린다. (순수 함수)"""
+    return [m for m in saved.get("screens", [])
+            if isinstance(m, str) and m.startswith("kp_arb.")
+            and m.split(" ", 1)[0] not in _RETIRED_SCREENS]
+
 
 _MUTEX_HANDLES: list[int] = []  # 단일 인스턴스 뮤텍스 핸들 유지(프로세스 수명 동안)
 
@@ -229,8 +243,7 @@ def layout_choices(
             raw = json.loads(text)
         except json.JSONDecodeError:
             continue
-        screens = ([m for m in raw.get("screens", []) if isinstance(m, str)
-                    and m.startswith("kp_arb.")] if isinstance(raw, dict) else [])
+        screens = restorable_screens(raw) if isinstance(raw, dict) else []
         names = ", ".join(_SCREEN_NAMES.get(t.split(" ", 1)[0], t) for t in screens) or "(없음)"
         stamp = _time.strftime("%m-%d %H:%M:%S", _time.localtime(mtime))
         out.append((n, f"{stamp}   {names}", screens))
@@ -333,8 +346,7 @@ def main() -> None:
     except (OSError, json.JSONDecodeError):
         saved_raw = {}
     saved = saved_raw if isinstance(saved_raw, dict) else {}
-    saved_screens = [m for m in saved.get("screens", [])
-                     if isinstance(m, str) and m.startswith("kp_arb.")]
+    saved_screens = restorable_screens(saved)
     # 복원 전엔 저장 목록을 보존(screens_to_save) — 저장할 게 없으면 처음부터 '복원 끝'.
     restore_box: dict[str, Any] = {"done": not saved_screens, "saved": saved_screens}
 
@@ -673,8 +685,6 @@ def main() -> None:
                          command=lambda: open_screen("kp_arb.order_autom"))
     m_screen.add_command(label="체결쏴 (자동M)-주식",
                          command=lambda: open_screen("kp_arb.order_autom_stock"))
-    m_screen.add_command(label="체결쏴 (자동M)-주식선물(HL선) 시험",
-                         command=lambda: open_screen("kp_arb.order_autom_hl_first"))
     m_screen.add_command(label="시세 모니터",
                          command=lambda: open_screen("kp_arb.monitor"))
     m_screen.add_command(label="FX 노출 감시",

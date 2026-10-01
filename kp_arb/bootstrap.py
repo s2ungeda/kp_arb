@@ -351,6 +351,9 @@ class LiveSystem:
         self.on_mark: list[Callable[[Mark], None]] = []    # HL 마크
         self.on_trade: list[Callable[[TradeTick], None]] = []        # 체결(현재가)
         self.on_expected: list[Callable[[ExpectedPrice], None]] = []  # 예상체결가
+        # 판정 환율 시세 수신(현물환율 CUR · 원달러선물 체결) — 자동M 판정 계기(exec §4, 사용자
+        # 2026-10-01). 원달러선물 호가는 값 계산에만 쓰고 여기로 알리지 않는다.
+        self.on_fx: list[Callable[[], None]] = []
         self.on_funding: list[Callable[[Underlying, float], None]] = []  # HL 예정 펀딩률
         self.on_fill: list[Callable[[Fill], None]] = []  # 체결통보 (OrderBook 반영 후 호출)
         # 체결·취소내역(최신 우선, 주문리스트) — 시동 이후 **당일치 전부**(사용자 확정 2026-09-16:
@@ -1483,6 +1486,8 @@ class LiveSystem:
             return  # 차근월물 등은 환율이론가에 안 먹인다(최근월물 기준 유지)
         self.usdkrw_futures = price
         self._recompute_fx_theory()
+        for handler in self.on_fx:
+            handler()
 
     def _apply_fx_spot(self, rate: float) -> None:
         """원달러 현물환율(CUR) 실시간 수신 → HL 환산 본선 환율. Naver 백업은 이걸로 억제."""
@@ -1499,6 +1504,8 @@ class LiveSystem:
         self.usdkrw_spot = rate
         self.usdkrw_spot_src = "LS"
         self._fx_spot_ts = _t.monotonic()
+        for handler in self.on_fx:
+            handler()
 
     async def _fx_loop(self) -> None:
         """환율 예비 갱신 — 시동 직후 초기값 + 30초 간격 확인 조회(t2111).
@@ -1618,6 +1625,11 @@ class LiveSystem:
         오판 방지) — 연결 여부만."""
         clients = [c for c in (self._stock_ws, self._deriv_ws) if c is not None]
         return bool(clients) and all(c.status.connected for c in clients)
+
+    def hl_feed_ok(self) -> bool:
+        """HL 채널(WS)이 연결 상태인가 — 자동M G0-1(사용자 2026-10-01: 어느 한쪽이라도 끊기면 나가
+        있는 선주문 취소 후 대기). LS와 같이 연결 여부만 본다."""
+        return self._hl_ws is not None and self._hl_ws.status.connected
 
     def ws_statuses(self) -> list[WsStatus]:
         """살아있는 WS 채널들의 현황(메인창 표·주문 안전차단 Phase 8-6용).

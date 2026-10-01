@@ -195,6 +195,8 @@ def settings_payload(common: dict[str, Any]) -> dict[str, Any]:
         "rel_buy": int(common["rel_buy"]), "rel_sell": int(common["rel_sell"]),
         "hl_margin_buy": float(common.get("hl_margin_buy", 1.0)) / 100.0,
         "hl_margin_sell": float(common.get("hl_margin_sell", 1.0)) / 100.0,
+        # HL 체결 수신도 판정 계기로(결정 63) — 옛 화면 상태에 키가 없으면 해제
+        "hl_trade_trigger": bool(common.get("hl_trade_trigger", False)),
         "risk_fwd_en": float(common["risk"]["fwd_en"]) / 100.0,
         "risk_fwd_ex": float(common["risk"]["fwd_ex"]) / 100.0,
         "risk_fwd_gap": float(common["risk"]["fwd_gap"]) / 100.0,
@@ -446,6 +448,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         "pre_delay": 1000, "resume_delay": 10, "pre_range": 0.4,
         "rel_buy": 1, "rel_sell": 1,
         "hl_margin_buy": 1.0, "hl_margin_sell": 1.0,  # 후주문 HP 여유(%) — 지정가 taker
+        "hl_trade_trigger": False,  # HL 체결 수신 때도 판정(결정 63, 기본 해제)
 
         "risk": {"fwd_en": 0.0, "fwd_ex": 0.5, "fwd_gap": 0.1,
                  "rev_en": 0.5, "rev_ex": 0.0, "rev_gap": 0.1},
@@ -517,7 +520,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
 
     def on_under_change(_e: object = None) -> None:
         """종목 콤보 — 그 종목의 종목 상태(세트·RT·체결차·기준수량·월물)을 코어에서 다시 보여준다.
-        이 창의 종목이 실행 중이면 콤보가 잠겨 바꿀 수 없다(사용자 확정 2026-09-17)."""
+        실행 중에도 바꿀 수 있다(사용자 2026-10-01) — 실행 중이던 종목은 코어에서 계속 돈다."""
         state_box["_loaded_under"] = None  # 다음 갱신 때 그 종목 상태으로 입력값 다시 채움
         agg_shown["under"] = ""
         agg_map.clear()
@@ -1216,6 +1219,13 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             e_hp.insert(0, f"{common.get(hk, 1.0):g}")
             e_hp.grid(row=r, column=1, padx=4, pady=2)
             hp_ents[hk] = e_hp
+        # 줄2 오른쪽 — 판정 계기(사용자 2026-10-01, exec §4·결정 63): HL 공개 체결 수신 때도 그
+        # 종목을 판정할지. 기본 해제(HL은 호가 수신만 계기).
+        trig = tk.LabelFrame(win, text="판정 계기")
+        trig.grid(row=2, column=2, columnspan=2, sticky="new", padx=6, pady=4)
+        hl_trade_var = tk.BooleanVar(win, value=bool(common.get("hl_trade_trigger", False)))
+        tk.Checkbutton(trig, text="HL 체결 수신 때도 판정", variable=hl_trade_var).grid(
+            row=0, column=0, sticky="w", padx=4, pady=2)
         # 줄1 오른쪽 — 선주문 딜레이·재개 딜레이·범위 (3행 — 호가단위 틀과 같은 줄, 행 높이 일치)
         pr = tk.LabelFrame(win, text="선주문")
         pr.grid(row=1, column=0, columnspan=2, sticky="new", padx=6, pady=4)
@@ -1268,6 +1278,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 common[rk] = choices.index(cb.get()) + 1
             for hk, e_hp in hp_ents.items():
                 common[hk] = parse_threshold(e_hp.get()) or 0.0
+            common["hl_trade_trigger"] = bool(hl_trade_var.get())
             for rk, e in risk_ents.items():
                 common["risk"][rk] = parse_threshold(e.get()) or 0.0
             refresh_windows_bar()
@@ -1404,6 +1415,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                        "rel_buy": common["rel_buy"], "rel_sell": common["rel_sell"],
                        "hl_margin_buy": common.get("hl_margin_buy", 1.0),
                        "hl_margin_sell": common.get("hl_margin_sell", 1.0),
+                       "hl_trade_trigger": bool(common.get("hl_trade_trigger", False)),
                        "risk": dict(common["risk"])}}
 
     def _restore_saved() -> None:
@@ -1444,6 +1456,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             for hk in ("hl_margin_buy", "hl_margin_sell"):
                 if isinstance(sc.get(hk), int | float):
                     common[hk] = float(sc[hk])
+            if isinstance(sc.get("hl_trade_trigger"), bool):
+                common["hl_trade_trigger"] = sc["hl_trade_trigger"]
             if isinstance(sc.get("risk"), dict):
                 for k in common["risk"]:
                     if isinstance(sc["risk"].get(k), int | float):
@@ -1678,6 +1692,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                          ("hl_margin_sell", "hl_margin_sell")):
             if isinstance(st.get(src), int | float):
                 common[dst] = float(st[src]) * 100.0  # 코어는 소수, 화면은 %
+        if isinstance(st.get("hl_trade_trigger"), bool):
+            common["hl_trade_trigger"] = st["hl_trade_trigger"]
         for src, dst in risk_map:
             if isinstance(am.get(src), int | float):
                 common["risk"][dst] = float(am[src]) * 100.0
@@ -1813,15 +1829,13 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                     for v_lbl, text in zip(vals_l, texts[:len(vals_l)], strict=True):
                         v_lbl.config(text=text)
         _refresh_merge_combo(data)
-        # 이 종목이 실행 중이면 종목·호가단위·월물 콤보와 '적' 잠금(실행 중 종목·상대 상품·
-        # 호가단위가 바뀌면 판정 기준이 통째로 바뀜). 종목 콤보 잠금은 사용자 2026-09-17 확정
-        # (09-08 "항상 열림"은 폐기 — 다른 종목은 다른 창에서 종목을 먼저 고른 뒤 돌린다).
-        # 거래소 콤보(주식)는 잠그지 않는다(사용자 2026-09-17) — 고르면 바로 코어에 간다.
-        # 주식 화면은 종목 콤보를 잠그지 않는다(사용자 2026-09-28, exec §7C) — 실행 중에도 다른
-        # 종목 상태를 보러 갈 수 있다('적'·호가단위는 그대로 잠금).
+        # 이 종목이 실행 중이면 호가단위·월물 콤보와 '적' 잠금(실행 중 상대 상품·호가단위가
+        # 바뀌면 판정 기준이 통째로 바뀜). 거래소 콤보(주식)는 잠그지 않는다(사용자 2026-09-17)
+        # — 고르면 바로 코어에 간다.
+        # 종목 콤보는 실행 중에도 잠그지 않는다(사용자 2026-10-01, exec 결정 65 — 주식은 09-28부터,
+        # 주식선물의 09-17 잠금은 폐기). 다른 종목 상태를 보러 갈 수 있고, 실행 중이던 종목은
+        # 코어에서 계속 돈다.
         running = _any_running()
-        lock_under = running and spec.product != "stock"
-        cb_under.config(state="disabled" if lock_under else "readonly")
         for cb in (cb_agg, cb_month):
             cb.config(state="disabled" if running else "readonly")
         btn_apply.config(state="disabled" if running else "normal")

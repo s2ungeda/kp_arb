@@ -29,6 +29,20 @@ def test_layout_choices_lists_generations_with_names() -> None:
     assert "HL 일반주문" in out[2][1]
 
 
+def test_retired_hl_first_screen_is_not_restored() -> None:
+    # 사용자 2026-10-01(exec 결정 62): HL선 시험 중지 — 메인 메뉴에서 뺐고(모듈은 남김), 지난 화면
+    # 구성에 남아 있어도 시동 복원·"화면 구성 되돌리기"에서 다시 띄우지 않는다.
+    from kp_arb.main_window import restorable_screens
+
+    saved = {"screens": ["kp_arb.order_autom", "kp_arb.order_autom_hl_first",
+                         "kp_arb.order_autom_hl_first 2", "kp_arb.order_hl 1", 7, "evil.module"]}
+    assert restorable_screens(saved) == ["kp_arb.order_autom", "kp_arb.order_hl 1"]
+    assert restorable_screens({}) == []
+    gens = [(1, 0.0, '{"screens": ["kp_arb.order_autom_hl_first", "kp_arb.monitor"]}')]
+    out = layout_choices(gens)
+    assert out[0][2] == ["kp_arb.monitor"] and "HL선" not in out[0][1]
+
+
 def test_screens_to_save_keeps_saved_list_until_restored() -> None:
     # 복원 전(코어 시동 대기·복원 포기)엔 저장 목록 보존 — 2초 주기 저장이 빈 목록으로
     # 덮어써 이전 화면들이 날아가던 문제(실측 2026-09-07).

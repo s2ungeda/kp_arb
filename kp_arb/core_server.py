@@ -631,6 +631,8 @@ async def _autom_command(
             for key in ("hl_margin_buy", "hl_margin_sell"):  # 후주문 지정가 여유(소수)
                 if key in body:
                     setattr(st, key, float(body[key]))
+            if "hl_trade_trigger" in body:  # HL 체결 수신도 판정 계기로(결정 63)
+                st.hl_trade_trigger = bool(body["hl_trade_trigger"])
             for key in ("risk_fwd_en", "risk_fwd_ex", "risk_fwd_gap",
                         "risk_rev_en", "risk_rev_ex", "risk_rev_gap"):
                 if key in body:  # 주식은 정방향 리스크값을 주식 칸(risk_stock_*)에
@@ -643,10 +645,11 @@ async def _autom_command(
             # (실측 2026-09-08: 주문가능시간을 줄인 순간 걸린 선주문이 취소됐는데 기록이 없었음).
             logging.getLogger("kp_arb.autom").info(
                 "[자동M] 체결쏴 설정 변경: 주문가능시간 %s 선주문딜레이 %dms 재개 %ds 범위 %.3f%% "
-                "상대호가 매수%d/매도%d 후주문HP 매수%.2f%%/매도%.2f%% 주문단위 %s "
+                "상대호가 매수%d/매도%d 후주문HP 매수%.2f%%/매도%.2f%% HL체결판정 %s 주문단위 %s "
                 "리스크 정 %s/%s/%s 역 %s/%s/%s",
                 st.windows, st.pre_delay_ms, st.resume_delay_s, st.pre_range * 100,
                 st.rel_buy, st.rel_sell, st.hl_margin_buy * 100, st.hl_margin_sell * 100,
+                "켬" if st.hl_trade_trigger else "끔",
                 {u.value: t for u, t in st.pre_tick.items()},
                 am.risk_fwd_en, am.risk_fwd_ex, am.risk_fwd_gap,
                 am.risk_rev_en, am.risk_rev_ex, am.risk_rev_gap)

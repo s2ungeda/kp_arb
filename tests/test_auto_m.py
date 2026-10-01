@@ -112,16 +112,19 @@ def test_replace_rule_cancel_then_wait_post_then_delay_then_fresh_qty() -> None:
     on_pre_fill(s, Block.ENTRY, 4, 201_000.0, mono=101)  # 후주문 40 대기 중
     # HL est 괴리 1%→2%면 역산가 203,000이지만 틱 3,000 내림으로 201,000 그대로 → 재발주 없음
     assert evaluate(s, Block.ENTRY, _sig(mono=101.5, hl_disp_bid=0.02), SETTINGS, U) == []
-    # 3%면 205,000 → 내림 204,000 ≠ 201,000 → 재발주 규칙 발동
-    acts = evaluate(s, Block.ENTRY, _sig(mono=102, hl_disp_bid=0.03), SETTINGS, U)
+    # 3%면 205,000 → 내림 204,000 ≠ 201,000 → 재발주 규칙 발동. 호가도 같이 올라(매도1 204,500)
+    # 204,000이 메이커 자리(결정 58: 상대호가를 넘는 역산가는 범위 시작으로 되돌리므로 호가가
+    # 그대로면 201,000 유지 → 재발주 없음)
+    up = dict(hl_disp_bid=0.03, sf_asks=[(204_500.0, 5), (207_500.0, 3)])
+    acts = evaluate(s, Block.ENTRY, _sig(mono=102, **up), SETTINGS, U)
     assert [(a.kind, a.order_id) for a in acts] == [("cancel_pre", "2801")]
-    assert evaluate(s, Block.ENTRY, _sig(mono=102.5, hl_disp_bid=0.03), SETTINGS, U) == []
+    assert evaluate(s, Block.ENTRY, _sig(mono=102.5, **up), SETTINGS, U) == []
     on_pre_cancelled(s, Block.ENTRY, mono=103, settings=SETTINGS)
     assert s.entry.await_post_then_delay and s.entry.status is LegStatus.PRE_PARTIAL
-    assert evaluate(s, Block.ENTRY, _sig(mono=103.5, hl_disp_bid=0.03), SETTINGS, U) == []
+    assert evaluate(s, Block.ENTRY, _sig(mono=103.5, **up), SETTINGS, U) == []
     on_post_fill(s, Block.ENTRY, 40, 1184.0, 1356.1, mono=104, settings=SETTINGS)
     assert s.rt == 4 and s.entry.status is LegStatus.SETTLE_DELAY
-    acts = evaluate(s, Block.ENTRY, _sig(mono=105.1, hl_disp_bid=0.03), SETTINGS, U)
+    acts = evaluate(s, Block.ENTRY, _sig(mono=105.1, **up), SETTINGS, U)
     assert acts[0].kind == "place_pre" and acts[0].qty == 10 and acts[0].price == 204_000.0
 
 
@@ -157,11 +160,12 @@ def test_signal_gate_uses_only_s_for_entry_and_nothing_for_exit() -> None:
     set_running(s, Block.ENTRY, True)
     acts = evaluate(s, Block.ENTRY, _sig(sf_spread_entry=-0.05), SETTINGS, U)  # SF 크게 미달
     assert [a.kind for a in acts] == ["place_pre"]  # 그래도 발주 — SF 기준값은 역산가에만
-    s2 = _set()
+    s2 = _set(pre_tick=500)
     s2.rt = 10  # 청산할 RT가 있어야 G4 통과
     set_running(s2, Block.EXIT, True)
     # 옛 규칙이면 SF괴리 0.05 > 청산 −0.001로 미달. hl_disp_ask −1.2% → 역산가 197,800 → 주문단위
-    # 3,000 올림 198,000 ≤ 매도 한계 (198,500 + 500) × 1.004 = 199,796 (G6 통과)
+    # 500 올림 198,000 → 범위 시작 199,000으로 보정(결정 58) ≤ 매도 한계 (198,500 + 500) × 1.004
+    # = 199,796 (G6 통과)
     acts2 = evaluate(s2, Block.EXIT, _sig(sf_spread_exit=0.05, hl_disp_ask=-0.012), SETTINGS, U)
     assert [a.kind for a in acts2] == ["place_pre"]  # 청산은 조건 비교 없음
     s3 = _set()
@@ -291,7 +295,8 @@ def test_fill_before_cancel_confirmation_does_not_freeze_in_delay() -> None:
     acts = evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
     assert [a.kind for a in acts] == ["place_pre"] and s.entry.pre_price == 201_000.0
     on_pre_ack(s, Block.ENTRY, "1")
-    acts = evaluate(s, Block.ENTRY, _sig(hl_disp_bid=0.03), SETTINGS, U)  # 역산가 204,000
+    acts = evaluate(s, Block.ENTRY, _sig(hl_disp_bid=0.03, sf_asks=[(204_500.0, 5)]),
+                    SETTINGS, U)  # 역산가 204,000(매도1 204,500 → 메이커 자리, 결정 58)
     assert [a.kind for a in acts] == ["cancel_pre"] and s.entry.replace_pending
     on_pre_fill(s, Block.ENTRY, 10, 201_000.0, mono=101.0)                # 취소 전에 전량 체결
     assert s.entry.status is LegStatus.POST_PENDING
@@ -308,19 +313,21 @@ def test_reverse_entry_is_sf_sell_hl_buy_with_flipped_gates() -> None:
     # G6는 HL 매도호가창 est·주문단위 올림·한계 (상대매수N호가+1틱)(1+범위) 이하. RT는 −쪽으로,
     # SF 순잔고 −, HL 순잔고 +. 화면 RT는 −값 그대로.
     s = AutoMSet(target_qty=100, per_qty=10, switch_delay_s=30, en_sf=0.005, en_s=0.005,
-                 ex_sf=-0.001, reverse=True)
+                 ex_sf=-0.001, reverse=True, pre_tick=500)
     assert s.entry.pre_side is Side.SELL and s.entry.post_side is Side.BUY
     assert s.exit.pre_side is Side.BUY and s.exit.post_side is Side.SELL
     set_running(s, Block.ENTRY, True)
     # G5: 매도호가창 S괴리(s_spread_exit)를 본다 — 기준(0.5%) 이상이면 미달
     acts = evaluate(s, Block.ENTRY, _sig(s_spread_exit=0.02, hl_disp_ask=-0.02), SETTINGS, U)
     assert acts == [] and "G5 미달" in s.entry.block_reason
-    # 통과: 역산가 = 200,000×(1 − 2.0% − 0.5%) = 195,000 → 3,000 올림 195,000; 한계(매도) =
-    # (매수1호가 198,500 + 500) × 1.004 = 199,796 → 195,000 ≤ 한계 → SF 매도 선주문
+    # 통과: 역산가 = 200,000×(1 − 2.0% − 0.5%) = 195,000 → 주문단위 500 올림 195,000; 한계(매도) =
+    # (매수1호가 198,500 + 500) × 1.004 = 199,796 → 195,000 ≤ 한계. 다만 매수1호가(198,500) 안쪽이라
+    # 범위 시작 199,000으로 되돌려 메이커로 건다(결정 58, 사용자 2026-09-30)
     acts = evaluate(s, Block.ENTRY, _sig(s_spread_exit=-0.01, hl_disp_ask=-0.02), SETTINGS, U)
     assert [a.kind for a in acts] == ["place_pre"]
-    assert acts[0].side is Side.SELL and acts[0].qty == 10 and acts[0].price == 195_000
+    assert acts[0].side is Side.SELL and acts[0].qty == 10 and acts[0].price == 199_000
     assert "범위 199,000~199,796" in s.entry.block_reason
+    assert "메이커 보정 195,000→199,000" in s.entry.block_reason
     # 역산가가 한계보다 높으면(너무 비싸게 팔려고 물러남) 범위 밖
     on_pre_ack(s, Block.ENTRY, "R1")
     evaluate(s, Block.ENTRY, _sig(s_spread_exit=-0.01, hl_disp_ask=0.03), SETTINGS, U)
@@ -361,9 +368,12 @@ def test_reverse_sets_and_risk_round_trip_through_dict() -> None:
     book.rev_sets[1].target_qty, book.rev_sets[1].rt, book.rev_sets[1].sf_net = 7, -3, -3
     book.rev_sets[1].en_sf = -0.015
     screen.risk_rev_en, screen.risk_rev_gap = 0.004, 0.002
+    screen.settings_stock.hl_trade_trigger = True  # HL 체결 판정 계기(결정 63) — 상품별 저장
     raw = asdict(screen)
     restored = AutoMScreen()
+    assert restored.settings.hl_trade_trigger is False  # 기본 해제
     autom_from_dict(restored, raw)
+    assert restored.settings_stock.hl_trade_trigger and not restored.settings.hl_trade_trigger
     r = restored.book(U).rev_sets[1]
     assert (r.target_qty, r.rt, r.sf_net, r.en_sf) == (7, -3, -3, -0.015) and r.reverse
     assert r.held == 3 and restored.book(U).sets[1].target_qty == 0
@@ -387,10 +397,10 @@ def test_limit_uses_market_tick_not_order_unit() -> None:
     # 진입 후주문 = HL 매도 → 매수호가창 est(191.88)
     assert "HL 매수1 191.9 매도1 191.95 est 191.88" in s.entry.block_reason
     # 청산 후주문 = HL 매수 → 매도호가창 est(191.97) — 같은 근거 줄 형식
-    s2 = _set()
+    s2 = _set(pre_tick=500)
     s2.rt = 10
     set_running(s2, Block.EXIT, True)
-    evaluate(s2, Block.EXIT, _sig(hl_disp_ask=-0.02), SETTINGS, U)  # 역산가 198,000 ≤ 한계
+    evaluate(s2, Block.EXIT, _sig(hl_disp_ask=-0.02), SETTINGS, U)  # 196,500 → 199,000 ≤ 한계
     assert s2.exit.block_reason.startswith("통과")
     assert "HL 매수1 191.9 매도1 191.95 est 191.97" in s2.exit.block_reason
     assert "주문단위 3000" in s.entry.block_reason  # 역산가 반올림 단위는 그대로 설정값
@@ -414,45 +424,41 @@ def test_gate_cancel_is_sent_once_until_confirmed() -> None:
         == ["cancel_pre"]  # 새 주문은 다시 1번 취소 가능
 
 
-def test_cancel_resent_after_confirm_timeout_and_alarm_after_limit() -> None:
-    # exec ㅂ3(2026-09-09): 취소를 보내고 3초 안에 확인이 없으면 "보냄" 표시를 풀고 다시 보낸다.
-    # 재전송이 3회를 넘으면 한 번 알람(alarm) — 상태줄 "취소실패", 사람이 수동 취소.
-    from kp_arb.auto_m import CANCEL_ALARM_TRIES, CANCEL_CONFIRM_S
+def test_cancel_waits_for_data_and_alarms_only_on_repeated_rejects() -> None:
+    # exec ㅂ3(사용자 2026-10-01, 결정 61): 취소를 보낸 뒤에는 **시간으로 다시 보내지 않는다** —
+    # 통보가 올 때까지 기다린다(옛 "3초 안에 확인 없으면 재전송"은 폐기). 다시 보내는 것은 취소
+    # 요청이 거부돼 표시가 되돌려진 때뿐이고, 그렇게 보낸 횟수가 3회를 넘으면 한 번 알람(alarm) —
+    # 상태줄 "취소실패", 사람이 수동 취소.
+    from kp_arb.auto_m import CANCEL_ALARM_TRIES, on_pre_cancel_failed
 
     s = _set()
     set_running(s, Block.ENTRY, True)
     s.entry.pre_qty = 1
     on_pre_ack(s, Block.ENTRY, "7001")
-    acts = set_running(s, Block.ENTRY, False, mono=100.0)     # 끔 → 취소 1회
+    acts = set_running(s, Block.ENTRY, False)                  # 끔 → 취소 1회
     assert [a.kind for a in acts] == ["cancel_pre"] and s.entry.cancel_tries == 1
-    assert evaluate(s, Block.ENTRY, _sig(mono=101.0), SETTINGS, U) == []  # 아직 확인 대기
-    late = _sig(mono=100.0 + CANCEL_CONFIRM_S)
-    acts = evaluate(s, Block.ENTRY, late, SETTINGS, U)         # 3초 지남 → 재전송
-    assert [a.kind for a in acts] == ["cancel_pre"] and "재전송 2회" in acts[0].reason
-    assert s.entry.cancel_tries == 2 and not s.entry.cancel_alarmed
-    mono = late.mono
+    for mono in (101.0, 103.0, 160.0, 4000.0):                 # 아무리 지나도 재전송 없음
+        assert evaluate(s, Block.ENTRY, _sig(mono=mono), SETTINGS, U) == []
+    assert s.entry.cancel_tries == 1 and s.entry.cancel_sent and not s.entry.cancel_alarmed
     kinds: list[str] = []
-    while s.entry.cancel_tries <= CANCEL_ALARM_TRIES:
-        mono += CANCEL_CONFIRM_S
-        kinds += [a.kind for a in evaluate(s, Block.ENTRY, _sig(mono=mono), SETTINGS, U)]
-    assert kinds == ["cancel_pre", "cancel_pre", "alarm"]     # 4회째에 알람 한 번
+    while s.entry.cancel_tries <= CANCEL_ALARM_TRIES:          # 취소 거부 → 다음 판정에서 다시
+        on_pre_cancel_failed(s, Block.ENTRY)
+        kinds += [a.kind for a in evaluate(s, Block.ENTRY, _sig(mono=4001.0), SETTINGS, U)]
+    assert kinds == ["cancel_pre", "cancel_pre", "cancel_pre", "alarm"]  # 4회째에 알람 한 번
     assert s.entry.cancel_alarmed and s.entry.pre_order_id == "7001"
-    mono += CANCEL_CONFIRM_S                                   # 그 뒤로도 재전송 계속, 알람 없음
-    again = evaluate(s, Block.ENTRY, _sig(mono=mono), SETTINGS, U)
+    on_pre_cancel_failed(s, Block.ENTRY)                       # 그 뒤 거부에도 다시, 알람은 한 번뿐
+    again = evaluate(s, Block.ENTRY, _sig(mono=4002.0), SETTINGS, U)
     assert [a.kind for a in again] == ["cancel_pre"]
-    on_pre_cancelled(s, Block.ENTRY, mono=mono, settings=SETTINGS)  # 확인 → 표시 전부 정리
+    on_pre_cancelled(s, Block.ENTRY, mono=4003.0, settings=SETTINGS)  # 확정 → 표시 전부 정리
     assert s.entry.cancel_tries == 0 and not s.entry.cancel_alarmed and not s.entry.cancel_sent
-    # 시각 없이 보낸 취소(접수 때 등)는 다음 판정 시각부터 확인을 기다린다
+    # 접수 때 보낸 취소(발주 응답 전에 실행 끔)도 같다 — 그 뒤 판정에서 다시 보내지 않는다
     s2 = _set()
     set_running(s2, Block.ENTRY, True)
     s2.entry.status, s2.entry.pre_qty = LegStatus.PRE_RESTING, 1
     set_running(s2, Block.ENTRY, False)
     assert [a.kind for a in on_pre_ack(s2, Block.ENTRY, "7002")] == ["cancel_pre"]
-    assert s2.entry.cancel_sent_mono is None
     assert evaluate(s2, Block.ENTRY, _sig(mono=200.0), SETTINGS, U) == []
-    assert s2.entry.cancel_sent_mono == 200.0
-    resend = evaluate(s2, Block.ENTRY, _sig(mono=203.0), SETTINGS, U)
-    assert [a.kind for a in resend] == ["cancel_pre"]
+    assert evaluate(s2, Block.ENTRY, _sig(mono=203.0), SETTINGS, U) == []
 
 
 def test_accum_matched_uses_smaller_side() -> None:
@@ -704,6 +710,51 @@ def test_ls_feed_down_holds_orders_and_cancels_resting() -> None:
     assert s.entry.running and s.entry.status is not LegStatus.HALTED
 
 
+def test_hl_feed_down_holds_orders_and_cancels_resting() -> None:
+    # G0-1 보강(사용자 2026-10-01, 결정 60): LS뿐 아니라 HL 채널이 끊겨도 — 어느 한쪽이라도 끊기면
+    # 나가 있는 선주문 취소 후 대기. 세트는 실행 유지, 회복하면 재개.
+    s = _set()
+    set_running(s, Block.ENTRY, True)
+    assert evaluate(s, Block.ENTRY, _sig(hl_feed_ok=False), SETTINGS, U) == []
+    assert "HL 피드 끊김" in s.entry.block_reason
+    assert s.entry.running and s.entry.status is not LegStatus.HALTED
+    acts = evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)       # 회복 → 선주문
+    assert [a.kind for a in acts] == ["place_pre"]
+    s.entry.pre_order_id = "78"
+    acts = evaluate(s, Block.ENTRY, _sig(hl_feed_ok=False), SETTINGS, U)
+    assert [a.kind for a in acts] == ["cancel_pre"]
+    assert s.entry.running and s.entry.status is not LegStatus.HALTED
+
+
+def test_wake_times_list_delay_switch_and_resume_deadlines() -> None:
+    # 판정은 시세가 올 때만(사용자 2026-10-01, 결정 59) — 시간으로 풀리는 조건은 엔진이 타이머로
+    # 판정하도록 끝나는 시각을 알려 준다: 선주문 딜레이 끝 · 전환대기 끝 · 재개 딜레이 끝.
+    from kp_arb.auto_m import wake_times
+
+    s = _set()                                    # 전환딜레이 30초
+    assert wake_times(s, SETTINGS, None) == []    # 실행 꺼짐 + 대기 → 판정 대상 아님
+    set_running(s, Block.ENTRY, True)
+    assert wake_times(s, SETTINGS, None) == []    # 감시 중 — 시간으로 풀릴 것이 없다
+    on_pre_reject(s, Block.ENTRY, mono=100.0, settings=SETTINGS)  # 거부 → 선주문 딜레이 1초
+    assert s.entry.status is LegStatus.SETTLE_DELAY
+    assert wake_times(s, SETTINGS, None) == [101.0]
+    s.last_exit_fill_mono = 90.0                  # 직전 청산 체결 → 진입은 30초 전환대기
+    assert sorted(wake_times(s, SETTINGS, None)) == [101.0, 120.0]
+    # 시장 정지·VI가 풀린 시각 + 재개 딜레이(10초)
+    assert sorted(wake_times(s, SETTINGS, 95.0)) == [101.0, 105.0, 120.0]
+    s.switch_delay_s = 0                          # 전환딜레이 0이면 그 타이머는 없다
+    assert sorted(wake_times(s, SETTINGS, None)) == [101.0]
+
+
+def test_next_edge_s_is_seconds_to_nearest_window_boundary_today() -> None:
+    # 주문가능시간 경계(시작·끝)도 타이머로 — 오늘 남은 경계 중 가장 가까운 것까지 남은 초.
+    st = AutoMSettings(windows=(("08:30:10", "08:46:20"), ("15:35:30", "15:46:55")))
+    assert st.next_edge_s(datetime(2026, 10, 1, 8, 30, 0)) == 10.0     # 첫 구간 시작
+    assert st.next_edge_s(datetime(2026, 10, 1, 8, 30, 10)) == 970.0   # 경계 위 → 다음(끝 08:46:20)
+    assert st.next_edge_s(datetime(2026, 10, 1, 15, 46, 54, 500_000)) == 0.5
+    assert st.next_edge_s(datetime(2026, 10, 1, 15, 46, 55)) is None   # 오늘 남은 경계 없음
+
+
 def test_price_offset_must_be_multiple_of_market_tick() -> None:
     # 사용자 2026-09-15: 잘못 넣으면(삼성 호가단위 500에 시작호가 100) 저장 때 바로 경고창.
     # 코어 스냅샷 sf_tick(지금 가격대 호가단위)이 있을 때만 검사, 없으면 G6이 잡는다.
@@ -748,8 +799,14 @@ def test_set_pre_tick_overrides_common_unit() -> None:
     assert acts[0].price == 201_000.0 and "주문단위 3000" in s.entry.block_reason  # 공통 3,000
     s2 = _set(pre_tick=1000)
     set_running(s2, Block.ENTRY, True)
-    acts = evaluate(s2, Block.ENTRY, _sig(hl_disp_bid=0.02), SETTINGS, U)
+    acts = evaluate(s2, Block.ENTRY, _sig(hl_disp_bid=0.02, sf_asks=[(203_500.0, 5)]),
+                    SETTINGS, U)  # 매도1 203,500 → 203,000은 메이커 자리(결정 58)
     assert acts[0].price == 203_000.0 and "주문단위 1000" in s2.entry.block_reason
+    # 호가가 201,500 그대로면 203,000은 상대호가를 넘으므로 201,000(매도1 − 1틱)으로 되돌린다
+    s3 = _set(pre_tick=1000)
+    set_running(s3, Block.ENTRY, True)
+    assert evaluate(s3, Block.ENTRY, _sig(hl_disp_bid=0.02), SETTINGS, U)[0].price == 201_000.0
+    assert "메이커 보정 203,000→201,000" in s3.entry.block_reason
     from kp_arb.auto_m import AutoMBook, _book_from_dict
 
     book = AutoMBook()
@@ -931,10 +988,54 @@ def test_stock_auction_skips_s_spread_filter_both_directions() -> None:
     assert evaluate(s3, Block.ENTRY, _sig(stock_auction=True), SETTINGS, U) == []
     # 역방향도 같다
     r = AutoMSet(target_qty=100, per_qty=10, switch_delay_s=30, en_sf=0.005, en_s=0.005,
-                 ex_sf=-0.001, reverse=True)
+                 ex_sf=-0.001, reverse=True, pre_tick=500)
     set_running(r, Block.ENTRY, True)
     assert evaluate(r, Block.ENTRY, _sig(s_spread_exit=0.02, hl_disp_ask=-0.02),
                     SETTINGS, U) == []
     acts = evaluate(r, Block.ENTRY, _sig(mono=101, s_spread_exit=0.02, hl_disp_ask=-0.02,
                                          stock_auction=True), SETTINGS, U)
     assert [a.kind for a in acts] == ["place_pre"] and acts[0].side is Side.SELL
+
+
+def test_maker_start_keeps_order_inside_range_start() -> None:
+    # 결정 58: 범위 시작(상대N호가 ∓ 1틱)이 안쪽 경계 — 매도는 그 이상, 매수는 그 이하로만.
+    # 순수 함수.
+    from kp_arb.auto_m import maker_start
+
+    # 주문단위 500(= 시세 호가단위)이면 범위 시작 그대로
+    assert maker_start(Side.SELL, 270_000.0, 270_500.0, 500) == 270_500.0  # 매수1과 같음 → 한 틱
+    assert maker_start(Side.SELL, 271_000.0, 270_500.0, 500) == 271_000.0  # 이미 바깥 → 그대로
+    assert maker_start(Side.BUY, 204_000.0, 201_000.0, 500) == 201_000.0   # 매도1 넘음 → 한 틱 아래
+    assert maker_start(Side.BUY, 199_000.0, 201_000.0, 500) == 199_000.0
+    # 결정 66(사용자 2026-10-01): 되돌린 자리도 세트의 주문단위 격자(시작호가 + k×주문단위)에 —
+    # 매도는 범위 시작 위쪽 첫 격자, 매수는 아래쪽 첫 격자. 하이닉스 운영 설정(주문단위 2,000,
+    # 시작호가 0/1,000)이면 두 세트가 보정 뒤에도 서로 다른 자리에 선다.
+    assert maker_start(Side.SELL, 1_598_000.0, 1_601_000.0, 2000, 0) == 1_602_000.0
+    assert maker_start(Side.SELL, 1_599_000.0, 1_601_000.0, 2000, 1000) == 1_601_000.0
+    assert maker_start(Side.BUY, 1_606_000.0, 1_603_000.0, 2000, 0) == 1_602_000.0
+    assert maker_start(Side.BUY, 1_605_000.0, 1_603_000.0, 2000, 1000) == 1_603_000.0
+    assert maker_start(Side.SELL, 270_000.0, 270_500.0, 3000) == 273_000.0
+    # 범위 시작과 같은 값은 안쪽이 아니다 — 그대로(이미 격자 위)
+    assert maker_start(Side.SELL, 1_602_000.0, 1_602_000.0, 2000, 0) == 1_602_000.0
+
+
+def test_maker_correction_snaps_to_order_unit_and_respects_limit() -> None:
+    # 결정 66: 보정한 주문가를 주문단위에 맞춘 뒤 한계를 본다. 매수1호가 198,500 → 범위 시작
+    # 199,000(호가단위 500). 범위 1%면 한계 199,000 × 1.01 = 200,990.
+    wide = AutoMSettings(windows=(("09:00:00", "15:20:00"),), pre_range=0.01)
+    sig = _sig(hl_disp_ask=-0.02)  # 청산(SF 매도) 역산가 196,200 — 매수1호가 안쪽
+    a = _set(pre_tick=2000)                        # 격자 …198,000·200,000…
+    b = _set(pre_tick=2000, price_offset=1000)     # 격자 …197,000·199,000·201,000…
+    for s in (a, b):
+        s.rt = 10
+        set_running(s, Block.EXIT, True)
+    acts_a = evaluate(a, Block.EXIT, sig, wide, U)
+    acts_b = evaluate(b, Block.EXIT, sig, wide, U)
+    assert acts_a[0].price == 200_000.0 and "메이커 보정 198,000→200,000" in a.exit.block_reason
+    assert acts_b[0].price == 199_000.0 and "메이커 보정 197,000→199,000" in b.exit.block_reason
+    # 범위가 좁아(0.4% → 한계 199,796) 격자에 맞춘 200,000이 한계를 넘으면 내지 않는다
+    c = _set(pre_tick=2000)
+    c.rt = 10
+    set_running(c, Block.EXIT, True)
+    assert evaluate(c, Block.EXIT, sig, SETTINGS, U) == []
+    assert "G6 범위 밖 역산가 198,000 메이커 보정 198,000→200,000" in c.exit.block_reason
