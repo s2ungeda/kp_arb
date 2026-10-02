@@ -553,6 +553,18 @@ class LiveSystem:
         # 저장된 최근월물 가격으로 즉시 다시 계산한다. (주식선물 이론가는 호출 때 계산하므로 무관)
         self._recompute_fx_theory()
 
+    def set_quote_probe(self, enabled: bool) -> None:
+        """시세 원문 기록 켬/끔(공통설정, DESIGN-settings §3·DESIGN-ls-xing §8) — xing 경로에만."""
+        import logging
+
+        probe = getattr(self._stock_ws, "_probe", None)
+        if probe is None:
+            return
+        if probe.enabled != enabled:
+            logging.getLogger("kp_arb.bootstrap").info(
+                "시세 원문 기록 %s — %s", "켬" if enabled else "끔", probe.directory)
+        probe.enabled = enabled
+
     def set_fx_futures_code(self, code: str) -> None:
         """환율 계산(역산현물가·환진입가)·동시호가 대응주문에 쓸 원달러선물 월물 반영 — 코어가
         공통설정에서 주입(DESIGN-settings §3, 사용자 2026-09-28). 빈 문자열·목록에 없는 코드는
@@ -1915,12 +1927,13 @@ class LiveSystem:
         """진입/청산 괴리 1줄씩을 logs/spread_YYYYMMDD.csv에 덧붙인다(있는 쌍만)."""
         import csv
         import time
-        from pathlib import Path
 
         lines = self._spread_csv_rows(time.strftime("%H:%M:%S"))
         if not lines:
             return
-        log_dir = Path(__file__).resolve().parent.parent / "logs"
+        from .logs import base_dir
+
+        log_dir = base_dir() / "logs"  # 배포판은 exe 옆(전엔 __file__ 기준이라 _internal 안에 생김)
         log_dir.mkdir(exist_ok=True)
         path = log_dir / f"spread_{time.strftime('%Y%m%d')}.csv"
         new_file = not path.exists()
@@ -2090,7 +2103,6 @@ async def bootstrap_live(
     _blog = _logging.getLogger("kp_arb.bootstrap")
     # LS 접근 방식(DESIGN-ls-xing.md): xing이면 COM 세션 하나(로그인은 여기서 1회, 끊기면
     # XingRealClient가 ensure_login으로 다시), REST/WS는 만들지 않는다.
-    import os
     import time as _time_mod
     from pathlib import Path
 
@@ -2243,14 +2255,13 @@ async def bootstrap_live(
                     _blog.warning("xing 재로그인 실패 — 2초 뒤 재시도: %s", exc)
                     await asyncio.sleep(2.0)
 
-        # 시세 원문 기록(임시 진단, DESIGN-ls-xing §8, 2026-10-02) — 기본 켬, KP_PROBE_TRS=0이면 끔.
-        # logs/probe/quote_trade_YYYYMMDD.jsonl, 5일 지난 파일은 시동 때 삭제
-        probe = None
-        if os.environ.get("KP_PROBE_TRS", "1").strip() not in ("0", "off", "false"):
-            from .quote_probe import QuoteProbe
+        # 시세 원문 기록(임시 진단, DESIGN-ls-xing §8, 2026-10-02) — 공통설정 "시세 원문 기록"으로
+        # 켜고 끈다(기본 끔, 코어가 시동·저장 때 set_quote_probe로 반영). 꺼진 채 만들어 둔다.
+        # logs/probe/quote_trade_YYYYMMDD.jsonl(배포판은 exe 옆), 5일 지난 파일은 시동 때 삭제
+        from .logs import base_dir
+        from .quote_probe import QuoteProbe
 
-            probe = QuoteProbe(Path(__file__).resolve().parent.parent / "logs" / "probe")
-            _blog.info("시세 원문 기록 켬 — %s (끄려면 .env에 KP_PROBE_TRS=0)", probe.directory)
+        probe = QuoteProbe(base_dir() / "logs" / "probe")
         xing_real = XingRealClient(
             xing_session, ensure_login=ensure_login, etf_symbols=etf_symbols,
             status=WsStatus(venue="LS", name="LS xing", kind="시세/주문", expects_stream=True),

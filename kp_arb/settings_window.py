@@ -157,10 +157,18 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     e_spot_e2.pack(side="left")
     tk.Label(spot_row2, text="비우면 미사용", fg=T.C_MUTED).pack(side="left", padx=(8, 0))
 
+    # 시세 원문 기록(DESIGN-ls-xing §8 임시 진단, 사용자 2026-10-02) — 기본 끔. 켜면 코어가 호가·
+    # 체결 TR 원문을 logs\probe\quote_trade_날짜.jsonl에 남긴다(하루 수백 MB, 5일 지나면 삭제).
+    var_probe = tk.BooleanVar(value=False)
+    tk.Checkbutton(form, text="시세 원문 기록", variable=var_probe, anchor="w").grid(
+        row=6, column=0, sticky="w", pady=(10, 2))
+    tk.Label(form, text="호가·체결 TR 원문 → logs\probe (분석용, 하루 수백 MB)",
+             fg=T.C_MUTED).grid(row=6, column=1, columnspan=3, sticky="w", padx=6,
+                                pady=(10, 2))
     # 알람 3줄 — [체크박스] 이벤트명  [wav 경로]  [찾아보기] [듣기]
-    tk.Label(form, text="알람 (wav)").grid(row=6, column=0, sticky="w", pady=(10, 2))
+    tk.Label(form, text="알람 (wav)").grid(row=7, column=0, sticky="w", pady=(10, 2))
     rows: dict[str, dict[str, Any]] = {}
-    for i, (key, name) in enumerate(_ALARMS, start=7):
+    for i, (key, name) in enumerate(_ALARMS, start=8):
         var = tk.BooleanVar(value=False)
         tk.Checkbutton(form, text=name, variable=var, width=10, anchor="w").grid(
             row=i, column=0, sticky="w", pady=1)
@@ -207,7 +215,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             "cmd": "settings_global", "hl_daily_limit_usdc": limit,
             "fx_carry_rate": fx_rate, "eq_carry_rate": eq_rate,
             "fx_fut_start": spot_s, "fx_fut_end": spot_e,
-            "fx_fut_start2": spot_s2, "fx_fut_end2": spot_e2}
+            "fx_fut_start2": spot_s2, "fx_fut_end2": spot_e2,
+            "quote_probe": bool(var_probe.get())}
         if cb_fx.get():  # 콤보가 비었으면(코어 시세 미접속) 월물 설정은 건드리지 않는다
             payload["fx_futures_code"] = fx_month_code(cb_fx.get())
         for key, r in rows.items():
@@ -256,6 +265,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                                         (e_spot_e2, "fx_fut_end2", "")):
                 entry.delete(0, "end")
                 entry.insert(0, str(settings.get(key) or default))
+            var_probe.set(bool(settings.get("quote_probe", False)))
             for key, r in rows.items():
                 snd = settings.get(key) or {}
                 r["var"].set(bool(snd.get("enabled", False)))

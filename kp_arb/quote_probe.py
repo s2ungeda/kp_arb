@@ -6,7 +6,7 @@
 원문 일부를 날짜별 jsonl로 남긴다. 판정·주문 경로와 무관한 기록만이고, 결론이 나면 뗀다.
 
 쓰기는 호출자(asyncio 루프)가 record()로 쌓고 flush()를 몇 초마다 불러 한 번에 쓴다 — COM 스레드·
-수신 콜백 안에서 파일을 열지 않는다.
+수신 콜백 안에서 파일을 열지 않는다. 켜고 끄기는 공통설정(기본 끔) → `enabled`.
 """
 from __future__ import annotations
 
@@ -32,8 +32,10 @@ class QuoteProbe:
     """record()로 모아 flush()로 쓴다. 파일은 <dir>/quote_trade_YYYYMMDD.jsonl(날짜는 쓰는 시점)."""
 
     def __init__(self, directory: Path, fields: dict[str, tuple[str, ...]] | None = None,
-                 keep_days: int = KEEP_DAYS) -> None:
+                 keep_days: int = KEEP_DAYS, enabled: bool = False) -> None:
         self.directory = directory
+        # 공통설정 "시세 원문 기록"(DESIGN-settings §3, 사용자 2026-10-02) — 기본 끔, 바꾸면 즉시
+        self.enabled = enabled
         self.fields = fields if fields is not None else PROBE_FIELDS
         self.keep_days = keep_days
         self._buf: list[str] = []
@@ -48,15 +50,18 @@ class QuoteProbe:
     def total(self) -> int:
         return self._n
 
-    def record(self, tr: str, fields: dict[str, str]) -> bool:
+    def record(self, tr: str, fields: dict[str, str], key: str = "") -> bool:
         """대상 TR이면 한 줄 쌓고 True. ms = 프로세스 기준 단조 시계(도착 순서·간격용), wall =
-        벽시계."""
+        벽시계, pc = 받은 PC 시각(HH:MM:SS.mmm), key = 등록할 때 쓴 종목코드. 꺼져 있으면 False."""
         keep = self.fields.get(tr)
-        if keep is None:
+        if keep is None or not self.enabled:
             return False
+        now = time.time()
         row: dict[str, object] = {
             "n": self._n, "ms": round((time.perf_counter() - self._t0) * 1000, 2), "tr": tr,
-            "wall": round(time.time(), 3),
+            "key": key.strip(), "wall": round(now, 3),
+            # 받은 PC의 시각(사람이 읽는 형식, 사용자 2026-10-02) — 서버 시간 필드(초)와 대조용
+            "pc": time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now * 1000) % 1000:03d}",
         }
         for k in keep:
             row[k] = fields.get(k, "")

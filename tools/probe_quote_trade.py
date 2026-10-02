@@ -14,7 +14,7 @@ for line in open(sys.argv[1], encoding="utf-8"):
     t = r.get("hotime") or r.get("chetime") or ""
     if not ("090000" <= t < "152000"):
         continue
-    r["code"] = (r.get("shcode") or r.get("futcode") or "").strip()
+    r["code"] = (r.get("shcode") or r.get("futcode") or r.get("key") or "").strip()
     r["t"] = t
     r["bid"] = int(r.get("bidho1") or r.get("bidho") or 0)
     r["ask"] = int(r.get("offerho1") or r.get("offerho") or 0)

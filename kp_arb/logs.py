@@ -140,6 +140,19 @@ def attach_daily_file(
     return logger
 
 
+def base_dir() -> Path:
+    """상태·로그를 둘 기준 폴더 — 배포판(exe)은 실행파일 옆, 개발은 프로젝트 루트.
+
+    frozen에서 __file__ 기준을 쓰면 _internal 안에 파일이 생긴다(운영 실측 2026-10-02: 시세 원문
+    기록 logs\probe가 _internal 아래 생겨 사용자가 못 찾음). 파일을 만드는 코드는 전부 이것을 쓴다.
+    """
+    import sys
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
 def setup_logging(name: str, *, level: int = logging.INFO) -> logging.Logger:
     """콘솔 + 날짜별 파일(logs/)에 남기는 로거를 만든다. 재호출해도 핸들러가 중복되지 않는다."""
     logger = logging.getLogger(f"kp_arb.{name}")
@@ -149,7 +162,7 @@ def setup_logging(name: str, *, level: int = logging.INFO) -> logging.Logger:
     logger.propagate = False
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 
-    log_dir = Path(__file__).resolve().parent.parent / "logs"
+    log_dir = base_dir() / "logs"
     log_dir.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d")
     file_handler = logging.FileHandler(log_dir / f"{name}_{stamp}.log", encoding="utf-8")

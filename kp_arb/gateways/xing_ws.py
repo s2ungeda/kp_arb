@@ -220,11 +220,11 @@ class XingRealClient(LSWebSocketClient):
 
     # --- 이벤트 → 부모 디스패치 ---
 
-    def _on_real(self, tr: str, _key: str, fields: dict[str, str]) -> None:
+    def _on_real(self, tr: str, key: str, fields: dict[str, str]) -> None:
         self.status.on_message(self._clock())
         self._real_counts[tr] = self._real_counts.get(tr, 0) + 1
         if self._probe is not None:
-            self._probe.record(tr, fields)
+            self._probe.record(tr, fields, key)
         try:
             self._dispatch(frame_from_real(tr, fields))
         except Exception:  # noqa: BLE001 - 한 건 문제로 스트림을 죽이지 않음

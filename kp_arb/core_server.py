@@ -67,16 +67,10 @@ _olog = logging.getLogger("kp_arb.order")  # 수동 주문 발주·거부 기록
 
 
 def _base_dir() -> Path:
-    """상태·로그를 둘 기준 폴더. 배포판(exe)은 실행파일 옆, 개발은 프로젝트 루트.
+    """상태·로그를 둘 기준 폴더 — logs.base_dir(배포판은 실행파일 옆)와 같다."""
+    from .logs import base_dir
 
-    frozen에서 __file__ 기준을 쓰면 _internal 안에 파일이 생겨 배포 폴더 복사가
-    막힌다(로그 잠김). 그래서 exe일 때는 sys.executable 옆을 쓴다.
-    """
-    import sys
-
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
+    return base_dir()
 
 
 # 입력값 저장 파일 (§6.2-0 상태 저장) — gitignore, 명령마다 갱신
@@ -225,6 +219,8 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
             g.fx_fut_start2, g.fx_fut_end2 = fut_s2, fut_e2
             # 환율 계산용 원달러선물 월물(2026-09-28) — 키 없으면 기존 값 유지, 빈 문자열 = 최근월물
             g.fx_futures_code = str(body.get("fx_futures_code", g.fx_futures_code)).strip()
+            if "quote_probe" in body:  # 시세 원문 기록 켬/끔(기본 끔)
+                g.quote_probe = bool(body["quote_probe"])
             for name, snd in (("sound_fill", g.sound_fill),
                               ("sound_error", g.sound_error), ("sound_ws", g.sound_ws)):
                 raw = body.get(name)
@@ -1185,6 +1181,9 @@ def make_app(
     boot_errors = list(boot_errors or [])
     if system is not None:  # 저장된 공통설정을 시동 시 LiveSystem에 주입
         system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)
+        # 시세 원문 기록(공통설정, 기본 끔) — 테스트용 가짜 시스템엔 없다
+        if hasattr(system, "set_quote_probe"):
+            system.set_quote_probe(state.settings.quote_probe)
         system.set_carry_rates(state.settings.fx_carry_rate, state.settings.eq_carry_rate)
         system.set_fx_fut_window(state.settings.fx_fut_start, state.settings.fx_fut_end,
                                   state.settings.fx_fut_start2, state.settings.fx_fut_end2)
@@ -1259,6 +1258,8 @@ def make_app(
                 state.settings.fx_fut_start2, state.settings.fx_fut_end2)
             # 환율 계산용 원달러선물 월물 즉시 반영(역산현물가 재계산)
             system.set_fx_futures_code(state.settings.fx_futures_code)
+            if hasattr(system, "set_quote_probe"):
+                system.set_quote_probe(state.settings.quote_probe)  # 시세 원문 기록 즉시 반영
         if payload.get("cmd") == "shutdown" and result.get("ok") and on_shutdown:
             # 응답을 먼저 보내고 잠시 뒤 종료 (화면이 결과를 받을 시간)
             asyncio.get_running_loop().call_later(0.2, on_shutdown)
