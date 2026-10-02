@@ -22,6 +22,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 
 from ..domain.enums import Underlying
+from ..quote_probe import QuoteProbe
 from ..ws_status import WsStatus
 from .ls_ws import LSWebSocketClient, WSConnection
 from .xing_com import XingSession
@@ -92,6 +93,7 @@ class XingRealClient(LSWebSocketClient):
         clock: Callable[[], float] | None = None,
         reconnect_backoff_s: float = 2.0,
         stats_every_s: float = 60.0,
+        probe: QuoteProbe | None = None,
     ) -> None:
         super().__init__(_NoConnector(), etf_symbols=etf_symbols, clock=clock,
                          status=status or WsStatus(venue="LS", name="LS xing", kind="시세/주문",
@@ -106,6 +108,8 @@ class XingRealClient(LSWebSocketClient):
         self._stats_every_s = stats_every_s
         self._running = False  # run()이 이미 도는 중 — 두 번째 run()은 대기만(아래)
         self._stop_event = asyncio.Event()
+        # 시세 원문 기록(임시 진단, DESIGN-ls-xing §8) — 수신 콜백에서 쌓고 _probe_loop가 5초마다 씀
+        self._probe = probe
         session.on_real.append(self._on_real)
         session.on_session.append(self._on_session)
 
@@ -124,6 +128,7 @@ class XingRealClient(LSWebSocketClient):
         self._running = True
         stats = asyncio.create_task(self._stats_loop()) if self._stats_every_s > 0 else None
         health = asyncio.create_task(self._health_loop())
+        probe_task = asyncio.create_task(self._probe_loop()) if self._probe is not None else None
         try:
             while not self._stopped:
                 await self._ensure_login()
@@ -140,8 +145,25 @@ class XingRealClient(LSWebSocketClient):
                     await asyncio.sleep(self._reconnect_backoff_s)
         finally:
             health.cancel()
+            if probe_task is not None:
+                probe_task.cancel()
+                if self._probe is not None:
+                    self._probe.flush()  # 종료 직전까지 쌓인 것
             if stats is not None:
                 stats.cancel()
+
+    async def _probe_loop(self, every_s: float = 5.0) -> None:
+        """시세 원문 기록을 몇 초마다 파일에 쓴다 — 수신 콜백 안에서 파일 I/O를 하지 않도록."""
+        assert self._probe is not None
+        gone = self._probe.purge_old()
+        if gone:
+            log.info("시세 원문 기록 오래된 파일 %d개 삭제", len(gone))
+        while not self._stopped:
+            await asyncio.sleep(every_s)
+            try:
+                self._probe.flush()
+            except OSError as exc:
+                log.warning("시세 원문 기록 쓰기 실패 — %s", exc)
 
     async def _health_loop(self, every_s: float = 1.0) -> None:
         """COM 스레드 심장박동 감시 — 멈추면 이 채널을 '끊김'으로(주문 안전차단·자동M 대기가
@@ -201,6 +223,8 @@ class XingRealClient(LSWebSocketClient):
     def _on_real(self, tr: str, _key: str, fields: dict[str, str]) -> None:
         self.status.on_message(self._clock())
         self._real_counts[tr] = self._real_counts.get(tr, 0) + 1
+        if self._probe is not None:
+            self._probe.record(tr, fields)
         try:
             self._dispatch(frame_from_real(tr, fields))
         except Exception:  # noqa: BLE001 - 한 건 문제로 스트림을 죽이지 않음

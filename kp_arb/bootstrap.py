@@ -2090,6 +2090,7 @@ async def bootstrap_live(
     _blog = _logging.getLogger("kp_arb.bootstrap")
     # LS 접근 방식(DESIGN-ls-xing.md): xing이면 COM 세션 하나(로그인은 여기서 1회, 끊기면
     # XingRealClient가 ensure_login으로 다시), REST/WS는 만들지 않는다.
+    import os
     import time as _time_mod
     from pathlib import Path
 
@@ -2242,10 +2243,18 @@ async def bootstrap_live(
                     _blog.warning("xing 재로그인 실패 — 2초 뒤 재시도: %s", exc)
                     await asyncio.sleep(2.0)
 
+        # 시세 원문 기록(임시 진단, DESIGN-ls-xing §8, 2026-10-02) — 기본 켬, KP_PROBE_TRS=0이면 끔.
+        # logs/probe/quote_trade_YYYYMMDD.jsonl, 5일 지난 파일은 시동 때 삭제
+        probe = None
+        if os.environ.get("KP_PROBE_TRS", "1").strip() not in ("0", "off", "false"):
+            from .quote_probe import QuoteProbe
+
+            probe = QuoteProbe(Path(__file__).resolve().parent.parent / "logs" / "probe")
+            _blog.info("시세 원문 기록 켬 — %s (끄려면 .env에 KP_PROBE_TRS=0)", probe.directory)
         xing_real = XingRealClient(
             xing_session, ensure_login=ensure_login, etf_symbols=etf_symbols,
             status=WsStatus(venue="LS", name="LS xing", kind="시세/주문", expects_stream=True),
-            reconnect_backoff_s=2.0)
+            reconnect_backoff_s=2.0, probe=probe)
         stock_ws: LSWebSocketClient = xing_real
         deriv_ws: LSWebSocketClient | None = xing_real
     else:
