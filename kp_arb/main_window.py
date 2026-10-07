@@ -2,8 +2,10 @@
 
     main.bat   (일상 운영 진입점 — 이것 하나만 실행)
 
-- 코어 ▸ 코어 시작(자식 프로세스) / 코어 안전종료(shutdown 명령 — 강제 킬 없음)
-- 화면 ▸ 전략 화면 / 시세 모니터 (별도 프로세스 — 메인을 닫아도 계속 돈다)
+- 메뉴(사용자 2026-10-06): 파일 ▸ 공통설정 / 화면 구성 되돌리기 · 주문 ▸ 체결쏴·일반주문·
+  주문 리스트·동시호가·FX 노출 · 시세 ▸ 시세표·HL 실시간 체결. 코어 메뉴는 없앰 — 코어는
+  메인과 함께 시작·종료(§12).
+- 화면은 별도 프로세스 — 메인을 닫으면 코어와 함께 종료된다.
 - 본문: 코어 상태 2초 갱신. 전략 화면은 코어 생명주기에 관여할 수 없다(사고 방지).
 """
 from __future__ import annotations
@@ -608,30 +610,6 @@ def main() -> None:
                 i, r.get("venue"), name, "연결" if up else "끊김",
                 f"{r.get('rx_count', 0):,}"))
 
-    def start_core() -> None:
-        if core_alive():
-            status.config(text="코어가 이미 떠 있음")
-            return
-        restart["intentional"] = False  # 사용자가 다시 켬 — 자동 재기동 재개
-        restart["gave_up"] = False
-        restart["cooldown"] = RESTART_COOLDOWN  # 부팅 유예
-        launch_module("kp_arb.core_server", console=False, watch_parent=True)
-        status.config(text="코어 시작 중 ...")
-
-    def stop_core() -> None:
-        restart["intentional"] = True  # 안전종료 — 자동 재기동하지 않음
-        if not core_alive():
-            status.config(text="코어 미접속 — 종료할 대상 없음")
-            return
-        status.config(text="안전종료 요청됨 — 자동 정지 후 종료(안 내려가면 강제 종료)")
-
-        def _run() -> None:  # 화면 스레드에서 기다리지 않는다(창이 얼지 않게)
-            text = ensure_core_down()
-            _slog().info("코어 종료 — %s", text)
-            root.after(0, lambda: status.config(text=text))
-
-        threading.Thread(target=_run, daemon=True).start()
-
     def restore_layout() -> None:
         """화면 구성 되돌리기 — ui_state 세대(최대 5)를 골라 그 화면들을 다시 연다."""
         from .ui_dialog import center_on_parent, show_message
@@ -679,34 +657,37 @@ def main() -> None:
         win.grab_set()
         lb.focus_set()
 
+    # 메뉴 구성(사용자 2026-10-06): 파일 / 주문 / 시세. 옛 '화면'은 '파일'로 이름을 바꾸고 공통설정·
+    # 되돌리기만 남김, 화면들은 주문·시세로 나눔. '코어' 메뉴는 없앰 — 코어는 메인과 함께 시작·종료
+    # (확정 2026-07-24)라 손으로 켜고 끌 일이 없다(자동 재기동은 그대로).
     menubar = tk.Menu(root)
-    m_screen = tk.Menu(menubar, tearoff=0)
-    m_screen.add_command(label="체결쏴 (자동M)",
-                         command=lambda: open_screen("kp_arb.order_autom"))
-    m_screen.add_command(label="체결쏴 (자동M)-주식",
-                         command=lambda: open_screen("kp_arb.order_autom_stock"))
-    m_screen.add_command(label="시세 모니터",
-                         command=lambda: open_screen("kp_arb.monitor"))
-    m_screen.add_command(label="FX 노출 감시",
-                         command=lambda: open_screen("kp_arb.fx_monitor"))
-    m_screen.add_command(label="HL 일반주문 (수동)",
-                         command=lambda: open_screen("kp_arb.order_hl"))
-    m_screen.add_command(label="HL 체결 (실시간 30건)",
-                         command=lambda: open_screen("kp_arb.hl_trades"))
-    m_screen.add_command(label="주문 리스트 (미체결·취소·정정)",
-                         command=lambda: open_screen("kp_arb.order_list"))
-    m_screen.add_command(label="원달러선물 동시호가 주문",
-                         command=lambda: open_screen("kp_arb.fx_auction_order"))
-    m_screen.add_separator()
-    m_screen.add_command(label="공통설정",
-                         command=lambda: open_screen("kp_arb.settings_window"))
-    m_screen.add_separator()
-    m_screen.add_command(label="화면 구성 되돌리기 (이전 세대)", command=restore_layout)
-    menubar.add_cascade(label="화면", menu=m_screen)
-    m_core = tk.Menu(menubar, tearoff=0)
-    m_core.add_command(label="코어 시작", command=start_core)
-    m_core.add_command(label="코어 안전종료", command=stop_core)
-    menubar.add_cascade(label="코어", menu=m_core)
+    m_file = tk.Menu(menubar, tearoff=0)
+    m_file.add_command(label="공통설정",
+                       command=lambda: open_screen("kp_arb.settings_window"))
+    m_file.add_separator()
+    m_file.add_command(label="화면 구성 되돌리기 (이전 세대)", command=restore_layout)
+    menubar.add_cascade(label="파일", menu=m_file)
+    m_order = tk.Menu(menubar, tearoff=0)
+    m_order.add_command(label="체결쏴 (자동M)",
+                        command=lambda: open_screen("kp_arb.order_autom"))
+    m_order.add_command(label="체결쏴 (자동M)-주식",
+                        command=lambda: open_screen("kp_arb.order_autom_stock"))
+    m_order.add_separator()
+    m_order.add_command(label="HL 일반주문 (수동)",
+                        command=lambda: open_screen("kp_arb.order_hl"))
+    m_order.add_command(label="주문 리스트 (미체결·취소·정정)",
+                        command=lambda: open_screen("kp_arb.order_list"))
+    m_order.add_command(label="원달러선물 동시호가 주문",
+                        command=lambda: open_screen("kp_arb.fx_auction_order"))
+    m_order.add_command(label="FX 노출 감시",
+                        command=lambda: open_screen("kp_arb.fx_monitor"))
+    menubar.add_cascade(label="주문", menu=m_order)
+    m_quote = tk.Menu(menubar, tearoff=0)
+    m_quote.add_command(label="시세표",
+                        command=lambda: open_screen("kp_arb.monitor"))
+    m_quote.add_command(label="HL 실시간 체결 (30건)",
+                        command=lambda: open_screen("kp_arb.hl_trades"))
+    menubar.add_cascade(label="시세", menu=m_quote)
     root.config(menu=menubar)
 
     _load_err = {"shown": False}
@@ -736,7 +717,7 @@ def main() -> None:
                 if status.cget("text") == "코어 시작 중 ...":  # 시작 요청 → 실제 연결 확인
                     status.config(text="코어 시작 완료")
             else:
-                lbl_core.config(text="코어: 미접속 — 메뉴 ▸ 코어 ▸ 코어 시작",
+                lbl_core.config(text="코어: 미접속 — 자동 재시동 대기(안 오르면 메인을 다시 시작)",
                                 fg="#8b0000")
             render_ws()
         finally:
