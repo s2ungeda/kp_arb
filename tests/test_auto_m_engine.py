@@ -626,6 +626,48 @@ async def test_cancel_alarm_raises_error_seq_and_snapshot_flags_it(monkeypatch: 
     await _settle()
 
 
+async def test_cancel_wait_watchdog_alarms_once_without_resending() -> None:
+    # 운영 2026-10-12: 취소 확정 통보를 놓친 채(H01 순서 역전) 세트가 2시간 넘게 "취소 확인 대기"에
+    # 갇혀 있었는데 화면·로그에 아무 표시가 없었다(L10). 감시 타이머가 대기 시간을 재서
+    # CANCEL_WAIT_ALARM_S를 넘으면 알람 한 번(error_seq) + 스냅샷 cancel_wait_s(상태줄).
+    # 재전송·해제는 하지 않는다(결정 61 유지) — 확정 통보가 오면 그때 정리.
+    from kp_arb.auto_m_engine import CANCEL_WAIT_ALARM_S, FEED_WATCH_S
+
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    now = datetime(2026, 9, 4, 10, 0, 0)
+    eng.pump(now, 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    sys_.cancel_confirm_delay = 10_000.0          # 취소는 받아들여졌지만 확정 통보가 안 온다
+    sys_.s_entry = -0.5                           # S괴리 미달(G5) → 선주문 취소
+    eng.tick(now, 101.0)
+    await asyncio.sleep(0.05)
+    assert sys_.cancel_calls == 1 and s.entry.cancel_sent
+    assert s.entry.cancel_sent_mono == 101.0
+    mono = 101.0 + CANCEL_WAIT_ALARM_S / 2
+    eng.pump(now, mono)
+    await _settle()
+    assert sys_.error_seq == 0                    # 아직 알람 전
+    row = eng.live_snapshot()[U.value]["sets"][0]["entry"]
+    assert row["cancel_wait_s"] is not None and row["cancel_wait_s"] >= 0
+    mono = 101.0 + CANCEL_WAIT_ALARM_S + FEED_WATCH_S
+    eng.pump(now, mono)
+    await _settle()
+    assert sys_.error_seq == 1 and s.entry.cancel_wait_alarmed
+    eng.pump(now, mono + 10 * FEED_WATCH_S)       # 알람은 한 번만, 재전송 없음
+    await _settle()
+    assert sys_.error_seq == 1 and sys_.cancel_calls == 1
+    assert s.entry.pre_order_id == "O1"
+    sys_.order_book.on_cancel("O1")               # 뒤늦게 온 확정 통보가 정리한다
+    await _settle()
+    assert s.entry.pre_order_id is None and s.entry.cancel_sent_mono is None
+    for task in list(eng._bg):
+        task.cancel()
+    await _settle()
+
+
 async def test_cancel_without_confirmation_or_response_is_never_resent() -> None:
     # 사용자 2026-10-01(결정 61): "취소확인은 데이터 올 때까지 기다림". ① 취소 요청은 받아들여졌는데
     # 확정 통보가 안 옴 → 시간이 지나도 다시 보내지 않는다(옛 3초 재전송 폐기). ② 취소 요청에 응답이
@@ -966,7 +1008,7 @@ async def test_engine_writes_per_underlying_log(tmp_path: Any) -> None:
     assert "행동 정방향 1세트 진입: place_post sell 40" in text
     # 발주 때 보관한 est와 체결 순간 다시 계산한 est를 나란히(사용자 2026-09-15) — 호가창이
     # 그대로면 둘이 같다(매수호가 1184 × 500 → 40계약 est 1184). 후주문 체결가 대비 차이는 유리 +.
-    assert "선주문 #O1 4 @ 1.602e+06 기준est 1184 현est 1184 → 누적" in text
+    assert "선주문 #O1 4 @ 1,602,000 기준est 1184 현est 1184 → 누적" in text
     assert "후주문 #O2 HL 40 @ 1183.5 기준est 1184 차이 -0.5(-0.042%) 현est 1184 " in text
 
 

@@ -58,6 +58,10 @@ class TrackedOrder:
     placed_at: str = ""     # 접수 시각(HH:MM:SS, 표시용) — 주문 리스트 '시각' 칸
     placed_epoch: float = 0.0  # 접수 시각(epoch 초, 정렬용) — 시동 조회분은 거래소 값으로 채움
     provisional_filled: float = 0.0  # 발주 응답 선반영 수량 — userFills 재통보 흡수용(HL 즉시체결)
+    # 이미 반영한 체결번호(LS yakseq/execno, HL tid) — 같은 체결이 두 번 오거나(서버 재전송)
+    # 코어 안에서
+    # 두 번 처리돼도(운영 사고 2026-10-12: 훅 이중 등록) 한 번만 반영. 비교·표시에서 제외
+    seen_fill_ids: set[str] = field(default_factory=set, compare=False, repr=False)
 
     @property
     def is_open(self) -> bool:
@@ -188,6 +192,16 @@ class OrderBook:
         if order is None:
             self._buffer_event(fill.order_id, "fill", fill)  # 체결이 track보다 먼저 — 보관
             return None
+        if fill.fill_id and fill.fill_id in order.seen_fill_ids:
+            # 같은 체결번호 두 번째 — 서버 재전송이든 코어 안 이중 처리든 반영하지 않는다.
+            # 숨기지 않고
+            # 경고로 남긴다(2026-10-12: 조용히 두 번 들어가 HL이 초과 헤지됨)
+            logging.getLogger("kp_arb.order").warning(
+                "중복 체결 통보 무시 #%s 체결번호 %s %g @ %g — 이미 반영됨",
+                         fill.order_id, fill.fill_id, fill.qty, fill.price)
+            return order
+        if fill.fill_id:
+            order.seen_fill_ids.add(fill.fill_id)
         qty = fill.qty
         if order.provisional_filled > 0:  # 발주응답 선반영분 — userFills 재통보 흡수
             absorbed = min(qty, order.provisional_filled)

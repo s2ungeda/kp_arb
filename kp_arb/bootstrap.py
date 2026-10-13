@@ -1287,9 +1287,13 @@ class LiveSystem:
         self._stock_ws.on_reconnect.append(lambda: self._on_ws_reconnect("주식"))
         if self._deriv_ws is not None:
             self._deriv_ws.subscribe_futures_fills()
-            self._deriv_ws.on_fill.append(apply_fill)
-            self._deriv_ws.on_order_event.append(apply_event)
-            self._deriv_ws.on_reconnect.append(lambda: self._on_ws_reconnect("선물"))
+            # xing은 한 객체가 주식·선물 두 자리에 들어온다(§2.2) — 훅을 또 걸면 통보 하나가 두 번
+            # 처리된다(운영 사고 2026-10-12: 부분체결이 이중 반영돼 HL 약 80계약 초과 헤지). 같은
+            # 객체면 주식 자리에 건 훅이 선물 통보도 받으니 여기서는 걸지 않는다.
+            if self._deriv_ws is not self._stock_ws:
+                self._deriv_ws.on_fill.append(apply_fill)
+                self._deriv_ws.on_order_event.append(apply_event)
+                self._deriv_ws.on_reconnect.append(lambda: self._on_ws_reconnect("선물"))
         if self._hl_ws is not None:
             def fan_mark(mark: Mark) -> None:
                 for handler in self.on_mark:
@@ -1462,7 +1466,9 @@ class LiveSystem:
         # run 자체가 아니라 **팩토리(.run)**를 넘긴다 — 재시작 때 새 코루틴을 만들어야 하므로.
         self._tasks.append(asyncio.create_task(
             self._guarded_ws("주식", self._stock_ws.run, self._mark_ws_dead)))
-        if self._deriv_ws is not None:
+        # xing은 한 객체가 두 자리(§2.2) — 같은 객체면 주식 자리에서 이미 돌고 있다(훅도 _wire에서
+        # 한 번만, 2026-10-12)
+        if self._deriv_ws is not None and self._deriv_ws is not self._stock_ws:
             self._tasks.append(
                 asyncio.create_task(
                     self._guarded_ws("선물", self._deriv_ws.run, self._mark_ws_dead))

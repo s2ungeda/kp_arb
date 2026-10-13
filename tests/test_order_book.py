@@ -1,4 +1,6 @@
 """OrderBook 계약 테스트 — 스냅샷 1회 + 이후 이벤트로만 상태·포지션·잔고 갱신."""
+import logging
+
 import pytest
 
 from kp_arb.domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
@@ -100,6 +102,26 @@ def test_on_fill_ignores_duplicate_after_full_fill() -> None:
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == -0.1
     ob.on_fill(fill("O1", 0.1, 168.0, fill_id="F2"))  # 중복(같은 체결 재통보) → 무시
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == -0.1  # 초과 안 됨
+
+
+def test_on_fill_same_fill_id_applied_once_on_partial_fill(
+        caplog: pytest.LogCaptureFixture) -> None:
+    # 운영 사고 2026-10-12: 같은 체결 통보가 코어 안에서 두 번 처리돼(훅 이중 등록) 부분체결이
+    # 이중 반영 → 유령 체결로 HL 약 80계약 초과 헤지. 장부는 "같은 주문의 같은 체결번호는 한 번만"
+    # 반영하고, 거를 때는 숨기지 않고 경고 로그를 남긴다. 체결번호가 다르면 정상 반영.
+    ob = OrderBook()
+    ob.track("O1", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=10, order_type=OrderType.LIMIT, price=300_000.0,
+        account=Account.KR_DERIV))
+    ob.on_fill(fill("O1", 3, 300_000.0, fill_id="C-1"))
+    with caplog.at_level(logging.WARNING, logger="kp_arb.order"):
+        ob.on_fill(fill("O1", 3, 300_000.0, fill_id="C-1"))  # 같은 통보 두 번째 → 무시
+    assert ob.order("O1").filled_qty == 3
+    assert ob.position_qty(SAMSUNG, Instrument.KR_STOCK_FUTURE, Account.KR_DERIV) == -3
+    assert any("중복 체결 통보 무시 #O1 체결번호 C-1" in r.getMessage() for r in caplog.records)
+    ob.on_fill(fill("O1", 2, 300_000.0, fill_id="C-2"))     # 다른 체결번호 → 반영
+    assert ob.order("O1").filled_qty == 5
 
 
 def _hl_intent(side: Side, qty: float) -> OrderIntent:

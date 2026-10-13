@@ -75,7 +75,9 @@ meme-core.exe (32bit, asyncio 메인 스레드)
   키 필드명은 Res InBlock의 첫 필드.
 - `bootstrap_live`: `KP_LS_API=xing`이면 토큰·REST·WS 대신 `XingSession`을 띄우고 위 둘을 조립. 계좌별 WS 두 개
   대신 **XingRealClient 하나**(계좌통보 SC/O01/C01/H01·시세·JIF·CUR·FC9/DC0·VI_ 전부) — `stock_ws`·`deriv_ws`
-  자리에 같은 객체를 넣어 `_wire`를 안 고친다.
+  자리에 같은 객체를 넣는다. **같은 객체면 `_wire`의 훅(체결·주문 통보·재연결)과 `start()`의 run은 한 번만**
+  (2026-10-13, exec 결정 68 — 두 자리에 각각 걸어 통보 하나가 두 번 처리됐고 부분체결 이중 반영으로 HL 초과 헤지,
+  운영 사고 10-12). 통보 순서 역전·이중 처리 대응표는 exec §12.
 - 시동 실패(xingAPI 미설치·로그인 실패)는 기존 `boot_errors` → 메인창 팝업.
 
 ## 3. 자격·설정

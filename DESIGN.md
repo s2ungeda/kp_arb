@@ -128,6 +128,7 @@
 
 ### 5.2 HLGateway
 - **메서드:** `connect()`, `subscribe_mark(coin)`, `subscribe_fills()`, `place_order(...)`, `cancel_order(...)`, `get_positions()`, `get_margin()`, `get_funding(coin)`
+- **통보 순서 역전 대응표(HL H1~H11):** [DESIGN-auto-m-exec.md](DESIGN-auto-m-exec.md) §12.2 (LS는 §12.1).
 - **주의:** HIP-3는 빌더(Trade.xyz) 오라클·유동성 의존. 국내장 개장 중엔 perp 오라클이 기관 spot 참조, 마감 후엔 자가 가격발견 → 마감 구간 mark는 spot 기준 아님(§8). 펀딩 주기·심볼·`dex:COIN` 형식 실측.
 
 ### 5.3 SessionService
@@ -163,6 +164,8 @@
 
 ### 5.9 OrderBook — 주문·포지션·잔고의 실시간 관리 (확정 v0.5)
 - **운영 모델:** ① **최초 실행 시 REST 스냅샷 1회**(계좌·포지션·잔고·미체결 주문 조회) → ② 이후는 **실시간 이벤트(WS 체결통보)가 기본** — 주문 상태 전이·포지션·잔고를 체결 이벤트로 증분 갱신한다(체결 대기 폴링 금지). ③ 동일 스냅샷 조회는 **온디맨드**(추후 UI 조회 버튼)로 재사용.
+- **같은 체결은 한 번만(2026-10-13):** 같은 주문의 같은 체결번호(LS yakseq/execno, HL tid)는 두 번째부터 반영하지 않고
+  경고 로그 — 서버 재전송이든 코어 안 이중 처리든(운영 사고 10-12, exec 결정 68·§12 L12).
 - **TrackedOrder:** `order_id, intent, account, status, filled_qty, avg_fill_price`. 상태 전이는 이벤트로만: `NEW → ACCEPTED(SC0) → PARTIAL/FILLED(SC1)` / `CANCELLED(SC3)` / `REJECTED(SC4)`.
 - **실시간 산출:** 체결 즉시 포지션(수량·평단)과 가용잔고를 로컬 증분 계산 → 리스크/전략이 실시간 값을 참조.
 - **HL 발주 즉시체결(개정 2026-08-11):** HL은 크로싱 주문이 **발주 응답에 `filled`로 즉시 체결**되어 온다. `place()`가 그 체결을 바로 OrderBook에 반영해(`pop_place_fill`) 미체결로 남지 않게 한다 — userFills WS를 놓쳐도(끊김 등) 정합. userFills가 중복으로 와도 **초과체결 가드**(`on_fill`: 이미 전량 체결이면 무시)로 이중 반영을 막는다.

@@ -23,7 +23,7 @@ rem key registration shortcut for the target PC (double-click)
     echo @echo off
     echo start "" "%%~dp0meme.exe" keys
 ) > "dist\meme\keys.bat"
-rem auto-M latency/slippage report from logs (today, or pass YYYYMMDD) -> logs\report_DATE.md
+rem auto-M report from logs (today, or pass YYYYMMDD) -> logs\report_DATE.md + logs\sprd_DATE.csv
 (
     echo @echo off
     echo cd /d "%%~dp0"

@@ -465,6 +465,32 @@ async def test_futures_o01_trcode_maps_cancel_and_amend() -> None:
         ("amend", "1962", "1960")]
 
 
+async def test_futures_h01_before_o01_is_held_until_cancel_ack_arrives() -> None:
+    # 운영 실측 2026-10-12(30건, 09:22~14:37): 취소 확정 H01(ordno 0000002364, ordordno "")이
+    # 취소 접수 O01/FO03(2364 → 원주문 2359)보다 **먼저** 왔다. 옛 코드는 원주문 없는 취소 통보를
+    # 흘려보내 엔진이 버렸고 세트가 "취소 확인 대기"에 갇혔다(L7). 이제 원주문을 모르는 H01은
+    # 보관했다가 접수 통보가 와서 대응이 생기면 그때 취소 확정으로 흘린다.
+    frames = [
+        {"header": {"tr_cd": "O01"},
+         "body": {"ordno": "2359", "orgordno": "0", "trcode1": "FO01"}},
+        {"header": {"tr_cd": "H01"}, "body": {"ordno": "0000002364", "ordordno": "",
+                                              "trcode": "TTRODP11301", "rejcode": "0000",
+                                              "qty": "1"}},
+        {"header": {"tr_cd": "O01"},
+         "body": {"ordno": "2364", "orgordno": "2359", "trcode1": "FO03"}},
+    ]
+    session = FakeConnection([json.dumps(f) for f in frames])
+    client = LSWebSocketClient(FakeConnector([session]))
+    events = []
+    client.on_order_event.append(events.append)
+
+    await client.run()
+
+    assert [(e.kind, e.order_id, e.org_order_id) for e in events] == [
+        ("ack", "2359", None), ("cancel_ack", "2364", "2359"), ("cancel", "2364", "2359")]
+    assert client._pending_h01 == {}  # 보관분은 비워진다
+
+
 async def test_futures_cancel_rejected_after_fill_is_not_a_cancel() -> None:
     # 운영 실측 2026-09-30 09:32:48 #3908(하이닉스 선물 매도 1): 체결(48.277) → 취소 접수 O01 FO03
     # (48.790, 취소주문 3909) → 체결 통보 C01(48.801) → H01 TTRODP11321 rejcode 0804 qty 0(48.801,

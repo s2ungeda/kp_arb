@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Protocol
@@ -31,6 +32,8 @@ from ..domain.enums import Instrument, Underlying, Venue
 from ..domain.models import Quote
 from ..order_log import ws_order_raw
 from ..ws_status import WsStatus
+
+_LOG = logging.getLogger("kp_arb.ls_ws")
 
 QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1", "UH1"})  # KRX/NXT/통합 호가
 FUTURES_QUOTE_TR = "JH0"   # 주식선물 호가 (body 필드는 H1_와 동일 가정 — 장중 실확인 예정)
@@ -262,6 +265,9 @@ class LSWebSocketClient:
         # 선물 취소·정정 주문번호 → 원주문번호(O01 FO02/FO03의 orgordno). 뒤에 오는 확정 통보
         # H01에는 원주문 칸(ordordno)이 비어 있어(xing 실측 2026-09-28) 여기서 찾는다
         self._org_by_cancel: dict[str, str] = {}
+        # 원주문을 못 찾은 H01(취소 확정이 취소 접수보다 먼저 온 경우 — 운영 2026-10-12 30건) 보관.
+        # 뒤에 O01/FO03이 와서 대응이 생기면 그때 취소 확정으로 흘린다. 키 = 취소주문번호
+        self._pending_h01: dict[str, dict[str, Any]] = {}
         self.on_quote: list[Callable[[Quote], None]] = []
         self.on_trade: list[Callable[[TradeTick], None]] = []          # 체결(현재가)
         self.on_expected: list[Callable[[ExpectedPrice], None]] = []   # 예상체결가
@@ -511,8 +517,28 @@ class LSWebSocketClient:
         elif tr_cd in ORDER_EVENT_TRS:
             ws_order_raw(Venue.LS, raw)  # 주문상태(접수/취소·O01/H01 등) 원본 상시 기록
             event = self._parse_order_event(tr_cd, msg)
+            if tr_cd == "H01" and event.org_order_id is None:
+                # 원주문 모름 = 취소 접수(O01/FO03)가 아직 안 옴. 버리지 말고 접수가 올 때까지 보관
+                # (순서가 거꾸로 와도 같은 결과가 나오게 — 운영 2026-10-12: 버려서 세트가 갇힘)
+                if len(self._pending_h01) >= self._PENDING_H01_CAP:
+                    del self._pending_h01[next(iter(self._pending_h01))]
+                self._pending_h01[event.order_id] = msg
+                _LOG.warning(
+                    "LS 취소 확정 H01 #%s — 원주문을 아직 모름(접수 통보 전), 보관",
+                            event.order_id)
+                return
             for event_handler in self.on_order_event:
                 event_handler(event)
+            held = None
+            if event.kind == "cancel_ack":
+                held = self._pending_h01.pop(event.order_id, None)
+            if held is not None:  # 보관해 둔 H01을 이제 원주문과 함께 흘린다
+                late = self._parse_order_event("H01", held)
+                _LOG.warning(
+                    "LS 취소 확정 H01 #%s → 원주문 #%s (접수 통보 뒤에 처리)",
+                            late.order_id, late.org_order_id)
+                for event_handler in self.on_order_event:
+                    event_handler(late)
         elif tr_cd == STATUS_TR:
             status = self._parse_status(msg)
             for status_handler in self.on_market_status:
@@ -759,6 +785,7 @@ class LSWebSocketClient:
         )
 
     _CANCEL_MAP_CAP = 4000  # 하루 취소 수천 건(운영 09-29 7,000건) — 오래된 것부터 버림
+    _PENDING_H01_CAP = 200  # 접수 통보가 끝내 안 오는 H01(다른 프로그램의 취소 등)은 오래된 것부터
 
     def _remember_cancel(self, cancel_no: str, org_no: str) -> None:
         if len(self._org_by_cancel) >= self._CANCEL_MAP_CAP:

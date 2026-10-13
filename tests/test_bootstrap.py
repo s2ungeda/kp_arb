@@ -1120,6 +1120,36 @@ async def test_strategy_loop_noop_places_nothing() -> None:
     assert system.order_book.open_orders() == []  # 주문 0건
 
 
+async def test_same_ws_object_in_both_slots_wires_hooks_once() -> None:
+    # 운영 사고 2026-10-12: xing은 한 객체가 주식·선물 두 자리에 들어오는데(DESIGN-ls-xing §2.2)
+    # _wire가 두 자리에 각각 훅을 걸어 통보 하나가 두 번 처리됐다(부분체결 이중 반영 → HL 초과
+    # 헤지). 같은 객체면 훅은 한 번만 — 선물 체결 C01 하나 = 장부 체결 한 번.
+    gw = MockLSGateway()
+    gw.seed_balance(Account.KR_DERIV, 50_000_000)
+    c01 = json.dumps({"header": {"tr_cd": "C01"},
+                      "body": {"ordno": "0000000001", "yakseq": "1", "chevol": "3",
+                               "cheprice": "3000.00", "chetime": "103212739"}})
+    ws = LSWebSocketClient(FakeConnector([c01]))
+    system = LiveSystem(
+        gateway=gw,  # type: ignore[arg-type]
+        order_book=OrderBook(), session=SessionService(), stock_ws=ws, deriv_ws=ws,
+    )
+    seen_fills: list[str] = []
+    system.order_book.track("1", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=10, order_type=OrderType.LIMIT, price=300_000.0,
+        account=Account.KR_DERIV))
+    await system.start()
+    ws.on_fill.append(lambda f: seen_fills.append(f.fill_id))
+    await system.wait()
+
+    assert len(ws.on_fill) == 2 and len(ws.on_order_event) == 1    # 코어 훅 1(+시험 훅 1)
+    assert len(ws.on_reconnect) == 1
+    assert seen_fills == ["1"]
+    order = system.order_book.order("1")
+    assert order is not None and order.filled_qty == 3              # 한 번만 반영
+
+
 async def test_deriv_ws_subscribes_futures_fills_only() -> None:
     system, _, deriv_connector = _system([], deriv_frames=[])
     await system.start()

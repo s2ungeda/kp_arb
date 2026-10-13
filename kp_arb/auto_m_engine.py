@@ -98,6 +98,10 @@ def is_cancel_gone(err_text: str) -> bool:
 # 감시 타이머 간격 — 채널 연결·시장 정지·VI 상태가 바뀌었는지 보고, 끊겨 있는 동안은 이 간격으로
 # 판정을 돌린다(exec §4 판정 계기, 결정 60). 값은 Claude가 고름(사용자 확인 필요).
 FEED_WATCH_S = 1.0
+# 취소 확인 대기가 이 시간을 넘으면 알람 + 상태줄 "취소 확인 대기 n초"
+# (재전송·해제 없음, 결정 61 유지).
+# 값은 Claude가 고름(사용자 확인 2026-10-13 예정)
+CANCEL_WAIT_ALARM_S = 30.0
 CANCEL_RETRY_S = 0.6  # 취소가 거부된 뒤 다시 보내기까지(한 건 취소·묶음 취소 공통, exec ㅂ3)
 SOURCE = "자동M"
 
@@ -392,12 +396,14 @@ class AutoMEngine:
         전 종목."""
         due, everything = self._dirty, self._dirty_all
         self._dirty, self._dirty_all = set(), False
+        self._mono = mono  # 판정이 없어도 시계는 흐른다(취소 확인 대기 초 표시)
         if mono - self._watch_at >= FEED_WATCH_S:
             self._watch_at = mono
             state = self._watch_snapshot()
             if state != self._watch_state or not (state[0] and state[1]):
                 everything = True  # 끊겨 있는 동안은 감시 때마다(취소가 실패했으면 다시 보내도록)
             self._watch_state = state
+            self._watch_cancel_wait(mono)
         in_window = self._settings.in_window(now.time())
         if in_window != self._in_window:
             self._in_window = in_window
@@ -414,6 +420,24 @@ class AutoMEngine:
         self._last_pump = mono
         if everything or due:
             self.tick(now, mono, None if everything else due)
+
+    def _watch_cancel_wait(self, mono: float) -> None:
+        """취소를 보냈는데 확인 통보가 CANCEL_WAIT_ALARM_S 넘게 안 온 다리 — 알람 한 번.
+        재전송은 하지 않는다(결정 61).
+        상태줄엔 스냅샷의 cancel_wait_s로 "취소 확인 대기 n초"가 보인다."""
+        for u, book in self.screen.books_of(self.product):
+            for reverse, index, s in book.all_sets():
+                for block in (Block.ENTRY, Block.EXIT):
+                    leg = s.leg(block)
+                    if (leg.cancel_sent and leg.pre_order_id and leg.cancel_sent_mono is not None
+                            and not leg.cancel_wait_alarmed
+                            and mono - leg.cancel_sent_mono >= CANCEL_WAIT_ALARM_S):
+                        leg.cancel_wait_alarmed = True
+                        self._apply(u, index, block, [Action(
+                            "alarm", order_id=leg.pre_order_id,
+                            reason=f"선주문 #{leg.pre_order_id} 취소 확인 통보 없음 "
+                                   f"{mono - leg.cancel_sent_mono:.0f}초 — LS에서 주문 상태 확인")],
+                            reverse)
 
     def _sleep_s(self, now: datetime, mono: float) -> float:
         """다음에 깨어날 때까지 — 감시 시각, 주문가능시간 경계, 세트 타이머 중 가장 이른 것."""
@@ -560,6 +584,9 @@ class AutoMEngine:
                     self._solo.discard(key)  # 한 건씩 보내는 것은 이번 한 번
                     self._spawn(self._place_pre(u, index, block, act, reverse))
             elif act.kind == "cancel_pre" and act.order_id:
+                leg = self._set(u, index, reverse).leg(block)
+                if leg.cancel_sent_mono is None:
+                    leg.cancel_sent_mono = self._mono  # 확인 대기 시작(감시 타이머가 본다)
                 if self._tick_cancel is not None:
                     self._tick_cancel.append(
                         (u, index, block, act.order_id, act.reason, reverse))
@@ -652,9 +679,9 @@ class AutoMEngine:
             self._log.warning("[자동M] %s 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → 즉시 취소",
                               u.value, self._tag(u, index, block, reverse), oid)
             self._apply(u, index, block, late, reverse)
-        self._log.info("[자동M] %s 선주문 %s %s %d @ %g → #%s",
+        self._log.info("[자동M] %s 선주문 %s %s %d @ %s → #%s",
                        u.value, self._tag(u, index, block, reverse), act.side.value, act.qty,
-                       act.price, oid)
+                       f"{act.price:,.0f}", oid)
 
     async def _place_hl_pre(self, u: Underlying, index: int, block: Block, act: Action,
                             reverse: bool = False) -> None:
@@ -1048,8 +1075,9 @@ class AutoMEngine:
             else f"기준est - 현est {self._fmt_est(est_now)}"
         if ref.leg == "pre":
             acts = on_pre_fill(s, ref.block, int(round(qty)), price, mono)
-            self.ulog(u).info("체결 %s: 선주문 #%s %g @ %g %s → 누적 %d/%d, HL 대기 %g | %s",
-                              tag, order.order_id, qty, price, est_pair, leg.pre_filled,
+            # 가격은 천 단위 쉼표(사용자 2026-10-13: %g는 1.65e+06처럼 지수로 찍혀 읽기 어려움)
+            self.ulog(u).info("체결 %s: 선주문 #%s %g @ %s %s → 누적 %d/%d, HL 대기 %g | %s",
+                              tag, order.order_id, qty, f"{price:,.0f}", est_pair, leg.pre_filled,
                               leg.pre_qty, leg.post_pending, self._ledger(s))
             # 코어 로그에도 체결가·체결수량(사용자 2026-09-14: 코어 로그엔 발주가만 있고 체결 없음)
             self._log.info("[자동M] %s 선주문 체결 %s #%s %s %g @ %s %s (누적 %d/%d)",
@@ -1309,8 +1337,9 @@ class AutoMEngine:
         self._log.warning("[자동M] %s 취소로 정리한 선주문 #%s 체결 %s %g @ %s — 취소보다 체결이 "
                           "먼저였음 → 헤지 후주문 %g (%s)", u.value, order.order_id,
                           order.intent.side.value, qty, f"{price:,.0f}", qty * s.hl_ratio, tag)
-        self.ulog(u).warning("체결 %s: 취소로 정리한 선주문 #%s %g @ %g (늦은 체결, 경합) → 헤지 "
-                             "후주문 %g, HL 대기 %g | %s", tag, order.order_id, qty, price,
+        self.ulog(u).warning("체결 %s: 취소로 정리한 선주문 #%s %g @ %s (늦은 체결, 경합) → 헤지 "
+                             "후주문 %g, HL 대기 %g | %s", tag, order.order_id, qty,
+                             f"{price:,.0f}",
                              qty * s.hl_ratio, leg.post_pending, self._ledger(s))
         self._apply(u, ref.index, ref.block, acts, ref.reverse)
         self._trace(u, ref.index, ref.block, leg, ref.reverse)
@@ -1419,8 +1448,8 @@ class AutoMEngine:
             monitor = {"fwd": {"en_sf": en_v, "en_s": sig.s_spread_entry, "ex_sf": ex_v},
                        "rev": {"en_sf": ex_v, "en_s": sig.s_spread_exit, "ex_sf": en_v}}
         fx_used, fx_src = self._system.usdkrw_effective()  # 지금 HL 환산에 쓰는 환율(화면 표시)
-        out = [self._set_row(s) for s in book.sets]
-        rev_out = [self._set_row(s) for s in book.rev_sets]  # 역방향 3세트(§7A·§7B)
+        out = [self._set_row(s, self._mono) for s in book.sets]
+        rev_out = [self._set_row(s, self._mono) for s in book.rev_sets]  # 역방향 3세트(§7A·§7B)
         # HL 호가단위(틱) 옵션 — 일반주문창과 같은 표(가격 자릿수 기반, 코어 계산 §5.10)
         hl = self._system.quotes.get((u, Instrument.HL_PERP, "hl"))
         ref = (hl.ask or hl.bid) if hl is not None else None
@@ -1456,8 +1485,9 @@ class AutoMEngine:
                                     if active is not None else None)}
 
     @staticmethod
-    def _set_row(s: AutoMSet) -> dict[str, Any]:
-        """세트 하나의 화면용 행 — RT는 부호 그대로(역방향은 0 또는 음수, 사용자 2026-09-14)."""
+    def _set_row(s: AutoMSet, mono: float) -> dict[str, Any]:
+        """세트 하나의 화면용 행 — RT는 부호 그대로(역방향은 0 또는 음수, 사용자 2026-09-14).
+        mono = 엔진의 마지막 단조 시계(취소 확인 대기 초 계산용)."""
         row: dict[str, Any] = {"rt": s.rt, "fill_diff": s.fill_diff, "reverse": s.reverse}
         for name, leg in (("entry", s.entry), ("exit", s.exit)):
             row[name] = {
@@ -1469,6 +1499,10 @@ class AutoMEngine:
                 "hl_unhedged": leg.hl_unhedged, "post_pending": leg.post_pending,
                 # 취소 재전송 한도 초과 → 상태줄 "취소실패 #번호 n회"(exec ㅂ3)
                 "cancel_failed": leg.cancel_alarmed, "cancel_tries": leg.cancel_tries,
+                # 취소 확인 대기 시간(초) — 보낸 뒤 통보가 안 온 동안만 값, 아니면 None
+                "cancel_wait_s": (round(mono - leg.cancel_sent_mono)
+                                  if leg.cancel_sent and leg.cancel_sent_mono is not None
+                                  else None),
                 # 마지막 선주문 거부(시각·사유·횟수) → 상태줄(사용자 2026-09-15)
                 "reject": leg.last_reject, "reject_at": leg.last_reject_at,
                 "hl_qty": leg.acc.hl_qty, "sf_qty": leg.acc.sf_qty,

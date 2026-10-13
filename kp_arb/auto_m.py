@@ -293,6 +293,11 @@ class Leg:
     cancel_sent: bool = False       # 관문(G2·G5·G6) 취소를 이미 보냄 — 확인 올 때까지 재전송 안 함
     cancel_tries: int = 0           # 이번 선주문에 취소를 보낸 횟수(거부 뒤 다시 보낸 것 포함)
     cancel_alarmed: bool = False    # 취소 거부가 되풀이돼 알람을 이미 냈음 → 상태줄 "취소실패"
+    # 취소를 보낸 시각(엔진이 넣음) — 확인 통보가 오래 안 오면 상태줄·알람으로 알린다
+    # (재전송은 안 함, 결정 61 유지). 운영 2026-10-12: 통보를 놓친 채 2시간 넘게 갇혀 있었는데
+    # 아무 표시가 없었다
+    cancel_sent_mono: float | None = None
+    cancel_wait_alarmed: bool = False
     await_post_then_delay: bool = False  # 취소 확인됨, 병행 후주문 체결 확인 뒤 딜레이
     reject_streak: int = 0          # 선주문 연속 거부 횟수 — 접수 뒤 체결·취소가 있으면 0으로
     # 마지막 선주문 거부 — 화면 상태줄에 "거부(n/3): 사유"로(사용자 2026-09-15: 거부났는지·사유를
@@ -337,6 +342,8 @@ class Leg:
         self.cancel_sent = False
         self.cancel_tries = 0
         self.cancel_alarmed = False
+        self.cancel_sent_mono = None
+        self.cancel_wait_alarmed = False
         # 선주문이 끝났으면(체결·취소·거부) 재발주 취소 대기도 끝 — 역산가 변경으로 취소를 보냈는데
         # 취소보다 체결이 먼저 된 경우(LS 01433) 이 표시가 남아 판이 끝나도 '쉼'에서 못 나왔다
         # (실측 2026-09-11 오후: 1·2세트 청산이 딜레이대기에 굳음).

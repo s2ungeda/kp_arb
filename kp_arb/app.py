@@ -27,10 +27,15 @@ def main() -> None:
     if arg == "core":
         from kp_arb.core_server import main as run
         run()
-    elif arg == "report":  # 운영 PC에서 로그만으로 리포트(콘솔 exe에서)
+    elif arg == "report":  # 운영 PC 로그만으로 리포트(콘솔 exe) — report.bat [YYYYMMDD] [로그폴더]
+        # 지연·밀림 보고서(logs/report_날짜.md) + 판별 정산 Sprd CSV(logs/sprd_날짜.csv,
+        # 사용자 2026-10-13)
         from kp_arb.report_latency import main as report
+        from kp_arb.report_sprd import main as report_csv
 
-        raise SystemExit(report(sys.argv[1:]))
+        rc = report(sys.argv[1:])
+        rc2 = report_csv(sys.argv[1:])
+        raise SystemExit(rc or rc2)
     elif arg == "xingcheck":  # xing 전수 점검(로그인·조회·실시간, 주문 없음) — xing_check.bat
         from kp_arb.xing_check import main as xing_check
 
