@@ -9,7 +9,7 @@ from kp_arb.core_server import _autom_command
 from kp_arb.domain.enums import Block, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent, Quote
 from kp_arb.gateways.ls_ws import Fill
-from kp_arb.order_book import OrderBook
+from kp_arb.order_book import OrderBook, OrderStatus
 from kp_arb.strategy_core import CoreState, ScreenKind
 
 U = Underlying.SK_HYNIX
@@ -275,6 +275,9 @@ async def test_post_order_linked_by_cloid_before_place_returns() -> None:
     assert abs(s.fill_diff - 4.037) < 1e-9 and s.entry.running
     assert s.entry.status is not LegStatus.POST_PENDING
     assert eng._pending_refs == {} and "O2" not in eng._orders and eng._orphan_fills == {}
+    # 검토 2026-10-13 ★3: 선식별이 등록·종료 처리까지 마친 뒤 발주 응답 경로가 _register를 또 불러도
+    # 같은 종료를 다시 처리하지 않는다(전엔 판 마무리 2회 → 마지막 판 매매결과가 빈 판으로 덮임)
+    assert s.entry.last_round is not None and abs(s.entry.last_round.hl_qty - 5.963) < 1e-9
 
 
 async def test_failed_post_order_relinked_when_identified_late() -> None:
@@ -565,36 +568,36 @@ async def test_cancel_crossed_by_fill_is_not_retried() -> None:
     await _settle()
 
 
-async def test_late_fill_after_cancel_confirmation_still_hedges() -> None:
-    # 운영 실측 2026-09-30 09:32:48 #3908(결정 56): 취소 확정으로 정리한 선주문의 체결이 뒤늦게
-    # 도착(취소보다 체결이 먼저였던 경합) → 옛 코드는 주인 없는 체결로 버려 HL 헤지가 빠졌다(SF 매도
-    # 1계약 노출). 이제 장부·RT·후주문 대기에 반영하고 헤지 후주문을 낸다. 그새 걸린 새 선주문은
-    # 그대로.
+async def test_partial_cancel_confirmation_waits_for_pending_fill_then_closes() -> None:
+    # 결정 69(사용자 2026-10-13, 결정 56 ②의 120초 타이머 폐기): 취소 확정 수량이 장부 남은 수량보다
+    # 적으면 차이만큼 체결이 와야 하는 주문 — 선주문은 열린 채 기다리고, 그 체결은 보통 선주문
+    # 체결로 들어와 헤지를 낸다. 셈이 맞으면 그때 취소 확정으로 정리. 운영 10-12 #1518 재현:
+    # 10계약 선주문, 취소 9 확정(1계약은 그새 체결·통보 늦음) → 체결 1 → 닫힘 → 다음 판.
     eng, sys_, state = _engine()
     eng.set_running(U, 0, Block.ENTRY, True)
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
     s = state.autom.book(U).sets[0]
     assert s.entry.pre_order_id == "O1"
-    sys_.order_book.on_cancel("O1")               # 취소 확정(밖에서 취소) → 엔진이 선주문 정리
+    sys_.order_book.on_cancel("O1", qty=9)        # 확정 9 < 남은 10 → 체결 1 대기(열어 둠)
     await _settle()
-    assert s.entry.pre_order_id is None and s.entry.status is LegStatus.ARMED
-    eng.tick(datetime(2026, 9, 4, 10, 0, 2), 102.0)  # 다음 바퀴 → 새 선주문 O2
+    assert s.entry.pre_order_id == "O1" and s.entry.status is LegStatus.PRE_RESTING
+    assert len(sys_.placed) == 1                  # 새 선주문 없음
+    eng.tick(datetime(2026, 9, 4, 10, 0, 2), 102.0)
     await _settle()
-    assert s.entry.pre_order_id == "O2" and len(sys_.placed) == 2
-    # 정리한 O1의 체결이 뒤늦게 온다(체결 → 취소 접수 → 취소 거부 순서였던 것)
+    assert len(sys_.placed) == 1
+    # 기다리던 체결 1 → 보통 선주문 체결로 헤지 후주문 10, 셈이 맞아 장부가 취소로 닫음 → 정리
     sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
     await _settle()
-    assert len(sys_.placed) == 3
-    post = sys_.placed[2]
+    assert len(sys_.placed) == 2
+    post = sys_.placed[1]
     assert post.instrument is Instrument.HL_PERP and post.side is Side.SELL and post.qty == 10
     assert s.sf_net == 1 and s.rt == 1 and abs(s.fill_diff - 10) < 1e-9  # 장부 반영, HL 대기 10
-    assert s.entry.pre_order_id == "O2" and s.entry.pre_filled == 0       # 새 선주문은 그대로
-    assert s.entry.status is LegStatus.PRE_RESTING
-    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O3", qty=10, price=1184.0, ts=0))
+    assert sys_.order_book.order("O1").status is OrderStatus.CANCELLED
+    assert s.entry.pre_order_id is None             # 취소 확정으로 정리(딜레이 → 다음 판)
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=10, price=1184.0, ts=0))
     await _settle()
     assert s.fill_diff == 0 and abs(s.hl_net + 10) < 1e-9                # 헤지 완성
-    assert s.entry.pre_order_id == "O2"                                  # 새 선주문 계속 대기
 
 
 async def test_cancel_alarm_raises_error_seq_and_snapshot_flags_it(monkeypatch: Any) -> None:
@@ -663,6 +666,37 @@ async def test_cancel_wait_watchdog_alarms_once_without_resending() -> None:
     sys_.order_book.on_cancel("O1")               # 뒤늦게 온 확정 통보가 정리한다
     await _settle()
     assert s.entry.pre_order_id is None and s.entry.cancel_sent_mono is None
+    for task in list(eng._bg):
+        task.cancel()
+    await _settle()
+
+
+async def test_cancel_wait_watchdog_covers_replace_cancel() -> None:
+    # 검토 2026-10-13 ★4: 역산가 변경 취소는 cancel_sent가 아니라 replace_pending — 어제(10-12)
+    # 갇힌 상태가 이것인데 결정 68 ④의 감시가 cancel_sent만 봐서 안 울렸다. 이제 둘 다.
+    from kp_arb.auto_m_engine import CANCEL_WAIT_ALARM_S, FEED_WATCH_S
+
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    now = datetime(2026, 9, 4, 10, 0, 0)
+    eng.pump(now, 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1" and s.entry.pre_price == 1_602_000.0
+    sys_.cancel_confirm_delay = 10_000.0          # 확정 통보가 안 온다
+    from kp_arb.domain.models import Quote
+    sys_.quotes[(U, Instrument.HL_PERP, "hl")] = Quote(  # HL 호가 변화 → 역산가 변경 → 취소
+        underlying=U, instrument=Instrument.HL_PERP, bid=1182.0, ask=1182.5, ts=0,
+        market="hl", bids=[(1182.0, 500.0)], asks=[(1182.5, 500.0)])
+    eng.tick(now, 101.0)
+    await asyncio.sleep(0.05)
+    assert sys_.cancel_calls == 1 and s.entry.replace_pending and not s.entry.cancel_sent
+    assert s.entry.cancel_sent_mono == 101.0
+    eng.pump(now, 101.0 + CANCEL_WAIT_ALARM_S + FEED_WATCH_S)
+    await _settle()
+    assert sys_.error_seq == 1 and s.entry.cancel_wait_alarmed and sys_.cancel_calls == 1
+    row = eng.live_snapshot()[U.value]["sets"][0]["entry"]
+    assert row["cancel_wait_s"] is not None and row["cancel_wait_s"] >= CANCEL_WAIT_ALARM_S
     for task in list(eng._bg):
         task.cancel()
     await _settle()

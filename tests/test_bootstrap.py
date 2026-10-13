@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -1150,6 +1151,56 @@ async def test_same_ws_object_in_both_slots_wires_hooks_once() -> None:
     assert order is not None and order.filled_qty == 3              # 한 번만 반영
 
 
+async def test_hl_cancel_update_closes_by_remaining_sz() -> None:
+    # 사용자 2026-10-13: "응답은 취소 주문이 잘 들어갔는지의 판단, 성공이면 취소 통보를 보고 판단."
+    # 취소 통보(orderUpdates canceled)의 sz = 취소 시점 남은 수량. 장부 남은 수량(0.2)보다
+    # 적으면(0.1)
+    # 취소 직전 체결 0.1의 통보가 뒤따르는 중 — 열어 두고 기다렸다가 체결이 오면 닫는다(결정 69).
+    from kp_arb.gateways.hl_ws import HLWebSocketClient
+
+    cancel_upd = json.dumps({"channel": "orderUpdates", "data": [
+        {"order": {"coin": "xyz:SMSN", "side": "A", "limitPx": "185.0", "sz": "0.1",
+                   "oid": 777, "timestamp": 1.0, "origSz": "0.2"},
+         "status": "canceled", "statusTimestamp": 1.0}]})
+    hl_fill = json.dumps({"channel": "userFills", "data": {"fills": [
+        {"coin": "xyz:SMSN", "px": "185.0", "sz": "0.1", "side": "A",
+         "oid": 777, "tid": 1, "time": 1.0}]}})
+    system = LiveSystem(
+        gateway=MockLSGateway(),  # type: ignore[arg-type]
+        order_book=OrderBook(), session=SessionService(),
+        stock_ws=LSWebSocketClient(FakeConnector([])),
+        hl_ws=HLWebSocketClient(FakeConnector([cancel_upd, hl_fill])),
+    )
+    system.order_book.track("777", _HL_INTENT)
+    await system.start()
+    await system.wait()
+    order = system.order_book.order("777")
+    assert order is not None and order.status is OrderStatus.CANCELLED
+    assert order.filled_qty == 0.1 and order.cancelled_qty == 0.1 and not order.cancel_assumed
+
+
+async def test_same_ws_object_reconnect_resyncs_both_ls_accounts() -> None:
+    # 검토 2026-10-13 ★6: xing(같은 객체)은 "선물" 훅을 안 거니 재연결 재동기가 주식 계좌만 되던
+    # 부작용(결정 68 ①) → 라벨 "xing"으로 두 계좌.
+    ws = LSWebSocketClient(FakeConnector([]))
+    system = LiveSystem(
+        gateway=MockLSGateway(),  # type: ignore[arg-type]
+        order_book=OrderBook(), session=SessionService(), stock_ws=ws, deriv_ws=ws,
+    )
+    scopes: list[Any] = []
+
+    async def fake_refresh(scope: Any = None) -> None:
+        scopes.append(scope)
+
+    system.refresh_snapshot = fake_refresh  # type: ignore[method-assign]
+    await system.start()
+    assert len(ws.on_reconnect) == 1
+    ws.on_reconnect[0]()
+    await asyncio.sleep(0.05)
+    assert scopes == [{Account.KR_STOCK, Account.KR_DERIV}]
+    await system.wait()
+
+
 async def test_deriv_ws_subscribes_futures_fills_only() -> None:
     system, _, deriv_connector = _system([], deriv_frames=[])
     await system.start()
@@ -1183,10 +1234,11 @@ def test_usdkrw_effective_priority_by_futures_window() -> None:
     assert system.usdkrw_effective(datetime(2026, 7, 20, 7, 29, 59)) == (None, "계산불가")
 
 
-async def test_cancel_many_batches_hl_and_updates_local_book() -> None:
-    # 일괄 취소(2026-09-28): HL은 게이트웨이 cancel_orders 한 번에 묶고(요청 한도), 성공 건은 취소
-    # 통보 채널이 없어 장부를 바로 갱신. 실패 건은 사유를 돌려주고 거부내역에 남긴다. 모르는
-    # 번호는 사유만. LS는 한 건씩.
+async def test_cancel_many_batches_hl_and_closes_by_order_update() -> None:
+    # 일괄 취소(2026-09-28): HL은 게이트웨이 cancel_orders 한 번에 묶고(요청 한도). 실패 건은 사유를
+    # 돌려주고 거부내역에 남긴다. 모르는 번호는 사유만. LS는 한 건씩. 성공 건은 응답으로 닫지 않고
+    # 취소 통보(orderUpdates canceled, sz)로 닫는다(사용자 2026-10-13: 응답은 접수 확인, 판단은
+    # 통보).
     from collections.abc import Sequence
 
     from kp_arb.gateways.mock_hl import MockHLGateway
@@ -1212,8 +1264,12 @@ async def test_cancel_many_batches_hl_and_updates_local_book() -> None:
     assert res[0] == ("H1", None) and res[2] == ("H3", None)
     assert res[1][0] == "H2" and res[1][1] is not None and "never placed" in res[1][1]
     assert res[3][0] == "NOPE" and res[3][1] is not None
-    assert system.order_book.order("H1") is None or not system.order_book.order("H1").is_open
-    assert system.order_book.order("H3") is None or not system.order_book.order("H3").is_open
+    from kp_arb.gateways.hl_ws import OrderUpdate
+    assert system.order_book.order("H1").is_open      # 응답만으로는 안 닫힘
+    system._on_hl_order_update(OrderUpdate(oid="H1", coin="xyz:SMSN", status="canceled",
+                                           side="A", sz=1.0, orig_sz=1.0, limit_px=1000.0))
+    assert not system.order_book.order("H1").is_open  # 통보(sz=남은 전부) → 닫힘
+    assert system.order_book.order("H3").is_open
     h2 = system.order_book.order("H2")
     assert h2 is not None and h2.is_open                         # 실패 건은 장부에 남음
     assert any(r.get("order_id") == "H2" for r in system.rejects)  # 거부내역에 기록

@@ -178,6 +178,9 @@ class OrderEvent(BaseModel):
     kind: str            # "ack" | "amend" | "cancel" | "reject" | "cancel_ack" | "cancel_reject"
     order_id: str        # ordno
     org_order_id: str | None = None  # 정정/취소 통보의 원주문(orgordno)
+    # 취소 **확정 수량**(exec 결정 69) — 선물 H01 `qty`(실정정취소수량) / 주식 SC3 `canccnfqty`
+    # (취소확인수량). 장부는 이 수량과 남은 수량을 대조해 주문을 닫는다(적으면 차이만큼 체결 대기)
+    qty: float | None = None
     body: dict[str, Any] = {}
 
 
@@ -777,10 +780,19 @@ class LSWebSocketClient:
             qty_zero = qty_raw != "" and _to_float(qty_raw) == 0.0
             if rej not in _H01_OK_REJCODES or qty_zero:
                 kind = "cancel_reject"
+        qty: float | None = None
+        if kind == "cancel":  # 확정 수량(결정 69): H01 qty=실정정취소수량 / SC3 canccnfqty
+            field = "qty" if tr_cd == "H01" else "canccnfqty"
+            raw = str(body.get(field, "")).strip()
+            qty = _to_float(raw) if raw else None
+            if qty is None:  # 비어 오면 장부가 남은 전부로 닫는다 — 실측에서 바로 알 수 있게
+                _LOG.warning("LS 취소 확정 %s #%s — 확정 수량 칸(%s) 비어 있음 → 남은 수량 전부로 "
+                             "닫음", tr_cd, ordno, field)
         return OrderEvent(
             kind=kind,
             order_id=ordno,
             org_order_id=org if org not in ("", "0") else None,
+            qty=qty,
             body=body,
         )
 

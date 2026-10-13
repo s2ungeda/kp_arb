@@ -431,6 +431,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 buy = o.get("side") == "buy"
                 inst = str(o.get("instrument"))
                 stk = _ST_KR.get(str(o.get("status")), o.get("status"))
+                cxl = o.get("cancelled") or 0
+                if cxl:  # 부분 취소 확정 뒤 체결 통보 대기(결정 69) — 왜 남아 있는지 보이게
+                    stk = f"취소 {_fmt_qty(cxl)} / 체결대기 {_fmt_qty(o.get('remaining'))}"
                 out.append((str(o.get("order_id")), "buy" if buy else "sell",
                             (_venue(inst), _sym(o.get("underlying"), inst),
                              "매수" if buy else "매도",

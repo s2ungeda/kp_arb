@@ -51,6 +51,53 @@ def test_snapshot_removes_stale_phantom_keeps_recent() -> None:
     assert ob.order("NEW") is not None    # 방금 낸 것은 보존
 
 
+def test_snapshot_merges_into_tracked_order_keeping_defenses() -> None:
+    # 검토 2026-10-13 ★2: 재동기가 추적 객체를 통째로 바꿔 끼우면 seen_fill_ids(중복 방어)·
+    # cancelled_qty가 사라진다 → 병합. ① 같은 체결번호 재통보는 재동기 뒤에도 무시 ② 스냅샷 체결이
+    # 더 많으면 차이를
+    # 훅으로 알림(resync-번호) ③ 로컬이 더 많으면 로컬 유지 ④ 로컬이 닫은 주문은 되돌리지 않음.
+    ob = OrderBook()
+    applied: list[tuple[float, str]] = []
+    ob.on_fill_applied.append(lambda o, q, p, f: applied.append((q, f)))
+    it = OrderIntent(venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+                     side=Side.SELL, qty=10, order_type=OrderType.LIMIT, price=300_000.0,
+                     account=Account.KR_DERIV, source="autom", tag="선정1진")
+    local = ob.track("O1", it)
+    ob.on_fill(fill("O1", 2, 300_000.0, fill_id="C-1"))
+    ob.load_snapshot(open_orders=[TrackedOrder("O1", it, status=OrderStatus.PARTIAL,
+                                               filled_qty=2)])
+    assert ob.order("O1") is local                                     # ① 객체 유지
+    ob.on_fill(fill("O1", 2, 300_000.0, fill_id="C-1"))                # 재통보 → 여전히 무시
+    assert local.filled_qty == 2 and applied == [(2, "C-1")]
+    ob.load_snapshot(open_orders=[TrackedOrder("O1", it, status=OrderStatus.PARTIAL,
+                                               filled_qty=5, avg_fill_price=300_000.0)])
+    assert local.filled_qty == 5 and applied[-1] == (3, "resync-O1")  # ② 끊긴 사이 체결 3
+    assert local.status is OrderStatus.PARTIAL
+    ob.load_snapshot(open_orders=[TrackedOrder("O1", it, status=OrderStatus.PARTIAL,
+                                               filled_qty=4)])
+    assert local.filled_qty == 5 and len(applied) == 2                 # ③ 로컬 유지
+    ob.on_cancel("O1", qty=5)                                          # 남은 5 취소 확정 → 닫힘
+    ob.load_snapshot(open_orders=[TrackedOrder("O1", it, status=OrderStatus.PARTIAL,
+                                               filled_qty=5)])
+    assert local.status is OrderStatus.CANCELLED and ob.open_orders() == []  # ④ 안 되돌림
+
+
+def test_fill_beyond_remaining_is_applied_with_error(caplog: pytest.LogCaptureFixture) -> None:
+    # 검토 2026-10-13 F: 셈을 넘는 체결은 장부가 틀렸다는 뜻 — 자르지 않고 반영(실제 돈) + 에러 로그
+    ob = OrderBook()
+    ob.track("O1", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=3, order_type=OrderType.LIMIT, price=300_000.0,
+        account=Account.KR_DERIV))
+    ob.on_cancel("O1", qty=2)                     # 남은 1
+    with caplog.at_level(logging.ERROR, logger="kp_arb.order"):
+        ob.on_fill(fill("O1", 2, 300_000.0, fill_id="C-1"))  # 2 체결 — 1 초과
+    o = ob.order("O1")
+    assert o.filled_qty == 2 and o.status is OrderStatus.CANCELLED
+    assert ob.position_qty(SAMSUNG, Instrument.KR_STOCK_FUTURE, Account.KR_DERIV) == -2
+    assert any("체결 2가 장부 남은 수량 1를 넘음" in r.getMessage() for r in caplog.records)
+
+
 def test_snapshot_keeps_exchange_orders() -> None:
     # 스냅샷(거래소 실측)에 있으면 나이와 무관하게 유지.
     ob = OrderBook()
@@ -122,6 +169,137 @@ def test_on_fill_same_fill_id_applied_once_on_partial_fill(
     assert any("중복 체결 통보 무시 #O1 체결번호 C-1" in r.getMessage() for r in caplog.records)
     ob.on_fill(fill("O1", 2, 300_000.0, fill_id="C-2"))     # 다른 체결번호 → 반영
     assert ob.order("O1").filled_qty == 5
+
+
+def test_cancel_closes_by_confirmed_qty_and_waits_for_pending_fills(
+        caplog: pytest.LogCaptureFixture) -> None:
+    # 결정 69(사용자 2026-10-13): "남은 수량이 있으면 기다리고 없으면 상태 확정" — 취소 확정 통보의
+    # 수량(H01 qty·SC3 canccnfqty·HL sz)과 장부 남은 수량을 대조해 닫는다. 운영 10-12 #1518: 3계약
+    # 중 1 체결, 장부는 2로 오인 → 취소 1 확정 → 실제 1계약이 살아 2초 뒤 체결. 옛 코드는 취소
+    # 통보에 바로 닫고 120초 타이머로 늦은 체결을 받았다(타이머 폐기).
+    ob = OrderBook()
+    ob.track("O1", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=3, order_type=OrderType.LIMIT, price=300_000.0,
+        account=Account.KR_DERIV))
+    ob.on_fill(fill("O1", 1, 300_000.0, fill_id="C-1"))
+    with caplog.at_level(logging.WARNING, logger="kp_arb.order"):
+        ob.on_cancel("O1", qty=1)                      # 확정 1 < 남은 2 → 체결 1 대기
+    o = ob.order("O1")
+    assert o.status is OrderStatus.PARTIAL and o.is_open and o.cancelled_qty == 1
+    assert o.remaining_qty == 1 and ob.open_orders() == [o]
+    assert any("부분 취소 확정 #O1: 확정 1 < 남은 2" in r.getMessage() for r in caplog.records)
+    ob.on_fill(fill("O1", 1, 300_000.0, fill_id="C-2"))  # 기다리던 체결 → 셈 끝 → 닫힘
+    assert o.status is OrderStatus.CANCELLED and o.filled_qty == 2 and ob.open_orders() == []
+    assert ob.position_qty(SAMSUNG, Instrument.KR_STOCK_FUTURE, Account.KR_DERIV) == -2
+    # 확정 = 남은 수량 → 바로 닫힘 / None(REST 응답으로 닫는 HL 취소) = 남은 전부
+    ob.track("O2", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=3, order_type=OrderType.LIMIT, price=300_000.0,
+        account=Account.KR_DERIV))
+    ob.on_cancel("O2", qty=3)
+    assert ob.order("O2").status is OrderStatus.CANCELLED
+    ob.track("O3", _hl_intent(Side.BUY, 1.0))
+    ob.on_cancel("O3")
+    assert ob.order("O3").status is OrderStatus.CANCELLED
+
+
+def test_snapshot_keeps_partially_cancelled_order_waiting_for_fill() -> None:
+    # 검토 2026-10-13 A(결정 69가 연 구멍): 부분 취소 확정 뒤 체결 통보를 기다리는 주문은 거래소
+    # 미체결 목록에 없는 게 정상 — 재동기 유령 정리에서 제외. 지우면 뒤따르는 체결이 미아가 된다.
+    import time as _t
+
+    ob = OrderBook()
+    ob.track("O1", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=10, order_type=OrderType.LIMIT, price=300_000.0,
+        account=Account.KR_DERIV))
+    ob.order("O1").placed_ts = _t.monotonic() - 1000.0           # 유예(15초) 한참 지남
+    ob.on_cancel("O1", qty=7)                                   # 확정 7 < 남은 10 → 체결 3 대기
+    ob.load_snapshot(open_orders=[], reconcile_accounts={Account.KR_DERIV},
+                     scope={Account.KR_DERIV})
+    o = ob.order("O1")
+    assert o is not None and o.is_open and o.remaining_qty == 3  # 유령 정리에서 제외
+    ob.on_fill(fill("O1", 3, 300_000.0, fill_id="C-1"))         # 기다리던 체결 → 닫힘
+    assert o.status is OrderStatus.CANCELLED and ob.open_orders() == []
+    # 셈이 끝난(취소로 닫힌) 주문은 종전대로 — 열린 게 아니라 정리 대상도 아님
+    ob.track("O2", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=10, order_type=OrderType.LIMIT, price=300_000.0,
+        account=Account.KR_DERIV))
+    ob.order("O2").placed_ts = _t.monotonic() - 1000.0
+    ob.load_snapshot(open_orders=[], reconcile_accounts={Account.KR_DERIV},
+                     scope={Account.KR_DERIV})
+    assert ob.order("O2") is None                                # 보통 유령은 정리
+
+
+def test_cancel_confirmed_more_than_remaining_closes_with_error(
+        caplog: pytest.LogCaptureFixture) -> None:
+    # 확정 수량 > 장부 남은 수량 = 장부가 체결을 더 셌다(이중 반영류) → 닫고 에러 로그(결정 69)
+    ob = OrderBook()
+    ob.track("O1", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=3, order_type=OrderType.LIMIT, price=300_000.0,
+        account=Account.KR_DERIV))
+    ob.on_fill(fill("O1", 2, 300_000.0, fill_id="C-1"))
+    with caplog.at_level(logging.ERROR, logger="kp_arb.order"):
+        ob.on_cancel("O1", qty=2)                      # 남은 1인데 2 확정
+    assert ob.order("O1").status is OrderStatus.CANCELLED
+    assert any("취소 확정 수량 2 > 장부 남은 수량 1 #O1" in r.getMessage() for r in caplog.records)
+
+
+def test_fill_after_closed_order_keeps_status_but_applies_money(
+        caplog: pytest.LogCaptureFixture) -> None:
+    # 검토 2026-10-13 ★1: 취소·거부로 닫은 주문에 체결이 오면(셈이 맞으면 올 일 없음) 상태는
+    # 되살리지 않고(유령 미체결 방지) 수량·포지션은 반영(실제 돈) + 에러 로그.
+    ob = OrderBook()
+    ob.track("O1", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=3, order_type=OrderType.LIMIT, price=300_000.0,
+        account=Account.KR_DERIV))
+    ob.on_cancel("O1", qty=3)
+    applied: list[float] = []
+    ob.on_fill_applied.append(lambda o, q, p, f: applied.append(q))
+    with caplog.at_level(logging.ERROR, logger="kp_arb.order"):
+        ob.on_fill(fill("O1", 1, 300_000.0, fill_id="C-9"))
+    o = ob.order("O1")
+    assert o.status is OrderStatus.CANCELLED and not o.is_open and ob.open_orders() == []
+    assert o.filled_qty == 1 and applied == [1]
+    assert ob.position_qty(SAMSUNG, Instrument.KR_STOCK_FUTURE, Account.KR_DERIV) == -1
+    assert any("종료(cancelled)된 주문 #O1에 체결 통보" in r.getMessage() for r in caplog.records)
+
+
+def test_fill_after_assumed_full_cancel_corrects_cancelled_qty(
+        caplog: pytest.LogCaptureFixture) -> None:
+    # HL(사용자 2026-10-13: LS처럼 셈하지 않음): 수량 없는 취소(응답·통보)는 남은 전부로 닫고,
+    # 취소 직전 체결의 늦은 통보는 정상 경합 — 취소 수량을 그만큼 줄이고 수량·포지션 반영, 상태는
+    # 그대로, 에러 아님.
+    ob = OrderBook()
+    ob.track("H1", _hl_intent(Side.SELL, 1.0))
+    ob.on_fill(fill("H1", 0.3, 100.0, fill_id="t1"))
+    ob.on_cancel("H1")                                  # 응답/통보 — 남은 0.7 취소로 가정
+    o = ob.order("H1")
+    assert o.status is OrderStatus.CANCELLED and o.cancelled_qty == 0.7 and o.cancel_assumed
+    with caplog.at_level(logging.WARNING, logger="kp_arb.order"):
+        ob.on_fill(fill("H1", 0.2, 100.0, fill_id="t2"))   # 취소 직전 체결, 통보가 늦음
+    assert o.status is OrderStatus.CANCELLED and o.filled_qty == 0.5
+    assert abs(o.cancelled_qty - 0.5) < 1e-9 and ob.open_orders() == []
+    assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == -0.5
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert any("취소 직전 체결(정상 경합)" in r.getMessage() for r in caplog.records)
+
+
+def test_cancel_before_track_replays_confirmed_qty() -> None:
+    # 취소 확정이 track보다 먼저 와도 확정 수량이 보관됐다가 replay에 쓰인다(결정 69)
+    ob = OrderBook()
+    ob.on_cancel("O1", qty=1)
+    ob.track("O1", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=3, order_type=OrderType.LIMIT, price=300_000.0,
+        account=Account.KR_DERIV))
+    ob.replay_pending("O1")
+    o = ob.order("O1")
+    assert o.is_open and o.cancelled_qty == 1 and o.remaining_qty == 2
 
 
 def _hl_intent(side: Side, qty: float) -> OrderIntent:

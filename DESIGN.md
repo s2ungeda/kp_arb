@@ -166,7 +166,12 @@
 - **운영 모델:** ① **최초 실행 시 REST 스냅샷 1회**(계좌·포지션·잔고·미체결 주문 조회) → ② 이후는 **실시간 이벤트(WS 체결통보)가 기본** — 주문 상태 전이·포지션·잔고를 체결 이벤트로 증분 갱신한다(체결 대기 폴링 금지). ③ 동일 스냅샷 조회는 **온디맨드**(추후 UI 조회 버튼)로 재사용.
 - **같은 체결은 한 번만(2026-10-13):** 같은 주문의 같은 체결번호(LS yakseq/execno, HL tid)는 두 번째부터 반영하지 않고
   경고 로그 — 서버 재전송이든 코어 안 이중 처리든(운영 사고 10-12, exec 결정 68·§12 L12).
-- **TrackedOrder:** `order_id, intent, account, status, filled_qty, avg_fill_price`. 상태 전이는 이벤트로만: `NEW → ACCEPTED(SC0) → PARTIAL/FILLED(SC1)` / `CANCELLED(SC3)` / `REJECTED(SC4)`.
+- **취소 확정은 수량으로(2026-10-13, 사용자 → exec 결정 69):** 취소 확정 통보의 수량(LS H01 `qty`·SC3 `canccnfqty`,
+  HL orderUpdates `sz`)과 남은 수량을 대조 — 같으면 닫고, 적으면 차이만큼 체결 통보를 기다린다(열린 채, 타이머 없음).
+  HL 취소 REST 응답은 접수 확인일 뿐 장부를 닫지 않는다(사용자: "성공이면 취소 통보를 보고 판단"). `cancelled_qty` 누적,
+  `remaining_qty` = 주문 − 체결 − 취소 확정. 닫힌 주문의 체결은 상태를 되살리지 않고 수량만 반영한다(수량 없는 취소로
+  닫았던 경우 `cancel_assumed`는 취소 수량 보정 + 경고, 확정 수량으로 닫은 경우는 에러).
+- **TrackedOrder:** `order_id, intent, account, status, filled_qty, avg_fill_price, cancelled_qty`. 상태 전이는 이벤트로만: `NEW → ACCEPTED(SC0) → PARTIAL/FILLED(SC1)` / `CANCELLED(SC3)` / `REJECTED(SC4)`.
 - **실시간 산출:** 체결 즉시 포지션(수량·평단)과 가용잔고를 로컬 증분 계산 → 리스크/전략이 실시간 값을 참조.
 - **HL 발주 즉시체결(개정 2026-08-11):** HL은 크로싱 주문이 **발주 응답에 `filled`로 즉시 체결**되어 온다. `place()`가 그 체결을 바로 OrderBook에 반영해(`pop_place_fill`) 미체결로 남지 않게 한다 — userFills WS를 놓쳐도(끊김 등) 정합. userFills가 중복으로 와도 **초과체결 가드**(`on_fill`: 이미 전량 체결이면 무시)로 이중 반영을 막는다.
 - **모의 한계:** 모의 서버는 SC 통보 미수신(실측) → OrderBook은 이벤트만 소비하도록 순수하게 두고, 모의 e2e 검증 시에만 "주문 응답→합성 Fill" 어댑터 사용. 실전에서는 어댑터 없이 동일 코드.

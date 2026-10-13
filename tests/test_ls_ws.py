@@ -388,7 +388,8 @@ async def test_next_month_futures_quote_parsed_with_next_instrument() -> None:
 async def test_order_events_dispatched_by_kind() -> None:
     # SC0=접수(ack) / SC3=취소(cancel, orgordno=원주문) → OrderEvent로 분화.
     ack = json.dumps({"header": {"tr_cd": "SC0"}, "body": {"ordno": "9852", "orgordno": "0"}})
-    cxl = json.dumps({"header": {"tr_cd": "SC3"}, "body": {"ordno": "9901", "orgordno": "9852"}})
+    cxl = json.dumps({"header": {"tr_cd": "SC3"}, "body": {"ordno": "9901", "orgordno": "9852",
+                                                           "canccnfqty": "7"}})
     session = FakeConnection([ack, cxl])
     client = LSWebSocketClient(FakeConnector([session]))
     events = []
@@ -489,6 +490,7 @@ async def test_futures_h01_before_o01_is_held_until_cancel_ack_arrives() -> None
     assert [(e.kind, e.order_id, e.org_order_id) for e in events] == [
         ("ack", "2359", None), ("cancel_ack", "2364", "2359"), ("cancel", "2364", "2359")]
     assert client._pending_h01 == {}  # 보관분은 비워진다
+    assert events[2].qty == 1.0  # H01 qty = 실정정취소수량(Res) → 장부가 남은 수량과 대조(결정 69)
 
 
 async def test_futures_cancel_rejected_after_fill_is_not_a_cancel() -> None:

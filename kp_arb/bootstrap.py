@@ -781,8 +781,12 @@ class LiveSystem:
         self._identify_hl_order(upd)  # 응답 전 통보면 cloid로 먼저 등록(아래 취소 처리가 주인을 앎)
         if not upd.is_terminal_cancel:
             return  # open/triggered(살아있음)·filled(userFills 담당)은 여기서 처리 안 함
+        # 취소는 **통보로** 판단한다(사용자 2026-10-13: "응답은 취소 주문이 잘 들어갔는지의 판단,
+        # 성공이면 취소 통보를 보고 판단").
+        # 통보의 sz = 취소 시점 남은 수량(취소 직전 체결은 이미 빠져 있음) → 장부 남은 수량과 대조해
+        # 닫는다(결정 69). 장부가 더 많으면 그 차이의 체결 통보(userFills)가 뒤따르는 중 — 기다린다
         order = (self.order_book.on_reject(upd.oid) if upd.is_rejected
-                 else self.order_book.on_cancel(upd.oid))
+                 else self.order_book.on_cancel(upd.oid, qty=upd.sz))
         log = order_log.logger_for(Venue.HYPERLIQUID)
         if order is not None:
             if upd.ended_with_remainder:  # 거래소가 잔량을 버리고 끝냄(증거금 한도 등, 실측 09-07)
@@ -890,7 +894,8 @@ class LiveSystem:
     # 재연결 채널 → 재동기 범위(계좌; HL은 None). 끊긴 시장만 다시 조회한다 — HL 재연결이
     # LS 장부까지 갈아 끼우다 선물 선주문을 지웠던 사고(2026-09-09) 방지.
     _RECONNECT_SCOPE: dict[str, set[Account | None]] = {
-        "주식": {Account.KR_STOCK}, "선물": {Account.KR_DERIV}, "HL": {None}}
+        "주식": {Account.KR_STOCK}, "선물": {Account.KR_DERIV}, "HL": {None},
+        "xing": {Account.KR_STOCK, Account.KR_DERIV}}  # 한 객체가 두 계좌(검토 10-13 ★6)
 
     async def _resync_after_reconnect(self, label: str) -> None:
         import asyncio as _asyncio
@@ -1104,12 +1109,16 @@ class LiveSystem:
             except Exception as exc:
                 self._record_reject(order.intent, str(exc), kind="취소", order_id=order_id)
                 raise
-            self.order_book.on_cancel(order_id)
+            # 응답 "success"는 취소 주문이 잘 들어갔다는 확인일 뿐 — 장부는 취소 통보(orderUpdates
+            # canceled, 남은 수량 sz)로 닫는다(사용자 2026-10-13: "응답은 취소 주문이 잘 들어갔는지
+            # 의 판단, 성공이면 취소 통보를 보고").
+            # 통보가 응답보다 먼저 와도 통보가 곧 취소라 그대로 처리된다. 옛 즉시 닫기는 취소 직전
+            # 체결의 늦은 통보를 "닫힌 주문의 체결"로 만들던 원인(검토 10-13 B)
 
     async def cancel_many(self, order_ids: Sequence[str]) -> list[tuple[str, str | None]]:
         """여러 건 취소 → (주문번호, 실패 사유|None) 목록. HL은 게이트웨이 cancel_orders로
         **한 요청**에 묶고(요청 한도, 사용자 2026-09-28), LS는 한 건씩(cancel). 모르는 번호는
-        사유만. HL 성공 건은 취소 통보 채널이 없어 로컬 장부를 바로 갱신한다(cancel과 같음)."""
+        사유만. HL 성공 건도 응답으로 닫지 않고 취소 통보(sz)로 닫는다(cancel과 같음)."""
         result: dict[str, str | None] = {}
         hl_ids: list[str] = []
         for oid in order_ids:
@@ -1130,9 +1139,7 @@ class LiveSystem:
             for oid, err in zip(hl_ids, errors, strict=True):
                 result[oid] = err
                 order = self.order_book.order(oid)
-                if err is None:
-                    self.order_book.on_cancel(oid)
-                elif order is not None:
+                if err is not None and order is not None:  # 성공 건은 취소 통보(sz)가 닫는다
                     self._record_reject(order.intent, err, kind="취소", order_id=oid)
         return [(oid, result[oid]) for oid in order_ids]
 
@@ -1284,7 +1291,11 @@ class LiveSystem:
         self._stock_ws.on_vi.append(self._on_vi)
         self._stock_ws.on_fill.append(apply_fill)
         self._stock_ws.on_order_event.append(apply_event)
-        self._stock_ws.on_reconnect.append(lambda: self._on_ws_reconnect("주식"))
+        # xing(같은 객체가 두 자리)은 재연결 재동기도 두 계좌 — "선물" 훅을 안 거니 라벨로 범위를
+        # 넓힌다(검토 2026-10-13 ★6: 결정 68 ①의 부작용으로 선물 계좌 재동기가 빠졌었음)
+        same = self._deriv_ws is self._stock_ws
+        self._stock_ws.on_reconnect.append(
+            lambda: self._on_ws_reconnect("xing" if same else "주식"))
         if self._deriv_ws is not None:
             self._deriv_ws.subscribe_futures_fills()
             # xing은 한 객체가 주식·선물 두 자리에 들어온다(§2.2) — 훅을 또 걸면 통보 하나가 두 번

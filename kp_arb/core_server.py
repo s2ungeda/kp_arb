@@ -415,6 +415,7 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
             "order_id": o.order_id, "underlying": it.underlying.value,
             "instrument": it.instrument.value, "side": it.side.value,
             "qty": it.qty, "remaining": o.remaining_qty,
+            "cancelled": o.cancelled_qty,  # 부분 취소 확정 뒤 체결 대기(결정 69) — 리스트 상태 칸
             "price": it.price, "status": o.status.value,
             "time": o.placed_at,  # 접수 시각(HH:MM:SS) — 주문 리스트 '시각' 칸
             "source": it.source,  # 출처(자동M·일반주문창·따라가기) — 주문 리스트 '출처' 칸·필터

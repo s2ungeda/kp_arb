@@ -210,7 +210,6 @@ class AutoMEngine:
         # 취소 확정으로 정리한 LS 선주문 → (세트, 시각). 그 뒤 체결이 오면(취소보다 체결이 먼저였던
         # 경합, 운영 실측 2026-09-30 #3908) 주인 없는 체결로 버리지 않고 그 세트에 헤지를 낸다
         # (결정 56)
-        self._late_refs: dict[str, tuple[_OrderRef, float]] = {}
         # 판정 계기(exec §4, 사용자 2026-10-01 결정 59) — 판정은 그 종목 시세가 들어온 때만. 시세
         # 수신이 종목에 표시해 두면 루프(run)가 표시된 종목만 한 바퀴 돈다. 타이머·감시는 pump에서.
         self._dirty: set[Underlying] = set()
@@ -429,14 +428,25 @@ class AutoMEngine:
             for reverse, index, s in book.all_sets():
                 for block in (Block.ENTRY, Block.EXIT):
                     leg = s.leg(block)
-                    if (leg.cancel_sent and leg.pre_order_id and leg.cancel_sent_mono is not None
+                    # 역산가 변경 취소는 cancel_sent가 아니라 replace_pending(검토 10-13 ★4 — 어제
+                    # 갇힌 상태가 바로 이것). 둘 다 본다. 취소 거부로 되돌려도 시각은 남겨 첫 시도
+                    # 기준으로 잰다(지속 실패도 알려야 하므로)
+                    if ((leg.cancel_sent or leg.replace_pending) and leg.pre_order_id
+                            and leg.cancel_sent_mono is not None
                             and not leg.cancel_wait_alarmed
                             and mono - leg.cancel_sent_mono >= CANCEL_WAIT_ALARM_S):
                         leg.cancel_wait_alarmed = True
+                        order = self._system.order_book.order(leg.pre_order_id)
+                        if order is not None and order.cancelled_qty > 0:
+                            # 취소는 확정됐는데 셈이 안 맞아 체결 통보를 기다리는 중(결정 69)
+                            what = (f"부분 취소 확정(취소 {order.cancelled_qty:g}) 뒤 체결 "
+                                    f"{order.remaining_qty:g} 통보 없음")
+                        else:
+                            what = "취소 확인 통보 없음"
                         self._apply(u, index, block, [Action(
                             "alarm", order_id=leg.pre_order_id,
-                            reason=f"선주문 #{leg.pre_order_id} 취소 확인 통보 없음 "
-                                   f"{mono - leg.cancel_sent_mono:.0f}초 — LS에서 주문 상태 확인")],
+                            reason=f"선주문 #{leg.pre_order_id} {what} "
+                                   f"{mono - leg.cancel_sent_mono:.0f}초 — LS 체결내역·주문 확인")],
                             reverse)
 
     def _sleep_s(self, now: datetime, mono: float) -> float:
@@ -995,7 +1005,15 @@ class AutoMEngine:
     def _register(self, oid: str, ref: _OrderRef) -> None:
         """주문번호 ↔ 세트 연결. 발주 응답 안에 이미 실린 체결(HL 즉시체결)은 place()가 끝나기
         전에 훅으로 먼저 오므로 그때는 주인을 모른다 — 모아 뒀다가 여기서 되돌려 반영한다
-        (실측 2026-09-07: 후주문 0.588 즉시체결이 세트에 안 잡혀 hl_net 0·HL 대기 1 남음)."""
+        (실측 2026-09-07: 후주문 0.588 즉시체결이 세트에 안 잡혀 hl_net 0·HL 대기 1 남음).
+
+        이미 등록된 번호면 아무것도 안 한다(검토 2026-10-13 ★3) — cloid 선식별(_on_hl_identified)이
+        먼저 등록하고 종료 통보까지 처리한 뒤 발주 응답 경로가 또 부르면, _forget이 지운 상태
+        기록 때문에 같은 종료를 새 상태로 다시 처리했다(판 마무리 2회 → 마지막 판 매매결과가 빈
+        판으로 덮임). 실패→복구 경로는 등록된 적이 없어 그대로 통과한다. 종료 처리로 _forget된
+        번호도 _seen_status에 남아 있어(아래) 재등록을 거른다."""
+        if oid in self._orders or oid in self._seen_status:
+            return
         self._orders[oid] = ref
         for order, qty, price in self._orphan_fills.pop(oid, []):
             self._apply_fill(ref, order, qty, price)
@@ -1044,10 +1062,8 @@ class AutoMEngine:
                          _fill_id: str) -> None:
         ref = self._orders.get(order.order_id)
         if ref is None:
-            late = self._late_refs.pop(order.order_id, None)
-            if late is not None:  # 취소로 정리한 선주문의 늦은 체결(결정 56) → 헤지
-                self._apply_late_pre_fill(late[0], order, qty, price)
-                return
+            # 취소로 닫은 선주문의 체결은 이제 오지 않는다 — 장부가 취소 확정 수량으로 닫으므로
+            # (결정 69) 셈이 안 끝난 체결은 선주문이 열린 채 보통 체결로 온다
             if order.intent.source == SOURCE:  # 우리 주문인데 아직 등록 전 — 등록 때 되돌려 반영
                 self._orphan_fills.setdefault(order.order_id, []).append((order, qty, price))
             return
@@ -1251,8 +1267,6 @@ class AutoMEngine:
                 if status == "cancelled":
                     on_pre_cancelled(s, ref.block, mono, self._settings)
                     self._forget(oid)
-                    if not s.hl_first:  # LS 선주문 — 늦은 체결이 오면 헤지를 내기 위해 잠시 기억
-                        self._remember_late(oid, ref, mono)
                 elif status == "rejected":
                     venue = "HL" if s.hl_first else "LS"
                     self._apply(u, ref.index, ref.block,
@@ -1312,38 +1326,15 @@ class AutoMEngine:
         self._trace(u, ref.index, ref.block, s.leg(ref.block), ref.reverse)
         self._persist()
 
+    _SEEN_CAP = 5000  # 하루 주문 수천 건 — 오래된 것부터 버림
+
     def _forget(self, oid: str) -> None:
+        """추적 해제. 마지막으로 처리한 상태(_seen_status)는 **남긴다** — 종료 처리 뒤 발주 응답
+        경로가 같은 번호를 다시 등록하려 할 때 거르고, 혹시 등록돼도 같은 종료를 또 처리하지 않게
+        (검토 2026-10-13 ★3)."""
         self._orders.pop(oid, None)
-        self._seen_status.pop(oid, None)
-
-    LATE_FILL_GRACE_S = 120.0  # 취소로 정리한 선주문의 늦은 체결을 받아 주는 시간
-
-    def _remember_late(self, oid: str, ref: _OrderRef, mono: float) -> None:
-        cutoff = mono - self.LATE_FILL_GRACE_S
-        for k in [k for k, (_r, at) in self._late_refs.items() if at < cutoff]:
-            del self._late_refs[k]
-        self._late_refs[oid] = (ref, mono)
-
-    def _apply_late_pre_fill(self, ref: _OrderRef, order: TrackedOrder, qty: float,
-                             price: float) -> None:
-        """취소 확정으로 정리한 선주문의 체결이 뒤늦게 옴(결정 56) — 취소보다 체결이 먼저였던 경합.
-        장부·RT·후주문 대기에 반영하고 **헤지(후주문)를 낸다**. 선주문 칸·진행 상태는 건드리지
-        않는다(그새 새 선주문이 걸려 있을 수 있음)."""
-        u = ref.underlying
-        s = self._set(u, ref.index, ref.reverse)
-        leg = s.leg(ref.block)
-        tag = self._tag(u, ref.index, ref.block, ref.reverse)
-        acts = on_pre_fill(s, ref.block, int(round(qty)), price, time.monotonic(), late=True)
-        self._log.warning("[자동M] %s 취소로 정리한 선주문 #%s 체결 %s %g @ %s — 취소보다 체결이 "
-                          "먼저였음 → 헤지 후주문 %g (%s)", u.value, order.order_id,
-                          order.intent.side.value, qty, f"{price:,.0f}", qty * s.hl_ratio, tag)
-        self.ulog(u).warning("체결 %s: 취소로 정리한 선주문 #%s %g @ %s (늦은 체결, 경합) → 헤지 "
-                             "후주문 %g, HL 대기 %g | %s", tag, order.order_id, qty,
-                             f"{price:,.0f}",
-                             qty * s.hl_ratio, leg.post_pending, self._ledger(s))
-        self._apply(u, ref.index, ref.block, acts, ref.reverse)
-        self._trace(u, ref.index, ref.block, leg, ref.reverse)
-        self._persist()
+        while len(self._seen_status) > self._SEEN_CAP:
+            del self._seen_status[next(iter(self._seen_status))]
 
     # ---------------------------------------------------------------- 명령 ---
     def set_running(self, u: Underlying, index: int, block: Block, value: bool,
@@ -1501,7 +1492,8 @@ class AutoMEngine:
                 "cancel_failed": leg.cancel_alarmed, "cancel_tries": leg.cancel_tries,
                 # 취소 확인 대기 시간(초) — 보낸 뒤 통보가 안 온 동안만 값, 아니면 None
                 "cancel_wait_s": (round(mono - leg.cancel_sent_mono)
-                                  if leg.cancel_sent and leg.cancel_sent_mono is not None
+                                  if (leg.cancel_sent or leg.replace_pending)
+                                  and leg.cancel_sent_mono is not None
                                   else None),
                 # 마지막 선주문 거부(시각·사유·횟수) → 상태줄(사용자 2026-09-15)
                 "reject": leg.last_reject, "reject_at": leg.last_reject_at,
