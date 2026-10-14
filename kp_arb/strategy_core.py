@@ -145,6 +145,15 @@ class ScreenState:
 
 
 @dataclass
+class DisconnectActions:
+    """LS(xing) 접속 끊김 때 할 일 — 사용자가 고르는 세 가지(DESIGN-settings §2a, 2026-10-14)."""
+
+    popup: bool = False     # 메인 창 팝업으로 알리고 재접속 안내
+    telegram: bool = False  # 텔레그램 알림
+    sound: bool = False     # 사운드 재생(알람 'WS 끊김' wav)
+
+
+@dataclass
 class SoundSetting:
     """알람 사운드 1종 — 재생 여부 + wav 파일 경로 (DESIGN-settings §2)."""
 
@@ -174,6 +183,8 @@ class GlobalSettings:
     sound_fill: SoundSetting = field(default_factory=SoundSetting)   # 주문 체결 시
     sound_error: SoundSetting = field(default_factory=SoundSetting)  # 에러(발주 거부·실패)
     sound_ws: SoundSetting = field(default_factory=SoundSetting)     # WS 끊김
+    # LS(xing) 접속 끊김 때 할 일(§2a) — 판정·행동은 메인 창, 코어는 저장·노출만
+    ls_disconnect: DisconnectActions = field(default_factory=DisconnectActions)
 
 
 @dataclass
@@ -358,6 +369,17 @@ def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
         if isinstance(rs, dict):
             snd.enabled = bool(rs.get("enabled", snd.enabled))
             snd.path = str(rs.get("path", snd.path))
+    apply_disconnect_actions(s.ls_disconnect, raw.get("ls_disconnect"))
+
+
+def apply_disconnect_actions(dc: DisconnectActions, raw: object) -> None:
+    """`ls_disconnect` dict → 설정(없거나 dict가 아니면 그대로, 키마다 bool만 받음)."""
+    if not isinstance(raw, dict):
+        return
+    for name in ("popup", "telegram", "sound"):
+        v = raw.get(name)
+        if isinstance(v, bool):
+            setattr(dc, name, v)
 
 
 def state_from_dict(data: dict[str, object]) -> CoreState:

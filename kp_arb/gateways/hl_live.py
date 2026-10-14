@@ -37,6 +37,19 @@ from .hl import HLError
 from .ls import OrderGoneError
 
 HL_DEX = "xyz"
+# SDK 요청(발주·취소·조회) 응답 대기 상한 — 우리 쪽 값(거래소 규칙 아님, LS 조회 10초와 같게; 검토
+# 2026-10-13 11번: 안 주면 requests가 무기한 기다려 HL선 선주문이 번호 없이 멈추고 취소도 못 함).
+# 시간 초과는 "결과 모름" — 발주는 cloid 유예 조회(결정 30)로, 취소는 통보로 정리된다
+HL_SDK_TIMEOUT_S = 10.0
+
+
+def _order_status_dead(status: str) -> bool:
+    """orderStatus 응답의 order.status가 거부·취소 계열인가(공식 문서 Info endpoint 상태표:
+    rejected·canceled·marginCanceled·scheduledCancel과 `…Rejected`/`…Canceled` 변형). 빈 값(모름)은
+    살아 있는 것으로 본다."""
+    s = status.strip()
+    return (s in ("rejected", "canceled", "scheduledCancel")
+            or s.endswith("Rejected") or s.endswith("Canceled"))
 NONCE_RETRIES = 2  # nonce 충돌 거부 재전송 횟수(주문 미접수 거부라 중복 주문 없음)
 
 
@@ -174,9 +187,9 @@ class HLSdkGateway(HLGateway):
         wallet = EthAccount.from_key(agent_key)
         exchange = Exchange(
             wallet, constants.MAINNET_API_URL,
-            account_address=address, perp_dexs=[HL_DEX],
+            account_address=address, perp_dexs=[HL_DEX], timeout=HL_SDK_TIMEOUT_S,
         )
-        info = Info(constants.MAINNET_API_URL, skip_ws=True)
+        info = Info(constants.MAINNET_API_URL, skip_ws=True, timeout=HL_SDK_TIMEOUT_S)
         clock = NonceClock()
         installed = install_nonce_clock(clock)
         if not installed:
@@ -337,8 +350,10 @@ class HLSdkGateway(HLGateway):
         took = int(time.time() * 1000) - sent_ms
         statuses: list[Any] = []
         whole_error: str | None = None
+        whole_comm = False  # 통신 오류·응답 없음 = 결과 모름(HLError = 거래소 거부와 구분)
         if failure is not None:
             whole_error = f"{type(failure).__name__}: {failure}"
+            whole_comm = not isinstance(failure, HLError)
         elif not isinstance(resp, dict) or resp.get("status") != "ok":
             whole_error = f"HL rejected: {resp.get('response') if isinstance(resp, dict) else resp}"
         else:
@@ -366,7 +381,7 @@ class HLSdkGateway(HLGateway):
                     continue
             if oid is None:
                 if whole_error is not None:
-                    res = PlaceResult(None, error=whole_error, whole=True)
+                    res = PlaceResult(None, error=whole_error, whole=True, comm=whole_comm)
                 elif status is None:
                     res = PlaceResult(None, error="no status in order response", whole=True)
                 else:
@@ -420,8 +435,15 @@ class HLSdkGateway(HLGateway):
             oid, (coin, intent.side is Side.BUY, float(intent.qty), float(intent.price or 0.0)))
 
     async def _recover_by_cloid(self, cloid: str) -> tuple[str, dict[str, Any]] | None:
-        """응답을 못 받은 발주를 orderStatus(cloid)로 확인 — 들어갔으면 (oid, 응답), 아니면 None.
-        공식 문서: orderStatus의 oid 자리에 16바이트 hex cloid를 넣을 수 있다."""
+        """응답을 못 받은 발주를 orderStatus(cloid)로 확인 — **살아 있거나 체결된** 주문이면
+        (oid, 응답), 아니면 None. 공식 문서(Info endpoint, Query order status by oid or cloid):
+        oid 자리에 16바이트 hex cloid 가능, 응답 `order.status`는 open/filled/canceled/rejected/
+        triggered/marginCanceled와 `…Canceled`/`…Rejected` 변형(badAloPxRejected 등)/
+        scheduledCancel.
+        거부·취소 계열은 "들어가지 않은(또는 이미 죽은) 주문"이라 None — 옛 코드는 상태를 안 봐
+        거부된
+        주문의 oid를 살아 있는 것으로 등록했다(검토 2026-10-13 ★8(b), 09-22 거짓 알람의 재조회
+        경로)."""
         try:
             resp = await self._post_info(
                 {"type": "orderStatus", "user": self._address, "oid": cloid})
@@ -434,6 +456,11 @@ class HLSdkGateway(HLGateway):
         try:
             oid = str(resp["order"]["order"]["oid"])
         except (KeyError, TypeError):
+            return None
+        status = str(resp.get("order", {}).get("status") or "")
+        if _order_status_dead(status):
+            order_log.logger_for(Venue.HYPERLIQUID).info(
+                "HL orderStatus(cloid %s) #%s 상태 %s — 살아 있는 주문 아님", cloid, oid, status)
             return None
         return oid, resp
 

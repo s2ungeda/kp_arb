@@ -331,3 +331,30 @@ async def test_realtime_advise_and_event_to_asyncio(res_dir: Path) -> None:
         assert r.advised == 0
     finally:
         s.close()
+
+
+async def test_disconnect_clears_realtime_keys_so_relogin_readvises(res_dir: Path) -> None:
+    # 검토 2026-10-13 ★5: 끊김(disconnect/logout) 뒤 재로그인하면 _advise_all이 같은 키를 다시
+    # advise하는데,
+    # 등록 키가 남아 있어 전부 "이미 등록"으로 건너뛰었다 — 서버 등록은 세션과 함께 죽었으므로
+    # 재등록이
+    # 안 나가 시세·계좌 통보가 끊긴 채였다. 끊김 이벤트에서 키를 비워 다시 AdviseRealData가 나간다.
+    s, fac = await _session(res_dir)
+    try:
+        await s.advise("H1_", "005930")
+        await s.advise("H1_", "000660")
+        r = fac._last_real
+        assert r.advised == 2
+        await s.advise("H1_", "005930")              # 같은 세션 — 중복은 안 보냄
+        assert r.advised == 2
+        s._call(lambda: s._on_session_event("disconnect"))
+        for _ in range(50):
+            if not s.logged_in:
+                break
+            await asyncio.sleep(0.01)
+        assert not s.logged_in
+        await s.advise("H1_", "005930")              # 재로그인 뒤 재등록 — 실제로 나간다
+        await s.advise("H1_", "000660")
+        assert r.advised == 4 and r.ResFileName.endswith("H1_.res")
+    finally:
+        s.close()

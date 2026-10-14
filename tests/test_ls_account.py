@@ -376,3 +376,63 @@ async def test_positions_skip_untracked_symbols() -> None:
     positions = await gw.get_positions(Account.KR_STOCK)
     assert len(positions) == 1
     assert positions[0].underlying is Underlying.SAMSUNG
+
+
+async def test_deriv_open_orders_follow_all_pages_when_transport_can_continue() -> None:
+    # 사용자 2026-10-14 "전체를 읽어와야지"(검토 10-13 16번): t0434 응답의 cts_ordno가 비지 않으면
+    # 그 값을
+    # InBlock에 넣고 tr_cont="Y"로 이어 받는다 — 전송 단이 이어 받기를 지원할 때(xing). 페이지마다
+    # 행을
+    # 모으고, 같은 주문은 한 번만.
+    from kp_arb.gateways.ls_rest import RestResponse
+
+    def row(ordno: int, rem: int = 1) -> dict[str, Any]:
+        return {"orgordno": 0, "hogatype": "L", "ordrem": rem, "ordgb": "지정가", "cheqty": 0,
+                "ordno": ordno, "price": "34225.00", "qty": 1, "expcode": "A1167000",
+                "medosu": "매도", "cheprice": "0.00", "status": "접수", "ordtime": "101530"}
+
+    pages = [
+        {"rsp_cd": "00000", "t0434OutBlock1": [row(1), row(2)],
+         "t0434OutBlock": {"cts_ordno": "0000002"}},
+        {"rsp_cd": "00000", "t0434OutBlock1": [row(2), row(3)],
+         "t0434OutBlock": {"cts_ordno": "0000003"}},
+        {"rsp_cd": "00000", "t0434OutBlock1": [row(4)], "t0434OutBlock": {"cts_ordno": ""}},
+    ]
+
+    class ContRequester:
+        supports_continuation = True
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []  # (tr, tr_cont, cts_ordno)
+
+        async def request(self, tr_cd: str, body: dict[str, Any] | None = None, *,
+                          path: str = "/", method: str = "POST",
+                          tr_cont: str = "N") -> RestResponse:
+            blk = (body or {})["t0434InBlock"]
+            self.calls.append((tr_cd, tr_cont, blk["cts_ordno"]))
+            return RestResponse(status_code=200, body=pages[len(self.calls) - 1])
+
+    req = ContRequester()
+    gw = LSApiGateway({Account.KR_STOCK: req, Account.KR_DERIV: req},  # type: ignore[dict-item]
+                      futures_symbols={Underlying.SAMSUNG: "A1167000"})
+    orders = await gw.get_open_orders(Account.KR_DERIV)
+    assert req.calls == [("t0434", "N", " "), ("t0434", "Y", "0000002"), ("t0434", "Y", "0000003")]
+    assert [o.order_id for o in orders] == ["1", "2", "3", "4"]      # 전 페이지, 중복 1회
+    assert gw.open_orders_supported(Account.KR_DERIV)
+
+
+async def test_deriv_open_orders_rest_stops_at_first_page_with_warning(caplog: Any) -> None:
+    # REST 전송 단은 응답 헤더 tr_cont_key를 못 돌려받아 이어 받지 못한다 — 첫 페이지 + 경고(백업
+    # 경로).
+    import logging
+
+    FIXTURES["t0434"]["t0434OutBlock"]["cts_ordno"] = "0069106"
+    try:
+        transport = AccountTransport()
+        gw = _gateway(transport)
+        with caplog.at_level(logging.WARNING):
+            orders = await gw.get_open_orders(Account.KR_DERIV)
+        assert transport.seen_trs == ["t0434"] and [o.order_id for o in orders] == ["69105"]
+        assert any("다음 페이지 미조회" in r.getMessage() for r in caplog.records)
+    finally:
+        FIXTURES["t0434"]["t0434OutBlock"]["cts_ordno"] = ""

@@ -168,9 +168,12 @@ def test_settings_global_command_and_persistence(tmp_path: Path) -> None:
         "sound_fill": {"enabled": True, "path": "C:/s/fill.wav"},
         "sound_ws": {"enabled": False, "path": "C:/s/ws.wav"},
         "fx_futures_code": " A756A000 ",  # 환율 계산용 원달러선물 월물(2026-09-28)
+        "ls_disconnect": {"popup": True, "telegram": False, "sound": True},  # §2a 2026-10-14
     })
     assert res["ok"]
     assert state.settings.fx_futures_code == "A756A000"
+    dc = state.settings.ls_disconnect
+    assert (dc.popup, dc.telegram, dc.sound) == (True, False, True)
     # 값을 안 보내면(콤보가 빈 화면) 기존 선택 유지, 빈 문자열이면 최근월물로 되돌림
     assert apply_command(state, {"cmd": "settings_global"})["ok"]
     assert state.settings.fx_futures_code == "A756A000"
@@ -187,6 +190,14 @@ def test_settings_global_command_and_persistence(tmp_path: Path) -> None:
     assert restored.settings.sound_fill.path == "C:/s/fill.wav"
     assert not restored.settings.sound_ws.enabled
     assert restored.settings.fx_futures_code == "A756A000"
+    rdc = restored.settings.ls_disconnect
+    assert (rdc.popup, rdc.telegram, rdc.sound) == (True, False, True)
+    # 키를 안 보내면 그대로, bool 아닌 값은 무시
+    assert apply_command(state, {"cmd": "settings_global"})["ok"]
+    assert apply_command(state, {"cmd": "settings_global",
+                                 "ls_disconnect": {"popup": "no", "telegram": True}})["ok"]
+    dc = state.settings.ls_disconnect
+    assert (dc.popup, dc.telegram, dc.sound) == (True, True, True)
     assert apply_command(state, {"cmd": "settings_global", "fx_futures_code": ""})["ok"]
     assert state.settings.fx_futures_code == ""
 

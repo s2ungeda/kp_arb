@@ -17,6 +17,12 @@ _ALARMS: tuple[tuple[str, str], ...] = (
     ("sound_error", "에러 발생 시"),
     ("sound_ws", "WS 끊김"),
 )
+# LS(xing) 접속 끊김 때 할 일(DESIGN-settings §2a, 사용자 2026-10-14) — 설정 키 → 체크박스 글
+_DISCONNECT_ACTIONS: tuple[tuple[str, str], ...] = (
+    ("popup", "팝업(재접속 안내)"),
+    ("telegram", "텔레그램"),
+    ("sound", "사운드"),
+)
 
 
 def is_time_text(text: str) -> bool:
@@ -192,6 +198,19 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             row=i, column=3, padx=2)
         rows[key] = {"var": var, "entry": e_path}
 
+    # LS(xing) 접속 끊김 때 할 일 — 체크박스 3개(DESIGN-settings §2a, 사용자 2026-10-14).
+    # 판정·행동은
+    # 메인 창(코어가 죽어도 알리려고), 여기서는 켬/끔만 고른다. 사운드는 위 'WS 끊김' 줄의 wav.
+    dc_row = 8 + len(_ALARMS)
+    tk.Label(form, text="LS 끊김 때").grid(row=dc_row, column=0, sticky="w", pady=(10, 2))
+    dc_frame = tk.Frame(form)
+    dc_frame.grid(row=dc_row, column=1, columnspan=3, sticky="w", padx=6, pady=(10, 2))
+    dc_vars: dict[str, tk.BooleanVar] = {}
+    for key, name in _DISCONNECT_ACTIONS:
+        dc_vars[key] = tk.BooleanVar(value=False)
+        tk.Checkbutton(dc_frame, text=name, variable=dc_vars[key], anchor="w").pack(
+            side="left", padx=(0, 10))
+
     btn = tk.Button(root, text="저장", width=12, font=T.FONT_STRONG)
     btn.pack(pady=(0, 8))
 
@@ -222,6 +241,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         for key, r in rows.items():
             payload[key] = {"enabled": bool(r["var"].get()),
                             "path": r["entry"].get().strip()}
+        payload["ls_disconnect"] = {k: bool(v.get()) for k, v in dc_vars.items()}
         send(payload, "저장")
 
     btn.config(command=do_save)
@@ -271,6 +291,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 r["var"].set(bool(snd.get("enabled", False)))
                 r["entry"].delete(0, "end")
                 r["entry"].insert(0, str(snd.get("path", "")))
+            dc = settings.get("ls_disconnect") or {}
+            for key, v in dc_vars.items():
+                v.set(bool(dc.get(key, False)))
         # 원달러선물 콤보 — 월물 목록은 시세 접속 뒤에야 오므로 설정값과 따로 채운다. 선택은
         # 최초 1회만 코어가 지금 쓰는 월물로 맞춘다(그 뒤엔 사용자 선택을 덮지 않음).
         fx = (data.get("live") or {}).get("fx_futures") or {}

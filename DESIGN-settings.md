@@ -26,6 +26,20 @@ DESIGN-manual-order §1-3/1-4가 예고한 **"설정 화면"** — 계정 단위
 - 설정 키: `sound_fill`{enabled, path}, `sound_error`{enabled, path}, `sound_ws`{enabled, path}.
 - **텔레그램 알림은 소리 알람과 별개**다(2026-09-21) — 자동주문 세트가 코어에 의해 중지될 때만 보낸다. 보내는 경우·안 보내는 경우·설정 방법은 [DESIGN-auto-m-exec.md §11.13](DESIGN-auto-m-exec.md). 공통설정 화면에는 항목이 없고 토큰·chat_id는 키 등록 화면에서 넣는다.
 
+## 2a. LS(xing) 접속 끊김 때 할 일 — 사용자 지시 2026-10-14 ("체크박스 3가지, 사용자 선택", "공통설정에 추가")
+- 배경: 2026-10-14 모의 실측에서 네트워크가 끊기자 코어가 죽어(DESIGN-ls-xing §7) 재접속은 사람이 해야 했다. 끊김을
+  사람이 바로 알게 하는 세 가지를 사용자가 고른다.
+- 설정 키 `ls_disconnect` {popup, telegram, sound} (각 bool, 기본 전부 끔). 공통설정 화면 알람 3줄 아래 한 줄:
+  `LS 끊김 때  [ ] 팝업(재접속 안내)  [ ] 텔레그램  [ ] 사운드`.
+- **판정은 메인 창**(코어가 죽어도 알려야 하므로). 이벤트 두 가지, 같은 끊김에 한 번씩(다시 연결되면 초기화):
+  ① `/state`의 WS 현황 중 **LS(xing) 채널이 연결→끊김**으로 바뀜(세션 끊김·COM 스레드 정지) ② **코어 응답 있음→없음**
+  (오늘처럼 코어가 죽은 경우 — 자동 재기동과 별개로 알린다). 시동 직후 첫 관측은 기준만 잡고 알리지 않는다.
+- 행동: **팝업** = 메인 창의 확인 버튼 알림(맨 위, 확인 누를 때까지) "LS 접속이 끊겼습니다(…) — 네트워크·로그인 상태를
+  확인하고 재접속하세요". 화면 스레드 규칙대로 폴링 스레드는 글만 남기고 화면 루프가 띄운다. **텔레그램** = alert.notify
+  종류 `ls_disconnect`(꺼 둔 종류 아님) 레벨 error. **사운드** = 알람 'WS 끊김' 줄의 wav를 재생(그 줄의 체크와 무관;
+  둘 다 켜져 있어도 한 번만). 셋 다 화면 로그에 남긴다.
+- 코어 계약: `settings_global`에 `ls_disconnect` dict(§4), 스냅샷 settings에 그대로 노출. 코어 쪽 행동은 없다.
+
 ## 3. 화면 (신규) — 메인 메뉴 "공통설정"
 - 상단: **HL 일일 한도(USDC)** 입력칸.
 - 이자율 2칸(환율·주식선물 이론가, %) — 2026-09-03.
@@ -33,11 +47,13 @@ DESIGN-manual-order §1-3/1-4가 예고한 **"설정 화면"** — 계정 단위
 - **현물환율 사용시간** `HH:MM ~ HH:MM`(기본 07:00~18:10) **+ 2구간** `HH:MM ~ HH:MM`(2026-09-16 추가, 기본 비움=미사용; 둘 다 넣거나 둘 다 비워야 하고 어느 구간이든 안이면 현물환) — 2026-09-04 사용자 입력으로 전환(전엔 config `fx_spot_window` 고정). 이 시간 안은 HL 환산에 LS 현물환율(CUR), 밖은 환율이론가(DESIGN §5.9). 형식 오류는 코어가 거부, 저장 즉시 반영.
 - **시세 원문 기록 체크박스**(사용자 2026-10-02, 기본 **끔**) — 알람 위 한 줄. 켜면 코어가 호가·체결 TR 원문을 `logs\probe\quote_trade_YYYYMMDD.jsonl`에 남긴다(임시 진단, DESIGN-ls-xing.md §8; 하루 수백 MB, 5일 지나면 삭제). 저장 즉시 반영. 캡처 docs/preview/settings_quote_probe.png.
 - 하단: 알람 3줄 — `[체크박스] 이벤트명   [wav 경로]   [찾아보기]`.
+- 그 아래 **LS 끊김 때** 한 줄 — 체크박스 3개(팝업·텔레그램·사운드), §2a(2026-10-14).
 - `[저장]` → 코어에 `settings_global` 전송 → `core_state.json` 저장.
 - UI: `ui_theme`(기본 폰트 9 등) 일관. 메인 메뉴 "화면"에 연결.
 
 ## 4. 코어 계약
-- 명령 `settings_global` {hl_daily_limit_usdc, sound_fill, sound_error, sound_ws, quote_probe} → 저장.
+- 명령 `settings_global` {hl_daily_limit_usdc, sound_fill, sound_error, sound_ws, quote_probe, ls_disconnect} → 저장.
+  - `ls_disconnect` {popup, telegram, sound}(§2a, 2026-10-14) — 키가 없으면 기존 값 유지.
   - `fx_futures_code`(원달러선물 월물 코드, 2026-09-28): 빈 문자열 = 최근월물. 키가 없으면 기존 값 유지(콤보가 빈 화면). 코어는 저장 뒤 바로 그 월물로 역산현물가를 다시 계산한다(`LiveSystem.set_fx_futures_code`). **차근은 최근월물 만기 3영업일 전부터**(exec 결정 75, 2026-10-14) — 밖이면 콤보에 차근이 안 보이고, 보내도 코어가 거부.
   - 화면 콤보용으로 `/state`의 `live.fx_futures`에 `months`([{code, ym}], 근·차근 순)와 `code`(지금 쓰는 월물)를 싣는다. `/manual_state`의 `fx_auction.code`도 같은 월물(동시호가 창 표시용).
 - 스냅샷(/state 또는 /manual_state)에 노출:

@@ -127,6 +127,19 @@ class HLWebSocketClient:
         self._bg_tasks: set[asyncio.Task[None]] = set()  # 훅 지연 실행 태스크(GC 방지)
         self._hooks_pending = False  # 재접속 훅 아직 안 울림(스냅샷 대기 중)
 
+    def _mark_disconnected(self) -> None:
+        """끊김 시각(epoch ms) — 감지한 순간이 아니라 **마지막 프레임을 받은 시각**으로 둔다.
+        반쯤 죽은 연결은 수십 초 뒤에야 오류로 드러나는데, 감지 시각을 쓰면 그 사이에 난 체결이
+        "끊김 이전"으로 분류돼 재접속 스냅샷에서 버려진다(검토 2026-10-13 9번). 단조시계의 마지막
+        수신 시각을 벽시계로 옮긴다; 한 건도 못 받았으면 지금."""
+        now_ms = time.time() * 1000.0
+        last = self.status.last_rx
+        if last is None:
+            self._disconnected_at_ms = now_ms
+            return
+        idle_ms = max(0.0, (self._clock() - last) * 1000.0)
+        self._disconnected_at_ms = now_ms - idle_ms
+
     # --- 구독 등록 ---
 
     def subscribe_marks(self) -> None:
@@ -248,7 +261,7 @@ class HLWebSocketClient:
             except (ConnectionError, OSError):
                 if self.status.connected:
                     self.status.on_disconnect()
-                    self._disconnected_at_ms = time.time() * 1000.0
+                    self._mark_disconnected()
                 attempts += 1
                 if attempts > self._max_reconnects:
                     raise
@@ -257,7 +270,7 @@ class HLWebSocketClient:
                 continue
             else:
                 self.status.on_disconnect()  # 스트림 정상 종료 = 서버가 닫음 = 끊김
-                self._disconnected_at_ms = time.time() * 1000.0
+                self._mark_disconnected()
                 return
             finally:
                 if ping_task is not None:

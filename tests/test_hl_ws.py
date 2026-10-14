@@ -459,3 +459,34 @@ def test_ping_interval_default_20s() -> None:
 
     sig = inspect.signature(HLWebSocketClient._ping_loop)
     assert sig.parameters["interval_s"].default == 20.0
+
+
+async def test_reconnect_cutoff_uses_last_received_frame_not_detection_time() -> None:
+    # 검토 2026-10-13 9번: 반쯤 죽은 연결은 마지막 프레임 뒤 수십 초 지나서야 오류로 드러난다. 끊김
+    # 시각을 "감지한 순간"으로 두면 그 사이(마지막 수신 ~ 감지)에 난 체결이 끊김 이전으로 분류돼
+    # 스냅샷에서 버려졌다. 기준은 마지막 수신 시각.
+    import time as _t
+
+    now_ms = int(_t.time() * 1000)
+    ticks = [1000.0, 1000.0, 1030.0, 1030.0, 1030.0]  # 마지막 프레임 1000s, 오류 감지 1030s
+    clock_calls = [0]
+
+    def clock() -> float:
+        i = min(clock_calls[0], len(ticks) - 1)
+        clock_calls[0] += 1
+        return ticks[i]
+
+    live = json.dumps({"channel": "userFills", "data": {"user": ADDR,
+                                                         "fills": [_fill(100, now_ms)]}})
+    s1 = _FailingConn([live, mark_frame()], fail_after=1)  # 1000s에 tid=100 수신 → 1030s에 오류
+    s2 = _FailingConn([_snapshot_frame([
+        _fill(100, now_ms),            # 이미 처리 — 중복
+        _fill(200, now_ms + 10_000),   # 마지막 수신 10초 뒤(감지 20초 전) — 옛 기준이면 버려짐
+    ])])
+    client = HLWebSocketClient(_MultiConnector([s1, s2]), clock=clock)
+    got: list[Fill] = []
+    client.on_fill.append(got.append)
+    await client.run()
+    assert [f.fill_id for f in got] == ["100", "200"]
+    assert client._disconnected_at_ms is not None
+    assert abs(client._disconnected_at_ms - now_ms) < 5_000  # 끊김 = 마지막 수신 근처(감지 30초 전)

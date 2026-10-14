@@ -601,3 +601,24 @@ def test_default_symbols_are_measured_values() -> None:
     assert HL_SYMBOLS[Underlying.SAMSUNG] == "xyz:SMSN"
     assert HL_SYMBOLS[Underlying.SK_HYNIX] == "xyz:SKHX"
     assert HL_SYMBOLS[Underlying.HYUNDAI] == "xyz:HYUNDAI"
+
+
+async def test_lookup_by_cloid_ignores_rejected_or_canceled_order() -> None:
+    # 검토 2026-10-13 ★8(b): orderStatus 응답의 order.status가 거부·취소 계열(공식 문서: rejected,
+    # badAloPxRejected 같은 …Rejected, canceled·marginCanceled 같은 …Canceled, scheduledCancel)이면
+    # 살아 있는 주문이 아니다 — 옛 코드는 상태를 안 봐 거부된 주문의 oid를 등록(09-22 거짓 알람
+    # 경로).
+    gw, _ex, inf = _gw()
+    cloid = gw.new_cloid()
+
+    def _resp(status: str) -> dict:  # type: ignore[type-arg]
+        return {"status": "order", "order": {
+            "order": {"coin": "xyz:SMSN", "side": "A", "limitPx": "180.0", "sz": "0.1",
+                      "oid": 485478010353, "origSz": "0.1", "cloid": cloid}, "status": status}}
+
+    for dead in ("rejected", "badAloPxRejected", "canceled", "marginCanceled", "scheduledCancel"):
+        inf.order_status = _resp(dead)
+        assert await gw.lookup_by_cloid(cloid) is None, dead
+    for alive in ("open", "filled", "triggered", ""):
+        inf.order_status = _resp(alive)
+        assert await gw.lookup_by_cloid(cloid) == "485478010353", alive

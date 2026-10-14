@@ -117,6 +117,8 @@ class FakeSystem:
             self.last_cloid = cloid  # 응답 유실 흉내 — 주문은 들어갔을 수 있다
             raise ConnectionError("Connection reset by peer")
         self.order_book.track(oid, intent)
+        if getattr(self, "reject_after_ack", False) and intent.instrument is SF:
+            self.order_book.on_reject(oid)  # 접수 뒤 거부 통보가 응답보다 먼저 장부에 반영됨
         if cloid and intent.instrument is Instrument.HL_PERP:
             # 코어가 응답 전 통보(cloid)로 oid를 식별한 경우 흉내 — 체결·취소보다 먼저 알린다
             for cb in self.on_hl_identified:
@@ -144,6 +146,9 @@ class FakeSystem:
             from kp_arb.gateways.ls_rest import RestTimeoutError
 
             raise RestTimeoutError("xing CFOAT00300 응답 없음: TimeoutError")
+        if getattr(self, "cancel_comm_error", False):  # 통신 오류 흉내(결과 모름)
+            self.cancel_attempts = getattr(self, "cancel_attempts", 0) + 1
+            raise ConnectionError("Connection reset by peer")
         fails = getattr(self, "cancel_fail_times", 0)  # LS 초당 한도 흉내 — 처음 n번 실패
         if fails > 0:
             self.cancel_fail_times = fails - 1
@@ -166,6 +171,9 @@ class FakeSystem:
         whole = getattr(self, "batch_whole_error", None)
         if whole:
             return [PlaceResult(None, error=whole, whole=True) for _ in intents]
+        if getattr(self, "batch_comm_error", False):  # 요청 자체가 통신 오류(결과 모름)
+            return [PlaceResult(None, error="ConnectionError: Connection reset by peer",
+                                whole=True, comm=True) for _ in intents]
         rejects: dict[int, str] = getattr(self, "batch_reject", {})
         out: list[Any] = []
         for i, intent in enumerate(intents):
@@ -1770,3 +1778,77 @@ async def test_hl_first_engine_ls_post_timeout_halts_and_alo_cross_reject_retrie
     assert s.entry.status is LegStatus.HALTED and s.exit.status is LegStatus.HALTED
     assert "응답 없음" in s.entry.halt_reason and "재전송 없이" in s.entry.halt_reason
     assert abs(s.fill_diff + 10) < 1e-9 and sys_.error_seq == 1
+
+
+async def test_reject_notice_before_ack_does_not_reinject_dead_number() -> None:
+    # 검토 2026-10-13 14번: 접수 뒤 거부 통보가 발주 응답보다 먼저 장부에 반영된 경우 — 옛 순서
+    # (등록 뒤 번호 보관)는 등록 중 거부를 처리해 번호를 지운 뒤 on_pre_ack가 죽은 번호를 다리에
+    # 다시 넣었다
+    # → 그 취소가 "잔량 없음"으로 끝나 replace_pending이 영원히 걸림. 지금은 보관 → 등록 순서라
+    # 거부 처리가 번호까지 정리하고 딜레이로 간다.
+    eng, sys_, state = _engine()
+    sys_.reject_after_ack = True
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert [p.instrument for p in sys_.placed] == [SF]
+    assert s.entry.pre_order_id is None                      # 죽은 번호가 남지 않음
+    assert s.entry.reject_streak == 1 and s.entry.status is LegStatus.SETTLE_DELAY
+    assert not s.entry.replace_pending and not s.entry.cancel_sent
+    assert sys_.cancelled == [] and "O1" not in eng._orders
+
+
+async def test_old_pre_order_notice_does_not_touch_current_pre_order() -> None:
+    # 검토 2026-10-13 13번: 다리가 이미 다른 선주문으로 넘어간 뒤(끔 → 해제 → 재발주) 옛 번호의 취소
+    # 확정이 오면, 옛 코드는 다리를 정리해 지금 선주문 번호를 지웠다 → 그 주문이 LS에 산 채
+    # 남고 다음 판이 한 장 더 냄. 지금은 추적만 끝내고 다리는 그대로.
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1" and "O1" in eng._orders
+    s.entry.pre_order_id = "O9"                              # 다리는 새 선주문으로 넘어간 상태 흉내
+    status_before = s.entry.status
+    sys_.order_book.on_cancel("O1")                          # 옛 번호의 취소 확정
+    await _settle()
+    assert s.entry.pre_order_id == "O9"                      # 지금 번호 유지
+    assert s.entry.status is status_before
+    assert "O1" not in eng._orders                           # 추적만 종료
+
+
+async def test_cancel_communication_error_is_not_retried(monkeypatch: Any) -> None:
+    # 사용자 2026-10-14(검토 15번 Q3): 취소 요청이 통신 오류로 끝나면 결과 모름 — 거부 응답과
+    # 달리 다시
+    # 보내지 않고 통보만 기다린다. 표시(취소 대기)도 되돌리지 않는다(30초 뒤 감시 알람이 사람에게).
+    monkeypatch.setattr("kp_arb.auto_m_engine.CANCEL_RETRY_S", 0.0)
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    sys_.cancel_comm_error = True
+    eng.set_running(U, 0, Block.ENTRY, False)      # 끔 → 선주문 취소 요청
+    await _settle()
+    assert sys_.cancel_attempts == 1               # 한 번만, 재시도 없음
+    assert sys_.cancelled == []
+    assert s.entry.pre_order_id == "O1" and s.entry.cancel_sent  # 표시 유지 — 통보 대기
+
+
+async def test_hl_first_batch_communication_failure_halts_sets_without_replacing() -> None:
+    # 사용자 2026-10-14(검토 15번): HL 선주문 묶음 요청이 통신 오류·응답 없음으로 끝나면 결과 모름 —
+    # 한 건씩 다시 보내지 않고 세트 중지(LS 선주문 응답 없음과 같음). 거부(묶음 전체 거부)와 다르다.
+    eng, sys_, state = await _hl_first_two_sets()
+    sys_.batch_comm_error = True
+    eng.tick(datetime(2026, 9, 30, 10, 0, 0), 100.0)
+    await _settle()
+    book = state.autom.book(U, "sf_hl_first")
+    for s in (book.sets[0], book.sets[1]):
+        assert s.entry.status is LegStatus.HALTED and not s.entry.running
+        assert "응답 없음" in (s.entry.halt_reason or "")
+    assert len(sys_.batches) == 1 and not sys_.placed
+    eng.tick(datetime(2026, 9, 30, 10, 0, 5), 105.0)   # 다음 판정에서도 재발주 없음
+    await _settle()
+    assert len(sys_.batches) == 1 and not sys_.placed

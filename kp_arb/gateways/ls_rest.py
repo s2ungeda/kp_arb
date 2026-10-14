@@ -192,6 +192,7 @@ class RateLimiter:
 
 class LSRestClient:
     """LS REST 공통 클라이언트. 토큰 주입 + 레이트리밋 + 지수 백오프 재시도."""
+    supports_continuation = False  # 응답 헤더 tr_cont_key를 못 돌려받음(위 request 참고)
 
     def __init__(
         self,
@@ -221,6 +222,10 @@ class LSRestClient:
     ) -> RestResponse:
         # 레이트리밋은 전송 전에 1회 판정(초과 시 전송하지 않고 즉시 차단).
         self._limiter.check(tr_cd)
+        if tr_cont == "Y":
+            # REST 연속조회는 응답 헤더 tr_cont_key를 되돌려 보내야 하는데 RestResponse가 헤더를
+            # 안 담아 지원하지 않는다(supports_continuation=False) — 호출자가 안 보내야 정상
+            _log.warning("LS REST %s tr_cont=Y — 연속조회 키(tr_cont_key) 없이 전송", tr_cd)
 
         token = await self._tokens.get_token()
         headers = build_headers(tr_cd, token, tr_cont=tr_cont)

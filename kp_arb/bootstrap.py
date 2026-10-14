@@ -17,6 +17,7 @@ HL 게이트웨이는 슬롯만 예비(라이브 결선 시 추가).
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import deque
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from datetime import date, datetime, time
@@ -74,6 +75,26 @@ from .ws_status import WsStatus
 # HL 발주가 통신 오류로 끝난 뒤 cloid를 기억해 두는 유예(초) — 살아 있는 주문의 늦은 통보를 받아
 # 주고, 끝에 orderStatus(cloid)로 한 번 더 확인한다(DESIGN §HL cloid ③, 검토 2026-09-11 §A).
 HL_PENDING_GRACE_S = 30.0
+SNAPSHOT_RETRY_DELAY_S = 1.0  # 재동기 왕복 중 체결이 끼면 한 번 더 조회하기까지(검토 10번)
+
+_STOCK_CODE = re.compile(r"^A?\d{6}$")
+_STOCK_ISIN = re.compile(r"^KR7\d{9}$")        # 주식 통보(SC1) Isuno는 ISIN
+_FUTURE_CODE = re.compile(r"^A?[1-4][0-9A-Z]{6,7}$")  # 파생 코드(1 선물·2/3 옵션·4 스프레드)
+
+
+def code_kind(code: str) -> tuple[str | None, str]:
+    """LS 종목코드의 종류 — ("stock"|"future"|None, 조회용 코드). 주식은 6자리("A" 접두 무관)
+    또는 ISIN(KR7+종목코드+3), 파생은 1~4로 시작하는 7~8자. 모르면 (None, 원문).
+    검토 2026-10-13 G3: 선물 주문에 주식 통보가 붙는 바로 그 경우(상품이 다름)를 종류로 먼저
+    가른다."""
+    c = code.strip()
+    if _STOCK_ISIN.match(c):
+        return "stock", c[3:9]
+    if _STOCK_CODE.match(c):
+        return "stock", c.lstrip("A")
+    if _FUTURE_CODE.match(c):
+        return "future", c
+    return None, c
 
 
 def select_near_month(
@@ -324,6 +345,7 @@ class LiveSystem:
         # 유예 안에 그 cloid의 통보가 오면 살아 있는 주문으로 등록(§HL cloid ③, 검토 09-11 §A).
         self._hl_failed: dict[str, tuple[OrderIntent, float]] = {}
         self.hl_pending_grace_s = HL_PENDING_GRACE_S  # 테스트에서 줄인다
+        self.snapshot_retry_delay_s = SNAPSHOT_RETRY_DELAY_S  # 재동기 왕복 중 체결 → 재조회 간격
         self.order_book = order_book
         self.session = session
         self._stock_ws = stock_ws
@@ -402,15 +424,61 @@ class LiveSystem:
 
     # --- 스냅샷 (최초 실행 + 온디맨드/UI 조회 버튼) ---
 
-    async def refresh_snapshot(self, scope: set[Account | None] | None = None) -> None:
+    async def refresh_snapshot(self, scope: set[Account | None] | None = None, *,
+                               _retry: bool = False) -> None:
         """거래소 실제값(REST)으로 장부 재동기. scope=None이면 전체(시동·수동 '적'),
-        지정하면 그 계좌(HL은 None)만 조회·갱신 — 재연결은 끊긴 시장만(사용자 2026-09-09)."""
+        지정하면 그 계좌(HL은 None)만 조회·갱신 — 재연결은 끊긴 시장만(사용자 2026-09-09).
+        검토 2026-10-13 10번: ① 포지션 조회에 실패한 계좌의 포지션·잔고는 지우지 않는다(옛 코드는
+        scope=None이면 전부 비워 공매도 검증이 오거부). ② REST 왕복 **중** 체결이 끼면 스냅샷이 그
+        체결을 품었는지 알 수 없어 잠깐 뒤 같은 범위를 한 번 더 조회한다(한 번만)."""
         import logging
 
         positions: list[Position] = []
         balances: dict[Account, float] = {}
         open_orders: list[TrackedOrder] = []
         reconciled: set[Account | None] = set()  # 조회 성공한 계좌만 phantom 정리 대상
+        pos_ok: set[Account | None] = set()      # 포지션 조회 성공 계좌(그 계좌만 갈아 끼움)
+        failed: list[Account] = []
+        fills_meanwhile: list[str] = []          # 왕복 중 장부에 적용된 체결(이번 범위)
+
+        def _note_fill(order: TrackedOrder, _qty: float, _price: float, fill_id: str) -> None:
+            acct = self.order_book.account_of(order.intent)
+            if scope is None or acct in scope:
+                fills_meanwhile.append(f"#{order.order_id}/{fill_id}")
+
+        self.order_book.on_fill_applied.append(_note_fill)
+        try:
+            await self._query_snapshot(scope, positions, balances, open_orders, reconciled,
+                                       pos_ok, failed)
+        finally:
+            self.order_book.on_fill_applied.remove(_note_fill)
+        eff_scope = scope
+        if scope is None and failed:
+            eff_scope = pos_ok  # 실패 계좌의 포지션·잔고는 그대로(빈 값으로 덮지 않음)
+            logging.getLogger("kp_arb.bootstrap").warning(
+                "재동기: %s 계좌 포지션 조회 실패 — 그 계좌 장부는 옛 값 유지",
+                ", ".join(a.value for a in failed))
+        # scope가 있으면 그 계좌의 포지션·잔고만 갈아 끼운다(다른 시장 장부는 그대로).
+        self.order_book.load_snapshot(
+            positions=positions, balances=balances, open_orders=open_orders,
+            reconcile_accounts=reconciled, scope=eff_scope,
+        )
+        if fills_meanwhile and not _retry:
+            logging.getLogger("kp_arb.bootstrap").warning(
+                "재동기 왕복 중 체결 %d건(%s) — 스냅샷이 품었는지 알 수 없어 %.0f초 뒤 한 번 더"
+                " 조회",
+                len(fills_meanwhile), " ".join(fills_meanwhile[:5]), self.snapshot_retry_delay_s)
+            await asyncio.sleep(self.snapshot_retry_delay_s)
+            await self.refresh_snapshot(scope, _retry=True)
+
+    async def _query_snapshot(
+        self, scope: set[Account | None] | None, positions: list[Position],
+        balances: dict[Account, float], open_orders: list[TrackedOrder],
+        reconciled: set[Account | None], pos_ok: set[Account | None], failed: list[Account],
+    ) -> None:
+        """재동기 REST 조회 부분 — 결과는 인자로 받은 그릇에 채운다(refresh_snapshot 전용)."""
+        import logging
+
         ls_accounts = [a for a in (Account.KR_STOCK, Account.KR_DERIV)
                        if scope is None or a in scope]
         for account in ls_accounts:
@@ -423,6 +491,7 @@ class LiveSystem:
                 balances[account] = await self._gw.get_balance(account)
                 stage = "포지션"
                 positions.extend(await self._gw.get_positions(account))
+                pos_ok.add(account)
                 stage = "미체결"
                 open_orders.extend(await self._gw.get_open_orders(account))
                 # 실제 조회가 되는 계좌만 유령 정리 대상. 선물 미체결 TR은 미확인이라 빈 결과가
@@ -435,24 +504,21 @@ class LiveSystem:
                     "%s 계좌 스냅샷: %s 조회 실패 — %s (%s)",
                     account.value, stage, snapshot_failure_note(stage), exc,
                 )
-                balances.setdefault(account, 0.0)
+                if account not in pos_ok:
+                    failed.append(account)
+                    balances.pop(account, None)  # 잔고도 옛 값 유지(0으로 덮지 않음)
         if self._hl is not None and (scope is None or None in scope):
             hl_pos, self.hl_detail = await self._hl.get_positions_and_details()  # 1회 조회
             positions.extend(hl_pos)
             open_orders.extend(await self._hl.get_open_orders())
             reconciled.add(None)  # HL 주문(계좌 없음) 조회 성공
+            pos_ok.add(None)
             # 미보유 종목은 clearinghouse가 레버리지를 안 줘 캡션이 기본값(5x)에 멈춘다 —
             # activeAssetData로 계좌 설정 레버리지를 읽어 보정(보유 종목 값은 유지). §D
             for u, lev in (await self._hl.get_leverage_settings()).items():
                 d = self.hl_detail.setdefault(u, {})
                 d.setdefault("leverage", lev["leverage"])
                 d.setdefault("leverage_cross", lev["leverage_cross"])
-        # 조회 실패 계좌의 살아있는 미체결이 빈 스냅샷 탓에 지워지지 않도록 성공 계좌만 정리.
-        # scope가 있으면 그 계좌의 포지션·잔고만 갈아 끼운다(다른 시장 장부는 그대로).
-        self.order_book.load_snapshot(
-            positions=positions, balances=balances, open_orders=open_orders,
-            reconcile_accounts=reconciled, scope=scope,
-        )
 
     def _record_fill(self, order: TrackedOrder, qty: float, price: float,
                      fill_id: str) -> None:
@@ -482,24 +548,43 @@ class LiveSystem:
 
     def _fill_symbol_ok(self, fill: Fill) -> bool:
         """LS 체결 통보의 종목코드가 장부 주문의 종목과 맞는가(결정 73: 계좌·번호로 찾고 종목은
-        대조). 코드가 없거나 장부에 그 주문이 없거나 변환기가 모르는 코드면 통과(장부가 알아서)."""
+        대조). 코드가 없거나 장부에 그 주문이 없으면 통과(장부가 알아서).
+        ① 코드 **종류**(주식/파생)가 주문 상품과 다르면 거부 + 에러 — 10-14 사고처럼 상품이 다른
+        바로 그 경우(검토 2026-10-13 G3; 옛 코드는 모르는 코드라며 통과시켰다).
+        ② 같은 종류인데 종목을 못 풀면(롤오버 직후 모르는 월물 등) 통과 + 경고 — 거부하면 헤지가
+        빠진다.
+        ③ 종목이 풀렸는데 다르면 거부 + 에러."""
         if not fill.symbol or fill.account is None:
             return True
         order = self.order_book.order(fill.order_id, fill.account)
         if order is None:
             return True
         intent = order.intent
-        if intent.instrument.is_stock_future:
-            u = self._resolve_fut_code(fill.symbol)
+        want = "future" if intent.instrument.is_stock_future else "stock"
+        kind, code = code_kind(fill.symbol)
+        log = order_log.logger_for(Venue.LS)
+        if kind is not None and kind != want:
+            log.error("체결 통보 #%s(계좌 %s) 종목코드 %s는 %s 코드인데 장부 주문은 %s(%s) — "
+                      "반영 안 함, 포지션 확인", fill.order_id, fill.account.value, fill.symbol,
+                      "주식" if kind == "stock" else "파생", intent.instrument.value,
+                      intent.underlying.value)
+            return False
+        if want == "future":
+            u = self._resolve_fut_code(code)
         else:
-            resolve = getattr(self._gw, "_resolve_spot", None)
-            pair = resolve(fill.symbol) if resolve is not None else None
-            u = pair[1] if pair is not None else None
-        if u is None or u == intent.underlying:
+            resolve = getattr(self._gw, "_resolve_spot", None)  # ETF 코드까지 아는 쪽
+            pair = resolve(code) if resolve is not None else None
+            u = pair[1] if pair is not None else Underlying.from_krx_code(code)
+        if u is None:
+            log.warning("체결 통보 #%s(계좌 %s) 종목코드 %s — 종목을 못 풀어 대조 없이 반영(%s %s)",
+                        fill.order_id, fill.account.value, fill.symbol,
+                        intent.instrument.value, intent.underlying.value)
             return True
-        order_log.logger_for(Venue.LS).error(
-            "체결 통보 #%s(계좌 %s) 종목 %s는 장부 주문 종목(%s)과 다름 — 반영 안 함, 포지션 확인",
-            fill.order_id, fill.account.value, fill.symbol, intent.underlying.value)
+        if u == intent.underlying:
+            return True
+        log.error("체결 통보 #%s(계좌 %s) 종목 %s는 장부 주문 종목(%s)과 다름 — 반영 안 함, 포지션"
+                  " 확인",
+                  fill.order_id, fill.account.value, fill.symbol, intent.underlying.value)
         return False
 
     def _record_cancel(self, order: TrackedOrder) -> None:
@@ -863,7 +948,7 @@ class LiveSystem:
         발주 실패로 처리했던 cloid(유예 중)의 통보면 살아 있는 주문 — 경고·알람과 함께 등록(③)."""
         import time as _t
 
-        if not upd.cloid or self.order_book.order(upd.oid) is not None:
+        if not upd.cloid or self.order_book.hl_order(upd.oid) is not None:
             return
         if upd.is_rejected:
             # 거부 통보(badAloPxRejected 등)는 "죽었음"의 확정 — 살아 있는 주문으로 등록하지 않는다.
@@ -881,11 +966,14 @@ class LiveSystem:
             return
         failed = self._hl_failed.pop(upd.cloid, None)
         if failed is None:
-            return
+            return  # 유예 끝 재조회가 이미 정리한 cloid — 재동기(재연결·'적'·재시동)가 안전망
         intent, expiry = failed
-        if _t.monotonic() > expiry:
-            return  # 유예 지남 — 재동기(재연결·'적'·재시동)가 일반 주문으로 잡는다
-        self._adopt_identified(upd.cloid, upd.oid, intent, late=True, how=upd.status)
+        # 유예가 지났어도 목록에 아직 있으면(재조회가 깨어나기 전 찰나) 등록한다 — 통보가 왔다는
+        # 것이
+        # 곧 살아 있다는 뜻. 옛 코드는 여기서 버려 재조회가 "이미 식별됨"으로 끝나 살아 있는 주문이
+        # 영영 빠졌다(검토 2026-10-13 ★8(a))
+        how = upd.status if _t.monotonic() <= expiry else f"{upd.status}, 유예 지난 직후"
+        self._adopt_identified(upd.cloid, upd.oid, intent, late=True, how=how)
 
     def _adopt_identified(self, cloid: str, oid: str, intent: OrderIntent, *,
                           late: bool, how: str) -> None:
@@ -933,7 +1021,7 @@ class LiveSystem:
             order_log.logger_for(Venue.HYPERLIQUID).info(
                 "HL 유예 끝 cloid %s — 통보·조회 모두 없음(주문 안 들어간 것으로 봄)", cloid)
             return
-        if self.order_book.order(oid) is None:
+        if self.order_book.hl_order(oid) is None:
             self._adopt_identified(cloid, oid, intent, late=True, how="유예 끝 orderStatus 조회")
 
     def _on_ws_reconnect(self, label: str) -> None:
@@ -1034,7 +1122,7 @@ class LiveSystem:
     def _adopt_hl_order(self, order_id: str, intent: OrderIntent,
                         place_fill: tuple[float, float] | None) -> None:
         """접수된 HL 주문을 장부에 등록 — 한 건 발주(place)와 묶음 발주(place_many) 공용."""
-        order = self.order_book.order(order_id)
+        order = self.order_book.hl_order(order_id)
         if order is None:
             order = self.order_book.track(order_id, intent)
         else:  # 응답보다 먼저 온 통보(cloid)로 이미 등록·체결 반영됨 — 그대로 잇는다
@@ -1177,33 +1265,42 @@ class LiveSystem:
             # 통보가 응답보다 먼저 와도 통보가 곧 취소라 그대로 처리된다. 옛 즉시 닫기는 취소 직전
             # 체결의 늦은 통보를 "닫힌 주문의 체결"로 만들던 원인(검토 10-13 B)
 
-    async def cancel_many(self, order_ids: Sequence[str]) -> list[tuple[str, str | None]]:
-        """여러 건 취소 → (주문번호, 실패 사유|None) 목록. HL은 게이트웨이 cancel_orders로
-        **한 요청**에 묶고(요청 한도, 사용자 2026-09-28), LS는 한 건씩(cancel). 모르는 번호는
-        사유만. HL 성공 건도 응답으로 닫지 않고 취소 통보(sz)로 닫는다(cancel과 같음)."""
-        result: dict[str, str | None] = {}
+    async def cancel_many(
+        self, order_ids: Sequence[str], accounts: Sequence[Account | None] | None = None,
+    ) -> list[tuple[str, str | None]]:
+        """여러 건 취소 → (주문번호, 실패 사유|None) 목록(입력 순서). HL은 게이트웨이
+        cancel_orders로 **한 요청**에 묶고(요청 한도, 사용자 2026-09-28), LS는 한 건씩(cancel).
+        모르는 번호는 사유만. HL 성공 건도 응답으로 닫지 않고 취소 통보(sz)로 닫는다(cancel과 같음).
+        accounts = 번호별 LS 계좌(결정 73 — 같은 번호가 계좌마다 겹치므로 아는 쪽은 넘긴다;
+        HL·모름은 None). 안 넘기면 번호가 한 계좌에만 열려 있을 때만 찾는다(검토 10-13 G2: 주식
+        HTS 주문과 선물 선주문이 같은 번호로 함께 열려 있으면 둘 다 "unknown"으로 건너뛰던 길)."""
+        if accounts is not None and len(accounts) != len(order_ids):
+            raise ValueError("cancel_many: accounts 길이가 order_ids와 다름")
+        errs: list[str | None] = [None] * len(order_ids)
         hl_ids: list[str] = []
-        for oid in order_ids:
-            order = self.order_book.order(oid)
+        hl_pos: dict[str, int] = {}
+        for i, oid in enumerate(order_ids):
+            acct = accounts[i] if accounts is not None else None
+            order = self.order_book.order(oid, acct)
             if order is None:
-                result[oid] = f"unknown order {oid}"
+                errs[i] = f"unknown order {oid}"
             elif order.intent.venue is Venue.LS:
                 try:
-                    await self.cancel(oid)
-                    result[oid] = None
+                    await self.cancel(oid, account=self.order_book.account_of(order.intent))
                 except Exception as exc:  # noqa: BLE001 - 건별 사유
-                    result[oid] = str(exc)
+                    errs[i] = str(exc)
             else:
                 hl_ids.append(oid)
+                hl_pos[oid] = i
         if hl_ids:
             assert self._hl is not None
             errors = await self._hl.cancel_orders(hl_ids)
             for oid, err in zip(hl_ids, errors, strict=True):
-                result[oid] = err
-                order = self.order_book.order(oid)
+                errs[hl_pos[oid]] = err
+                order = self.order_book.hl_order(oid)
                 if err is not None and order is not None:  # 성공 건은 취소 통보(sz)가 닫는다
                     self._record_reject(order.intent, err, kind="취소", order_id=oid)
-        return [(oid, result[oid]) for oid in order_ids]
+        return list(zip(order_ids, errs, strict=True))
 
     async def update_leverage(
         self, underlying: Underlying, leverage: int, *, is_cross: bool

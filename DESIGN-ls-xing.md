@@ -56,12 +56,20 @@ meme-core.exe (32bit, asyncio 메인 스레드)
 - asyncio → COM: `loop.run_in_executor` 대신 요청 큐 + `asyncio.Future`(응답은 `loop.call_soon_threadsafe`로
   완료). COM → asyncio: 이벤트(`OnReceiveRealData`/`OnReceiveData`/`OnReceiveMessage`/`OnLogin`…)에서 필드를
   dict로 뽑아 `call_soon_threadsafe`로 넘긴다. **COM 스레드에서 네트워크·파일 I/O 금지**(화면 규칙과 같음).
-- `tr` 요청은 XAQuery 객체 하나당 한 번에 하나(직렬). **주문 전용 XAQuery**를 따로 두어 조회 뒤에 줄 서지
+- `tr` 요청은 차선(조회·주문)마다 한 번에 하나(직렬). **주문 전용 차선**을 따로 두어 조회 뒤에 줄 서지
   않게 한다. 시간 초과(조회 10초·주문 30초, 기존 값)면 주문 TR은 `RestTimeoutError`와 같은 뜻(결과 모름).
+- **요청마다 XAQuery를 새로 만들고 응답을 요청 순번으로 귀속**(검토 2026-10-13 ★7, 2026-10-14 반영): 시간 초과로
+  정리한 앞 요청의 늦은 응답(OnReceiveMessage/OnReceiveData)이 같은 차선의 다음 요청 결과가 되지 않게 — 순번이
+  다르거나 `data`의 TR 이름이 다르면 경고만 남기고 버린다. 줄 서 있던 요청은 보내기 직전에 **호출자 포기(asyncio
+  쪽 시간 초과)·마감 경과를 확인해 보내지 않는다**(COM 정지 회복 때 "결과 모름"으로 끝난 주문들이 옛 가격으로
+  한꺼번에 나가던 길을 막음). asyncio 쪽 시간 초과는 COM 전용 `_pending`을 직접 건드리지 않고 COM 스레드에
+  그 요청(순번)만 빼 달라고 맡긴다.
 - 응답 코드: `OnReceiveMessage(bIsSystemError, nMessageCode, szMessage)` — 성공 판정은 기존과 같이 `00`으로
   시작. `rsp_cd/rsp_msg`로 옮겨 기존 파서·거부내역이 그대로 쓴다.
 - 실시간(XAReal)은 TR마다 객체 하나, `AdviseRealData` 전에 `SetFieldData(InBlock, 키필드, 0, key)`. 키 필드명은
-  **Res 파일 InBlock에서 읽는다**(추측 금지, [OPEN]).
+  **Res 파일 InBlock에서 읽는다**(추측 금지, [OPEN]). **끊김(OnDisconnect/OnLogout)이 오면 등록 키를 비운다** —
+  서버 등록은 세션과 함께 죽으므로 재로그인 뒤 `_advise_all`이 전 구독을 실제로 다시 보낸다(검토 2026-10-13 ★5,
+  2026-10-14 반영; 전엔 키가 남아 전부 "이미 등록"으로 건너뜀). 모의에서 끊김→재로그인 실측은 사용자 진행(§7).
 - 초당 한도: 요청 직전 `GetTRCountPerSec/GetTRCountBaseSec/GetTRCountLimit/GetTRCountRequest`로 xing이 주는
   값으로 판단(기존 `RateLimiter` 표는 REST 전용으로 남김).
 
@@ -138,6 +146,9 @@ meme-core.exe (32bit, asyncio 메인 스레드)
   전부 정지, 세션은 '연결'. 조치: `_drain`은 한 바퀴에 지금 든 명령만; `query()` asyncio 쪽 2차 시간 초과(`STUCK_GRACE_S`);
   COM 스레드 심장박동 `last_beat`·`thread_stalled()` + `XingRealClient._health_loop`(정지 → 채널 끊김 표시 → 자동M G0-1
   대기, 회복 → 연결). 모의 시험이 전부 순차 요청이라 못 잡았던 것 — **동시 요청 회귀 테스트** 추가.
+  후속(검토 ★7, 2026-10-14): 줄 선 요청이 앞 요청 뒤에 마감이 지난 채 전송되던 것·앞 요청의 늦은 응답이 뒤 요청에
+  붙던 것·asyncio 쪽 시간 초과가 COM 전용 자료를 직접 지우던 것을 고침(§2.1). 회귀 테스트: 같은 차선 두 요청
+  시간 초과 때 뒤 요청 **전송 안 함**, 늦은 응답 무시, asyncio 시간 초과 뒤 차선 재사용.
 - **주식 주문 TR 이름이 다르다:** xing Res는 `CSPAT00600/00700/00800`(REST는 …601/701/801). InBlock1
   필드는 REST와 같고 **`MbrNo`(NXT)·`MgntrnCode`·`LoanDt` 있음** → `XingQueryClient`가 요청·응답 블록
   접두를 바꿔 게이트웨이는 REST 이름 그대로.
@@ -205,6 +216,19 @@ meme-core.exe (32bit, asyncio 메인 스레드)
 
 ## 7. [OPEN] — 남은 것
 - xingAPI 서버 호스트·포트(real/demo) — DevCenter 로그인 창 값(`KP_XING_HOST`, 기본 포트 20001).
+- 끊김 → 재로그인 뒤 시세(H1_/CUR 등)·계좌 통보(SC*/O01/C01/H01)가 다시 오는지 — **실측 2026-10-14 15:13(개발 PC, 모의):
+  네트워크를 끊자 재로그인 경로가 돌기 전에 코어가 죽었다.** 같은 ID로 DevCenter 중복 로그인은 세션을 안 끊음(모의).
+  Windows 오류 보고: python.exe(코어 pid 28196) 0xc0000005, 모듈 pythoncom312.dll `PyGatewayBase::GetIDsOfNames` —
+  호출 스택은 COM 스레드의 `PumpWaitingMessages` → XA_Session.dll(끊김 이벤트) → pythoncom 이벤트 받이(이름 찾기)에서
+  접근 위반. 즉 **우리 파이썬 코드(OnDisconnect 처리)에 들어오기 전**, xingAPI가 끊김 이벤트를 올리는 순간 pywin32 안에서
+  죽는다. 덤프: `%LOCALAPPDATA%\CrashDumps\python.exe.28196.dmp`(cdb로 스택 확인). 메인 창이 약 4분 뒤(부팅 유예 60틱)
+  코어를 자동 재기동해 15:17:05 정상 복귀(로그인·실시간 59건·시세 수신). **[OPEN] 원인·대책:** ① 세션만 띄우는 최소
+  스크립트로 모의에서 끊어 재현(우리 코드와 무관한 pywin32×xing 문제인지) ② pywin32 312 / 이벤트 받이 방식(DispatchWithEvents
+  대신 WithEvents+별도 핸들러, 또는 `_SessionEvents`에 타입라이브러리의 이벤트 이름 전부 정의) ③ 재현되면 끊김 감지를
+  이벤트가 아니라 수신 멈춤(심장박동)으로 바꾸고 이벤트 받이를 끊는 방안. 운영 위험: 네트워크가 잠깐 끊기면 코어가 죽고
+  재기동까지 수 분 — 그 사이 헤지 없는 다리가 있으면 사람이 봐야 한다.
+- t0434 연속조회를 **새 XAQuery 객체 + InBlock cts_ordno + Request(True)**로 이어 받는 방식이 실서버에서 통하는지
+  (2026-10-14 구현, 모의 미제공 TR이라 실측 대기 — 공식 설명서상 연속키는 InBlock 필드로 전달).
 - OpenAPI(REST/WS)와 xing을 **같이 로그인**해도 되는지(전환 기간에 둘 다 뜰 수 있음).
 - 통보 TR의 `cheprice` 단위(REST WS는 원화의 1/100)가 xing에서도 같은지 — 첫 체결 로그로 확인.
 - CUR 키: Res `base_id`는 6자 — WS의 8자 키는 advise 때 6자로 잘린다(같은 값). 실측 뒤 하나로.

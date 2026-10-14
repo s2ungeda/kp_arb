@@ -102,6 +102,7 @@ class LSApiGateway(LSGateway):
     DERIV_DEPOSIT_TR = "CFOBQ10500"     # 선물옵션 예탁금·증거금 (get_balance)
     DERIV_POSITIONS_TR = "t0441"        # 선물옵션 잔고평가 (운영 실측 — CFOAQ50600은 거부)
     DERIV_OPEN_ORDERS_TR = "t0434"      # 선물옵션 체결/미체결 (문서 확인·실측 대기 2026-09-09)
+    DERIV_OPEN_ORDERS_MAX_PAGES = 50    # t0434 이어 받기 상한(안전장치 — 우리 쪽 값)
     STOCK_ACC_PATH = "/stock/accno"
     DERIV_ACC_PATH = "/futureoption/accno"
     FUTURES_MASTER_TR = "t8401"         # 주식선물 마스터 (종목코드 조회, 실측 v6.7)
@@ -396,39 +397,61 @@ class LSApiGateway(LSGateway):
         미체결(chegb "2")을 받고, 안전하게 잔량(ordrem) > 0만 남긴다.
         요청 InBlock: expcode(8)·chegb(0전체/1체결/2미체결)·sortgb(1역순/2순)·cts_ordno(처음 Space).
         응답 OutBlock1: ordno·orgordno·medosu·ordgb·qty·price(9.2)·cheqty·cheprice·ordrem·status·
-        ordtime·expcode·hogatype. 연속조회는 응답 헤더 tr_cont_key가 필요한데 RestResponse가 헤더를
-        안 담아 첫 페이지만(초과 시 경고 로그). 모의 미제공(01900)이면 빈 결과이고
-        open_orders_supported도 거짓으로 남는다(유령 정리 제외). price 단위는 실측으로 확인."""
+        ordtime·expcode·hogatype. **연속조회(사용자 2026-10-14 "전체를 읽어와야지"):** 응답
+        OutBlock의 `cts_ordno`가 비지 않으면 그 값을 InBlock `cts_ordno`에 넣고 tr_cont="Y"
+        (xing은 Request(True))로 이어 받는다 — 전송 단이 이어 받기를 지원할 때
+        (`supports_continuation`, xing). REST는 응답 헤더 `tr_cont_key`를 RestResponse가 안
+        담아 첫 페이지만(경고 로그; REST는 백업 경로). 페이지 수 상한은 안전장치. 모의
+        미제공(01900)이면 빈 결과이고 open_orders_supported도 거짓으로 남는다(유령 정리
+        제외). price 단위는 실측으로 확인."""
         fields = self._account_fields(Account.KR_DERIV)
         out: list[TrackedOrder] = []
         seen: set[str] = set()
         codes = list(dict.fromkeys(self._futures_codes.values()))  # 중복 제거·순서 유지
+        can_continue = bool(getattr(self._rest_for(Account.KR_DERIV),
+                                    "supports_continuation", False))
         for code in codes:
-            body = {f"{self.DERIV_OPEN_ORDERS_TR}InBlock": {
-                "accno": fields.get("AcntNo", ""), "passwd": fields.get("Pwd", ""),
-                "expcode": code, "chegb": "2", "sortgb": "2", "cts_ordno": " ",
-            }}
-            resp = await self._request_paced(
-                Account.KR_DERIV, self.DERIV_OPEN_ORDERS_TR, body, self.DERIV_ACC_PATH)
-            if str(resp.body.get("rsp_cd", "")) in _PAPER_UNSUPPORTED_RSP_CDS:
-                self._deriv_open_orders_ok = False
-                return []  # 모의 미제공 → 빈 결과, 유령 정리 제외
-            self._check_ok(resp, self.DERIV_OPEN_ORDERS_TR)
-            raw_rows = resp.body.get(f"{self.DERIV_OPEN_ORDERS_TR}OutBlock1")
-            rows = list(raw_rows) if isinstance(raw_rows, list) else []
-            for row in rows:
-                if float(row.get("ordrem") or 0) <= 0:
-                    continue  # 전량 체결·취소 완료 행
-                o = self._deriv_open_order(row)
-                if o is not None and o.order_id not in seen:
-                    seen.add(o.order_id)
-                    out.append(self._adopt(o))
-            tail = resp.body.get(f"{self.DERIV_OPEN_ORDERS_TR}OutBlock") or {}
-            if str(tail.get("cts_ordno") or "").strip():
-                # 연속 조회 키가 왔다 — 미체결이 한 페이지를 넘는 경우(자동M은 세트당 1건이라 드묾).
-                order_log.logger_for(Venue.LS).warning(
-                    "t0434 %s 미체결이 한 페이지를 넘음(cts_ordno=%s) — 다음 페이지는 미조회",
-                    code, tail.get("cts_ordno"))
+            cts = " "  # 처음 조회는 Space(공식 문서)
+            for page in range(1, self.DERIV_OPEN_ORDERS_MAX_PAGES + 1):
+                body = {f"{self.DERIV_OPEN_ORDERS_TR}InBlock": {
+                    "accno": fields.get("AcntNo", ""), "passwd": fields.get("Pwd", ""),
+                    "expcode": code, "chegb": "2", "sortgb": "2", "cts_ordno": cts,
+                }}
+                resp = await self._request_paced(
+                    Account.KR_DERIV, self.DERIV_OPEN_ORDERS_TR, body, self.DERIV_ACC_PATH,
+                    tr_cont="Y" if page > 1 else "N")
+                if str(resp.body.get("rsp_cd", "")) in _PAPER_UNSUPPORTED_RSP_CDS:
+                    self._deriv_open_orders_ok = False
+                    return []  # 모의 미제공 → 빈 결과, 유령 정리 제외
+                self._check_ok(resp, self.DERIV_OPEN_ORDERS_TR)
+                raw_rows = resp.body.get(f"{self.DERIV_OPEN_ORDERS_TR}OutBlock1")
+                rows = list(raw_rows) if isinstance(raw_rows, list) else []
+                for row in rows:
+                    if float(row.get("ordrem") or 0) <= 0:
+                        continue  # 전량 체결·취소 완료 행
+                    o = self._deriv_open_order(row)
+                    if o is not None and o.order_id not in seen:
+                        seen.add(o.order_id)
+                        out.append(self._adopt(o))
+                tail = resp.body.get(f"{self.DERIV_OPEN_ORDERS_TR}OutBlock") or {}
+                next_key = str(tail.get("cts_ordno") or "").strip()
+                if not next_key:
+                    break  # 마지막 페이지
+                if not can_continue:
+                    order_log.logger_for(Venue.LS).warning(
+                        "t0434 %s 미체결이 한 페이지를 넘음(cts_ordno=%s) — 이 전송 단(REST)은 "
+                        "이어 "
+                        "받기를 못 해 다음 페이지 미조회", code, next_key)
+                    break
+                if page == self.DERIV_OPEN_ORDERS_MAX_PAGES:
+                    order_log.logger_for(Venue.LS).error(
+                        "t0434 %s 미체결 %d페이지 넘김 — 상한에서 멈춤(cts_ordno=%s), 나머지 "
+                        "미조회",
+                        code, page, next_key)
+                    break
+                order_log.logger_for(Venue.LS).info(
+                    "t0434 %s 미체결 %d페이지 → 이어 받기(cts_ordno=%s)", code, page, next_key)
+                cts = next_key
         self._deriv_open_orders_ok = True
         return out
 
@@ -467,7 +490,8 @@ class LSApiGateway(LSGateway):
     STOCK_MARKET_PATH = "/stock/market-data"
 
     async def _request_paced(
-        self, account: Account, tr_cd: str, body: dict[str, Any], path: str
+        self, account: Account, tr_cd: str, body: dict[str, Any], path: str,
+        tr_cont: str = "N",
     ) -> RestResponse:
         """초당 한도(RateLimitError)에 걸리면 잠깐 기다렸다 재시도 — 시동 일괄 조회용.
 
@@ -478,7 +502,8 @@ class LSApiGateway(LSGateway):
 
         for _ in range(10):
             try:
-                return await self._rest_for(account).request(tr_cd, body, path=path)
+                return await self._rest_for(account).request(tr_cd, body, path=path,
+                                                              tr_cont=tr_cont)
             except RateLimitError:
                 await _asyncio.sleep(0.6)
         raise RateLimitError(f"{tr_cd} 초당 한도 지속")

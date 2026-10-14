@@ -17,14 +17,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .bootstrap import LiveSystem
-from .domain.enums import Instrument, OrderType, Side, Underlying, Venue
+from .domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .gateways.ls import OrderGoneError
-from .gateways.ls_rest import RateLimitError, RestError
+from .gateways.ls_rest import RateLimitError, RestError, RestTimeoutError
 from .gateways.ls_ws import Fill
 from .logs import setup_logging
 from .order_book import OrderStatus
 from .pegging import PegAction, decide, target_price
+from .routing import account_for
 
 _log = logging.getLogger("kp_arb.peg_order")
 
@@ -58,7 +59,12 @@ class PegController:
     order_price: float | None = None
     busy: bool = False  # 주문/정정 진행 중 겹침 방지
     pending: bool = False  # 진행 중 새 호가 도착 — 끝나면 최신 호가로 즉시 한 번 더
+    stalled: bool = False  # 발주·정정·취소 응답 없음(결과 모름) — 사람이 확인할 때까지 멈춤
     flip_on_fill: bool = True  # 체결 시 그 수량만큼 반대 방향으로 전환해 무한 반복
+
+    def _account(self) -> Account | None:
+        """LS 계좌 — 조회·정정·취소에 번호와 같이 넘긴다(결정 73, 검토 G2). HL은 None."""
+        return account_for(self.instrument) if self.venue is Venue.LS else None
 
     def _quote(self) -> Quote | None:
         market = "krx" if self.venue is Venue.LS else "hl"
@@ -75,8 +81,10 @@ class PegController:
         """한 번의 점검: 체결 확인 → 목표가 계산 → 신규/정정/취소후신규. 상태 문자열 반환."""
         system = self.system
         note = ""
+        if self.stalled:
+            return "응답 없음 — 결과 모름, 미체결 확인 뒤 다시 시작"
         if self.order_id is not None:
-            order = system.order_book.order(self.order_id)
+            order = system.order_book.order(self.order_id, self._account())
             if order is not None and order.status is OrderStatus.FILLED:
                 _log.info("전량 체결 #%s @ %s", self.order_id, self.order_price)
                 self.order_id = None
@@ -109,16 +117,25 @@ class PegController:
                 # 취소 후 신규로 대체. 취소가 성공한 경우에만 신규를 낸다. 취소 중 잔량
                 # 없으면(체결/취소됨) OrderGoneError → 아래 except가 체결 확인으로 이어감.
                 assert self.order_id is not None
-                await system.cancel(self.order_id)
+                await system.cancel(self.order_id, account=None)
                 self.order_id = None
                 self.order_price = None
                 self.order_id = await system.place(self._intent(decision.price))
             else:  # LS 정정(정정 TR — 요청 1회)
                 assert self.order_id is not None
-                self.order_id = await system.amend_price(self.order_id, decision.price)
+                self.order_id = await system.amend_price(self.order_id, decision.price,
+                                                         account=self._account())
         except RateLimitError:
             # 초당 요청 한도(주문 TR 2회/초) — 흔한 정상 흐름. 다음 호가에서 재시도.
             return "요청 한도 대기"
+        except RestTimeoutError as exc:
+            # 응답 없음 = 결과 모름(첫 요청이 접수됐을 수 있다) — 재발주·재정정 금지(CLAUDE.md §7,
+            # 검토 2026-10-13 15번). 옛 코드는 RestError로 받아 "거부 — 재시도"로 다음 호가에
+            # 또 냈다(실계좌 도구). 멈추고 사람이 미체결을 확인한다.
+            self.stalled = True
+            _log.error("응답 없음(결과 모름) #%s @ %s — 재전송 안 함, 정지: %s",
+                       old_id or "-", old_price if old_price is not None else "-", exc)
+            return "응답 없음 — 결과 모름, 미체결 확인 뒤 다시 시작"
         except OrderGoneError:
             # 잔량 없음 = 이미 체결(또는 취소)된 주문 — 체결과의 경합으로 종종
             # 일어나는 정상 흐름. 다음 점검에서 체결이 확인되면 매도 전환/종료.
@@ -146,11 +163,11 @@ class PegController:
         system = self.system
         if self.order_id is None:
             return "정지"
-        order = system.order_book.order(self.order_id)
+        order = system.order_book.order(self.order_id, self._account())
         if order is not None and order.is_open:
             _log.info("Run 해제 — 미체결 취소 #%s @ %s", self.order_id, self.order_price)
             try:
-                await system.cancel(self.order_id)
+                await system.cancel(self.order_id, account=self._account())
             except OrderGoneError:
                 _log.info("취소 불필요(잔량 없음) #%s", self.order_id)
         self.order_id = None
@@ -289,6 +306,11 @@ def main() -> None:
                 status_var.set(result)
                 if result == "filled":
                     status_var.set("전량 체결 — 정지")
+                    run_var.set(False)
+                    controller.clear()
+                    detach_handlers()
+                    return
+                if result.startswith("응답 없음"):  # 결과 모름 — 따라가기 정지(재전송 금지)
                     run_var.set(False)
                     controller.clear()
                     detach_handlers()

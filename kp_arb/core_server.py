@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 from pydantic import ValidationError
 
-from .domain.enums import Instrument, OrderType, Side, Underlying, Venue
+from .domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .fx_auction import FxAuctionSettings
 from .hl_merge import merge_tick_options
@@ -44,6 +44,7 @@ from .strategy_core import (
     CoreState,
     ScreenKind,
     ScreenState,
+    apply_disconnect_actions,
     parse_operating_hours,
     state_from_dict,
     validate_run,
@@ -227,6 +228,8 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
                 if isinstance(raw, dict):
                     snd.enabled = bool(raw.get("enabled", snd.enabled))
                     snd.path = str(raw.get("path", snd.path))
+            # LS 끊김 때 할 일(DESIGN-settings §2a, 2026-10-14) — 키 없으면 기존 값 유지
+            apply_disconnect_actions(g.ls_disconnect, body.get("ls_disconnect"))
             return _ok()
         if cmd == "fx_month":  # 환율 표시용 원달러선물 월물 (§6.2-7)
             choice = str(body["choice"])
@@ -717,6 +720,18 @@ async def _autom_command(
     return _fail([f"알 수 없는 자동M 명령: {cmd!r}"])
 
 
+def _account_from_body(body: dict[str, Any]) -> Account | None:
+    """화면이 보낸 상품(instrument) → LS 계좌(결정 73). HL·없음·모르는 값이면 None."""
+    inst_raw = body.get("instrument")
+    if not isinstance(inst_raw, str) or not inst_raw:
+        return None
+    try:
+        inst = Instrument(inst_raw)
+    except ValueError:
+        return None
+    return account_for(inst) if inst is not Instrument.HL_PERP else None
+
+
 async def _manual_command(
     system: LiveSystem | None, body: dict[str, Any], state: CoreState | None = None
 ) -> dict[str, Any]:
@@ -763,14 +778,7 @@ async def _manual_command(
             return _fail(["order_id 필요"])
         # 화면이 행의 상품(instrument)을 같이 보내면 계좌로 풀어 같은 번호의 다른 계좌 주문을
         # 건드리지 않는다(결정 73). 안 보내면 번호가 한 계좌에만 있을 때만 취소된다
-        inst_raw = body.get("instrument")
-        acct = None
-        if isinstance(inst_raw, str) and inst_raw:
-            try:
-                inst = Instrument(inst_raw)
-                acct = account_for(inst) if inst is not Instrument.HL_PERP else None
-            except ValueError:
-                acct = None
+        acct = _account_from_body(body)
         try:
             await system.cancel(str(order_id), account=acct)
         except Exception as exc:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
@@ -788,12 +796,16 @@ async def _manual_command(
             side = Side(side_raw) if side_raw else None
         except ValueError:
             return _fail([f"잘못된 side: {side_raw}"])
-        targets = [o.order_id for o in system.order_book.open_orders()
-                   if o.intent.underlying is underlying and o.intent.instrument is instrument
-                   and (side is None or o.intent.side is side)]
+        picked = [o for o in system.order_book.open_orders()
+                  if o.intent.underlying is underlying and o.intent.instrument is instrument
+                  and (side is None or o.intent.side is side)]
+        targets = [o.order_id for o in picked]
+        # 거른 주문의 계좌를 번호와 같이 넘긴다 — 같은 번호가 다른 계좌에도 열려 있으면 번호만으로는
+        # 못 가려 건너뛰었다(검토 10-13 G2, 결정 73 마무리)
+        accounts = [system.order_book.account_of(o.intent) for o in picked]
         # HL은 cancel 액션 하나에 묶어 한 요청(요청 한도 절약), LS는 한 건씩 — cancel_many가 가른다.
         # 하나가 실패해도 나머지는 계속(실패는 세어서 보고).
-        results = await system.cancel_many(targets) if targets else []
+        results = await system.cancel_many(targets, accounts) if targets else []
         cancelled = sum(1 for _oid, err in results if err is None)
         failed = [f"#{oid}: {err}" for oid, err in results if err is not None]
         for item in failed:
@@ -824,7 +836,8 @@ async def _manual_command(
             return _fail(["order_id·price 필요"])
         # HL 정정 금지(DESIGN-manual-order 2026-08-11 — 크로싱 정정 시 주문 소실). 화면
         # 차단(order_list)에 더해 코어에서도 방어 — 다른 경로로 들어와도 modify가 안 나간다.
-        target = system.order_book.order(str(order_id))
+        acct = _account_from_body(body)  # 상품 → 계좌(결정 73, manual_cancel과 같음)
+        target = system.order_book.order(str(order_id), acct)
         if target is not None and target.intent.venue is Venue.HYPERLIQUID:
             return _fail(["HL은 정정 미지원 — 취소 후 신규 주문하세요"])
         reduce_only = bool(body.get("reduce_only", False))  # 정정 화면 체크(HL 전용)
@@ -832,7 +845,7 @@ async def _manual_command(
         try:
             new_id = await system.amend_price(
                 str(order_id), float(raw),
-                reduce_only=reduce_only, post_only=post_only)
+                reduce_only=reduce_only, post_only=post_only, account=acct)
         except Exception as exc:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
             _olog.warning("수동주문 정정 실패: #%s @ %s — %s", order_id, raw, exc)  # #3
             return _fail([f"정정 실패: {exc}"])

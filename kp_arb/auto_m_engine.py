@@ -104,6 +104,14 @@ FEED_WATCH_S = 1.0
 # 값은 Claude가 고름(사용자 확인 2026-10-13 예정)
 CANCEL_WAIT_ALARM_S = 30.0
 CANCEL_RETRY_S = 0.6  # 취소가 거부된 뒤 다시 보내기까지(한 건 취소·묶음 취소 공통, exec ㅂ3)
+
+
+def _is_comm_error(exc: BaseException) -> bool:
+    """통신 오류·응답 없음(연결 끊김·소켓 오류·시간 초과) = **결과 모름** — 거래소의 거부 응답
+    (RestError·
+    HLError 등 RuntimeError 계열)과 구분한다. 결과 모름이면 발주·취소를 다시 보내지 않고 통보를
+    기다린다(CLAUDE.md §7; 검토 2026-10-13 15번, 사용자 2026-10-14 "통보만 기다림")."""
+    return isinstance(exc, (OSError, TimeoutError))
 SOURCE = "자동M"
 
 
@@ -686,9 +694,16 @@ class AutoMEngine:
             # (실측 2026-09-17 14:40: 다음 켬 때 "pre_resting → armed"로 보여 안 꺼진 줄 알기 쉬움)
             self._trace(u, index, block, s.leg(block), reverse)
             return
-        self._register(oid, _OrderRef(u, index, block, "pre", reverse))  # 상품은 엔진 단위
+        # 번호 보관(on_pre_ack)을 등록(_register → 통보 반영)보다 **먼저** — 등록 중 이미 온 종료
+        # 통보(접수 뒤 거부·취소)가 처리되면 번호도 그 자리에서 같이 정리된다. 옛 순서(등록 뒤
+        # 보관)는 정리된 죽은 번호를 다리에 다시 넣어 그 취소가 "잔량 없음"으로 끝나고
+        # replace_pending이 영원히 걸렸다(검토 2026-10-13 14번). 응답 전 식별(cloid)이 종료까지
+        # 끝낸 번호는 넣지 않는다
+        if self._already_closed(oid, u, index, block, reverse):
+            return
         late = on_pre_ack(s, block, oid)  # 발주 중 꺼졌/중지됐으면 취소 행동
-        if late:
+        self._register(oid, _OrderRef(u, index, block, "pre", reverse))  # 상품은 엔진 단위
+        if late and oid in self._orders:  # 등록 중 종료된 주문이면 취소할 것이 없다
             self._log.warning("[자동M] %s 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → 즉시 취소",
                               u.value, self._tag(u, index, block, reverse), oid)
             self._apply(u, index, block, late, reverse)
@@ -714,6 +729,15 @@ class AutoMEngine:
         try:
             oid = await self._system.place(intent, cloid=cloid)
         except Exception as exc:  # noqa: BLE001 - 거부 → ALO 겹침이면 재역산, 아니면 결정 29
+            if _is_comm_error(exc):
+                # 응답 없음·통신 오류 = 결과 모름 — 들어갔을 수 있어 재발주하면 두 장. LS 선주문
+                # 응답
+                # 없음과 같이 **세트 중지**(사용자 2026-09-16·2026-10-14). 코어의 cloid 유예 조회가
+                # 살아 있는 주문을 찾으면 등록·알람하고, _pending_refs를 남겨 두어 식별되면 이
+                # 세트에
+                # 연결된다(체결은 장부로).
+                self._halt_hl_pre_unknown(u, index, block, s, exc, reverse)
+                return
             if cloid:
                 self._pending_refs.pop(cloid, None)
             text = str(exc)
@@ -729,15 +753,29 @@ class AutoMEngine:
             return
         if cloid:
             self._pending_refs.pop(cloid, None)
-        self._register(oid, ref)
+        if self._already_closed(oid, u, index, block, reverse):  # 14번 — 위 LS 선주문과 같음
+            return
         late = on_pre_ack(s, block, oid)
-        if late:
+        self._register(oid, ref)
+        if late and oid in self._orders:
             self._log.warning("[자동M] %s HL 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → 즉시 "
                               "취소", u.value, self._tag(u, index, block, reverse), oid)
             self._apply(u, index, block, late, reverse)
         self._log.info("[자동M] %s HL 선주문(ALO) %s %s %d @ %g → #%s",
                        u.value, self._tag(u, index, block, reverse), act.side.value, act.qty,
                        act.price, oid)
+
+    def _halt_hl_pre_unknown(self, u: Underlying, index: int, block: Block, s: AutoMSet,
+                             exc: BaseException | str, reverse: bool) -> None:
+        """HL 선주문 응답 없음·통신 오류(결과 모름) → 세트 중지. 한 건 발주·묶음 발주 공용."""
+        text = str(exc)
+        reason = ("HL 선주문 응답 없음/통신 오류 — 들어갔을 수 있음, 미체결·잔고 확인 뒤 해제: "
+                  + reject_reason_text(text))
+        self._log.error("[자동M] %s HL 선주문 응답 없음 %s → 세트 중지(재발주 안 함) — %s",
+                        u.value, self._tag(u, index, block, reverse), text)
+        self._apply(u, index, block, halt_set(s, block, reason), reverse)
+        s.leg(block).last_reject_at = time.strftime("%H:%M:%S")
+        self._trace(u, index, block, s.leg(block), reverse)
 
     async def _place_hl_pre_batch(self, items: list[_PreItem]) -> None:
         """HL선 선주문 묶음(exec §7D 묶음 전송) — 한 바퀴에서 나온 ALO 선주문을 요청 하나로 보내고
@@ -774,6 +812,11 @@ class AutoMEngine:
                 items, refs, cloids, results, strict=True):
             s = self._set(u, index, reverse)
             tag = self._tag(u, index, block, reverse)
+            if res.order_id is None and res.whole and res.comm:
+                # 요청 자체가 통신 오류·응답 없음 = 결과 모름 — 한 건씩 다시 보내지 않고 세트 중지
+                # (_place_hl_pre의 같은 경우와 같음). _pending_refs는 남긴다(식별되면 세트 연결)
+                self._halt_hl_pre_unknown(u, index, block, s, res.error or "", reverse)
+                continue
             if cloid:
                 self._pending_refs.pop(cloid, None)
             if res.order_id is None:
@@ -791,9 +834,11 @@ class AutoMEngine:
                 s.leg(block).last_reject_at = time.strftime("%H:%M:%S")
                 self._trace(u, index, block, s.leg(block), reverse)
                 continue
-            self._register(res.order_id, ref)
+            if self._already_closed(res.order_id, u, index, block, reverse):  # 14번
+                continue
             late = on_pre_ack(s, block, res.order_id)
-            if late:
+            self._register(res.order_id, ref)
+            if late and res.order_id in self._orders:
                 self._log.warning("[자동M] %s HL 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → "
                                   "즉시 취소", u.value, tag, res.order_id)
                 self._apply(u, index, block, late, reverse)
@@ -811,7 +856,14 @@ class AutoMEngine:
         ids = [it[3] for it in items]
         try:
             results = await self._system.cancel_many(ids)
-        except Exception as exc:  # noqa: BLE001 - 요청 자체가 실패 → 전부 실패로
+        except Exception as exc:  # noqa: BLE001 - 요청 자체가 실패
+            if _is_comm_error(exc):
+                # 통신 오류·응답 없음 = 결과 모름 — 한 건씩 다시 보내지 않고 통보를 기다린다
+                # (사용자 2026-10-14, 검토 15번). 취소 대기 감시가 30초 뒤 알람.
+                self._log.error("[자동M] 묶음 취소 통신 오류 %s — 결과 모름, 재전송 안 함, 통보 "
+                                "대기: "
+                                "%s: %s", ids, type(exc).__name__, exc)
+                return
             results = [(oid, f"{type(exc).__name__}: {exc}") for oid in ids]
         errors = dict(results)
         for u, index, block, order_id, reason, reverse in items:
@@ -934,7 +986,15 @@ class AutoMEngine:
                 self._log.info("[자동M] 취소 불필요 #%s — 이미 체결/취소됨(통보로 정리): %s",
                                order_id, exc)
                 return
-            except Exception as exc:  # noqa: BLE001 - 한도·통신 오류 등
+            except Exception as exc:  # noqa: BLE001 - 한도 등 거부 응답(아래) / 통신 오류(여기)
+                if _is_comm_error(exc):
+                    # 통신 오류·응답 없음 = 결과 모름 — 거부 응답과 달리 다시 보내지 않고 통보를
+                    # 기다린다(사용자 2026-10-14, 검토 15번). 표시도 되돌리지 않는다(취소 대기
+                    # 감시가 30초 뒤 알람).
+                    self._log.error("[자동M] 취소 통신 오류 #%s — 결과 모름, 재전송 안 함, 통보 "
+                                    "대기: "
+                                    "%s: %s", order_id, type(exc).__name__, exc)
+                    return
                 self._log.warning("[자동M] 취소 실패 #%s (%d/3) — %s", order_id, attempt + 1, exc)
                 if attempt < 2:
                     await asyncio.sleep(CANCEL_RETRY_S)
@@ -1007,6 +1067,18 @@ class AutoMEngine:
                        price, oid)
 
     # ------------------------------------------------------------ 주문 통보 ---
+    def _already_closed(self, oid: str, u: Underlying, index: int, block: Block,
+                        reverse: bool) -> bool:
+        """발주 응답이 왔는데 이 번호가 이미 **종료까지 처리된** 번호인가 — 응답 전 식별(cloid)로
+        등록돼 거부·취소·체결 통보까지 끝나 추적에서 빠진 경우(★3·14번). 그 번호를 다리에 다시
+        넣지 않도록 호출한 쪽이 발주 뒷처리를 건너뛴다."""
+        if oid in self._seen_status and oid not in self._orders:
+            self._log.info("[자동M] %s 선주문 %s #%s — 응답 전에 이미 종료 처리된 번호, 다시 넣지"
+                           " 않음",
+                           u.value, self._tag(u, index, block, reverse), oid)
+            return True
+        return False
+
     def _register(self, oid: str, ref: _OrderRef) -> None:
         """주문번호 ↔ 세트 연결. 발주 응답 안에 이미 실린 체결(HL 즉시체결)은 place()가 끝나기
         전에 훅으로 먼저 오므로 그때는 주인을 모른다 — 모아 뒀다가 여기서 되돌려 반영한다
@@ -1313,6 +1385,19 @@ class AutoMEngine:
                               "선" if ref.leg == "pre" else "후", oid, status,
                               order.filled_qty, order.intent.qty)
             if ref.leg == "pre":
+                cur = s.leg(ref.block).pre_order_id
+                if cur is not None and cur != oid and status in ("cancelled", "rejected",
+                                                                  "filled"):
+                    # 다리가 이미 다른 선주문(#cur)으로 넘어갔다(끔 → 해제 → 재발주). 옛 번호의
+                    # 종료 통보로 다리를 정리하면 지금 선주문 번호가 지워져 그 주문이 LS에 산 채
+                    # 남고 다음 판이 한 장 더 낸다(검토 2026-10-13 13번). 추적만 끝내고 다리는
+                    # 그대로
+                    self.ulog(u).warning("통보 %s: 옛 선주문 #%s %s — 지금 선주문은 #%s, 다리 상태"
+                                         " 반영 안 함(추적만 종료)",
+                                         self._tag(u, ref.index, ref.block, ref.reverse),
+                                         oid, status, cur)
+                    self._forget(oid)
+                    continue
                 if status == "cancelled":
                     on_pre_cancelled(s, ref.block, mono, self._settings)
                     self._forget(oid)

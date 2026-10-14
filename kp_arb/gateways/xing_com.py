@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import queue
 import threading
@@ -93,6 +94,11 @@ class _Pending:
     spec: ResSpec
     future: asyncio.Future[QueryResult]
     deadline: float
+    # 요청 순번·그 요청의 XAQuery(검토 2026-10-13 ★7 (b)): 요청마다 객체를 새로 만들고 이벤트를
+    # 순번으로 귀속시켜, 시간 초과로 정리한 앞 요청의 늦은 응답이 같은 차선의 다음 요청 결과가
+    # 되지 않게 한다
+    seq: int = 0
+    query: Any = None
     rsp_cd: str = ""
     rsp_msg: str = ""
 
@@ -123,8 +129,9 @@ class XingSession:
         self._ready = threading.Event()
         # COM 스레드 전용 상태
         self._session: Any = None
-        self._queries: dict[str, Any] = {}          # lane → XAQuery
+        self._queries: dict[str, Any] = {}          # lane → 마지막 XAQuery(한도 조회용)
         self._pending: dict[str, _Pending] = {}     # lane → 진행 중 요청
+        self._seq = itertools.count(1)              # 요청 순번(★7 (b))
         self._reals: dict[str, Any] = {}            # tr → XAReal
         self.last_beat = 0.0  # COM 스레드 루프가 마지막으로 돈 시각(_clock) — 정지 감시용
         self._real_keys: dict[str, set[str]] = {}   # tr → advise된 키
@@ -266,6 +273,15 @@ class XingSession:
             self._login_future = None
         if kind in ("logout", "disconnect"):
             self.logged_in = False
+            # 서버 쪽 실시간 등록은 세션과 함께 죽는다 — 등록 키를 비워 재로그인 뒤 _advise_all이
+            # 실제로 AdviseRealData를 다시 보내게 한다(검토 2026-10-13 ★5: 전엔 키가 남아 전부 "이미
+            # 등록"으로 건너뛰어 재로그인 뒤 시세·계좌 통보가 끊긴 채였다). XAReal 객체는 그대로
+            # 쓴다
+            n = sum(len(k) for k in self._real_keys.values())
+            if n:
+                log.warning("xing 세션 %s — 실시간 등록 %d건 비움(재로그인 뒤 다시 등록)", kind, n)
+            for tr in self._real_keys:
+                self._real_keys[tr] = set()
         for cb in self.on_session:
             self._emit(cb, kind, code, msg)
 
@@ -290,8 +306,18 @@ class XingSession:
             timeout_s = ORDER_TIMEOUT_S if lane == LANE_ORDER else QUERY_TIMEOUT_S
         fut: asyncio.Future[QueryResult] = self._loop.create_future()
         deadline = self._clock() + timeout_s
+        seq = next(self._seq)
 
         def _do() -> None:
+            # 줄 서는 동안 호출자가 포기했거나(asyncio 쪽 시간 초과) 마감이 지났으면 보내지 않는다
+            # (검토 2026-10-13 ★7 (a): COM 정지 회복 때 "결과 모름"으로 끝난 주문들이 옛 가격으로
+            # 한꺼번에 나가던 길)
+            if fut.done():
+                log.warning("xing %s 요청 — 줄 서는 동안 호출자가 포기함, 전송 안 함", tr)
+                return
+            if self._clock() >= deadline:
+                self._resolve(fut, exc=XingTimeout(f"{tr} 앞 요청에 막혀 마감 지남 — 전송 안 함"))
+                return
             if lane in self._pending:
                 # 앞 요청 진행 중 — 뒤로 다시 줄 세운다(펌프 한 바퀴 뒤)
                 self._cmds.put(_do)
@@ -301,11 +327,10 @@ class XingSession:
             except ResError as exc:
                 self._resolve(fut, exc=XingError(str(exc)))
                 return
-            q = self._queries.get(lane)
-            if q is None:
-                q = self._factory.create_query()
-                q.sink = lambda kind, *a, ln=lane: self._on_query_event(ln, kind, *a)
-                self._queries[lane] = q
+            # 요청마다 XAQuery를 새로 — 이벤트가 그 요청의 순번으로 온다(★7 (b))
+            q = self._factory.create_query()
+            q.sink = lambda kind, *a, ln=lane, sq=seq: self._on_query_event(ln, sq, kind, *a)
+            self._queries[lane] = q
             q.ResFileName = str(self._res_dir / f"{tr}.res")
             for name, rows in blocks.items():
                 rows_list = rows if isinstance(rows, list) else [rows]
@@ -315,7 +340,7 @@ class XingSession:
                 for i, row in enumerate(rows_list):
                     for fname, value in row.items():
                         q.SetFieldData(name, fname, i, "" if value is None else str(value))
-            self._pending[lane] = _Pending(tr, spec, fut, deadline)
+            self._pending[lane] = _Pending(tr, spec, fut, deadline, seq=seq, query=q)
             rc = int(q.Request(next_))
             if rc < 0:
                 del self._pending[lane]
@@ -328,13 +353,29 @@ class XingSession:
         try:
             return await asyncio.wait_for(fut, limit)
         except TimeoutError as exc:
-            self._pending.pop(lane, None)
+            # _pending은 COM 스레드 전용 — 여기(asyncio)서 직접 pop하지 않고 그 스레드에 맡긴다
+            # (검토 ★7 (c)). 스레드가 멈춰 있으면 회복 뒤 _expire가 같은 요청을 정리한다
+            self._call(lambda: self._abandon(lane, seq))
             raise XingTimeout(f"{tr} 응답 없음(COM 스레드 무응답 {limit:.0f}초)") from exc
 
-    def _on_query_event(self, lane: str, kind: str, *args: Any) -> None:
-        """XAQuery 이벤트(COM 스레드): ('message', sys_err, code, msg) / ('data', tr)."""
+    def _abandon(self, lane: str, seq: int) -> None:
+        """호출자가 포기한 요청을 차선에서 뺀다(COM 스레드). 다른 요청이면 건드리지 않는다."""
         p = self._pending.get(lane)
-        if p is None:
+        if p is not None and p.seq == seq:
+            del self._pending[lane]
+
+    def _on_query_event(self, lane: str, seq: int, kind: str, *args: Any) -> None:
+        """XAQuery 이벤트(COM 스레드): ('message', sys_err, code, msg) / ('data', tr).
+        seq = 이벤트를 보낸 XAQuery의 요청 순번 — 지금 진행 중인 요청과 다르면(시간 초과로 정리한 앞
+        요청의 늦은 응답) 버린다(★7 (b)). 'data'는 TR 이름까지 대조."""
+        p = self._pending.get(lane)
+        if p is None or p.seq != seq:
+            log.warning("xing 늦은 응답 무시 — 차선 %s %s 순번 %s(진행 중 %s) %s", lane, kind, seq,
+                        p.seq if p is not None else "없음",
+                        "".join(str(a) for a in args[:3]) if kind == "message" else "")
+            return
+        if kind == "data" and args and str(args[0]).strip() and str(args[0]).strip() != p.tr:
+            log.warning("xing 응답 TR 불일치 — 차선 %s 기대 %s 받음 %s, 무시", lane, p.tr, args[0])
             return
         if kind == "message":
             sys_err, code, msg = bool(args[0]), str(args[1]), str(args[2])
@@ -345,7 +386,7 @@ class XingSession:
                 self._resolve(p.future, QueryResult(p.tr, code, msg))
             return
         if kind == "data":
-            q = self._queries[lane]
+            q = p.query if p.query is not None else self._queries[lane]
             result = QueryResult(p.tr, p.rsp_cd or "00000", p.rsp_msg,
                                  self._read_blocks(q, p.spec), bool(getattr(q, "IsNext", False)))
             del self._pending[lane]
@@ -385,7 +426,7 @@ class XingSession:
             q = self._queries.get(LANE_QUERY)
             if q is None:
                 q = self._factory.create_query()
-                q.sink = lambda kind, *a: self._on_query_event(LANE_QUERY, kind, *a)
+                q.sink = lambda kind, *a: self._on_query_event(LANE_QUERY, 0, kind, *a)
                 self._queries[LANE_QUERY] = q
             self._resolve(fut, (int(q.GetTRCountPerSec(tr)), int(q.GetTRCountBaseSec(tr)),
                                 int(q.GetTRCountLimit(tr)), int(q.GetTRCountRequest(tr))))

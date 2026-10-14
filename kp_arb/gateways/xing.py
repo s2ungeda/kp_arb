@@ -138,6 +138,10 @@ def _alias_row(tr_cd: str, block: str, row: Mapping[str, Any], known: set[str],
 class XingQueryClient:
     """계좌 하나 몫의 TR 요청 클라이언트(TrRequester) — 실제 전송은 공유 XingSession."""
 
+    # 연속조회(tr_cont="Y" → XAQuery.Request(True)) 가능 — 이어 받을 키는 호출자가 InBlock의 cts
+    # 필드에 넣는다(xing은 응답 헤더 키가 따로 없다). 게이트웨이의 t0434 전체 페이지 조회가 본다
+    supports_continuation = True
+
     def __init__(self, session: XingSession, *, res_dir: Path | str | None = None,
                  now: Callable[[], float] = time.monotonic) -> None:
         self._session = session

@@ -16,7 +16,7 @@ from kp_arb.bootstrap import (
 )
 from kp_arb.domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent, Position
-from kp_arb.gateways.ls_ws import LSWebSocketClient, WSClosed
+from kp_arb.gateways.ls_ws import Fill, LSWebSocketClient, WSClosed
 from kp_arb.gateways.mock_ls import MockLSGateway
 from kp_arb.order_book import OrderBook, OrderStatus
 from kp_arb.session_service import SessionService
@@ -1664,3 +1664,155 @@ def test_daily_logs_keep_whole_day_and_roll_at_midnight() -> None:
     assert roll_daily_logs(state, "2026-09-16", fills, cancels) is False and len(fills) == 500
     assert roll_daily_logs(state, "2026-09-17", fills, cancels) is True
     assert not fills and not cancels and state["day"] == "2026-09-17"
+
+
+async def test_cancel_many_with_accounts_tells_same_number_apart() -> None:
+    # 검토 2026-10-13 G2(결정 73 마무리): 주식 HTS 주문과 선물 선주문이 **같은 번호로 함께 열려**
+    # 있으면(10-14 사고 조합) 번호만으로는 못 가려 "unknown"으로 건너뛰어 선주문이 LS에 남았다.
+    # 계좌를 같이 넘기면 각각 제 계좌로 취소하고, 결과는 입력 순서대로 온다.
+    from kp_arb.domain.enums import Account
+
+    system, _, _ = _system([])
+    sent: list[tuple[str, float | None, Account | None]] = []
+
+    async def _cancel(order_id: str, qty: float | None = None,
+                      account: Account | None = None) -> None:
+        sent.append((order_id, qty, account))
+
+    system._gw.cancel_order = _cancel  # type: ignore[method-assign]
+    system.order_book.track("4545", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
+        side=Side.SELL, qty=8, price=80_000.0, account=Account.KR_STOCK))
+    system.order_book.track("4545", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.BUY, qty=10, price=80_000.0, account=Account.KR_DERIV))
+    # 계좌 없이 — 둘 다 열려 있어 가릴 수 없음 → 보내지 않고 사유만
+    res0 = await system.cancel_many(["4545"])
+    assert res0[0][1] is not None and "unknown" in res0[0][1] and sent == []
+    # 계좌와 함께 — 각각 제 계좌로 취소(수량은 그 주문의 남은 수량)
+    res = await system.cancel_many(["4545", "4545"], [Account.KR_DERIV, Account.KR_STOCK])
+    assert res == [("4545", None), ("4545", None)]
+    assert sent == [("4545", 10.0, Account.KR_DERIV), ("4545", 8.0, Account.KR_STOCK)]
+    import pytest
+    with pytest.raises(ValueError, match="길이"):
+        await system.cancel_many(["4545"], [None, None])
+
+
+async def test_failed_hl_notice_right_after_grace_end_is_still_adopted() -> None:
+    # 검토 2026-10-13 ★8(a): 유예가 지난 직후~재조회가 깨어나기 전 찰나에 온 통보 — 옛 코드는
+    # pop만 하고
+    # 버려 재조회가 "이미 식별됨"으로 끝나 살아 있는 주문이 영영 빠졌다. 통보가 왔다 = 살아 있다
+    # → 등록.
+    import asyncio as _aio
+    import time as _t
+
+    import pytest
+
+    system, _, cloid, noted = _failing_hl_system(grace_s=5.0)
+    with pytest.raises(ConnectionError):
+        await system.place(_HL_INTENT)
+    for t in list(system._bg):
+        t.cancel()  # 유예 끝 재조회가 아직 안 깨어난 상태를 고정
+    await _aio.sleep(0)
+    intent, _ = system._hl_failed[cloid]
+    system._hl_failed[cloid] = (intent, _t.monotonic() - 1.0)  # 유예는 이미 지남
+    await system.start()
+    await system.wait()  # orderUpdates(cloid)·userFills 도착
+    order = system.order_book.order("777")
+    assert order is not None and order.filled_qty == 0.2 and noted == ["777"]
+    assert system.error_seq == 1 and cloid not in system._hl_failed
+
+
+def test_code_kind_tells_stock_from_derivative() -> None:
+    from kp_arb.bootstrap import code_kind
+
+    assert code_kind("KR7005930003") == ("stock", "005930")   # SC1 Isuno(ISIN)
+    assert code_kind("A005930") == ("stock", "005930")
+    assert code_kind("005930") == ("stock", "005930")
+    assert code_kind("A1167000") == ("future", "A1167000")    # 주식선물(테스트 표기)
+    assert code_kind("111V9000") == ("future", "111V9000")
+    assert code_kind("175X9000") == ("future", "175X9000")    # 원달러선물
+    assert code_kind("") == (None, "") and code_kind("XYZ") == (None, "XYZ")
+
+
+async def test_fill_symbol_check_rejects_other_kind_and_passes_unknown_same_kind() -> None:
+    # 검토 2026-10-13 G3: 2차 방어(종목 대조)가 상품이 다른 바로 그 경우에 눈을 감았다 — 선물
+    # 주문에 주식
+    # 코드 체결(10-14 사고 모양)은 변환기가 모르는 코드라 통과. 이제 코드 종류를 먼저 가른다:
+    # 종류가 다르면 거부, 같은 종류인데 모르는 월물이면 통과(+경고), 종목이 다르면 거부.
+    system, _, _ = _system([])
+    system.futures_symbols = {SAMSUNG: "A1167000", Underlying.SK_HYNIX: "A1168000"}
+    system.order_book.track("9", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.BUY, qty=1, order_type=OrderType.LIMIT, price=1_000.0, account=Account.KR_DERIV))
+    system.order_book.track("8", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
+        side=Side.BUY, qty=10, order_type=OrderType.LIMIT, price=80_000.0,
+        account=Account.KR_STOCK))
+
+    def fill(oid: str, acct: Account, sym: str) -> Fill:
+        return Fill(fill_id="x", order_id=oid, qty=1, price=1.0, ts=0, account=acct, symbol=sym)
+
+    ok = system._fill_symbol_ok
+    assert ok(fill("9", Account.KR_DERIV, "KR7005930003")) is False   # 선물 주문 + 주식 ISIN → 거부
+    assert ok(fill("9", Account.KR_DERIV, "A005930")) is False
+    assert ok(fill("9", Account.KR_DERIV, "A1167000")) is True        # 제 월물
+    assert ok(fill("9", Account.KR_DERIV, "A1199000")) is True        # 모르는 월물 — 통과(경고)
+    assert ok(fill("9", Account.KR_DERIV, "A1168000")) is False       # 하이닉스 선물 → 거부
+    assert ok(fill("8", Account.KR_STOCK, "A1167000")) is False       # 주식 주문 + 선물 코드 → 거부
+    assert ok(fill("8", Account.KR_STOCK, "KR7005930003")) is True    # ISIN도 풀어서 대조
+    assert ok(fill("8", Account.KR_STOCK, "KR7000660001")) is False   # 하이닉스 주식 → 거부
+    assert ok(fill("8", Account.KR_STOCK, "")) is True                # 코드 없음 — 통과
+
+
+async def test_refresh_snapshot_keeps_positions_of_account_whose_query_failed() -> None:
+    # 검토 2026-10-13 10번 ②: 포지션 조회에 실패한 계좌의 포지션·잔고를 빈 값으로 덮지 않는다 —
+    # 옛 코드는 scope=None이면 전부 비워 선물 계좌 조회가 한 번 실패하면 공매도 검증이 오거부.
+    from kp_arb.gateways.ls_rest import RestError
+
+    system, _, _ = _system([])
+    system.order_book.load_snapshot(
+        positions=[Position(venue=Venue.LS, instrument=Instrument.KR_STOCK_FUTURE,
+                            underlying=SAMSUNG, side=Side.SELL, qty=3, avg_price=1_000.0,
+                            account=Account.KR_DERIV)],
+        balances={Account.KR_DERIV: 7_000_000.0})
+    gw = system._gw
+    orig = gw.get_positions
+
+    async def _positions(account: Account) -> Any:
+        if account is Account.KR_DERIV:
+            raise RestError("500 server error")
+        return await orig(account)
+
+    gw.get_positions = _positions  # type: ignore[method-assign]
+    await system.refresh_snapshot()
+    ob = system.order_book
+    assert ob.position_qty(SAMSUNG, Instrument.KR_STOCK_FUTURE, Account.KR_DERIV) == -3  # 유지
+    assert ob.balance(Account.KR_DERIV) == 7_000_000.0                                   # 유지
+    assert ob.position_qty(SAMSUNG, Instrument.KR_STOCK, Account.KR_STOCK) == 100        # 조회값
+
+
+async def test_refresh_snapshot_requeries_once_when_fill_lands_during_round_trip() -> None:
+    # 검토 2026-10-13 10번 ①: REST 왕복 중 체결이 장부에 들어오면 스냅샷(조회 시점 값)이 그 체결을
+    # 품었는지 알 수 없다 — 경고 뒤 같은 범위를 한 번 더 조회한다(한 번만, 무한 반복 아님).
+    system, _, _ = _system([])
+    system.snapshot_retry_delay_s = 0.0
+    system.order_book.track("77", OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
+        side=Side.BUY, qty=10, order_type=OrderType.LIMIT, price=80_000.0,
+        account=Account.KR_STOCK))
+    gw = system._gw
+    orig = gw.get_positions
+    calls = [0]
+
+    async def _positions(account: Account) -> Any:
+        calls[0] += 1
+        if calls[0] == 1:  # 첫 조회 왕복 중 체결 통보 도착 흉내
+            system.order_book.on_fill(Fill(fill_id="f1", order_id="77", qty=10, price=80_000.0,
+                                           ts=0, account=Account.KR_STOCK))
+        return await orig(account)
+
+    gw.get_positions = _positions  # type: ignore[method-assign]
+    await system.refresh_snapshot(scope={Account.KR_STOCK})
+    assert calls[0] == 2                                   # 한 번 더 조회(그 뒤는 안 함)
+    assert system.order_book.position_qty(SAMSUNG, Instrument.KR_STOCK, Account.KR_STOCK) == 100

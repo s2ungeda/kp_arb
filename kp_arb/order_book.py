@@ -233,6 +233,15 @@ class OrderBook:
     def _key_of(cls, intent: OrderIntent, order_id: str) -> tuple[Account | None, str]:
         return (cls._acct_of(intent), order_id)
 
+    @classmethod
+    def account_of(cls, intent: OrderIntent) -> Account | None:
+        """장부가 이 주문을 둔 계좌(LS) — 번호만 넘기던 경로가 계좌를 같이 넘길 때 쓴다(검토 G2)."""
+        return cls._acct_of(intent)
+
+    def hl_order(self, order_id: str) -> TrackedOrder | None:
+        """HL 주문만 찾는다(계좌 없음 키). HL 통보·응답 경로에서 LS 번호로 흘러가지 않게 명시."""
+        return self._orders.get((None, order_id))
+
     def _find(self, order_id: str, account: Account | None = None) -> TrackedOrder | None:
         """주문 찾기(결정 73). 계좌를 주면 그 계좌의 번호만. 안 주면 HL(계좌 None) 먼저, 없으면
         LS 계좌들 중 **그 번호가 하나뿐일 때만** 돌려준다 — 둘 이상이면 열린 것이 하나뿐일 때 그것,

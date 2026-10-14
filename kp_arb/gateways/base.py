@@ -70,6 +70,10 @@ class PlaceResult:
     error: str | None = None
     whole: bool = False
     fill: tuple[float, float] | None = None
+    # 요청 자체가 통신 오류·응답 없음으로 끝남 = **결과 모름**(거부 아님). 호출자는 재발주하지
+    # 않는다
+    # (CLAUDE.md §7 재전송 금지; 검토 2026-10-13 15번, 사용자 2026-10-14 "통보만 기다림")
+    comm: bool = False
 
 
 class LSGateway(ABC):

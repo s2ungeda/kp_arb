@@ -78,6 +78,8 @@ class _FakeSystem:
                      connected=True)]
         self.placed: list[OrderIntent] = []
         self.cancelled: list[str] = []
+        self.cancel_accounts: list[Any] = []  # cancel_many에 같이 온 계좌(결정 73, 검토 G2)
+        self.amend_accounts: list[Any] = []
         self.amended: list[tuple[str, float, bool, bool]] = []
         self.leverage_calls: list[tuple[Underlying, int, bool]] = []
         self.merges: list[tuple[Underlying, int | None, int | None]] = []
@@ -99,8 +101,10 @@ class _FakeSystem:
             raise self._fail
         self.cancelled.append(order_id)
 
-    async def cancel_many(self, order_ids: list[str]) -> list[tuple[str, str | None]]:
+    async def cancel_many(self, order_ids: list[str],
+                          accounts: list[Any] | None = None) -> list[tuple[str, str | None]]:
         """일괄 취소(2026-09-28) — 실제 코어는 HL을 한 요청에 묶는다; 여기선 한 건씩 흉내."""
+        self.cancel_accounts = list(accounts or [])
         out: list[tuple[str, str | None]] = []
         for oid in order_ids:
             try:
@@ -111,8 +115,10 @@ class _FakeSystem:
         return out
 
     async def amend_price(self, order_id: str, price: float, *,
-                          reduce_only: bool = False, post_only: bool = False) -> str:
+                          reduce_only: bool = False, post_only: bool = False,
+                          account: Any = None) -> str:
         self.amended.append((order_id, price, reduce_only, post_only))
+        self.amend_accounts.append(account)
         return "OID-2"
 
     def set_hl_aggregation(self, u: Underlying, n_sig_figs: int | None,
@@ -249,6 +255,12 @@ async def test_manual_cancel_all_cancels_only_that_symbol_and_instrument() -> No
     r = await _manual_command(sys, {"cmd": "manual_cancel_all", "underlying": "samsung",
                                     "instrument": "hl_perp"})
     assert r["ok"] and r["cancelled"] == 2 and sorted(sys.cancelled) == ["H1", "H2"]
+    assert sys.cancel_accounts == [None, None]        # HL은 계좌 없음
+    # LS 주문은 거른 주문의 계좌를 번호와 같이 넘긴다(결정 73, 검토 G2)
+    rl = await _manual_command(sys, {"cmd": "manual_cancel_all", "underlying": "samsung",
+                                     "instrument": "kr_stock"})
+    from kp_arb.domain.enums import Account
+    assert rl["ok"] and sys.cancelled[-1] == "L1" and sys.cancel_accounts == [Account.KR_STOCK]
     # 대상이 없어도 정상(0건). 잘못된 인자는 거부
     r0 = await _manual_command(sys, {"cmd": "manual_cancel_all", "underlying": "hyundai",
                                      "instrument": "hl_perp"})
@@ -321,6 +333,13 @@ async def test_manual_amend_calls_system() -> None:
               "reduce_only": True, "post_only": True})
     assert r["ok"] and r["order_id"] == "OID-2"
     assert sys.amended == [("X1", 80500.0, True, True)]  # 정정 옵션 전달
+    assert sys.amend_accounts == [None]                   # 상품 없이 오면 계좌 없음
+    # 상품을 같이 보내면 계좌로 풀어 넘긴다(결정 73, 검토 G2 — manual_cancel과 같은 변환)
+    from kp_arb.domain.enums import Account
+    r2 = await _manual_command(
+        sys, {"cmd": "manual_amend", "order_id": "X1", "price": 80500,
+              "instrument": "kr_stock_future"})
+    assert r2["ok"] and sys.amend_accounts[-1] is Account.KR_DERIV
 
 
 async def test_manual_leverage_calls_system() -> None:

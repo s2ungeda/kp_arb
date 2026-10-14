@@ -85,9 +85,14 @@ class _FakePegSystem:
         self.placed: list[tuple[str, float]] = []
         self.cancelled: list[str] = []
         self.amended: list[tuple[str, float]] = []
+        self.accounts: list[Any] = []  # 조회·정정·취소에 같이 온 계좌(결정 73, 검토 G2)
         self._n = 0
 
     async def place(self, intent: OrderIntent) -> str:
+        if getattr(self, "timeout_place", False):
+            from kp_arb.gateways.ls_rest import RestTimeoutError
+
+            raise RestTimeoutError("REST CSPAT00600 응답 없음: TimeoutError")
         self._n += 1
         oid = f"P{self._n}"
         self.placed.append((oid, intent.price or 0.0))
@@ -96,11 +101,14 @@ class _FakePegSystem:
 
     async def cancel(self, order_id: str, account: Any = None) -> None:
         self.cancelled.append(order_id)
-        self.order_book.on_cancel(order_id)
+        self.accounts.append(account)
+        self.order_book.on_cancel(order_id, account=account)
 
     async def amend_price(self, order_id: str, price: float, *,
-                          reduce_only: bool = False, post_only: bool = False) -> str:
+                          reduce_only: bool = False, post_only: bool = False,
+                          account: Any = None) -> str:
         self.amended.append((order_id, price))
+        self.accounts.append(account)
         return order_id  # 정정은 원주문번호 유지(가짜)
 
 
@@ -148,3 +156,32 @@ async def test_peg_ls_moves_by_amend() -> None:
     assert sys.amended == [("P1", 100_100.0)]         # 정정
     assert sys.cancelled == []                        # 취소 없음
     assert len(sys.placed) == 1                       # 신규 없음
+    # 정정·취소에 LS 계좌를 같이 넘긴다(결정 73, 검토 G2) — 같은 번호가 다른 계좌에도 열려 있을 때
+    # 번호만으로는 못 찾아 ValueError로 창이 멈추거나 정지 때 취소를 건너뛰던 길
+    from kp_arb.domain.enums import Account
+    assert sys.accounts == [Account.KR_STOCK]
+    sys.order_book.track("P1", OrderIntent(  # 선물 계좌에 같은 번호가 열려 있어도
+        venue=Venue.LS, underlying=Underlying.SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=1, price=100.0))
+    assert "취소" in await pc.stop()                    # 주식 계좌 쪽을 찾아 취소
+    assert sys.cancelled == ["P1"] and sys.accounts[-1] is Account.KR_STOCK
+
+
+async def test_peg_timeout_is_result_unknown_and_stops_without_replacing() -> None:
+    # 검토 2026-10-13 15번(사용자 2026-10-14 "통보만 기다림"): 발주 응답 없음은 거부가 아니라 결과
+    # 모름 —
+    # 옛 코드는 RestTimeoutError를 RestError로 받아 "거부 — 재시도"로 다음 호가에 또 냈다(실계좌
+    # 도구).
+    # 이제 멈추고(stalled) 다음 스텝에서도 내지 않는다.
+    sys = _FakePegSystem()
+    key = (Underlying.SAMSUNG, Instrument.KR_STOCK, "krx")
+    pc = PegController(system=sys, venue=Venue.LS,  # type: ignore[arg-type]
+                       underlying=Underlying.SAMSUNG, instrument=Instrument.KR_STOCK,
+                       side=Side.BUY, level=1, qty=10.0)
+    sys.quotes[key] = _ls_quote(100_000)
+    sys.timeout_place = True
+    st = await pc.step()
+    assert st.startswith("응답 없음") and pc.stalled
+    sys.timeout_place = False
+    assert (await pc.step()).startswith("응답 없음")       # 멈춘 채 — 재발주 없음
+    assert sys.placed == [] and sys.amended == []

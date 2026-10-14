@@ -170,3 +170,33 @@ def test_alarm_skip_reason() -> None:
     assert alarm_skip_reason({"enabled": False, "path": "a.wav"}) == "꺼짐"
     assert alarm_skip_reason({"enabled": True, "path": " "}) == "wav 경로 없음"
     assert alarm_skip_reason({"enabled": True, "path": "C:/snd/error.wav"}) is None
+
+
+def test_ls_disconnect_events_only_ls_connected_to_disconnected() -> None:
+    # DESIGN-settings §2a(사용자 2026-10-14): LS(xing) 채널이 연결→끊김으로 바뀔 때만, 같은 끊김에
+    # 한 번.
+    # 첫 관측·HL 채널·끊김→연결은 알리지 않는다.
+    from kp_arb.main_window import ls_disconnect_events
+
+    prev: dict[str, bool] = {}
+    ls_up = {"venue": "LS", "name": "LS xing", "connected": True}
+    hl_up = {"venue": "HL", "name": "HL", "connected": True}
+    assert ls_disconnect_events(prev, [ls_up, hl_up]) == []                     # 첫 관측 = 기준
+    ls_dn = dict(ls_up, connected=False)
+    hl_dn = dict(hl_up, connected=False)
+    assert ls_disconnect_events(prev, [ls_dn, hl_dn]) == ["LS xing"]            # LS만
+    assert ls_disconnect_events(prev, [ls_dn, hl_dn]) == []                     # 같은 끊김은 한 번
+    assert ls_disconnect_events(prev, [ls_up, hl_up]) == []                     # 다시 연결
+    assert ls_disconnect_events(prev, [ls_dn]) == ["LS xing"]                   # 또 끊기면 또
+
+
+def test_core_down_event_once_per_transition() -> None:
+    from kp_arb.main_window import core_down_event
+
+    box: dict[str, object] = {}
+    assert core_down_event(box, False) is False   # 시동 직후 미접속은 기준만(알림 없음)
+    assert core_down_event(box, True) is False
+    assert core_down_event(box, False) is True    # 있음 → 없음
+    assert core_down_event(box, False) is False   # 계속 없음은 다시 안 알림
+    assert core_down_event(box, True) is False
+    assert core_down_event(box, False) is True

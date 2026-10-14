@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -218,6 +219,27 @@ def _restart_step(
         st["gave_up"] = True
         return "give_up"
     return "restart"
+
+
+def ls_disconnect_events(prev: dict[str, bool], rows: list[dict[str, Any]]) -> list[str]:
+    """/state WS 현황에서 **LS(xing) 채널이 연결→끊김**으로 바뀐 이름 목록(순수, DESIGN-settings
+    §2a).
+    prev(이름 → 마지막 연결 여부)는 제자리 갱신. 첫 관측·HL 채널·끊김→연결은 알리지 않는다."""
+    out: list[str] = []
+    for row in rows:
+        name = str(row.get("name"))
+        conn = bool(row.get("connected"))
+        if str(row.get("venue")) == "LS" and prev.get(name) is True and not conn:
+            out.append(name)
+        prev[name] = conn
+    return out
+
+
+def core_down_event(box: dict[str, Any], alive: bool) -> bool:
+    """코어 응답 **있음→없음** 전이인가(순수). box['alive']는 제자리 갱신, 첫 관측은 기준만."""
+    prev = box.get("alive")
+    box["alive"] = alive
+    return prev is True and not alive
 
 
 def screens_to_save(open_now: list[str], restore_done: bool, saved: list[str]) -> list[str]:
@@ -434,6 +456,49 @@ def main() -> None:
                 _play_alarm(settings, "sound_ws", f"{name} 끊김")
             sound_box["ws"][name] = conn
 
+    # LS(xing) 끊김 때 할 일(DESIGN-settings §2a, 사용자 2026-10-14) — 판정은 여기(코어가 죽어도
+    # 알림).
+    # 폴링 스레드는 사운드·텔레그램을 바로 하고, 팝업은 글만 남겨 화면 루프(refresh)가 띄운다.
+    dc_box: dict[str, Any] = {"ws": {}, "alive": None, "settings": {}, "popup_text": None}
+
+    def check_ls_disconnect(data: dict[str, Any] | None, alive: bool) -> None:
+        if data and isinstance(data.get("settings"), dict):
+            dc_box["settings"] = data["settings"]  # 코어가 죽은 뒤에도 마지막 설정으로
+        events = ls_disconnect_events(dc_box["ws"], (data or {}).get("ws") or []) if data else []
+        if core_down_event(dc_box, alive):
+            events.append("코어 응답 없음")
+        if not events:
+            return
+        settings = dc_box["settings"]
+        dc = settings.get("ls_disconnect") or {}
+        why = ", ".join(events)
+        _slog().warning("LS 끊김 알림 — %s (설정: 팝업 %s·텔레그램 %s·사운드 %s)", why,
+                        bool(dc.get("popup")), bool(dc.get("telegram")), bool(dc.get("sound")))
+        text = (f"LS 접속이 끊겼습니다 — {why}.\n네트워크·로그인 상태를 확인하고 재접속하세요"
+                "(코어가 죽었으면 자동 재시동을 기다리거나 메인을 다시 시작).")
+        if dc.get("sound"):
+            snd = settings.get("sound_ws") or {}
+            # 'WS 끊김' 줄이 켜져 있으면 check_sounds가 같은 전이에 이미 재생 — 두 번 울리지 않게
+            generic = alarm_skip_reason(snd) is None and "코어 응답 없음" not in events
+            path = str(snd.get("path") or "").strip()
+            if generic:
+                pass
+            elif not path:
+                _slog().warning("LS 끊김 사운드 건너뜀 — 'WS 끊김' wav 경로 없음")
+            else:
+                err = sound.play_wav(path)
+                _slog().log(logging.ERROR if err else logging.INFO,
+                            "LS 끊김 사운드 %s %s", "재생 실패: " + err if err else "재생", path)
+        if dc.get("telegram"):
+            try:
+                from . import alert
+                sent = alert.notify(text.replace("\n", " "), "error", category="ls_disconnect")
+                _slog().info("LS 끊김 텔레그램 %s", "보냄" if sent else "안 보냄(미설정·실패)")
+            except Exception as exc:  # noqa: BLE001 - 알림 실패가 감시를 멈추지 않게
+                _slog().warning("LS 끊김 텔레그램 실패 — %s", exc)
+        if dc.get("popup"):
+            dc_box["popup_text"] = text  # 화면 루프가 띄운다(화면 스레드 규칙)
+
     def poll_core() -> None:
         while True:
             # 5초 — /state가 커지고 코어가 바쁘면 1초를 넘긴다(운영 2026-09-29 14:55 "Cannot write
@@ -452,6 +517,7 @@ def main() -> None:
             # 조회 실패면 WS 표를 비우지 않는다(사용자 2026-09-29: LS·HL 줄이 사라져 "끊겼나" 오판).
             # 코어 미접속은 위 상태줄("코어: 미접속")이 보여 준다.
             check_sounds(data)  # 알람(체결·에러·WS끊김)
+            check_ls_disconnect(data, alive)  # LS 끊김 때 할 일(팝업·텔레그램·사운드)
             if not closing["flag"]:  # 종료 중엔 재기동·저장 안 함
                 maybe_restart_core(alive)
                 save_ui_state()
@@ -712,6 +778,12 @@ def main() -> None:
             if errs and not closing["flag"] and not _load_err["shown"]:
                 _on_load_error(errs)
                 return  # 종료 진행 — 다음 refresh 예약 안 함
+            popup_text = dc_box.get("popup_text")
+            if popup_text and not closing["flag"]:
+                dc_box["popup_text"] = None
+                from .ui_dialog import show_message
+
+                show_message(root, "LS 접속 끊김", popup_text)
             if alive_box["alive"]:
                 lbl_core.config(text="코어: 연결됨 (127.0.0.1:8787)", fg="dark green")
                 if status.cget("text") == "코어 시작 중 ...":  # 시작 요청 → 실제 연결 확인
