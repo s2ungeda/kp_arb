@@ -1254,6 +1254,13 @@ class AutoMEngine:
             self._log.warning("[자동M] 상태 저장 실패 — %s", exc)
         self._persist_ms = (time.perf_counter() - t0) * 1000
 
+    def _next_month_info(self, u: Underlying) -> dict[str, Any]:
+        check = getattr(self._system, "next_month_allowed", None)
+        if not callable(check):
+            return {"allowed": True, "note": ""}
+        ok, why = check(u, "EQ")
+        return {"allowed": bool(ok), "note": str(why)}
+
     def _ls_account_pre(self) -> Account:
         """이 엔진 상품의 선주문(LS) 계좌 — 주식선물·HL선 후주문은 선물옵션, 주식은 주식 계좌."""
         return Account.KR_STOCK if self.product == "stock" else Account.KR_DERIV
@@ -1494,6 +1501,8 @@ class AutoMEngine:
                 "monitor": monitor, "sf_tick": sf_tick, "hl_step": hl_step,
                 "fx": {"used": fx_used, "src": fx_src},  # 사용 환율(값, 출처 현물|선물역산)
                 "ref_qty": book.ref_qty, "future_month": book.future_month,
+                # 차근월물 선택 가능 여부·사유(결정 75) — 화면 월물 콤보가 '적' 때 확인
+                "next_month": self._next_month_info(u),
                 "market": book.market,  # 주식 거래소(KRX/NXT) — 화면 콤보 복원용
                 "hl_merge_ticks": merge_ticks,
                 "hl_merge_active": ({"n_sig_figs": active[0], "mantissa": active[1]}

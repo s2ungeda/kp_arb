@@ -38,7 +38,7 @@ DESIGN-manual-order §1-3/1-4가 예고한 **"설정 화면"** — 계정 단위
 
 ## 4. 코어 계약
 - 명령 `settings_global` {hl_daily_limit_usdc, sound_fill, sound_error, sound_ws, quote_probe} → 저장.
-  - `fx_futures_code`(원달러선물 월물 코드, 2026-09-28): 빈 문자열 = 최근월물. 키가 없으면 기존 값 유지(콤보가 빈 화면). 코어는 저장 뒤 바로 그 월물로 역산현물가를 다시 계산한다(`LiveSystem.set_fx_futures_code`).
+  - `fx_futures_code`(원달러선물 월물 코드, 2026-09-28): 빈 문자열 = 최근월물. 키가 없으면 기존 값 유지(콤보가 빈 화면). 코어는 저장 뒤 바로 그 월물로 역산현물가를 다시 계산한다(`LiveSystem.set_fx_futures_code`). **차근은 최근월물 만기 5영업일 전부터**(exec 결정 75, 2026-10-14) — 밖이면 콤보에 차근이 안 보이고, 보내도 코어가 거부.
   - 화면 콤보용으로 `/state`의 `live.fx_futures`에 `months`([{code, ym}], 근·차근 순)와 `code`(지금 쓰는 월물)를 싣는다. `/manual_state`의 `fx_auction.code`도 같은 월물(동시호가 창 표시용).
 - 스냅샷(/state 또는 /manual_state)에 노출:
   - 위 설정값 + **`fill_seq`**(체결마다 +1) + **`error_seq`**(발주 거부·실패마다 +1)

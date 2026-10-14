@@ -293,8 +293,12 @@ def live_snapshot(
             "position": runtime.virtual_position if runtime is not None else 0,
         }
     # 공통설정 원달러선물 콤보용(2026-09-28) — 월물 목록(근·차근 순)과 지금 환율 계산에 쓰는 월물
+    fx_next_ok, fx_next_why = (system.next_month_allowed(None, "USD")
+                               if hasattr(system, "next_month_allowed") else (True, ""))
     fx_futures = {"months": [{"code": c, "ym": ym} for c, ym in system.fx_futures_months()],
-                  "code": system.fx_futures_code()}
+                  "code": system.fx_futures_code(),
+                  # 차근 선택 가능 여부·사유(결정 75) — 공통설정 콤보가 차근을 보일지 정한다
+                  "next_allowed": fx_next_ok, "next_note": fx_next_why}
     return {"connected": True, "rehearsal": True, "screens": screens,
             "fx_futures": fx_futures}
 
@@ -608,6 +612,13 @@ async def _autom_command(
             month = str(body["month"]).strip()
             if month not in ("near", "next"):
                 return _fail([f"월물 값 오류: {month!r}"])
+            if month == "next":  # 차근은 최근월물 만기 5영업일 전부터(결정 75)
+                system = getattr(engine, "_system", None)
+                check = getattr(system, "next_month_allowed", None)
+                if callable(check):
+                    ok, why = check(Underlying(str(body["underlying"])), "EQ")
+                    if not ok:
+                        return _fail([why])
             _book().future_month = month
             return _ok()
         if cmd == "autom_settings":
@@ -1265,6 +1276,14 @@ def make_app(
             if result.get("ok") and save:
                 save()  # 세트 설정·공통설정·RT 저장
             return web.json_response(result, dumps=_dumps)
+        if (cmd == "settings_global" and system is not None
+                and hasattr(system, "next_month_allowed") and payload.get("fx_futures_code")):
+            # 원달러선물 차근은 최근월물 만기 5영업일 전부터(결정 75) — 밖이면 저장 거부
+            months = system.fx_futures_months()
+            if len(months) > 1 and str(payload["fx_futures_code"]) == months[1][0]:
+                ok_next, why_next = system.next_month_allowed(None, "USD")
+                if not ok_next:
+                    return web.json_response({"ok": False, "errors": [why_next]}, dumps=_dumps)
         result = apply_command(state, payload)
         if result.get("ok") and save:
             save()  # 입력값 저장 — 재시작 시 복원 (§6.2-0)

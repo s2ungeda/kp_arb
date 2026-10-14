@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
-from datetime import datetime, time
+from datetime import date, datetime, time
 from typing import Any
 
 from . import order_log
@@ -623,6 +623,21 @@ class LiveSystem:
         self.usdkrw_futures = (self.fx_futures_price.get(picked[0])
                                if picked is not None else None)
         self._recompute_fx_theory()
+
+    def next_month_allowed(self, u: Underlying | None = None, product: str = "EQ",
+                           today: date | None = None) -> tuple[bool, str]:
+        """차근월물 선택 가능?(결정 75, 사용자 2026-10-14: 영업일 기준 잔존만기 5일 전부터).
+        product "EQ" = 그 종목 주식선물 최근월물 만기 / "USD" = 원달러선물 최근월물 만기.
+        만기를 모르면(시동 조회 실패 등) 막지 않는다 — 사유에 적는다."""
+        from .theory import next_month_window
+
+        if product == "USD":
+            ym = self._fx_months[0][1] if self._fx_months else None
+        else:
+            ym = self.futures_expiry.get((u, Instrument.KR_STOCK_FUTURE)) if u else None
+        if not ym:
+            return True, "최근월물 만기 정보 없음 — 제한 못 함"
+        return next_month_window(int(ym), product, today or date.today())
 
     def fx_futures_months(self) -> list[tuple[str, int]]:
         """구독 중인 원달러선물 월물 (코드, 만기YYYYMM) 근·차근 순 — 공통설정 콤보용."""

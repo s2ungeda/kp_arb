@@ -515,6 +515,12 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
 
     def apply_market() -> None:
         u = cur_under()
+        if spec.has_month and MONTH_MAP.get(cb_month.get()) == "next":
+            # 차근월물은 최근월물 만기 5영업일 전부터(결정 75) — 코어 판단을 따르고 아니면 최근으로
+            info = _live_book().get("next_month") or {}
+            if info and not info.get("allowed", True):
+                warn_center(str(info.get("note") or "차근월물은 아직 선택할 수 없습니다"))
+                cb_month.set("최근")
         if cb_agg.get() in agg_map:  # 틱 목록이 아직 없으면(가격 미수신) 머지는 건너뜀
             nsf, mant = agg_map[cb_agg.get()]
             send({"cmd": "manual_hl_merge", "underlying": u,
@@ -781,9 +787,19 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                                 bd=1, highlightthickness=0,
                                 command=partial(open_set_dialog, dtag, i))
             btn_set.grid(row=r, column=col["set"], padx=1, pady=1, sticky="nsew")
-            lbl_rt = tk.Label(grid, text="-", width=7, anchor="e", bg="white",
-                              relief="solid", bd=1, font=T.FONT_BASE_LG)  # RT선진입
+            # RT선진입 — 행에서 바로 입력(사용자 2026-10-14, 결정 74): 고친 값은 **진입·청산 실행을
+            # 켤 때** 세트설정의 'RT 진입수량 수동 입력'과 같은 1회성 값으로 같이 나간다(Enter 없음,
+            # 사용자
+            # 같은 날 정정). Esc = 코어 값으로 되돌림. 진입·청산 둘 다 꺼진
+            # 세트만 열림(실행 중 잠금). 평소엔 코어 스냅샷 값을 보여 준다(편집 중엔 안 덮음)
+            lbl_rt = tk.Entry(grid, width=7, justify="right", bg="white",
+                              disabledbackground="white", disabledforeground="black",
+                              validate="key",
+                              validatecommand=vcmd_sint if dtag == "rev" else vcmd_int,
+                              font=T.FONT_BASE_LG)  # RT선진입
             lbl_rt.grid(row=r, column=col["rt"], padx=1, pady=1, sticky="nsew")
+            lbl_rt.bind("<KeyRelease>", partial(mark_rt_edited, dtag, i))
+            lbl_rt.bind("<Escape>", partial(revert_rt, dtag, i))
             lbl_diff = tk.Label(grid, text="-", width=6, anchor="e", bg="white",
                                 relief="solid", bd=1, font=T.FONT_BASE_LG)  # 체결차
             lbl_diff.grid(row=r, column=col["diff"], padx=1, pady=1, sticky="nsew")
@@ -935,12 +951,19 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                     errs.append("청산을 입력하세요")
             # 리스크방지의 진입 기준값 — SF 화면은 진입SF, 주식 화면은 진입S(결정 대기, 화면 골격)
             errs += check_risk(dtag, en_sf if spec.has_en_sf else en_s, ex_sf, *_risk_of(dtag))
+            rt_override, rt_errs = rt_override_on_run(dtag, i)  # RT 칸 고친 값(결정 74)
+            errs += rt_errs
             if errs:  # 필수 미입력·위반 — 경고, 실행 시작 안 함(버튼 상태 유지)
                 screen_log().info("%s 버튼 %s %d세트 %s: 실행 안 함 — %s", spec.log_tag, dtag,
                                   i + 1, side, " / ".join(errs))
                 warn_center("\n".join(errs))
                 return
             w["en_sf"], w["en_s"], w["ex_sf"] = en_sf, en_s, ex_sf
+            if rt_override is not None:  # 세트설정 'RT 수동 입력'과 같은 1회성 — 세트 설정에 실림
+                w["rt_manual"] = rt_override
+                screen_log().info("%s RT 수동 입력(행) %s %d세트: %s → 실행 켬과 함께",
+                                  spec.log_tag,
+                                  dtag, i + 1, rt_override)
         w[key] = on = turning_on
         # 코어 상태가 명령을 반영하기까지(실시간 채널 0.2~0.3초) 화면 표시를 코어값이 덮어쓰지
         # 않게 한다 — 안 그러면 잠금→풀림→잠금으로 깜빡인다(사용자 실증 2026-09-04).
@@ -959,6 +982,9 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         block = "entry" if side == "en" else "exit"
         if on:
             send(set_payload(i, w, cur_under(), dtag), "세트 설정")
+            w["rt_manual"] = None  # 1회성 — 다음 켬에 안 실리게
+            w["_rt_edited"] = False  # 코어 값이 다시 칸을 채운다
+            w["_rt_core"] = w["rt"].get()
             if release:  # 중지 해제 먼저(같은 큐라 순서 보장) → 실행
                 send({"cmd": "autom_release", "underlying": cur_under(), "set": i,
                       "block": block, "direction": dtag}, "중지 해제")
@@ -1008,10 +1034,64 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         w["delay"] = parse_qty(w["sec"].get())
 
     def _lock_qty_row(w: dict[str, Any]) -> None:
-        """목표수량·1회주문·초 행 입력칸 — 진입·청산 어느 쪽이든 실행 중이면 잠금(결정 72)."""
+        """목표수량·1회주문·초·RT 행 입력칸 — 진입·청산 어느 쪽이든 실행 중이면 잠금(결정 72·74).
+        """
         st = "disabled" if (w["run_en"] or w["run_ex"]) else "normal"
-        for ent in ("tg", "per_lbl", "sec"):
+        for ent in ("tg", "per_lbl", "sec", "rt"):
             w[ent].config(state=st)
+
+    def _show_rt(w: dict[str, Any], text: str) -> None:
+        """코어 RT 값을 칸에 — 편집 중(포커스)이면 덮지 않는다. 잠긴 칸은 잠시 열어 쓰고 다시
+        잠금."""
+        e = w["rt"]
+        w["_rt_core"] = text
+        if w.get("_rt_edited"):  # 고쳐 둔 값 — 실행 켤 때 나가거나 Esc로 되돌릴 때까지 유지
+            return
+        try:
+            if root.focus_get() is e:
+                return
+        except (tk.TclError, KeyError):
+            pass
+        if e.get() == text:
+            return
+        locked = str(e.cget("state")) == "disabled"
+        e.config(state="normal", validate="none")  # 쉼표·'-'는 키 검사에 걸리므로 잠시 끔
+        e.delete(0, "end")
+        e.insert(0, "" if text == "-" else text)
+        e.config(validate="key")
+        if locked:
+            e.config(state="disabled")
+
+    def revert_rt(dtag: str, i: int, _e: Any = None) -> None:
+        """Esc·포커스 이탈 — Enter 없이 나가면 코어 값으로 되돌림(기준수량 칸과 같은 규칙)."""
+        w = sets[(dtag, i)]
+        e = w["rt"]
+        core = str(w.get("_rt_core") or "")
+        w["_rt_edited"] = False
+        if str(e.cget("state")) == "disabled" or e.get() == core:
+            return
+        e.config(validate="none")
+        e.delete(0, "end")
+        e.insert(0, core)
+        e.config(validate="key")
+
+    def mark_rt_edited(dtag: str, i: int, _e: Any = None) -> None:
+        """RT 칸에 키 입력 — 코어 값과 다르면 '고친 값'으로 표시(스냅샷이 덮지 않게)."""
+        w = sets[(dtag, i)]
+        core = str(w.get("_rt_core") or "").replace(",", "")
+        w["_rt_edited"] = w["rt"].get().strip().replace(",", "") != core
+
+    def rt_override_on_run(dtag: str, i: int) -> tuple[int | None, list[str]]:
+        """실행을 켤 때 RT 칸에 고친 값이 있으면 (값, 오류들) — 세트설정 'RT 진입수량 수동 입력'과
+        같은 1회성 값(결정 74). 안 고쳤으면 (None, [])."""
+        w = sets[(dtag, i)]
+        if not w.get("_rt_edited"):
+            return None, []
+        text = w["rt"].get().strip().replace(",", "")
+        if text == str(w.get("_rt_core") or "").replace(",", ""):
+            return None, []
+        errs = rt_manual_errors(dtag, text)
+        return (None if errs else parse_qty(text)), errs
 
     def open_set_dialog(dtag: str, i: int) -> None:
         w = sets[(dtag, i)]
@@ -1384,7 +1464,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             w["hl_unit"], w["hl_offset"] = 0.5, 0.0  # HL선 USD 표본(결정 55)
             w["tg"].insert(0, "10,000")  # 목표·1회·초는 입력칸(결정 72)
             w["per_lbl"].insert(0, "100")
-            w["rt"].config(text="9,999")
+            _show_rt(w, "9,999")
             w["diff"].config(text="-999")
             w["sec"].insert(0, "30")
             # 방향별 리스크방지에 맞는 샘플(정=양수 진입 / 역=음수 진입) — 탭 이동 거짓경고 방지
@@ -1846,7 +1926,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                             seen[(dtag, i, side)] = (detail, time.monotonic())
                         details.append(detail)
                 # RT는 부호 그대로 — 역방향은 0 또는 음수(사용자 확정 2026-09-14)
-                w["rt"].config(text=_fmt_num(row.get("rt")))
+                _show_rt(w, _fmt_num(row.get("rt")))
                 # 체결차는 HL 소수 계약 그대로(0.612 등) — 정수로 반올림하면 "1"로 보여 한도(1)에
                 # 걸린 줄 안다(실측 2026-09-17 주식 1회 1주, HL 0.388 부분 체결)
                 w["diff"].config(text=_fmt_diff(row.get("fill_diff")))

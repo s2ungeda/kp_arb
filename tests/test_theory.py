@@ -117,3 +117,27 @@ def test_pick_fx_futures_by_code_or_near() -> None:
     assert pick_fx_futures(months, "") == ("175W09", 202609)
     assert pick_fx_futures(months, "175W08") == ("175W09", 202609)  # 만기로 빠진 코드
     assert pick_fx_futures([], "175W10") is None
+
+
+def test_next_month_window_opens_five_business_days_before_expiry() -> None:
+    # 결정 75(사용자 2026-10-14): 주식선물·원달러선물 차근월물은 최근월물 만기(최종거래일) 영업일
+    # 기준
+    # 5일 전부터 고를 수 있다. 영업일 = 월~금(공휴일 달력 없음 — [OPEN]).
+    from datetime import date
+
+    from kp_arb.theory import business_days_until, expiry_date, next_month_window
+
+    exp = expiry_date(202610, "EQ")                      # 2026-10 둘째 목요일 = 10-08
+    assert exp == date(2026, 10, 8)
+    assert business_days_until(date(2026, 10, 1), exp) == 5    # 10-02(금)·05·06·07·08
+    assert business_days_until(date(2026, 9, 30), exp) == 6
+    assert business_days_until(exp, exp) == 0
+    assert business_days_until(date(2026, 10, 9), exp) == -1
+    assert next_month_window(202610, "EQ", date(2026, 9, 30))[0] is False  # 6영업일: 아직
+    ok, why = next_month_window(202610, "EQ", date(2026, 10, 1))
+    assert ok and "5영업일" in why                                       # 5영업일 — 열림
+    assert next_month_window(202610, "EQ", date(2026, 10, 8))[0] is True   # 만기일
+    assert next_month_window(202610, "EQ", date(2026, 10, 12))[0] is True  # 지남(롤 전)
+    # 원달러선물은 셋째 월요일 — 2026-10 = 10-19. 10-12(월)부터 5영업일
+    assert next_month_window(202610, "USD", date(2026, 10, 9))[0] is False
+    assert next_month_window(202610, "USD", date(2026, 10, 12))[0] is True

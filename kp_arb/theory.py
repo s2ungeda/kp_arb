@@ -36,6 +36,34 @@ def days_to_expiry(yyyymm: int, product: str, today: date) -> int:
     return remain if remain > 0 else 1
 
 
+def business_days_until(today: date, target: date) -> int:
+    """오늘 다음 날부터 target까지의 영업일 수(월~금). target이 오늘이면 0, 지났으면 음수.
+    공휴일은 빼지 않는다 — 휴장일 달력이 코어에 없다([OPEN], 결정 75)."""
+    if target <= today:
+        return -sum(1 for k in range((today - target).days)
+                    if (target + timedelta(days=k)).weekday() < 5)
+    return sum(1 for k in range(1, (target - today).days + 1)
+               if (today + timedelta(days=k)).weekday() < 5)
+
+
+# 차근월물 선택 가능 구간 — 최근월물 만기 5영업일 전부터(사용자 2026-10-14, 결정 75)
+NEXT_MONTH_WINDOW_DAYS = 5
+
+
+def next_month_window(yyyymm: int, product: str, today: date,
+                      window: int = NEXT_MONTH_WINDOW_DAYS) -> tuple[bool, str]:
+    """차근월물을 고를 수 있는가(결정 75): 최근월물 만기(최종거래일) **5영업일 전부터** 만기일까지.
+    (허용 여부, 설명) — 설명은 화면·거부 사유용. product: "EQ" 주식선물 / "USD" 원달러선물."""
+    exp = expiry_date(yyyymm, product)
+    left = business_days_until(today, exp)
+    if left < 0:
+        return True, f"최근월물 {yyyymm % 100}월 만기 {exp.month}-{exp.day} 지남"
+    if left <= window:
+        return True, f"최근월물 만기 {exp.month}-{exp.day}까지 {left}영업일 — 차근 선택 가능"
+    return False, (f"차근월물은 최근월물 만기({exp.month}-{exp.day}) {window}영업일 전부터 — "
+                   f"지금 {left}영업일 남음")
+
+
 def is_rolled(yyyymm: int, product: str, now: datetime) -> bool:
     """해당 월물이 롤오버 시점(최종거래일 15:45)을 지났는가."""
     exp = expiry_date(yyyymm, product)

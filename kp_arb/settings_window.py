@@ -275,6 +275,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         # 최초 1회만 코어가 지금 쓰는 월물로 맞춘다(그 뒤엔 사용자 선택을 덮지 않음).
         fx = (data.get("live") or {}).get("fx_futures") or {}
         months = fx.get("months") or []
+        if not fx.get("next_allowed", True):  # 차근은 최근월물 만기 5영업일 전부터(결정 75)
+            months = months[:1]
         labels = [fx_month_label(str(m["code"]), int(m["ym"]), i) for i, m in enumerate(months)]
         if labels and state_box.get("fx_labels") != labels:
             state_box["fx_labels"] = labels
