@@ -508,6 +508,20 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     if spec.has_month:  # 주식 화면엔 월물이 없다(콤보는 만들되 안 붙임 — 아래 코드 공용)
         cb_month.pack(side="left", padx=(0, 4))
 
+    def _guard_next_month() -> bool:
+        """차근을 골랐는데 구간 밖(최근월물 만기 3영업일 전, 결정 75)이면 알림 + 최근으로 되돌림.
+        콤보를 바꾸는 순간('적' 전)에도 부른다(사용자 2026-10-14). 되돌렸으면 True."""
+        if not spec.has_month or MONTH_MAP.get(cb_month.get()) != "next":
+            return False
+        info = _live_book().get("next_month") or {}
+        if not info or info.get("allowed", True):
+            return False
+        warn_center(str(info.get("note") or "차근월물은 아직 선택할 수 없습니다"))
+        cb_month.set("최근")
+        return True
+
+    cb_month.bind("<<ComboboxSelected>>", lambda _e: _guard_next_month())
+
     def cur_under() -> str:
         """이 창이 보여주는 종목(코어의 종목 상태 키). 자동M 상태는 코어가 종목별로 따로
         든다(2026-09-08)."""
@@ -515,12 +529,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
 
     def apply_market() -> None:
         u = cur_under()
-        if spec.has_month and MONTH_MAP.get(cb_month.get()) == "next":
-            # 차근월물은 최근월물 만기 3영업일 전부터(결정 75) — 코어 판단을 따르고 아니면 최근으로
-            info = _live_book().get("next_month") or {}
-            if info and not info.get("allowed", True):
-                warn_center(str(info.get("note") or "차근월물은 아직 선택할 수 없습니다"))
-                cb_month.set("최근")
+        _guard_next_month()  # 차근 구간 밖이면 알림 + 최근(콤보 선택 때 이미 걸렀지만 '적' 때도)
         if cb_agg.get() in agg_map:  # 틱 목록이 아직 없으면(가격 미수신) 머지는 건너뜀
             nsf, mant = agg_map[cb_agg.get()]
             send({"cmd": "manual_hl_merge", "underlying": u,
