@@ -611,6 +611,13 @@ class LiveSystem:
 
         picked = pick_fx_futures(self._fx_months, code)
         log = logging.getLogger("kp_arb.bootstrap")
+        if (picked is not None and len(self._fx_months) > 1 and picked[0] == self._fx_months[1][0]):
+            ok_next, why_next = self.next_month_allowed(None, "USD")
+            if not ok_next:  # 저장된 차근이 오늘은 구간 밖(결정 75) — 최근으로
+                log.warning("공통설정 원달러선물 차근 %s → 최근월물 %s — %s", picked[0],
+                            self._fx_months[0][0], why_next)
+                picked = self._fx_months[0]
+                code = picked[0]
         if code and (picked is None or picked[0] != code):
             log.warning("공통설정 원달러선물 %s 은 월물 목록에 없음(만기 등) — 최근월물 %s 사용",
                         code, picked[0] if picked is not None else "없음")

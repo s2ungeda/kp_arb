@@ -426,6 +426,10 @@ async def test_books_run_independently_per_underlying() -> None:
     assert not late["ok"] and "3영업일" in late["errors"][0] and ob.future_month == "near"
     assert (await _autom_command(eng, state, {"cmd": "autom_month", "underlying": other.value,
                                               "month": "near"}))["ok"]
+    # 어제 골라 둔 차근이 오늘 구간 밖이면(시동 복원) 감시 틱이 최근으로 되돌린다(사용자 2026-10-14)
+    ob.future_month = "next"
+    eng.pump(datetime(2026, 9, 4, 10, 0, 0), 500.0)
+    assert ob.future_month == "near"
 
 
 def test_legacy_single_autom_state_migrates_to_screen_underlying_book() -> None:

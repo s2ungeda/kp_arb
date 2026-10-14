@@ -1970,6 +1970,13 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # 현물이 예상체결가라 S괴리를 판정에 안 쓴다는 표시. 끝나면 다시 빨강. 코어 /state의 장운영
         # 단계로.
         _paint_auction(s_auction_bg(data.get("phase")))
+        if spec.has_month:  # 코어가 월물을 되돌리면(결정 75) 콤보도 — 코어 값이 바뀔 때만
+            core_month = _live_book().get("future_month")
+            if core_month and core_month != state_box.get("_month_seen"):
+                state_box["_month_seen"] = core_month
+                label = next((k for k, v in MONTH_MAP.items() if v == core_month), None)
+                if label and cb_month.get() != label:
+                    cb_month.set(label)
         # 매매결과 누적(정·역 각각) — 진입 = entry 누적, 청산 = exit 누적(세트 합산). 칸 이름은
         # 방향별 배치표(_ACC_ROWS_*)에서: 정방향 진입 -HP/+SF/-환, 역방향 진입 +HP/-SF/+환 …
         for dtag, acc_rows in spec.acc_rows.items():

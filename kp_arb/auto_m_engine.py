@@ -404,6 +404,7 @@ class AutoMEngine:
                 everything = True  # 끊겨 있는 동안은 감시 때마다(취소가 실패했으면 다시 보내도록)
             self._watch_state = state
             self._watch_cancel_wait(mono)
+            self._enforce_next_month()
         in_window = self._settings.in_window(now.time())
         if in_window != self._in_window:
             self._in_window = in_window
@@ -1253,6 +1254,23 @@ class AutoMEngine:
         except Exception as exc:  # noqa: BLE001 - 저장 실패는 로그만
             self._log.warning("[자동M] 상태 저장 실패 — %s", exc)
         self._persist_ms = (time.perf_counter() - t0) * 1000
+
+    def _enforce_next_month(self) -> None:
+        """차근으로 둔 종목이 구간 밖(최근월물 만기 3영업일 전, 결정 75)이면 최근으로 되돌린다 —
+        어제 골라 둔 차근이 오늘 구간 밖인 채 시동·복원되는 경우(사용자 2026-10-14). 감시 틱(1초)
+        마다."""
+        check = getattr(self._system, "next_month_allowed", None)
+        if not callable(check) or self.product == "stock":
+            return
+        for u, book in self.screen.books_of(self.product):
+            if book.future_month != "next":
+                continue
+            ok, why = check(u, "EQ")
+            if not ok:
+                book.future_month = "near"
+                self._log.warning("[자동M] %s 월물 차근 → 최근으로 되돌림 — %s (결정 75)",
+                                  u.value, why)
+                self._persist()
 
     def _next_month_info(self, u: Underlying) -> dict[str, Any]:
         check = getattr(self._system, "next_month_allowed", None)
