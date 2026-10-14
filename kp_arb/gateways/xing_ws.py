@@ -21,7 +21,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 
-from ..domain.enums import Underlying
+from ..domain.enums import Account, Underlying
 from ..quote_probe import QuoteProbe
 from ..ws_status import WsStatus
 from .ls_ws import LSWebSocketClient, WSConnection
@@ -94,8 +94,10 @@ class XingRealClient(LSWebSocketClient):
         reconnect_backoff_s: float = 2.0,
         stats_every_s: float = 60.0,
         probe: QuoteProbe | None = None,
+        account_numbers: dict[str, Account] | None = None,
     ) -> None:
         super().__init__(_NoConnector(), etf_symbols=etf_symbols, clock=clock,
+                         account_numbers=account_numbers,
                          status=status or WsStatus(venue="LS", name="LS xing", kind="시세/주문",
                                                    expects_stream=True),
                          max_reconnects=1_000_000, reconnect_backoff_s=reconnect_backoff_s)

@@ -134,7 +134,7 @@ class FakeSystem:
                 self.order_book.on_cancel(oid)
         return oid
 
-    async def cancel(self, order_id: str) -> None:
+    async def cancel(self, order_id: str, account: Any = None) -> None:
         self.cancel_calls = getattr(self, "cancel_calls", 0) + 1
         if getattr(self, "cancel_gone", False):  # 체결과 교차 — LS 03416/01433(OrderGoneError)
             from kp_arb.gateways.ls import OrderGoneError
@@ -644,7 +644,7 @@ async def test_cancel_wait_watchdog_alarms_once_without_resending() -> None:
     s = state.autom.book(U).sets[0]
     assert s.entry.pre_order_id == "O1"
     sys_.cancel_confirm_delay = 10_000.0          # 취소는 받아들여졌지만 확정 통보가 안 온다
-    sys_.s_entry = -0.5                           # S괴리 미달(G5) → 선주문 취소
+    state.autom.settings.windows = (("09:00:00", "09:30:00"),)  # 10:00 = 시간 밖(G2) → 취소
     eng.tick(now, 101.0)
     await asyncio.sleep(0.05)
     assert sys_.cancel_calls == 1 and s.entry.cancel_sent
@@ -713,7 +713,7 @@ async def test_cancel_without_confirmation_or_response_is_never_resent() -> None
     s = state.autom.book(U).sets[0]
     assert s.entry.pre_order_id == "O1"
     sys_.cancel_timeout = True
-    sys_.s_entry = -0.5                           # S괴리 미달(G5) → 걸린 선주문 취소
+    state.autom.settings.windows = (("09:00:00", "09:30:00"),)  # 시간 밖(G2) → 걸린 선주문 취소
     eng.tick(datetime(2026, 9, 4, 10, 0, 1), 101.0)
     await asyncio.sleep(0.05)
     assert sys_.cancel_calls == 1 and s.entry.cancel_sent
@@ -865,8 +865,16 @@ async def test_watch_timer_cancels_resting_orders_when_either_feed_drops() -> No
     assert sys_.cancelled == ["O1", "O2"]
 
 
-async def test_run_loop_wakes_on_market_data_and_does_not_spin() -> None:
+async def test_run_loop_wakes_on_market_data_and_does_not_spin(monkeypatch: Any) -> None:
     # 루프 종료성·헛돌기 확인: 시세가 없으면 감시 간격으로만 깨어나고, 시세 수신이 오면 바로 판정.
+    # run()은 벽시계(datetime.now)를 쓰므로 고정한다 — 2026-10-14 08:31에 돌렸더니 선물 동시호가
+    # 시간대라 판정이 막혀 실패(시각 의존 테스트였음).
+    class _FixedNow(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> "_FixedNow":  # noqa: D102
+            return cls(2026, 9, 4, 10, 0, 0)
+
+    monkeypatch.setattr("kp_arb.auto_m_engine.datetime", _FixedNow)
     eng, sys_, state = _engine()
     eng.set_running(U, 0, Block.ENTRY, True)
     pumps = 0
@@ -1052,7 +1060,7 @@ async def test_engine_cancel_on_signal_loss_and_halt_on_post_reject() -> None:
     eng.set_running(U, 0, Block.ENTRY, True)
     eng.tick(now, 100.0)
     await _settle()
-    sys_.s_entry = 0.0  # S괴리 미달 → 걸어둔 선주문 취소
+    state.autom.settings.windows = (("09:00:00", "09:30:00"),)  # 시간 밖(G2) → 걸어둔 선주문 취소
     eng.tick(now, 101.0)
     await _settle()
     assert sys_.cancelled == ["O1"]
@@ -1060,7 +1068,7 @@ async def test_engine_cancel_on_signal_loss_and_halt_on_post_reject() -> None:
     assert s.entry.status is LegStatus.ARMED and s.entry.pre_order_id is None
 
     # 다시 조건 충족 → 신규 → 전량 체결 → 후주문(지정가) 발주 → 잔량이 걸려 있어도 엔진은 취소 안 함
-    sys_.s_entry = 0.01
+    state.autom.settings.windows = (("09:00:00", "15:20:00"),)  # 다시 시간 안
     eng.tick(now, 102.0)
     await _settle()
     sys_.order_book.on_fill(Fill(fill_id="f3", order_id="O2", qty=10, price=1_602_000.0, ts=0))

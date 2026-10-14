@@ -391,7 +391,7 @@ async def test_cancel_with_no_remaining_qty_is_order_gone_without_sending() -> N
     gw = system._gw
     sent: list[str] = []
 
-    async def spy(order_id: str, qty: float | None = None) -> None:
+    async def spy(order_id: str, qty: float | None = None, account: Any = None) -> None:
         sent.append(order_id)
 
     gw.cancel_order = spy  # type: ignore[method-assign]
@@ -1201,6 +1201,40 @@ async def test_same_ws_object_reconnect_resyncs_both_ls_accounts() -> None:
     await system.wait()
 
 
+async def test_stock_notice_with_same_number_does_not_touch_futures_order() -> None:
+    # 운영 사고 2026-10-14 09:06(결정 73): 주식 계좌 HTS #4545 체결 8주(08:24, 미추적 보관) → 선물
+    # 자동M
+    # 선주문 #4545(09:06) 등록 때 재생돼 "8계약 체결" → HL 80계약 초과 헤지. 이제 통보는 계좌를 싣고
+    # 장부는 (계좌, 번호)로 찾는다 — 주식 통보는 주식 주문에만, 선물 선주문은 그대로 0 체결.
+    gw = MockLSGateway()
+    gw.seed_balance(Account.KR_DERIV, 50_000_000)
+    stock_fill = json.dumps({"header": {"tr_cd": "SC1"}, "body": {
+        "accno": "20142871001", "ordno": "4545", "execno": "37246", "execqty": "8",
+        "execprc": "1464000", "exectime": "082417137", "Isuno": "KR7000660001"}})
+    stock_cancel = json.dumps({"header": {"tr_cd": "SC3"}, "body": {
+        "accno": "20142871001", "ordno": "4514", "orgordno": "4508", "canccnfqty": "100"}})
+    ws = LSWebSocketClient(FakeConnector([stock_fill, stock_cancel]), account_numbers={
+        "20142871001": Account.KR_STOCK, "20142871002": Account.KR_DERIV})
+    system = LiveSystem(
+        gateway=gw,  # type: ignore[arg-type]
+        order_book=OrderBook(), session=SessionService(), stock_ws=ws, deriv_ws=ws,
+    )
+    await system.start()
+    await system.wait()  # 주식 통보 두 건이 미추적으로 보관됨
+    for oid, price in (("4545", 1_475_000.0), ("4508", 1_474_000.0)):
+        system.order_book.track(oid, OrderIntent(
+            venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+            side=Side.BUY, qty=1, order_type=OrderType.LIMIT, price=price,
+            account=Account.KR_DERIV))
+        system.order_book.replay_pending(oid)
+    fut = system.order_book.order("4545", Account.KR_DERIV)
+    assert fut is not None and fut.filled_qty == 0 and fut.is_open      # 주식 8주는 안 들어감
+    fut2 = system.order_book.order("4508", Account.KR_DERIV)
+    assert fut2 is not None and fut2.is_open and fut2.cancelled_qty == 0  # 주식 취소 100도 안 옴
+    assert system.order_book.position_qty(SAMSUNG, Instrument.KR_STOCK_FUTURE,
+                                          Account.KR_DERIV) == 0
+
+
 async def test_deriv_ws_subscribes_futures_fills_only() -> None:
     system, _, deriv_connector = _system([], deriv_frames=[])
     await system.start()
@@ -1232,6 +1266,45 @@ def test_usdkrw_effective_priority_by_futures_window() -> None:
     assert system.usdkrw_effective(outside) == (1_498.5, "현물")
     # 07:30 전은 계산하지 않는다
     assert system.usdkrw_effective(datetime(2026, 7, 20, 7, 29, 59)) == (None, "계산불가")
+
+
+def test_spot_source_hana_before_nine_and_until_ls_cur_arrives() -> None:
+    # 사용자 2026-10-14(exec 결정 70, 09-28 폐지분 복원): 하나고시 환율을 ① 09:00 전 ② 시동 직후
+    # ③ LS
+    # CUR 시세를 받을 때까지 쓴다. 09:00 뒤 LS CUR를 받았으면 LS. 하나고시가 없으면 있는 쪽.
+    from datetime import datetime
+
+    system, _, _ = _system([])
+    early, late = datetime(2026, 10, 14, 8, 30), datetime(2026, 10, 14, 9, 0)
+    assert system.hana_spot_needed()                       # 아직 LS가 출처가 된 적 없음
+    system._resolve_spot(late)
+    assert system.usdkrw_spot is None and system.usdkrw_spot_src is None
+    system._apply_hana_spot(1_380.0)                       # ② 시동 직후 하나고시
+    assert (system.usdkrw_spot, system.usdkrw_spot_src) == (1_380.0, "하나고시")
+    # LS CUR 첫 수신 — _apply_fx_spot은 벽시계로 판정하므로 여기선 값만 넣고 시각을 주입한다
+    system._spot_ls = 1_381.5
+    system._resolve_spot(early)
+    assert (system.usdkrw_spot, system.usdkrw_spot_src) == (1_380.0, "하나고시")  # ①
+    assert system.hana_spot_needed()
+    system._resolve_spot(late)                             # 09:00 뒤 + LS 있음 → LS
+    assert (system.usdkrw_spot, system.usdkrw_spot_src) == (1_381.5, "LS")
+    assert not system.hana_spot_needed()                   # 조회 끝
+    system._apply_hana_spot(1_379.0)                       # 뒤늦은 하나고시 값은 LS를 못 밀어냄
+    system._resolve_spot(late)
+    assert system.usdkrw_spot_src == "LS"
+    system._resolve_spot(early)                            # 한 번 넘어가면 09:00 전(다음 날)에도 LS
+    assert system.usdkrw_spot_src == "LS"
+    # 하나고시 조회가 안 되는 상태에서 09:00 전이면 LS 값이라도 쓴다
+    other, _, _ = _system([])
+    other._apply_fx_spot(1_382.0)
+    other._resolve_spot(early)
+    assert (other.usdkrw_spot, other.usdkrw_spot_src) == (1_382.0, "LS")
+    # 판정용(결정 47)·정산용은 그대로 usdkrw_spot을 본다 — 08:30은 우선시간(08:45~) 전 = "밖" → 현물
+    fresh, _, _ = _system([])
+    fresh._apply_hana_spot(1_379.0)
+    fresh._resolve_spot(early)
+    assert fresh.usdkrw_effective(early) == (1_379.0, "현물")
+    assert fresh.fx_entry_rate(early) == 1_379.0
 
 
 async def test_cancel_many_batches_hl_and_closes_by_order_update() -> None:

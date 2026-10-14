@@ -94,7 +94,7 @@ class _FakePegSystem:
         self.order_book.track(oid, intent)
         return oid
 
-    async def cancel(self, order_id: str) -> None:
+    async def cancel(self, order_id: str, account: Any = None) -> None:
         self.cancelled.append(order_id)
         self.order_book.on_cancel(order_id)
 

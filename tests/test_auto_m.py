@@ -133,8 +133,9 @@ def test_gates_cancel_or_hold_resting_order() -> None:
     set_running(s, Block.ENTRY, True)
     evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
     on_pre_ack(s, Block.ENTRY, "1")
-    # G5 미달 → 취소
-    acts = evaluate(s, Block.ENTRY, _sig(mono=101, s_spread_entry=0.001), SETTINGS, U)
+    # G2 시간 밖 → 취소(옛 G5 S괴리 미달 취소는 결정 71로 필터 삭제)
+    acts = evaluate(s, Block.ENTRY, _sig(mono=101, now=datetime(2026, 9, 4, 16, 0)),
+                    SETTINGS, U)
     assert [a.kind for a in acts] == ["cancel_pre"]
     on_pre_cancelled(s, Block.ENTRY, mono=102, settings=SETTINGS)
     assert s.entry.status is LegStatus.ARMED and s.entry.pre_order_id is None
@@ -154,12 +155,19 @@ def test_gates_cancel_or_hold_resting_order() -> None:
         == "place_pre"
 
 
-def test_signal_gate_uses_only_s_for_entry_and_nothing_for_exit() -> None:
-    # 정정 2026-09-07(exec §11.3): 진입은 S괴리만 비교(SF괴리 미달이어도 통과), 청산은 비교 없음.
+def test_signal_gate_has_no_spread_filter_for_entry_or_exit() -> None:
+    # 결정 71(사용자 2026-10-14): 주식선물 진입의 S괴리 필터 삭제 — SF·S 괴리 둘 다 비교하지 않고
+    # 기준값(진입SF)만 있으면 낸다(기준값은 역산가에). 청산은 전부터 비교 없음(2026-09-07).
     s = _set()
     set_running(s, Block.ENTRY, True)
-    acts = evaluate(s, Block.ENTRY, _sig(sf_spread_entry=-0.05), SETTINGS, U)  # SF 크게 미달
-    assert [a.kind for a in acts] == ["place_pre"]  # 그래도 발주 — SF 기준값은 역산가에만
+    acts = evaluate(s, Block.ENTRY, _sig(sf_spread_entry=-0.05, s_spread_entry=0.001),
+                    SETTINGS, U)  # SF·S 둘 다 크게 미달
+    assert [a.kind for a in acts] == ["place_pre"]  # 그래도 발주 — 기준값은 역산가에만
+    s3 = _set()
+    s3.en_s = None  # 주식선물 진입S 칸은 표시용 — 비어 있어도 낸다
+    set_running(s3, Block.ENTRY, True)
+    assert evaluate(s3, Block.ENTRY, _sig(s_spread_entry=None), SETTINGS, U)[0].kind \
+        == "place_pre"
     s2 = _set(pre_tick=500)
     s2.rt = 10  # 청산할 RT가 있어야 G4 통과
     set_running(s2, Block.EXIT, True)
@@ -317,9 +325,7 @@ def test_reverse_entry_is_sf_sell_hl_buy_with_flipped_gates() -> None:
     assert s.entry.pre_side is Side.SELL and s.entry.post_side is Side.BUY
     assert s.exit.pre_side is Side.BUY and s.exit.post_side is Side.SELL
     set_running(s, Block.ENTRY, True)
-    # G5: 매도호가창 S괴리(s_spread_exit)를 본다 — 기준(0.5%) 이상이면 미달
-    acts = evaluate(s, Block.ENTRY, _sig(s_spread_exit=0.02, hl_disp_ask=-0.02), SETTINGS, U)
-    assert acts == [] and "G5 미달" in s.entry.block_reason
+    # (역방향 G5 S괴리 필터도 결정 71로 삭제 — s_spread_exit 값은 판정에 안 쓰임)
     # 통과: 역산가 = 200,000×(1 − 2.0% − 0.5%) = 195,000 → 주문단위 500 올림 195,000; 한계(매도) =
     # (매수1호가 198,500 + 500) × 1.004 = 199,796 → 195,000 ≤ 한계. 다만 매수1호가(198,500) 안쪽이라
     # 범위 시작 199,000으로 되돌려 메이커로 건다(결정 58, 사용자 2026-09-30)
@@ -482,10 +488,6 @@ def test_block_reason_records_gate_and_basis() -> None:
     set_running(s, Block.ENTRY, True)
     evaluate(s, Block.ENTRY, _sig(now=datetime(2026, 9, 4, 16, 0)), SETTINGS, U)
     assert s.entry.block_reason.startswith("G2")
-    evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.001), SETTINGS, U)
-    # G5 미달 근거엔 실시간 괴리값을 안 넣는다(틱마다 바뀌어 로그 도배, 2026-09-10) — 기준값만
-    assert "G5 미달" in s.entry.block_reason and "0.500%" in s.entry.block_reason
-    assert "0.100%" not in s.entry.block_reason
     evaluate(s, Block.ENTRY, _sig(hl_disp_bid=-0.01), SETTINGS, U)
     assert "G6 범위 밖" in s.entry.block_reason and "범위 201,000~200,196" in s.entry.block_reason
     evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)
@@ -971,36 +973,30 @@ def test_stock_post_fill_records_sprd_base_without_sf_theory() -> None:
     assert sf.entry.acc.ref_qty == 0 and sf.entry.acc.sprd() is None
 
 
-def test_stock_auction_skips_s_spread_filter_both_directions() -> None:
-    # 결정 57(사용자 2026-09-30): 주식 동시호가 시간엔 현물 현재가가 예상체결가라 S괴리가 이상하다 →
-    # 주식선물 G5 S괴리 비교를 정·역방향 모두 건너뛴다(기준값은 있어야 함). 동시호가가 아니면
-    # 그대로.
+def test_stock_auction_no_longer_special_for_sf_entry() -> None:
+    # 결정 57(동시호가 때 S괴리 비교 생략)은 결정 71(S괴리 필터 자체 삭제)로 뜻이 없어짐 —
+    # 동시호가든 아니든, S괴리 값이 있든 없든 기준값(진입SF)만 있으면 낸다. 근거 문구의 '필터
+    # 생략' 표시도 없음. 역방향도 같다.
     s = _set()
     set_running(s, Block.ENTRY, True)
-    assert evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.001), SETTINGS, U) == []  # 평소: 미달
-    assert "G5 미달" in s.entry.block_reason
-    acts = evaluate(s, Block.ENTRY, _sig(mono=101, s_spread_entry=0.001, stock_auction=True),
+    acts = evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.001, stock_auction=True),
                     SETTINGS, U)
-    assert [a.kind for a in acts] == ["place_pre"]  # 동시호가: 통과
-    assert "동시호가: S괴리 필터 생략" in s.entry.block_reason
-    # S괴리 값이 아예 없어도(동시호가엔 est가 비정상) 기준값만 있으면 낸다
+    assert [a.kind for a in acts] == ["place_pre"]
+    assert "필터 생략" not in s.entry.block_reason and "G5" not in s.entry.block_reason
     s2 = _set()
     set_running(s2, Block.ENTRY, True)
-    assert evaluate(s2, Block.ENTRY, _sig(s_spread_entry=None, stock_auction=True),
-                    SETTINGS, U)[0].kind == "place_pre"
-    # 기준값이 없으면 동시호가여도 안 낸다
-    s3 = _set(en_s=None)
+    assert evaluate(s2, Block.ENTRY, _sig(s_spread_entry=None), SETTINGS, U)[0].kind \
+        == "place_pre"
+    # 진입SF 기준값이 없으면 안 낸다(역산가를 못 구함)
+    s3 = _set(en_sf=None)
     set_running(s3, Block.ENTRY, True)
-    assert evaluate(s3, Block.ENTRY, _sig(stock_auction=True), SETTINGS, U) == []
-    # 역방향도 같다
+    assert evaluate(s3, Block.ENTRY, _sig(), SETTINGS, U) == []
+    assert "G5 진입SF 기준값 없음" in s3.entry.block_reason
     r = AutoMSet(target_qty=100, per_qty=10, switch_delay_s=30, en_sf=0.005, en_s=0.005,
                  ex_sf=-0.001, reverse=True, pre_tick=500)
     set_running(r, Block.ENTRY, True)
-    assert evaluate(r, Block.ENTRY, _sig(s_spread_exit=0.02, hl_disp_ask=-0.02),
-                    SETTINGS, U) == []
-    acts = evaluate(r, Block.ENTRY, _sig(mono=101, s_spread_exit=0.02, hl_disp_ask=-0.02,
-                                         stock_auction=True), SETTINGS, U)
-    assert [a.kind for a in acts] == ["place_pre"] and acts[0].side is Side.SELL
+    acts = evaluate(r, Block.ENTRY, _sig(s_spread_exit=0.02, hl_disp_ask=-0.02), SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"]  # 옛 역방향 G5 미달값이어도 낸다
 
 
 def test_maker_start_keeps_order_inside_range_start() -> None:

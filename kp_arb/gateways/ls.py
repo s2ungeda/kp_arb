@@ -130,7 +130,8 @@ class LSApiGateway(LSGateway):
         # 단일종목 레버리지 ETF 코드(config.yaml에서 주입). 없으면 ETF 미취급.
         self._etf_symbols: dict[Underlying, str] = dict(etf_symbols or {})
         self._etf_underlying = {v: k for k, v in self._etf_symbols.items()}
-        self._orders: dict[str, OrderContext] = {}
+        # 키 (계좌, 주문번호) — 계좌마다 번호가 따로 매겨져 겹친다(결정 73, 운영 사고 2026-10-14)
+        self._orders: dict[tuple[Account, str], OrderContext] = {}
         # 선물 미체결 조회(t0434)가 실제로 성공한 적이 있는가 — 성공 전엔 재동기 유령 정리 대상에서
         # 제외(빈 결과를 "조회 성공"으로 봐 걸린 선주문을 지운 사고, 실측 2026-09-09 #20851).
         self._deriv_open_orders_ok = False
@@ -206,7 +207,7 @@ class LSApiGateway(LSGateway):
         except Exception as exc:  # 거부·오류도 거래소별 파일에 남긴다(발주거부)
             order_log.order_rejected(intent, exc)
             raise
-        self._orders[order_id] = OrderContext(order_id, intent, account, body)
+        self._orders[(account, order_id)] = OrderContext(order_id, intent, account, body)
         order_log.order_placed(intent, order_id, getattr(resp, "body", None))
         return order_id
 
@@ -239,9 +240,10 @@ class LSApiGateway(LSGateway):
         *,
         qty: float | None = None,
         price: float | None = None,
+        account: Account | None = None,
     ) -> str:
         """원주문을 정정. 원주문 컨텍스트(계좌·종목)를 참조해 새 주문 id 반환."""
-        ctx = self._require(order_id)
+        ctx = self._require(order_id, account)
         if ctx.intent.instrument in self._SPOT:
             tr_cd, path = self.SPOT_AMEND_TR, self.SPOT_PATH
             body = self._amend_body(ctx, qty, price)
@@ -250,7 +252,7 @@ class LSApiGateway(LSGateway):
             body = self._future_amend_body(ctx, qty, price)
         resp = await self._rest_for(ctx.account).request(tr_cd, body, path=path)
         new_id = self._parse_order_id(resp, tr_cd)
-        self._orders[new_id] = OrderContext(
+        self._orders[(ctx.account, new_id)] = OrderContext(
             new_id, ctx.intent, ctx.account, body, replaces=order_id
         )
         order_log.order_amended(Venue.LS, order_id, new_id, qty, price)
@@ -263,8 +265,9 @@ class LSApiGateway(LSGateway):
             return True
         return account is Account.KR_DERIV and self._deriv_open_orders_ok
 
-    async def cancel_order(self, order_id: str, qty: float | None = None) -> None:
-        ctx = self._require(order_id)
+    async def cancel_order(self, order_id: str, qty: float | None = None,
+                           account: Account | None = None) -> None:
+        ctx = self._require(order_id, account)
         if ctx.intent.instrument in self._SPOT:
             tr_cd, path = self.SPOT_CANCEL_TR, self.SPOT_PATH
             body = self._cancel_body(ctx, qty)
@@ -352,9 +355,9 @@ class LSApiGateway(LSGateway):
         취소·정정 본문에 필요한 것은 계좌·종목(의도)·주문번호뿐이라 스냅샷 행으로 충분하다.
         이미 아는 주문(이 프로세스가 낸 것)은 원래 문맥을 유지한다.
         """
-        if order.order_id not in self._orders:
-            account = order.intent.account or account_for(order.intent.instrument)
-            self._orders[order.order_id] = OrderContext(
+        account = order.intent.account or account_for(order.intent.instrument)
+        if (account, order.order_id) not in self._orders:
+            self._orders[(account, order.order_id)] = OrderContext(
                 order.order_id, order.intent, account, request_body={})
         return order
 
@@ -823,8 +826,15 @@ class LSApiGateway(LSGateway):
 
     # --- 응답 파싱 ---
 
-    def _require(self, order_id: str) -> OrderContext:
-        ctx = self._orders.get(order_id)
+    def _require(self, order_id: str, account: Account | None = None) -> OrderContext:
+        """주문 문맥 — 계좌를 주면 그 계좌의 번호(결정 73). 없으면 번호가 한 계좌에만 있을 때만."""
+        if account is not None:
+            ctx = self._orders.get((account, order_id))
+        else:
+            found = [c for (_a, oid), c in self._orders.items() if oid == order_id]
+            if len(found) > 1:
+                raise ValueError(f"order_id {order_id} is in several accounts — account required")
+            ctx = found[0] if found else None
         if ctx is None:
             raise ValueError(f"unknown order_id {order_id}")
         return ctx

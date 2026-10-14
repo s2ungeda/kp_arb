@@ -126,6 +126,10 @@ STOCK_SPEC = ScreenSpec(
 _CREDIT_BG = "#d9f2d9"  # 신용 세트 행 바탕(옅은 초록, 사용자 2026-09-16) — 중지(검정)가 우선
 # 짝수 세트 행 바탕(하늘, 사용자 2026-09-16 — 주식선물 8세트는 줄이 많아 헷갈림) + 스냅샷 Sprd 칸
 _ALT_BG = "#e8f0f8"
+# 같은 실행 버튼이 이 시간 안에 다시 눌리면 무시(2026-10-14 운영 로그: 켬 뒤 32ms~0.8s에 끔이
+# 따라오는 쌍이 되풀이 — 두 번 눌림인지 두 번 불린 건지 가리기 위해 클릭 로그와 함께 넣음)
+# 10-14 11:03 시험: 0.8초는 일부러 끄는 둘째 클릭(0.78s)까지 삼켰다 → 더블클릭만 잡는 0.3초
+RUN_CLICK_GUARD_S = 0.3
 
 
 def run_caption(side: str, credit: bool) -> str:
@@ -415,6 +419,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     T.apply_base(root)
     root.option_add("*Font", T.FONT_BASE_LG)  # 큰 화면 — 자동T와 같은 11pt
     vcmd_int = (root.register(is_int_text), "%P")
+    # 세트 행 목표수량·1회주문 — 주식은 천 단위 쉼표 허용(세트설정 창과 같음)
+    vcmd_qty_row = (root.register(is_qty_text), "%P") if spec.qty_commas else vcmd_int
     vcmd_sint = (root.register(is_signed_int_text), "%P")  # 역방향 RT 수동 입력('-' 허용)
     vcmd_dec = (root.register(is_decimal_text), "%P")
     vcmd_time = (root.register(is_time_text), "%P")
@@ -439,7 +445,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         threading.Thread(target=poller, daemon=True).start()
 
     def send(payload: dict[str, Any], label: str) -> None:
-        jobs.put(({**payload, "screen": spec.screen_tag, "product": spec.product}, label))
+        # sent_at: 코어가 받은 시각과의 차이를 로그에 남겨 지연 위치(화면·전송·코어)를 잰다
+        # (2026-10-14)
+        jobs.put(({**payload, "screen": spec.screen_tag, "product": spec.product,
+                   "sent_at": time.time()}, label))
 
     # 화면 상태(로컬) — v1은 표시·입력만. 공통설정(체결쏴 설정) 기본값은 목업 기준.
     common: dict[str, Any] = {
@@ -460,7 +469,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             # 신용(주식): 아래쪽 credit_default_rows개 세트는 기본 체크(사용자 2026-09-16)
             credit_default = (spec.credit_boxes
                               and i >= rows_by[d] - spec.credit_default_rows)
-            sets[(d, i)] = {"target": 0, "per": 0, "delay": 0, "offset": 0, "tick": 0,
+            sets[(d, i)] = {"_dtag": d, "_index": i,  # 로그 꼬리표
+                            "target": 0, "per": 0, "delay": 0, "offset": 0, "tick": 0,
                             "en_sf": None,
                             "en_s": None, "ex_sf": None, "rt_manual": None,
                             "clear_diff": False, "credit": credit_default}
@@ -739,11 +749,17 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         for i in range(rows_by[dtag]):  # 세트 줄(기본 3)
             r = rbase + i + 2
             w = sets[(dtag, i)]
-            lbl_tg = tk.Label(grid, text="-", width=6, anchor="e", bg="#fffbcc",  # 목표수량(노랑)
-                              relief="solid", bd=1, font=T.FONT_BASE_LG)  # 목표수량
+            # 목표수량·1회주문·초는 행에서 바로 입력(사용자 2026-10-14, exec 결정 72 — 전엔 라벨이라
+            # 설정 창으로만). 실행 중(진입이든 청산이든)엔 잠근다. 색은 전과 같게(노랑·회색)
+            lbl_tg = tk.Entry(grid, width=6, justify="right", bg="#fffbcc",
+                              disabledbackground="#fffbcc", disabledforeground="black",
+                              validate="key", validatecommand=vcmd_qty_row,
+                              font=T.FONT_BASE_LG)  # 목표수량(노랑)
             lbl_tg.grid(row=r, column=col["tg"], padx=1, pady=1, sticky="nsew")
-            lbl_per = tk.Label(grid, text="-", width=5, anchor="e", bg="#f0f0f0",
-                               relief="solid", bd=1, font=T.FONT_BASE_LG)  # 1회주문
+            lbl_per = tk.Entry(grid, width=5, justify="right", bg="#f0f0f0",
+                               disabledbackground="#f0f0f0", disabledforeground="black",
+                               validate="key", validatecommand=vcmd_qty_row,
+                               font=T.FONT_BASE_LG)  # 1회주문
             lbl_per.grid(row=r, column=col["per"], padx=1, pady=1, sticky="nsew")
             e_en_sf = tk.Entry(grid, width=5, justify="right", validate="key",
                                validatecommand=vcmd_dec, font=T.FONT_NUM_LG)  # 진입 SF
@@ -771,8 +787,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             lbl_diff = tk.Label(grid, text="-", width=6, anchor="e", bg="white",
                                 relief="solid", bd=1, font=T.FONT_BASE_LG)  # 체결차
             lbl_diff.grid(row=r, column=col["diff"], padx=1, pady=1, sticky="nsew")
-            lbl_sec = tk.Label(grid, text="-", width=3, anchor="e", bg="#f0f0f0",
-                               relief="solid", bd=1, font=T.FONT_BASE_LG)  # 전환딜레이 초
+            lbl_sec = tk.Entry(grid, width=3, justify="right", bg="#f0f0f0",
+                               disabledbackground="#f0f0f0", disabledforeground="black",
+                               validate="key", validatecommand=vcmd_int,
+                               font=T.FONT_BASE_LG)  # 전환딜레이 초
             lbl_sec.grid(row=r, column=col["sec"], padx=1, pady=1, sticky="nsew")
             w.update({"tg": lbl_tg, "per_lbl": lbl_per, "e_en_sf": e_en_sf,
                       "e_en_s": e_en_s, "e_ex_sf": e_ex_sf, "btn_en": btn_en,
@@ -849,6 +867,16 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         w = sets[(dtag, i)]
         key = f"run_{side}"
         turning_on = not w[key]
+        now = time.time()
+        since = now - w.get(f"_click_{side}", 0.0)
+        screen_log().info("%s 버튼 %s %d세트 %s: 표시 %s → %s (앞 클릭 뒤 %.2fs)", spec.log_tag,
+                          dtag, i + 1, "진입" if side == "en" else "청산",
+                          "켬" if w[key] else "끔", "켬" if turning_on else "끔", since)
+        if since < RUN_CLICK_GUARD_S:
+            screen_log().warning("%s 버튼 %s %d세트 %s: %.2fs 안 재클릭 — 무시", spec.log_tag,
+                                 dtag, i + 1, side, since)
+            return
+        w[f"_click_{side}"] = now
         release = False
         if turning_on:
             # 중지(HALTED)는 사람이 직접 풀어야 재개(exec §2) — 확인 뒤 해제 + 실행(2026-09-07)
@@ -872,16 +900,21 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                                   "해제해도 체결차 장부는 그대로입니다. 헤지를 정리했으면\n"
                                   "세트설정의 '체결차 Clear'로 0을 만든 뒤 해제하세요.\n"
                                   "'예' — 세트 중지를 풀고(진입·청산 모두) 실행합니다."):
+                    screen_log().info("%s 버튼 %s %d세트 %s: 실행 안 함 — 중지 해제 취소",
+                                      spec.log_tag, dtag, i + 1, side)
                     return
                 release = True
         if turning_on:  # 모니터 수치가 안 떠 있으면 실행 금지(사용자 2026-09-16) — '적' 먼저
             mon_texts = [str(lbl.cget("text")) for key, lbl in mon.items()
                          if key.startswith(f"{dtag}_")]
             if not monitor_ready(mon_texts):
+                screen_log().info("%s 버튼 %s %d세트 %s: 실행 안 함 — 모니터 수치 없음('적' 먼저)",
+                                  spec.log_tag, dtag, i + 1, side)
                 warn_center("모니터 수치가 없습니다 — '적'을 눌러 종목·호가단위·기준수량을\n"
                             "적용하고 수치가 뜬 뒤 실행하세요")
                 return
         if turning_on:  # 실행 시작 전 필수 입력 + 리스크방지 검증(인라인 현재값 확정)
+            _sync_qty_from_row(w)  # 목표·1회·초 행 입력값(결정 72)
             en_sf = parse_threshold(w["e_en_sf"].get())
             en_s = parse_threshold(w["e_en_s"].get())
             ex_sf = parse_threshold(w["e_ex_sf"].get())
@@ -893,7 +926,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                     errs.append("1회주문수량을 입력하세요")
                 if en_sf is None and spec.has_en_sf:
                     errs.append("진입SF를 입력하세요")
-                if en_s is None:
+                if en_s is None and not spec.has_en_sf:  # 주식만(주식선물 진입S는 표시용, 결정 71)
                     errs.append("진입S를 입력하세요")
             else:  # 청산 실행 — 1회주문·청산 필수
                 if w["per"] <= 0:
@@ -903,6 +936,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             # 리스크방지의 진입 기준값 — SF 화면은 진입SF, 주식 화면은 진입S(결정 대기, 화면 골격)
             errs += check_risk(dtag, en_sf if spec.has_en_sf else en_s, ex_sf, *_risk_of(dtag))
             if errs:  # 필수 미입력·위반 — 경고, 실행 시작 안 함(버튼 상태 유지)
+                screen_log().info("%s 버튼 %s %d세트 %s: 실행 안 함 — %s", spec.log_tag, dtag,
+                                  i + 1, side, " / ".join(errs))
                 warn_center("\n".join(errs))
                 return
             w["en_sf"], w["en_s"], w["ex_sf"] = en_sf, en_s, ex_sf
@@ -912,14 +947,14 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         w[f"_pend_{side}"] = time.time() + 2.0
         btn = w["btn_en" if side == "en" else "btn_ex"]
         if on:  # 진입중=빨강, 청산중=파랑, 흰 글씨 볼드
-            btn.config(bg=T.C_BUY if side == "en" else T.C_SELL, fg="white",
-                       font=T.FONT_NUM_LG)
+            _btn_paint(btn, T.C_BUY if side == "en" else T.C_SELL, "white", T.FONT_NUM_LG)
         else:
-            btn.config(bg=_idle_btn_bg(w), fg="black", font=T.FONT_BASE_LG)
+            _btn_paint(btn, _idle_btn_bg(w), "black", T.FONT_BASE_LG)
         # 실행 중엔 해당 기준값 칸 잠금(진입=SF·S 두 칸 / 청산=SF 한 칸) — DESIGN-auto-m
         st = "disabled" if on else "normal"
         for ent in (("e_en_sf", "e_en_s") if side == "en" else ("e_ex_sf",)):
             w[ent].config(state=st)
+        _lock_qty_row(w)
         # 코어 실행(정·역 공통, 역방향 2026-09-14) — 켤 때 세트 입력값을 먼저 보내고 실행 명령
         block = "entry" if side == "en" else "exit"
         if on:
@@ -930,6 +965,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         send({"cmd": "autom_run", "underlying": cur_under(), "set": i, "block": block,
               "value": on, "direction": dtag},
              "실행" if on else "정지")
+        w[f"_pend_logged_{side}"] = False
+        screen_log().info("%s 버튼 %s %d세트 %s: 화면 색 %s로 바꾸고 명령 보냄(세트설정 %s)",
+                          spec.log_tag, dtag, i + 1, "진입" if side == "en" else "청산",
+                          "빨강/파랑" if on else "쉼", "함께" if on else "없음")
 
     def clear_acc(dtag: str, group: str) -> None:
         accs = sets[(dtag, 0)].get("_acc", {}).get(group, {})
@@ -962,8 +1001,22 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         win.focus_set()
         win.wait_window()
 
+    def _sync_qty_from_row(w: dict[str, Any]) -> None:
+        """세트 행의 목표수량·1회주문·초 입력값 → 세트 상태(결정 72). 빈칸은 0."""
+        w["target"] = parse_qty(w["tg"].get())
+        w["per"] = parse_qty(w["per_lbl"].get())
+        w["delay"] = parse_qty(w["sec"].get())
+
+    def _lock_qty_row(w: dict[str, Any]) -> None:
+        """목표수량·1회주문·초 행 입력칸 — 진입·청산 어느 쪽이든 실행 중이면 잠금(결정 72)."""
+        st = "disabled" if (w["run_en"] or w["run_ex"]) else "normal"
+        for ent in ("tg", "per_lbl", "sec"):
+            w[ent].config(state=st)
+
     def open_set_dialog(dtag: str, i: int) -> None:
         w = sets[(dtag, i)]
+        if not (w["run_en"] or w["run_ex"]):  # 행에서 고친 값이 있으면 그걸 보여 준다
+            _sync_qty_from_row(w)
         win = tk.Toplevel(root)
         win.title(f"{'정방향' if dtag == 'fwd' else '역방향'} {i + 1}세트 설정")
         win.resizable(False, False)
@@ -1059,7 +1112,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 errs.append(f"신용 세트는 1회주문수량이 1주여야 합니다 (입력 {per})")
             if en_sf is None and spec.has_en_sf:
                 errs.append("진입SF를 입력하세요")
-            if en_s is None:
+            if en_s is None and not spec.has_en_sf:  # 주식만 — 주식선물 진입S는 표시용(결정 71)
                 errs.append("진입S를 입력하세요")
             if ex_sf is None:
                 errs.append("청산을 입력하세요")
@@ -1114,6 +1167,13 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         tk.Button(btns, text="취소", width=8, command=win.destroy).pack(side="left", padx=4)
         _center(win)
 
+    def _btn_paint(btn: tk.Button, bg: str, fg: str, font: Any) -> None:
+        """실행 버튼 색 — **마우스가 올라가 있는 동안 보이는 색(activebackground)도 같이** 바꾼다.
+        tk 버튼은 포인터가 위에 있으면 bg 대신 activebackground를 그려, 클릭 직후(포인터가 아직 버튼
+        위) bg만 빨강으로 바꾸면 안 바뀐 것처럼 보였다(사용자 2026-10-14: "눌렀는데 빨간색으로 안
+        변해 한 번 더 눌렀다" → 두 번째 클릭이 끔). 포인터가 떠나야 빨강이 보이던 것."""
+        btn.config(bg=bg, fg=fg, font=font, activebackground=bg, activeforeground=fg)
+
     def _idle_btn_bg(w: dict[str, Any]) -> str:
         """쉬는 실행 버튼의 바탕 — 신용 세트는 초록, 짝수 줄(주식선물)은 하늘, 아니면 기본
         버튼색(사용자 2026-09-16: 줄 띠가 버튼까지 이어지는 주식 쪽 모양이 낫다)."""
@@ -1132,7 +1192,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 bg = _CREDIT_BG
             else:
                 bg = _ALT_BG if alt else orig_bg  # 짝수 세트 하늘(주식선물)
-            lbl.config(bg=bg, fg="white" if halted else "black")
+            fg = "white" if halted else "black"
+            lbl.config(bg=bg, fg=fg)
+            if isinstance(lbl, tk.Entry):  # 입력칸(목표·1회·초)은 잠긴 상태의 색도 같이
+                lbl.config(disabledbackground=bg, disabledforeground=fg)
         # 띠가 끊기지 않게 입력칸·설정 버튼도 — 신용 행은 초록(사용자 2026-09-16: 버튼까지),
         # 짝수 행은 하늘, 중지 행은 원래 색(값 칸 검정이 이미 뜻을 가짐)
         band_bg = None if halted else (_CREDIT_BG if credit else (_ALT_BG if alt else None))
@@ -1142,7 +1205,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         for side in ("en", "ex"):
             btn = w.get(f"btn_{side}")
             if btn is not None and not halted and not w.get(f"run_{side}"):
-                btn.config(bg=_idle_btn_bg(w))
+                btn.config(bg=_idle_btn_bg(w), activebackground=_idle_btn_bg(w))
 
     def apply_set_display(dtag: str, i: int) -> None:
         w = sets[(dtag, i)]
@@ -1151,19 +1214,22 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         w["btn_en"].config(text=run_caption("en", bool(w.get("credit"))))
         w["btn_ex"].config(text=run_caption("ex", bool(w.get("credit"))))
         _paint_row_bg(w)
-        w["tg"].config(text=str(w["target"]) if w["target"] else "-")
-        w["per_lbl"].config(text=str(w["per"]) if w["per"] else "-")
-        w["sec"].config(text=str(w["delay"]) if w["delay"] is not None else "-")  # 0도 표시
-        # 실행 중이면 잠긴 칸도 잠시 열어 값 반영 후 다시 잠금(세트설정은 실행 중에도 가능).
-        for key, entkey, running in (("en_sf", "e_en_sf", w["run_en"]),
-                                     ("en_s", "e_en_s", w["run_en"]),
-                                     ("ex_sf", "e_ex_sf", w["run_ex"])):
+        # 목표수량·1회주문·초 입력칸(결정 72) — 실행 중이면 잠시 열어 값 반영 후 다시 잠금
+        qty_locked = bool(w["run_en"] or w["run_ex"])
+        qty_fmt = format_qty if spec.qty_commas else str
+        for entkey, text, locked in (
+                ("tg", qty_fmt(int(w["target"])) if w["target"] else "", qty_locked),
+                ("per_lbl", qty_fmt(int(w["per"])) if w["per"] else "", qty_locked),
+                ("sec", str(w["delay"]) if w["delay"] is not None else "", qty_locked),
+                ("e_en_sf", f"{w['en_sf']:g}" if w["en_sf"] is not None else "", w["run_en"]),
+                ("e_en_s", f"{w['en_s']:g}" if w["en_s"] is not None else "", w["run_en"]),
+                ("e_ex_sf", f"{w['ex_sf']:g}" if w["ex_sf"] is not None else "", w["run_ex"])):
             e = w[entkey]
             e.config(state="normal")
             e.delete(0, "end")
-            if w[key] is not None:
-                e.insert(0, f"{w[key]:g}")
-            if running:
+            if text:
+                e.insert(0, text)
+            if locked:
                 e.config(state="disabled")
 
     def open_common_dialog() -> None:
@@ -1316,11 +1382,11 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             w["target"], w["per"], w["delay"] = 10000, 100, 30  # 상태도 채워 설정창과 일관
             w["tick"] = 3000  # 세트별 선주문 주문단위 표본(세트설정 창)
             w["hl_unit"], w["hl_offset"] = 0.5, 0.0  # HL선 USD 표본(결정 55)
-            w["tg"].config(text="10,000")
-            w["per_lbl"].config(text="100")
+            w["tg"].insert(0, "10,000")  # 목표·1회·초는 입력칸(결정 72)
+            w["per_lbl"].insert(0, "100")
             w["rt"].config(text="9,999")
             w["diff"].config(text="-999")
-            w["sec"].config(text="30")
+            w["sec"].insert(0, "30")
             # 방향별 리스크방지에 맞는 샘플(정=양수 진입 / 역=음수 진입) — 탭 이동 거짓경고 방지
             en, ex = ("0.50", "-0.10") if dtag == "fwd" else ("-1.50", "0.90")
             w["e_en_sf"].insert(0, en)
@@ -1525,25 +1591,48 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         on = bool(leg.get("running"))
         status_code = str(leg.get("status") or "idle")
         key = f"run_{side}"
-        if w[key] != on and time.time() < w.get(f"_pend_{side}", 0.0):
+        now = time.time()
+        tag = (f"{w.get('_dtag', '?')} {int(w.get('_index', -1)) + 1}세트 "
+               f"{'진입' if side == 'en' else '청산'}")
+        clicked = w.get(f"_click_{side}", 0.0)
+        if w[key] != on and now < w.get(f"_pend_{side}", 0.0):
+            if not w.get(f"_pend_logged_{side}"):  # 보호 구간마다 한 줄
+                w[f"_pend_logged_{side}"] = True
+                screen_log().info("%s 스냅샷 보류 %s: 표시 %s ≠ 코어 %s(%s) — 클릭 뒤 %.2fs",
+                                  spec.log_tag, tag, "켬" if w[key] else "끔",
+                                  "켬" if on else "끔", status_code, now - clicked)
             return  # 방금 누른 버튼 — 코어가 반영할 때까지 화면 표시 유지(깜빡임 방지)
+        if w.get(f"_pend_{side}", 0.0) > 0.0 and w[key] == on:
+            # 클릭 뒤 처음으로 코어 값이 표시와 같아짐 — 반영 확인(이후 보호 해제)
+            screen_log().info("%s 코어 반영 확인 %s: %s(%s) — 클릭 뒤 %.0fms", spec.log_tag, tag,
+                              "켬" if on else "끔", status_code, (now - clicked) * 1000.0)
+            w[f"_pend_{side}"] = 0.0
+            w[f"_pend_logged_{side}"] = False
+        elif w[key] != on:
+            # 보호 밖에서 코어 값이 표시를 바꿈 — 누가 바꿨는지(보호 끝난 뒤 낡은 스냅샷? 다른 창?
+            # 코어 중지?) 가리기 위해 남긴다
+            screen_log().warning("%s 스냅샷이 표시 바꿈 %s: %s → %s(%s) — 마지막 클릭 뒤 %.2fs",
+                                 spec.log_tag, tag, "켬" if w[key] else "끔",
+                                 "켬" if on else "끔", status_code, now - clicked)
+            w[f"_pend_logged_{side}"] = False
         btn = w["btn_en" if side == "en" else "btn_ex"]
         # 캡션은 항상 '진입'/'청산'(사용자 2026-09-04) — 진행 상태는 색(실행중 빨강/파랑,
         # 중지 검정)과 상태줄 상세로만 보여준다.
         text = run_caption(side, bool(w.get("credit")))  # 주식 신용이면 신용/상환
+        btn.config(text=text)
         if status_code == "halted":
-            btn.config(text=text, bg="black", fg="white", font=T.FONT_NUM_LG)
+            _btn_paint(btn, "black", "white", T.FONT_NUM_LG)
         elif on:
-            btn.config(text=text, bg=T.C_BUY if side == "en" else T.C_SELL, fg="white",
-                       font=T.FONT_NUM_LG)
+            _btn_paint(btn, T.C_BUY if side == "en" else T.C_SELL, "white", T.FONT_NUM_LG)
         else:
-            btn.config(text=text, bg=_idle_btn_bg(w), fg="black", font=T.FONT_BASE_LG)
+            _btn_paint(btn, _idle_btn_bg(w), "black", T.FONT_BASE_LG)
         if w[key] == on:
             return
         w[key] = on
         st = "disabled" if on else "normal"
         for ent in (("e_en_sf", "e_en_s") if side == "en" else ("e_ex_sf",)):
             w[ent].config(state=st)
+        _lock_qty_row(w)
 
     def _leg_detail(i: int, side: str, leg: dict[str, Any], dtag: str = "fwd") -> str | None:
         """상태줄용 진행 상세 — 감시/대기 외 상태만 한 줄. 역방향은 '역' 표시."""
@@ -1649,6 +1738,9 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         if not changed:
             return
         state_box["_sets_sigs"] = sigs
+        if prev:  # 창 열 때 첫 서명은 제외 — 그 뒤 코어 세트값이 바뀐 것만 기록(시험 로그 10-14)
+            screen_log().info("%s 코어 세트값 변경 → 칸 다시 채움: %s", spec.log_tag,
+                              sorted((d, i + 1) for d, i in changed))
         # **바뀐 세트만** 다시 채운다(사용자 2026-09-17) — 전 세트를 채우면 다른 세트에서 고치고
         # 아직 안 보낸 인라인 괴리율이 옛 코어 값으로 되돌아간다(여러 세트를 빠르게 고친 뒤 한
         # 세트를 켰을 때 실증).

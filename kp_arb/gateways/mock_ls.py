@@ -48,7 +48,8 @@ class MockLSGateway(LSGateway):
         self.fx_placed.append((code, side, qty, price))
         return f"FX-{next(self._ids)}"
 
-    async def cancel_order(self, order_id: str, qty: float | None = None) -> None:
+    async def cancel_order(self, order_id: str, qty: float | None = None,
+                           account: Account | None = None) -> None:
         return None
 
     def open_orders_supported(self, account: Account) -> bool:

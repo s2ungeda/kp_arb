@@ -15,9 +15,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from . import order_log
-from .domain.enums import Account, Instrument, Side, Underlying
+from .domain.enums import Account, Instrument, Side, Underlying, Venue
 from .domain.models import OrderIntent, Position
 from .gateways.ls_ws import Fill, OrderEvent
+from .routing import account_for
 
 # 스냅샷 재조정 유예(초): 방금 낸 주문은 아직 거래소 미체결조회에 안 뜰 수 있어, 이 시간
 # 안에 tracked된 주문은 스냅샷에 없어도 지우지 않는다(그보다 오래된 phantom만 정리).
@@ -92,7 +93,10 @@ class _Pos:
 
 class OrderBook:
     def __init__(self) -> None:
-        self._orders: dict[str, TrackedOrder] = {}
+        # 주문 키 = (계좌, 주문번호). LS는 계좌마다 번호를 따로 매겨 주식·선물 번호가 겹친다(운영
+        # 사고 2026-10-14: 주식 HTS #4545의 체결 8주가 선물 선주문 #4545에 들어가 HL 80계약 초과
+        # 헤지 — 결정 73 "계좌·종목·주문번호로 찾는다"). HL은 계좌 None
+        self._orders: dict[tuple[Account | None, str], TrackedOrder] = {}
         self._positions: dict[_PositionKey, _Pos] = {}
         self._balances: dict[Account, float] = {}
         # 체결이 **실제 적용될 때**(즉시체결·대기체결 공용, 흡수된 재통보는 제외) 불리는
@@ -104,7 +108,9 @@ class OrderBook:
         # 미아 이벤트 버퍼(주문 역전 대비) — track 전에 온 WS 이벤트(체결·접수·취소·거부)를
         # 주문번호별로 보관했다가 track 직후 replay. LS·HL 공용. 외부 주문은 상한으로 버려짐.
         # (종류, 체결, 취소 확정 수량) — 도착 순서대로
-        self._pending: dict[str, list[tuple[str, Fill | None, float | None]]] = {}
+        # 키 (계좌, 주문번호) — 주식 통보가 같은 번호의 선물 주문에 재생되지 않게(결정 73)
+        self._pending: dict[tuple[Account | None, str],
+                            list[tuple[str, Fill | None, float | None]]] = {}
 
     # --- 최초/온디맨드 스냅샷 (REST 조회 결과 주입) ---
 
@@ -138,12 +144,13 @@ class OrderBook:
             self._positions[key] = _Pos(qty=p.signed_qty, avg_price=p.avg_price)
         # 미체결 재조정: 스냅샷(거래소 실측)에 있으면 갱신, 없으면 **오래된 것만** 제거 —
         # HL 취소/체결 통보 누락으로 남은 phantom 정리. 방금 낸 주문(유예 내)은 보존.
-        snapshot = {o.order_id: o for o in open_orders}
+        snapshot = {self._key_of(o.intent, o.order_id): o for o in open_orders}
         now = time.monotonic()
-        for oid in list(self._orders):
-            if oid in snapshot:
+        for okey in list(self._orders):
+            if okey in snapshot:
                 continue
-            order = self._orders[oid]
+            oid = okey[1]
+            order = self._orders[okey]
             if reconcile_accounts is not None and order.intent.account not in reconcile_accounts:
                 continue  # 조회 실패(또는 미조회) 계좌 — 살아있는 주문 보존
             if order.cancelled_qty > 0 and order.remaining_qty > 0:
@@ -154,11 +161,11 @@ class OrderBook:
                     oid, order.cancelled_qty, order.remaining_qty)
                 continue
             if now - order.placed_ts >= _SNAPSHOT_GRACE_S:
-                del self._orders[oid]
-        for oid, snap in snapshot.items():
-            cur = self._orders.get(oid)
+                del self._orders[okey]
+        for okey, snap in snapshot.items():
+            cur = self._orders.get(okey)
             if cur is None:
-                self._orders[oid] = snap
+                self._orders[okey] = snap
             else:
                 self._merge_snapshot_order(cur, snap)
         self._changed()
@@ -215,10 +222,42 @@ class OrderBook:
 
     # --- 주문 등록 (place_order 직후) ---
 
+    @staticmethod
+    def _acct_of(intent: OrderIntent) -> Account | None:
+        """주문의 계좌 — LS는 intent.account(없으면 상품으로 라우팅), HL은 None."""
+        if intent.venue is not Venue.LS:
+            return None
+        return intent.account or account_for(intent.instrument)
+
+    @classmethod
+    def _key_of(cls, intent: OrderIntent, order_id: str) -> tuple[Account | None, str]:
+        return (cls._acct_of(intent), order_id)
+
+    def _find(self, order_id: str, account: Account | None = None) -> TrackedOrder | None:
+        """주문 찾기(결정 73). 계좌를 주면 그 계좌의 번호만. 안 주면 HL(계좌 None) 먼저, 없으면
+        LS 계좌들 중 **그 번호가 하나뿐일 때만** 돌려준다 — 둘 이상이면 열린 것이 하나뿐일 때 그것,
+        아니면 None + 경고(계좌 없이 가릴 수 없는 번호)."""
+        if account is not None:
+            return self._orders.get((account, order_id))
+        hl = self._orders.get((None, order_id))
+        if hl is not None:
+            return hl
+        matches = [o for (a, oid), o in self._orders.items() if oid == order_id and a is not None]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            live = [o for o in matches if o.is_open]
+            if len(live) == 1:
+                return live[0]
+            logging.getLogger("kp_arb.order").warning(
+                "주문번호 #%s가 계좌 %s에 겹침 — 계좌 없이는 가릴 수 없음", order_id,
+                [str(self._acct_of(o.intent)) for o in matches])
+        return None
+
     def track(self, order_id: str, intent: OrderIntent) -> TrackedOrder:
         order = TrackedOrder(order_id=order_id, intent=intent, placed_ts=time.monotonic(),
                              placed_at=time.strftime("%H:%M:%S"), placed_epoch=time.time())
-        self._orders[order_id] = order
+        self._orders[self._key_of(intent, order_id)] = order
         self._changed()
         return order
 
@@ -228,10 +267,10 @@ class OrderBook:
 
     # --- 이벤트 (WS 체결통보 → 상태 전이 + 증분 갱신) ---
 
-    def on_ack(self, order_id: str) -> TrackedOrder | None:
-        order = self._orders.get(order_id)
+    def on_ack(self, order_id: str, account: Account | None = None) -> TrackedOrder | None:
+        order = self._find(order_id, account)
         if order is None:
-            self._buffer_event(order_id, "ack")  # 접수 통보가 track보다 먼저 — 보관
+            self._buffer_event(order_id, "ack", account=account)  # 접수 통보가 track보다 먼저
             return None
         if order.status is OrderStatus.NEW:
             order.status = OrderStatus.ACCEPTED
@@ -245,9 +284,9 @@ class OrderBook:
         체결을 재통보하는 만큼(provisional_filled)을 흡수해 이중 반영을 막는다 —
         부분 즉시체결(잔량이 남는 경우)도 안전.
         """
-        order = self._orders.get(fill.order_id)
+        order = self._find(fill.order_id, fill.account)
         if order is None:
-            self._buffer_event(fill.order_id, "fill", fill)  # 체결이 track보다 먼저 — 보관
+            self._buffer_event(fill.order_id, "fill", fill, account=fill.account)  # track 전
             return None
         if fill.fill_id and fill.fill_id in order.seen_fill_ids:
             # 같은 체결번호 두 번째 — 서버 재전송이든 코어 안 이중 처리든 반영하지 않는다.
@@ -304,7 +343,7 @@ class OrderBook:
 
         체결내역(deque) 기록·엔진 통지는 userFills가 전담하므로 여기선 호출하지 않는다.
         """
-        order = self._orders.get(fill.order_id)
+        order = self._find(fill.order_id, fill.account)
         if order is None:
             return None
         applied = min(fill.qty, order.remaining_qty)  # 주문수량 초과분은 무시
@@ -340,7 +379,8 @@ class OrderBook:
             return OrderStatus.CANCELLED if order.cancelled_qty > 0 else OrderStatus.FILLED
         return OrderStatus.PARTIAL if order.filled_qty > 0 else order.status
 
-    def on_cancel(self, order_id: str, qty: float | None = None) -> TrackedOrder | None:
+    def on_cancel(self, order_id: str, qty: float | None = None,
+                  account: Account | None = None) -> TrackedOrder | None:
         """취소 확정 통보(결정 69, 사용자 2026-10-13: "남은 수량이 있으면 기다리고 없으면 상태
         확정"). qty = 거래소가 확정한 취소 수량(H01 qty / SC3 canccnfqty / HL sz), None = 남은
         수량 전부(REST 응답으로 닫는 HL 취소 등).
@@ -348,9 +388,9 @@ class OrderBook:
         · 확정 < 남은 수량 → 차이는 체결됐는데 통보가 아직 안 온 것. 열어 둔 채 기다린다(시간
           제한 없음 — 옛 120초 타이머 폐기). 체결이 와서 셈이 맞으면 그때 닫힌다.
         · 확정 > 남은 수량 → 장부가 체결을 더 셌다는 뜻(이중 반영류). 닫고 에러 로그."""
-        order = self._orders.get(order_id)
+        order = self._find(order_id, account)
         if order is None:
-            self._buffer_event(order_id, "cancel", qty=qty)  # 취소 통보가 track보다 먼저 — 보관
+            self._buffer_event(order_id, "cancel", qty=qty, account=account)  # track 전 — 보관
             return None
         if not order.is_open:
             return order
@@ -371,10 +411,10 @@ class OrderBook:
         self._changed()
         return order
 
-    def on_reject(self, order_id: str) -> TrackedOrder | None:
-        order = self._orders.get(order_id)
+    def on_reject(self, order_id: str, account: Account | None = None) -> TrackedOrder | None:
+        order = self._find(order_id, account)
         if order is None:
-            self._buffer_event(order_id, "reject")  # 거부 통보가 track보다 먼저 — 보관
+            self._buffer_event(order_id, "reject", account=account)  # 거부 통보가 track보다 먼저
             return None
         if order.is_open:
             order.status = OrderStatus.REJECTED
@@ -384,13 +424,13 @@ class OrderBook:
     def on_order_event(self, event: OrderEvent) -> TrackedOrder | None:
         """WS 주문 이벤트(SC0/2/3/4) 디스패치. 결선: client.on_order_event.append(...)"""
         if event.kind == "ack":
-            return self.on_ack(event.order_id)
+            return self.on_ack(event.order_id, account=event.account)
         # 취소/거부 통보는 새 통보의 원주문(orgordno)이 대상. 없으면 자기 자신.
         target = event.org_order_id or event.order_id
         if event.kind == "cancel":
-            return self.on_cancel(target, qty=event.qty)
+            return self.on_cancel(target, qty=event.qty, account=event.account)
         if event.kind == "reject":
-            return self.on_reject(target)
+            return self.on_reject(target, account=event.account)
         return None  # amend(정정)는 새 주문 재등록이 필요 — 상위(게이트웨이 결선)에서 처리
 
     # --- 미아 이벤트 버퍼 (주문 역전 대비, LS·HL 공용) ---
@@ -398,42 +438,51 @@ class OrderBook:
     _PENDING_CAP = 512  # 상한 — 외부(내가 안 낸) 주문 이벤트가 무한정 쌓이지 않게
 
     def _buffer_event(self, order_id: str, kind: str, fill: Fill | None = None,
-                      qty: float | None = None) -> None:
+                      qty: float | None = None, account: Account | None = None) -> None:
         """track 안 된 주문번호로 온 WS 이벤트를 도착 순서대로 보관 — track 시 replay.
 
         체결이면 경고 한 줄(주문번호마다 1회) — 실증 2026-09-16: 응답 없는 발주(#3326)가 체결됐는데
         조용히 보관만 해서 헤지 없는 SF 매도를 아무도 몰랐다. 발주 응답 전 체결(정상 역전)도 같은
         경고가 뜨지만 곧 track되며 replay되니 로그에서 짝을 확인할 수 있다."""
-        buf = self._pending.get(order_id)
+        key = (account, order_id)
+        buf = self._pending.get(key)
         if buf is None:
             if len(self._pending) >= self._PENDING_CAP:  # 가장 오래된 미아부터 버림
                 del self._pending[next(iter(self._pending))]
-            buf = self._pending[order_id] = []
+            buf = self._pending[key] = []
         if kind == "fill" and fill is not None and not any(k == "fill" for k, _f, _q in buf):
             logging.getLogger("kp_arb.order").warning(
-                "미추적 주문 #%s 체결 통보 %g @ %g — 이 프로세스가 낸 주문이 아니거나 응답 없는 "
-                "발주(보관, 등록되면 반영 / 안 되면 포지션 직접 확인)",
-                order_id, fill.qty, fill.price)
+                "미추적 주문 #%s(계좌 %s) 체결 통보 %g @ %g — 이 프로세스가 낸 주문이 아니거나 "
+                "응답 없는 발주(보관, 등록되면 반영 / 안 되면 포지션 직접 확인)",
+                order_id, account.value if account is not None else "HL", fill.qty,
+                fill.price)
         buf.append((kind, fill, qty))
 
-    def replay_pending(self, order_id: str) -> None:
+    def replay_pending(self, order_id: str, account: Account | None = None) -> None:
         """그 주문번호로 track 직후 호출 — 보관된 이벤트를 도착 순서대로 반영(역전 복구).
 
         체결이 apply_place_fill보다 먼저 왔어도, replay를 apply_place_fill **뒤**에 두면
         provisional_filled가 겹친 체결을 흡수해 이중 반영을 막는다.
         """
-        events = self._pending.pop(order_id, None)
+        if account is None:  # 등록된 주문의 계좌로 — 같은 번호의 다른 계좌 통보는 건드리지 않는다
+            order = self._find(order_id)
+            account = self._acct_of(order.intent) if order is not None else None
+        events = list(self._pending.pop((account, order_id), []))
+        if account is not None:
+            # 계좌 없이 보관된 이벤트(계좌를 안 싣는 호출자 — 실제 LS 통보는 항상 계좌가 있다)도
+            # 이어 붙임
+            events += self._pending.pop((None, order_id), [])
         if not events:
             return
         for kind, fill, qty in events:
             if kind == "fill" and fill is not None:
                 self.on_fill(fill)
             elif kind == "ack":
-                self.on_ack(order_id)
+                self.on_ack(order_id, account=account)
             elif kind == "cancel":
-                self.on_cancel(order_id, qty=qty)
+                self.on_cancel(order_id, qty=qty, account=account)
             elif kind == "reject":
-                self.on_reject(order_id)
+                self.on_reject(order_id, account=account)
 
     # --- 증분 계산 (순수) ---
 
@@ -471,8 +520,9 @@ class OrderBook:
 
     # --- 실시간 조회 ---
 
-    def order(self, order_id: str) -> TrackedOrder | None:
-        return self._orders.get(order_id)
+    def order(self, order_id: str, account: Account | None = None) -> TrackedOrder | None:
+        """주문 조회 — 계좌를 주면 그 계좌의 번호(결정 73). 없으면 HL → 유일한 LS 번호 순."""
+        return self._find(order_id, account)
 
     def open_orders(self) -> list[TrackedOrder]:
         return [o for o in self._orders.values() if o.is_open]

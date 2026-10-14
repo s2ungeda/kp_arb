@@ -82,9 +82,12 @@ class LSGateway(ABC):
     async def place_order(self, intent: OrderIntent) -> str: ...
 
     @abstractmethod
-    async def cancel_order(self, order_id: str, qty: float | None = None) -> None:
+    async def cancel_order(self, order_id: str, qty: float | None = None,
+                           account: Account | None = None) -> None:
         """취소. qty = 남은 수량(호출자가 장부 기준으로 넘김) — LS는 취소수량이 취소가능수량을
-        넘으면 거부(01443, 실측 2026-09-09: 원주문 수량으로 보내 부분체결 뒤 거부)."""
+        넘으면 거부(01443, 실측 2026-09-09: 원주문 수량으로 보내 부분체결 뒤 거부).
+        account = 주문의 계좌(결정 73 — 계좌마다 번호가 겹치므로 둘로 특정; None이면 번호가 한
+        계좌에만 있을 때만)."""
 
     def open_orders_supported(self, account: Account) -> bool:
         """이 계좌의 미체결 조회(get_open_orders)가 실제 조회인가. False면 재동기 때 그 계좌의

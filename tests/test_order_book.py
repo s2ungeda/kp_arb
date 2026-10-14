@@ -302,6 +302,65 @@ def test_cancel_before_track_replays_confirmed_qty() -> None:
     assert o.is_open and o.cancelled_qty == 1 and o.remaining_qty == 2
 
 
+def test_same_order_number_in_two_ls_accounts_is_kept_apart() -> None:
+    # 결정 73(사용자 2026-10-14, 운영 사고 같은 날): LS 주문번호는 계좌마다 따로 매겨져 주식 #4545와
+    # 선물 #4545가 공존한다. 장부 키는 (계좌, 번호) — 주식 통보(계좌 KR_STOCK)가 선물 주문에
+    # 들어가지
+    # 않고, 같은 번호 둘 다 추적된다. 계좌 없이 조회하면 번호가 한 계좌뿐일 때만 찾는다.
+    ob = OrderBook()
+    stock = ob.track("4545", OrderIntent(
+        venue=Venue.LS, underlying=Underlying.SK_HYNIX, instrument=Instrument.KR_STOCK,
+        side=Side.BUY, qty=100, order_type=OrderType.LIMIT, price=1_464_000.0,
+        account=Account.KR_STOCK))
+    fut = ob.track("4545", OrderIntent(
+        venue=Venue.LS, underlying=Underlying.SK_HYNIX, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.BUY, qty=1, order_type=OrderType.LIMIT, price=1_475_000.0,
+        account=Account.KR_DERIV))
+    assert ob.order("4545", Account.KR_STOCK) is stock
+    assert ob.order("4545", Account.KR_DERIV) is fut
+    assert ob.order("4545") is None                                 # 둘 다 열림 — 계좌 없인 못 가림
+    ob.on_fill(Fill(fill_id="s1", order_id="4545", qty=8, price=1_464_000.0, ts=0,
+                    account=Account.KR_STOCK))                      # 주식 8주 체결(10-14 실제 통보)
+    assert stock.filled_qty == 8 and fut.filled_qty == 0            # 선물 주문은 그대로
+    ob.on_cancel("4545", qty=92, account=Account.KR_STOCK)          # 주식 남은 92 취소
+    assert stock.status is OrderStatus.CANCELLED and fut.is_open
+    assert ob.order("4545") is fut                                  # 열린 것이 하나면 그것
+    assert ob.position_qty(Underlying.SK_HYNIX, Instrument.KR_STOCK_FUTURE,
+                           Account.KR_DERIV) == 0
+    assert ob.position_qty(Underlying.SK_HYNIX, Instrument.KR_STOCK, Account.KR_STOCK) == 8
+
+
+def test_pending_events_are_kept_per_account() -> None:
+    # 운영 사고 2026-10-14 재현: 08:23 주식 HTS #4508 취소 100주·#4545 체결 8주가 미추적으로
+    # 보관됐다가
+    # 09:06 선물 자동M이 같은 번호로 선주문을 내자 그 주문에 재생됐다(취소 100 > 남은 1, 체결 8 →
+    # HL 80
+    # 초과 헤지). 이제 보관도 (계좌, 번호)라 선물 주문 등록 때 주식 통보는 재생되지 않는다.
+    ob = OrderBook()
+    ob.on_fill(Fill(fill_id="s1", order_id="4545", qty=8, price=1_464_000.0, ts=0,
+                    account=Account.KR_STOCK))
+    ob.on_cancel("4508", qty=100, account=Account.KR_STOCK)
+    fut = ob.track("4545", OrderIntent(
+        venue=Venue.LS, underlying=Underlying.SK_HYNIX, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.BUY, qty=1, order_type=OrderType.LIMIT, price=1_475_000.0,
+        account=Account.KR_DERIV))
+    ob.replay_pending("4545")
+    assert fut.filled_qty == 0 and fut.is_open
+    fut2 = ob.track("4508", OrderIntent(
+        venue=Venue.LS, underlying=Underlying.SK_HYNIX, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.BUY, qty=1, order_type=OrderType.LIMIT, price=1_474_000.0,
+        account=Account.KR_DERIV))
+    ob.replay_pending("4508")
+    assert fut2.is_open and fut2.cancelled_qty == 0
+    # 뒤늦게 주식 쪽 주문이 등록되면 보관분은 그 주문에 들어간다
+    stock = ob.track("4545", OrderIntent(
+        venue=Venue.LS, underlying=Underlying.SK_HYNIX, instrument=Instrument.KR_STOCK,
+        side=Side.BUY, qty=100, order_type=OrderType.LIMIT, price=1_464_000.0,
+        account=Account.KR_STOCK))
+    ob.replay_pending("4545", Account.KR_STOCK)
+    assert stock.filled_qty == 8 and fut.filled_qty == 0
+
+
 def _hl_intent(side: Side, qty: float) -> OrderIntent:
     return OrderIntent(venue=Venue.HYPERLIQUID, underlying=SAMSUNG,
                        instrument=Instrument.HL_PERP, side=side, qty=qty,

@@ -28,7 +28,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel
 
-from ..domain.enums import Instrument, Underlying, Venue
+from ..domain.enums import Account, Instrument, Underlying, Venue
 from ..domain.models import Quote
 from ..order_log import ws_order_raw
 from ..ws_status import WsStatus
@@ -159,6 +159,10 @@ class Fill(BaseModel):
     price: float
     fee: float = 0.0
     ts: float
+    # 통보의 계좌(LS: accno → Account, 모르면 TR 종류로 주식/선물 계좌) · 종목코드(대조용).
+    # LS 주문번호는 계좌마다 따로 매겨져 주식·선물 번호가 겹친다(운영 사고 2026-10-14, 결정 73)
+    account: Account | None = None
+    symbol: str = ""
 
 
 class MarketStatus(BaseModel):
@@ -178,6 +182,8 @@ class OrderEvent(BaseModel):
     kind: str            # "ack" | "amend" | "cancel" | "reject" | "cancel_ack" | "cancel_reject"
     order_id: str        # ordno
     org_order_id: str | None = None  # 정정/취소 통보의 원주문(orgordno)
+    account: Account | None = None   # 통보의 계좌(결정 73) — 장부 키 (계좌, 주문번호)
+    symbol: str = ""                 # 종목코드(대조용)
     # 취소 **확정 수량**(exec 결정 69) — 선물 H01 `qty`(실정정취소수량) / 주식 SC3 `canccnfqty`
     # (취소확인수량). 장부는 이 수량과 남은 수량을 대조해 주문을 닫는다(적으면 차이만큼 체결 대기)
     qty: float | None = None
@@ -243,9 +249,13 @@ class LSWebSocketClient:
         reconnect_backoff_s: float = 0.0,
         status: WsStatus | None = None,
         clock: Callable[[], float] | None = None,
+        account_numbers: dict[str, Account] | None = None,
     ) -> None:
         self._connector = connector
         self._token = token
+        # 계좌번호 → Account(결정 73). 통보의 accno를 풀어 체결·주문 이벤트에 싣는다. 없거나 모르는
+        # 번호면 TR 종류로(SC* = 주식 계좌, O01/C01/H01 = 선물옵션 계좌)
+        self._account_numbers: dict[str, Account] = dict(account_numbers or {})
         # WS 세션 현황(Phase 8-3) — 연결/끊김·수신카운트. 미주입 시 자체 생성.
         self.status = status or WsStatus(
             venue="LS", name="LS", kind="시세/주문", expects_stream=True)
@@ -267,10 +277,10 @@ class LSWebSocketClient:
         self._conn: WSConnection | None = None
         # 선물 취소·정정 주문번호 → 원주문번호(O01 FO02/FO03의 orgordno). 뒤에 오는 확정 통보
         # H01에는 원주문 칸(ordordno)이 비어 있어(xing 실측 2026-09-28) 여기서 찾는다
-        self._org_by_cancel: dict[str, str] = {}
+        self._org_by_cancel: dict[tuple[Account | None, str], str] = {}  # (계좌, 취소번호)
         # 원주문을 못 찾은 H01(취소 확정이 취소 접수보다 먼저 온 경우 — 운영 2026-10-12 30건) 보관.
         # 뒤에 O01/FO03이 와서 대응이 생기면 그때 취소 확정으로 흘린다. 키 = 취소주문번호
-        self._pending_h01: dict[str, dict[str, Any]] = {}
+        self._pending_h01: dict[tuple[Account | None, str], dict[str, Any]] = {}
         self.on_quote: list[Callable[[Quote], None]] = []
         self.on_trade: list[Callable[[TradeTick], None]] = []          # 체결(현재가)
         self.on_expected: list[Callable[[ExpectedPrice], None]] = []   # 예상체결가
@@ -525,7 +535,7 @@ class LSWebSocketClient:
                 # (순서가 거꾸로 와도 같은 결과가 나오게 — 운영 2026-10-12: 버려서 세트가 갇힘)
                 if len(self._pending_h01) >= self._PENDING_H01_CAP:
                     del self._pending_h01[next(iter(self._pending_h01))]
-                self._pending_h01[event.order_id] = msg
+                self._pending_h01[(event.account, event.order_id)] = msg
                 _LOG.warning(
                     "LS 취소 확정 H01 #%s — 원주문을 아직 모름(접수 통보 전), 보관",
                             event.order_id)
@@ -534,7 +544,7 @@ class LSWebSocketClient:
                 event_handler(event)
             held = None
             if event.kind == "cancel_ack":
-                held = self._pending_h01.pop(event.order_id, None)
+                held = self._pending_h01.pop((event.account, event.order_id), None)
             if held is not None:  # 보관해 둔 H01을 이제 원주문과 함께 흘린다
                 late = self._parse_order_event("H01", held)
                 _LOG.warning(
@@ -733,8 +743,26 @@ class LSWebSocketClient:
         except ValueError:
             return None
 
+    def _account_of(self, tr_cd: str, body: dict[str, Any]) -> Account:
+        """통보의 계좌(결정 73) — accno가 등록된 번호면 그 계좌, 아니면 TR 종류로(주식 SC* /
+        선물옵션 O01·C01·H01 — 원달러선물 계좌(KR_FX)는 accno로만 가릴 수 있다)."""
+        accno = str(body.get("accno", "")).strip()
+        acct = self._account_numbers.get(accno)
+        if acct is not None:
+            return acct
+        return Account.KR_STOCK if tr_cd.startswith("SC") else Account.KR_DERIV
+
+    @staticmethod
+    def _symbol_of(body: dict[str, Any]) -> str:
+        for key in ("expcode", "Isuno", "isuno", "shtnIsuno", "shcode"):
+            v = str(body.get(key, "")).strip()
+            if v:
+                return v
+        return ""
+
     def _parse_fill(self, tr_cd: str, msg: dict[str, Any]) -> Fill:
         body = msg["body"]
+        account, symbol = self._account_of(tr_cd, body), self._symbol_of(body)
         if tr_cd == "C01":
             # 선물 체결 실측: chevol/chetime, cheprice는 원화의 1/100(실측: 3000.00=300,000원).
             return Fill(
@@ -744,6 +772,7 @@ class LSWebSocketClient:
                 price=float(body["cheprice"]) * 100.0,
                 fee=0.0,
                 ts=float(body["chetime"]),
+                account=account, symbol=symbol,
             )
         # 주식 SC1 실측 필드: ordno/execno/execqty/execprc/exectime(HHMMSSmmm).
         return Fill(
@@ -753,6 +782,7 @@ class LSWebSocketClient:
             price=float(body["execprc"]),
             fee=0.0,  # 수수료 필드(cmsnamtexecamt)는 모의에서 공백 — 라이브 확정 시 반영
             ts=float(body["exectime"]),
+            account=account, symbol=symbol,
         )
 
     def _parse_order_event(self, tr_cd: str, msg: dict[str, Any]) -> OrderEvent:
@@ -761,6 +791,7 @@ class LSWebSocketClient:
         org = _norm_ordno(body.get("orgordno") or body.get("ordordno") or "")
         ordno = _norm_ordno(body.get("ordno", ""))
         kind = ORDER_EVENT_TRS[tr_cd]
+        account = self._account_of(tr_cd, body)
         if tr_cd == "O01":
             # 선물 접수 통보의 trcode1 = 주문 종류(FO01 신규·FO02 정정·FO03 취소). 취소·정정 접수는
             # 아직 확정이 아니다(취소보다 체결이 먼저면 뒤에 거부가 온다 — 실측 2026-09-30 #3908).
@@ -768,13 +799,13 @@ class LSWebSocketClient:
             # 기억해 둔다.
             kind = _O01_KIND_BY_TRCODE.get(str(body.get("trcode1", "")).strip(), kind)
             if kind in ("cancel_ack", "amend") and org not in ("", "0") and ordno:
-                self._remember_cancel(ordno, org)
+                self._remember_cancel((account, ordno), org)
         elif tr_cd == "H01":
             # 정정·취소 확정 통보 — rejcode 0000·수량>0이면 확정, 아니면 거부(원주문은 그대로 —
             # 이미 체결·취소됐다는 뜻. 체결 통보 C01이 정리한다). 원주문은 ordordno, 비어 있으면
             # 취소 접수 때 기억한 것.
             if org in ("", "0"):
-                org = self._org_by_cancel.get(ordno, "")
+                org = self._org_by_cancel.get((account, ordno), "")
             rej = str(body.get("rejcode", "")).strip()
             qty_raw = str(body.get("qty", "")).strip()
             qty_zero = qty_raw != "" and _to_float(qty_raw) == 0.0
@@ -793,16 +824,17 @@ class LSWebSocketClient:
             order_id=ordno,
             org_order_id=org if org not in ("", "0") else None,
             qty=qty,
+            account=account, symbol=self._symbol_of(body),
             body=body,
         )
 
     _CANCEL_MAP_CAP = 4000  # 하루 취소 수천 건(운영 09-29 7,000건) — 오래된 것부터 버림
     _PENDING_H01_CAP = 200  # 접수 통보가 끝내 안 오는 H01(다른 프로그램의 취소 등)은 오래된 것부터
 
-    def _remember_cancel(self, cancel_no: str, org_no: str) -> None:
+    def _remember_cancel(self, cancel_key: tuple[Account | None, str], org_no: str) -> None:
         if len(self._org_by_cancel) >= self._CANCEL_MAP_CAP:
             del self._org_by_cancel[next(iter(self._org_by_cancel))]
-        self._org_by_cancel[cancel_no] = org_no
+        self._org_by_cancel[cancel_key] = org_no
 
     def _parse_status(self, msg: dict[str, Any]) -> MarketStatus:
         return MarketStatus(tr_key=msg.get("header", {}).get("tr_key", ""), body=msg["body"])

@@ -54,6 +54,7 @@ from .gateways.ls_ws import (
 from .limits import DailyFilled, DailyLimitExceeded, would_exceed_daily_limit
 from .order_book import OrderBook, TrackedOrder
 from .risk import RiskManager, RiskState
+from .routing import account_for
 from .session import reference_instrument
 from .session_service import FUTURES_MARKET, STOCK_MARKET, SessionService
 from .strategy.base import Strategy
@@ -136,6 +137,10 @@ def select_months(
 
 # 환율 계산 시작 시각 — 이 전에는 판정용·정산용 환율을 만들지 않는다(exec 결정 47, 2026-09-28).
 FX_CALC_START = time(7, 30)
+# 하나은행 고시환율(네이버 경유)을 현물환으로 쓰는 시각 경계(사용자 2026-10-14, exec 결정 70):
+# 이 전엔 언제나 하나고시, 이 뒤엔 LS CUR를 받은 뒤부터 LS. 받기 전엔 하나고시
+FX_HANA_UNTIL = time(9, 0)
+FX_HANA_POLL_S = 10.0  # 하나고시가 현물환 출처인 동안의 조회 간격(사용자 2026-10-14: 10초)
 
 
 def roll_daily_logs(state: dict[str, str], today: str, *logs: deque[dict[str, Any]]) -> bool:
@@ -293,11 +298,18 @@ class LiveSystem:
         # 환율이론가(원달러선물 현물환산, DESIGN §6.1) — WS(FC9/DC0) 실시간 + 예비 조회 갱신.
         self.usdkrw_theory: float | None = None
         self.usdkrw_futures: float | None = None  # 원달러선물 현재가 원값(표시용)
-        # 외환현물(LS CUR — 엑셀 시세!N6/O6, 2026-08-21). 최종 체결가를 유효기간 없이 현재가로
-        # 쓴다(exec 결정 47). 출처는 LS뿐(하나고시 백업 폐지 2026-09-28) — 상태줄 표시용.
+        # 외환현물 — 지금 쓰는 값(usdkrw_spot)과 출처(usdkrw_spot_src "LS"|"하나고시"). LS CUR 최종
+        # 체결가는 유효기간 없이 현재가(exec 결정 47). 하나고시(네이버 경유 하나은행 고시 매매
+        # 기준율)는 09:00 전·시동 직후·LS CUR를 받기 전에 쓴다(사용자 2026-10-14, 결정 70 —
+        # 09-28 폐지했다가 복원).
+        # 두 원천은 따로 들고(_spot_ls·_spot_hana) _resolve_spot이 시각·수신 여부로 고른다
         self.usdkrw_spot: float | None = None
         self._fx_spot_ts = 0.0  # 마지막 LS 현물환율(CUR) 수신 시각(로그·진단용)
         self.usdkrw_spot_src: str | None = None
+        self._spot_ls: float | None = None    # LS CUR 최종 체결가(시동 뒤 받은 것)
+        self._spot_hana: float | None = None  # 하나고시 마지막 조회값
+        # LS가 한 번 출처가 되면 그 뒤론 하나고시를 안 쓰고 조회도 안 한다
+        self._spot_ls_took_over = False
         # 외환선물 우선시간 — 1~2구간(공통설정이 시동 때 덮어씀). 어느 구간이든 안이면 "안".
         # 원소 = (시작 time, 끝 time)
         self._fx_fut_windows: list[tuple[Any, Any]] = [
@@ -467,6 +479,28 @@ class LiveSystem:
             "source": it.source,                            # 출처(주문 리스트 '출처' 칸·필터)
             "tag": it.tag,                                  # 세트 꼬리표(자동M, 2026-09-16)
         })
+
+    def _fill_symbol_ok(self, fill: Fill) -> bool:
+        """LS 체결 통보의 종목코드가 장부 주문의 종목과 맞는가(결정 73: 계좌·번호로 찾고 종목은
+        대조). 코드가 없거나 장부에 그 주문이 없거나 변환기가 모르는 코드면 통과(장부가 알아서)."""
+        if not fill.symbol or fill.account is None:
+            return True
+        order = self.order_book.order(fill.order_id, fill.account)
+        if order is None:
+            return True
+        intent = order.intent
+        if intent.instrument.is_stock_future:
+            u = self._resolve_fut_code(fill.symbol)
+        else:
+            resolve = getattr(self._gw, "_resolve_spot", None)
+            pair = resolve(fill.symbol) if resolve is not None else None
+            u = pair[1] if pair is not None else None
+        if u is None or u == intent.underlying:
+            return True
+        order_log.logger_for(Venue.LS).error(
+            "체결 통보 #%s(계좌 %s) 종목 %s는 장부 주문 종목(%s)과 다름 — 반영 안 함, 포지션 확인",
+            fill.order_id, fill.account.value, fill.symbol, intent.underlying.value)
+        return False
 
     def _record_cancel(self, order: TrackedOrder) -> None:
         """취소내역 보관(주문 리스트 '취소' 행) — 원주문 정보 기준(주문번호·주문가·주문수량·
@@ -941,6 +975,8 @@ class LiveSystem:
                     intent, str(exc),
                     kind="응답없음" if isinstance(exc, RestTimeoutError) else "발주")
                 raise
+            if intent.account is None:  # 장부 키 (계좌, 번호) — 라우팅 계좌를 채워 둔다(결정 73)
+                intent = intent.model_copy(update={"account": account_for(intent.instrument)})
             self.order_book.track(order_id, intent)
             self.order_book.replay_pending(order_id)  # track 전에 온 이벤트 반영(역전 대비)
             return order_id
@@ -1053,6 +1089,7 @@ class LiveSystem:
     async def amend_price(
         self, order_id: str, price: float, *,
         reduce_only: bool = False, post_only: bool = False,
+        account: Account | None = None,
     ) -> str:
         """가격 정정 (LS 전용) — 새 주문번호를 등록하고 원주문은 취소 처리.
 
@@ -1062,7 +1099,7 @@ class LiveSystem:
         지점이라 여기서 막으면 어느 경로로 와도 HL modify가 나가지 않는다.
         LS는 CSPAT00701/CFOAT00200. 수량은 **잔량 기준** — 부분체결 후 원수량 정정 거부(01442).
         """
-        order = self.order_book.order(order_id)
+        order = self.order_book.order(order_id, account)
         if order is None:
             raise ValueError(f"unknown order {order_id}")
         if order.intent.venue is not Venue.LS:  # HL 등 — 정정 금지, 취소 후 신규로
@@ -1071,7 +1108,8 @@ class LiveSystem:
         if qty <= 0:
             raise OrderGoneError(f"order {order_id} has no remaining qty")
         try:
-            new_id = await self._gw.amend_order(order_id, qty=qty, price=price)
+            new_id = await self._gw.amend_order(order_id, qty=qty, price=price,
+                                                account=order.intent.account)
         except Exception as exc:  # 정정 거부/오류도 거래소별 파일에 남긴다(실린 옵션 포함)
             order_log.order_amend_rejected(
                 order.intent.venue, order_id, exc, qty=qty, price=price,
@@ -1083,12 +1121,13 @@ class LiveSystem:
         self.order_book.track(new_id, new_intent)
         self.order_book.replay_pending(new_id)  # 새 주문번호로 track 전에 온 이벤트 반영
         if new_id != order_id:
-            self.order_book.on_cancel(order_id)  # 원주문은 정정으로 소멸
+            self.order_book.on_cancel(order_id, account=order.intent.account)  # 원주문 소멸
         return new_id
 
-    async def cancel(self, order_id: str) -> None:
-        """venue 라우팅 취소. HL은 취소 통보 채널이 없어 로컬 상태도 갱신."""
-        order = self.order_book.order(order_id)
+    async def cancel(self, order_id: str, account: Account | None = None) -> None:
+        """venue 라우팅 취소. account = LS 계좌(결정 73 — 번호가 계좌마다 겹치므로 아는 쪽은
+        넘긴다; None이면 번호가 한 계좌에만 있을 때만 찾는다). HL 장부는 취소 통보가 닫는다."""
+        order = self.order_book.order(order_id, account)
         if order is None:
             raise ValueError(f"unknown order {order_id}")
         if order.intent.venue is Venue.LS:
@@ -1098,7 +1137,8 @@ class LiveSystem:
             if order.remaining_qty <= 0:
                 raise OrderGoneError(f"order {order_id} has no remaining qty")
             try:
-                await self._gw.cancel_order(order_id, qty=order.remaining_qty)  # 상태는 통보로
+                await self._gw.cancel_order(order_id, qty=order.remaining_qty,
+                                            account=order.intent.account)  # 상태는 통보로
             except Exception as exc:  # 취소 거부·응답 없음 → 거부내역(원주문번호와 함께)
                 self._record_reject(order.intent, str(exc), kind="취소", order_id=order_id)
                 raise
@@ -1223,6 +1263,8 @@ class LiveSystem:
                 handler(expected)
 
         def apply_fill(fill: Fill) -> None:
+            if not self._fill_symbol_ok(fill):
+                return  # 종목이 장부 주문과 다른 통보 — 반영 안 함(위에서 에러 로그)
             self.order_book.on_fill(fill)
             for handler in self.on_fill:  # OrderBook 반영 뒤라 상태 조회가 안전
                 handler(fill)
@@ -1474,6 +1516,8 @@ class LiveSystem:
         # 무한 배경 기록/조회 — wait()(스트리밍 소진 대기) 대상이 아니라 aux로 둔다.
         self._aux_tasks = [asyncio.create_task(self._spread_csv_loop()),
                            asyncio.create_task(self._prev_funding_loop())]
+        if self._fx_futures is not None:  # 라이브 구성 — 하나고시 현물환 조회(결정 70)
+            self._aux_tasks.append(asyncio.create_task(self._hana_spot_loop()))
         # run 자체가 아니라 **팩토리(.run)**를 넘긴다 — 재시작 때 새 코루틴을 만들어야 하므로.
         self._tasks.append(asyncio.create_task(
             self._guarded_ws("주식", self._stock_ws.run, self._mark_ws_dead)))
@@ -1524,17 +1568,80 @@ class LiveSystem:
 
         if rate <= 0:
             return
-        if self.usdkrw_spot_src != "LS":  # 출처 전환(첫 수신·백업→LS 복귀)만 기록 — 틱마다 X
+        if self._spot_ls is None:  # 첫 수신만 기록 — 틱마다 X
             import logging
 
             logging.getLogger("kp_arb.bootstrap").info(
                 "LS 현물환율(CUR) 수신 시작 %.2f (이전 출처: %s)", rate,
                 self.usdkrw_spot_src or "없음")
-        self.usdkrw_spot = rate
-        self.usdkrw_spot_src = "LS"
+        self._spot_ls = rate
         self._fx_spot_ts = _t.monotonic()
+        self._resolve_spot()
         for handler in self.on_fx:
             handler()
+
+    def _apply_hana_spot(self, rate: float) -> None:
+        """하나고시 조회값 저장 → 출처 재판정(결정 70)."""
+        if rate <= 0:
+            return
+        self._spot_hana = rate
+        self._resolve_spot()
+        for handler in self.on_fx:
+            handler()
+
+    def _resolve_spot(self, now: datetime | None = None) -> None:
+        """현물환 출처 고르기(사용자 2026-10-14, exec 결정 70): ① 09:00 전 ② 시동 직후 ③ LS CUR를
+        받을 때까지 = 하나고시. 09:00 뒤 LS CUR를 받았으면 LS — **한 번 LS로 넘어가면 그 뒤로는 계속
+        LS**(하나고시 조회도 끝, 사용자 같은 날). 하나고시 조회가 안 됐으면 있는 쪽. 출처가 바뀔
+        때만 로그."""
+        moment = now if now is not None else datetime.now()
+        if self._spot_ls is not None and (self._spot_ls_took_over
+                                          or moment.time() >= FX_HANA_UNTIL):
+            self._spot_ls_took_over = True
+            value, src = self._spot_ls, "LS"
+        elif self._spot_hana is not None:
+            value, src = self._spot_hana, "하나고시"
+        elif self._spot_ls is not None:  # 09:00 전인데 하나고시 조회가 안 됨 — LS 값이라도
+            value, src = self._spot_ls, "LS"
+        else:
+            value, src = None, None
+        if src != self.usdkrw_spot_src:
+            import logging
+
+            logging.getLogger("kp_arb.bootstrap").info(
+                "현물환 출처 %s → %s (%s)", self.usdkrw_spot_src or "없음", src or "없음",
+                f"{value:.2f}" if value is not None else "-")
+        self.usdkrw_spot, self.usdkrw_spot_src = value, src
+
+    def hana_spot_needed(self) -> bool:
+        """지금 하나고시를 조회해야 하는가 — LS가 아직 출처가 된 적 없을 때(결정 70)."""
+        return not self._spot_ls_took_over
+
+    async def _hana_spot_loop(self) -> None:
+        """하나고시 조회 루프(결정 70) — 시동 직후 한 번, 그 뒤 하나고시가 출처인 동안 10초마다.
+        LS가 출처가 되면(09:00 뒤 CUR 수신) 조회를 그만두고 끝난다(사용자: "LS로 넘어가면 하나고시
+        조회는 하지 않는다" — 재시동 전까지 다시 안 씀). 조회 실패는 첫 번만 기록."""
+        import logging
+
+        from .gateways.fx_spot import fetch_usdkrw_spot
+
+        log = logging.getLogger("kp_arb.bootstrap")
+        failed = False
+        while True:
+            self._resolve_spot()  # 09:00을 지나며 LS로 넘어가는 전환은 여기서(CUR 틱 없이도)
+            if not self.hana_spot_needed():
+                log.info("현물환 출처가 LS로 넘어감 — 하나고시 조회 종료")
+                return
+            spot = await fetch_usdkrw_spot()
+            if spot is None:
+                if not failed:
+                    log.warning("하나고시 현물환 조회 실패(네이버) — 재시도 계속, 그동안 %s",
+                                "LS 값" if self._spot_ls is not None else "현물환 없음")
+                failed = True
+            else:
+                failed = False
+                self._apply_hana_spot(spot)
+            await asyncio.sleep(FX_HANA_POLL_S)
 
     async def _fx_loop(self) -> None:
         """환율 예비 갱신 — 시동 직후 초기값 + 30초 간격 확인 조회(t2111).
@@ -1552,7 +1659,7 @@ class LiveSystem:
         failures = 0
         # (옛 2초 대기 삭제 2026-09-14: t2111이 한도 표에 없어 근거 없는 기본 2회에 막혔던 것.
         #  공식 한도 10회를 표에 넣어 시동 초기값(월물 2건) 직후 바로 조회해도 안 걸린다.)
-        # (하나고시 백업 조회는 2026-09-28 폐지 — exec 결정 47: 현물환율은 LS CUR 하나뿐.)
+        # (하나고시 현물환은 _hana_spot_loop가 따로 — 결정 70, 2026-10-14.)
         while True:
             now = datetime.now()
             if not 8 <= now.hour < 16:  # 세션 밖 — 마지막 값 유지
@@ -1836,7 +1943,15 @@ class LiveSystem:
             if price is not None and price > 0:
                 self._apply_fx_price(code, price)
                 fx_filled += 1
-        # (시동 때 하나고시로 현물환율을 채우던 것은 2026-09-28 폐지 — CUR가 올 때까지 "없음".)
+        if self._fx_futures is not None and self._spot_ls is None:  # 라이브 구성 — 시동 초기값
+            try:
+                from .gateways.fx_spot import fetch_usdkrw_spot
+
+                spot = await fetch_usdkrw_spot()
+            except Exception:  # noqa: BLE001 - 조회 실패는 루프가 다시
+                spot = None
+            if spot is not None:
+                self._apply_hana_spot(spot)
         log.info("시동 초기값 채움 — 현재가 %d종, 원달러선물 %d/%d월물, 현물환율 %s "
                  "(현재가 %.1fs, 전체 %.1fs)",
                  len(self.trades), fx_filled, len(self._fx_months),
@@ -2230,7 +2345,7 @@ async def bootstrap_live(
 
         return LSWebSocketClient(
             LSWebSocketConnector(url), token_provider=fresh_token,
-            etf_symbols=etf_symbols,
+            etf_symbols=etf_symbols, account_numbers=accounts.numbers(),
             # 선물 WS는 계좌 통보(O01/C01/H01)만 받아 평소 데이터가 없다 — "시세 지연(무데이터)"
             # 헛경고(하루 10회+, 2026-09-03 실측)를 막기 위해 스트림 기대를 끈다.
             status=WsStatus(venue="LS", name=name,
@@ -2282,7 +2397,7 @@ async def bootstrap_live(
         xing_real = XingRealClient(
             xing_session, ensure_login=ensure_login, etf_symbols=etf_symbols,
             status=WsStatus(venue="LS", name="LS xing", kind="시세/주문", expects_stream=True),
-            reconnect_backoff_s=2.0, probe=probe)
+            reconnect_backoff_s=2.0, probe=probe, account_numbers=accounts.numbers())
         stock_ws: LSWebSocketClient = xing_real
         deriv_ws: LSWebSocketClient | None = xing_real
     else:

@@ -267,6 +267,11 @@ class LSAccounts:
         """그 계좌 자격이 등록돼 있는가 — KR_FX는 선택이라 없을 수 있다(§9.1)."""
         return account in self._by_account
 
+    def numbers(self) -> dict[str, Account]:
+        """계좌번호 → Account. 실시간 통보(accno)를 계좌로 풀 때 쓴다(2026-10-14, 결정 73 —
+        LS 주문번호는 계좌마다 따로 매겨져 주식·선물 번호가 겹친다)."""
+        return {a.number: acct for acct, a in self._by_account.items()}
+
     def for_account(self, account: Account) -> LSAccount:
         try:
             return self._by_account[account]

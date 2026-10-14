@@ -493,6 +493,45 @@ async def test_futures_h01_before_o01_is_held_until_cancel_ack_arrives() -> None
     assert events[2].qty == 1.0  # H01 qty = 실정정취소수량(Res) → 장부가 남은 수량과 대조(결정 69)
 
 
+async def test_events_carry_account_from_accno_or_tr_family() -> None:
+    # 결정 73: 통보의 accno가 등록된 계좌번호면 그 계좌, 없거나 모르면 TR 종류(SC*=주식,
+    # O01/C01/H01=
+    # 선물옵션)로. 원달러선물 계좌(KR_FX)는 accno로만 가려진다. 종목코드도 실린다(대조용).
+    from kp_arb.domain.enums import Account
+
+    frames = [
+        {"header": {"tr_cd": "SC1"}, "body": {"accno": "20142871001", "ordno": "4545",
+                                              "execno": "1", "execqty": "8", "execprc": "1464000",
+                                              "exectime": "082417137", "Isuno": "KR7000660001"}},
+        {"header": {"tr_cd": "C01"}, "body": {"accno": "20142871002", "ordno": "0000004545",
+                                              "chevol": "1", "cheprice": "14750.00",
+                                              "chetime": "090622000", "yakseq": "7",
+                                              "expcode": "KR4A506B0002"}},
+        {"header": {"tr_cd": "C01"}, "body": {"accno": "20142871003", "ordno": "77",
+                                              "chevol": "1", "cheprice": "13500.00",
+                                              "chetime": "090622000", "yakseq": "8"}},
+        {"header": {"tr_cd": "SC3"}, "body": {"ordno": "4514", "orgordno": "4508",
+                                              "canccnfqty": "100"}},
+        {"header": {"tr_cd": "O01"}, "body": {"ordno": "4508", "orgordno": "0",
+                                              "trcode1": "FO01"}},
+    ]
+    session = FakeConnection([json.dumps(f) for f in frames])
+    client = LSWebSocketClient(FakeConnector([session]), account_numbers={
+        "20142871001": Account.KR_STOCK, "20142871002": Account.KR_DERIV,
+        "20142871003": Account.KR_FX})
+    fills, events = [], []
+    client.on_fill.append(fills.append)
+    client.on_order_event.append(events.append)
+
+    await client.run()
+
+    assert [(f.order_id, f.account, f.symbol) for f in fills] == [
+        ("4545", Account.KR_STOCK, "KR7000660001"), ("4545", Account.KR_DERIV, "KR4A506B0002"),
+        ("77", Account.KR_FX, "")]
+    assert [(e.kind, e.order_id, e.account) for e in events] == [
+        ("cancel", "4514", Account.KR_STOCK), ("ack", "4508", Account.KR_DERIV)]  # accno 없음→TR
+
+
 async def test_futures_cancel_rejected_after_fill_is_not_a_cancel() -> None:
     # 운영 실측 2026-09-30 09:32:48 #3908(하이닉스 선물 매도 1): 체결(48.277) → 취소 접수 O01 FO03
     # (48.790, 취소주문 3909) → 체결 통보 C01(48.801) → H01 TTRODP11321 rejcode 0804 qty 0(48.801,

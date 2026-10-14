@@ -750,8 +750,18 @@ async def _manual_command(
         order_id = body.get("order_id")
         if not order_id:
             return _fail(["order_id 필요"])
+        # 화면이 행의 상품(instrument)을 같이 보내면 계좌로 풀어 같은 번호의 다른 계좌 주문을
+        # 건드리지 않는다(결정 73). 안 보내면 번호가 한 계좌에만 있을 때만 취소된다
+        inst_raw = body.get("instrument")
+        acct = None
+        if isinstance(inst_raw, str) and inst_raw:
+            try:
+                inst = Instrument(inst_raw)
+                acct = account_for(inst) if inst is not Instrument.HL_PERP else None
+            except ValueError:
+                acct = None
         try:
-            await system.cancel(str(order_id))
+            await system.cancel(str(order_id), account=acct)
         except Exception as exc:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
             _olog.warning("수동주문 취소 실패: #%s — %s", order_id, exc)  # #3 실패 로그
             return _fail([f"취소 실패: {exc}"])
@@ -1241,6 +1251,14 @@ def make_app(
             result = _fx_command(fx_service, payload)
             return web.json_response(result, dumps=_dumps)
         if isinstance(cmd, str) and cmd.startswith("autom_"):
+            sent_at = payload.get("sent_at")  # 화면이 보낸 시각 — 전송·대기 지연 계측(2026-10-14)
+            if isinstance(sent_at, int | float):
+                lag_ms = (time.time() - float(sent_at)) * 1000.0
+                logging.getLogger("kp_arb.core").log(
+                    logging.WARNING if lag_ms > 500 else logging.INFO,
+                    "자동M 명령 %s 세트 %s %s value=%s — 화면 전송 뒤 %.0fms", cmd,
+                    payload.get("set", "-"), payload.get("block", "-"),
+                    payload.get("value", "-"), lag_ms)
             result = await _autom_command(
                 {"sf": autom, "stock": autom_stock, "sf_hl_first": autom_hl_first}, state,
                 payload)

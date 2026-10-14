@@ -560,27 +560,16 @@ def _cancel_if_resting(leg: Leg, force: bool = False) -> list[Action]:
 
 
 def _passes_signal(s: AutoMSet, leg: Leg, sig: Signals) -> bool:
-    """G5 판정(exec §11.3, 정정 2026-09-07) — 진입: **S(현물)괴리 > 진입S만** / 청산: **비교 없음**.
+    """G5 판정(exec §11.3) — **수치 필터 없음, 기준값만 있으면 통과**(주식 2026-09-18, 주식선물
+    2026-10-14 결정 71 — 옛 "S괴리 > 진입S" 필터 삭제).
 
-    SF 기준값(진입SF·청산SF)은 판정이 아니라 **역산가(G6)** 에 쓴다 — 선주문은 그 기준값이
-    체결로 보장되는 가격(maker)에 걸므로 SF 괴리를 따로 비교할 이유가 없다. S 괴리는
-    진입 허용 조건으로만 본다(실제 매매는 SF+HL).
+    기준값(진입SF·청산SF / 주식 진입·청산)은 판정이 아니라 **역산가(G6)** 에 쓴다 — 선주문은
+    그 기준값이 체결로 보장되는 가격(maker)에 걸므로 괴리를 따로 비교할 이유가 없다. 주식선물의
+    진입S 칸은 모니터 표시용으로만 남는다(필수 아님).
     """
-    if s.product == "stock":
-        # 주식은 **수치 필터 없음**(사용자 확정 2026-09-18) — 기준값만 있으면 바로 낸다. 주문가가
-        # H/(1+기준값)로 역산되므로 그 가격에 걸어 두면 체결 시 기준값이 보장된다(호가 뒤에 서는
-        # 것도 허용). 주식선물의 S괴리 필터(아래)는 그대로.
-        return (s.en_s if leg.block is Block.ENTRY else s.ex_sf) is not None
+    del sig  # 실시간 괴리값은 더 이상 안 본다(G6 역산가·범위가 판정)
     if leg.block is Block.ENTRY:
-        if s.en_sf is None or s.en_s is None:
-            return False
-        if sig.stock_auction:
-            # 주식 동시호가(결정 57): 현물 현재가가 예상체결가라 S괴리를 믿을 수 없다 → 비교 생략,
-            # 기준값(역산가)만으로 낸다. 정·역방향 같음
-            return True
-        if s.reverse:  # 역방향 진입(§7A G5): 매도호가창 est 기준 S괴리 < +HP/-S
-            return sig.s_spread_exit is not None and sig.s_spread_exit < s.en_s
-        return sig.s_spread_entry is not None and sig.s_spread_entry > s.en_s
+        return (s.en_s if s.product == "stock" else s.en_sf) is not None
     return s.ex_sf is not None
 
 
@@ -766,15 +755,7 @@ def _evaluate_hl_first(
     thr = s.threshold(block)
     if thr is None:
         return hold("G5 기준값 없음", _cancel_if_resting(leg))
-    # G5 S괴리 필터 — 주식선물과 같은 식(§11.3, 사용자 2026-09-30 결정 54: 정·역 모두). 09-22·23의
-    # "시험 동안 필터 없음"은 거둠. 진입: 정방향 S괴리 > 진입S / 역방향 S괴리 < 진입S, 청산은 비교
-    # 없음
-    if block is Block.ENTRY and s.en_s is None:
-        return hold("G5 진입S 기준값 없음", _cancel_if_resting(leg))
-    if not _passes_signal(s, leg, sig):
-        why = (f"G5 미달 S괴리 {'>' if s.reverse else '<'} 진입S {s.en_s * 100:.3f}%"
-               if block is Block.ENTRY and s.en_s is not None else "G5 미달")
-        return hold(why, _cancel_if_resting(leg))
+    # G5 S괴리 필터는 주식선물과 같이 삭제(결정 54로 넣었던 것, 2026-10-14 결정 71) — 기준값만
     side = leg.pre_side  # HL 다리(정방향 진입 = 매도)
     # LS 후주문을 테이커로 잡을 SF 호가: HL 매도(LS 매수)면 SF 매도1호가, HL 매수면 SF 매수1호가
     sf_quote = ((sig.sf_asks[0][0] if sig.sf_asks else None) if side is Side.SELL
@@ -822,8 +803,7 @@ def _evaluate_hl_first(
              f"{sf_disp * 100:.3f}%+{thr * 100:.3f}%)/환율 {sig.fx:,.2f} SF호가 {sf_quote:,.0f} "
              f"이론가 {sig.sf_theory:,.0f} {rng_txt} HL 매수1 {sig.hl_bid1:g} "
              f"매도1 {sig.hl_ask1:g}"
-             + (" [주식 동시호가: S괴리 필터 생략]" if sig.stock_auction and block is Block.ENTRY
-                else ""))
+             )
     hl_qty = qty * s.hl_ratio  # 선주문은 HL 계약(SF 계약 × 10)
     if leg.pre_order_id is None and leg.status is LegStatus.ARMED:
         if qty < 1:
@@ -835,6 +815,11 @@ def _evaluate_hl_first(
         leg.status = LegStatus.PRE_RESTING
         return hold(f"통과 → HL 선주문 {hl_qty}계약 {basis}",
                     [Action("place_pre", side=side, qty=hl_qty, price=price)])
+    if leg.pre_order_id is not None and leg.pre_price is None:
+        # 번호는 있는데 가격이 없다 = 상태 꼬임(운영 2026-10-14: 다른 계좌 통보가 섞여 판정이 예외로
+        # 죽기를 되풀이). 예외 대신 걸린 주문을 취소해 정리한다
+        return hold("선주문 가격 없음(상태 꼬임) → 취소",
+                    [Action("cancel_pre", order_id=leg.pre_order_id, reason="선주문 가격 없음")])
     if leg.pre_order_id is not None and leg.pre_price != price:
         leg.replace_pending = True
         return hold(f"역산가 변경 {leg.pre_price:g}→{price:g} → 취소 후 재발주 ({basis})",
@@ -865,15 +850,10 @@ def evaluate(
     qty = gate
     if s.hl_first:
         return _evaluate_hl_first(s, leg, block, sig, settings, qty, hold)
-    # G5 판정
+    # G5 — 기준값만 본다(수치 필터 없음, 결정 71)
     if not _passes_signal(s, leg, sig):
-        if block is Block.ENTRY:
-            # 실시간 괴리값을 넣지 않는다 — 틱마다 "바뀐 근거"가 되어 줄이 쌓임(실측 09-10).
-            # 이 근거는 파일 로그에도 안 남긴다(엔진 _trace가 "G5 미달" 건너뜀, 사용자 09-10).
-            why = (f"G5 미달 수치 < 진입 {pct(s.en_s)}" if s.product == "stock"
-                   else f"G5 미달 S괴리 < 진입S {pct(s.en_s)}")
-        else:
-            why = "G5 청산 기준값 없음"
+        why = (f"G5 {'진입' if s.product == 'stock' else '진입SF'} 기준값 없음"
+               if block is Block.ENTRY else "G5 청산 기준값 없음")
         return hold(why, _cancel_if_resting(leg))
     # G6 역산가 → 허용범위
     thr = s.threshold(block)
@@ -937,9 +917,7 @@ def evaluate(
     basis = (f"{formula} "
              f"주문단위 {tick} 시작호가 {s.price_offset} {rng_txt} 매수1 {won(bid1)} "
              f"매도1 {won(ask1)} 환율 {fx_txt} "
-             f"HL 매수1 {usd(sig.hl_bid1)} 매도1 {usd(sig.hl_ask1)} est {usd(hl_est)}"
-             + (" [주식 동시호가: S괴리 필터 생략]" if sig.stock_auction and block is Block.ENTRY
-                else ""))
+             f"HL 매수1 {usd(sig.hl_bid1)} 매도1 {usd(sig.hl_ask1)} est {usd(hl_est)}")
     # 통과 — 없으면 발주, 있고 역산가가 바뀌었으면 재발주 규칙(취소→후주문 확인→딜레이→신규)
     if leg.pre_order_id is None and leg.status is LegStatus.ARMED:
         if qty < 1:
@@ -950,6 +928,11 @@ def evaluate(
         leg.status = LegStatus.PRE_RESTING
         return hold(f"통과 → 선주문 {qty}계약 {basis}",
                     [Action("place_pre", side=side, qty=qty, price=price)])
+    if leg.pre_order_id is not None and leg.pre_price is None:
+        # 번호는 있는데 가격이 없다 = 상태 꼬임(운영 2026-10-14: 다른 계좌 통보가 섞여 판정이 예외로
+        # 죽기를 되풀이). 예외 대신 걸린 주문을 취소해 정리한다
+        return hold("선주문 가격 없음(상태 꼬임) → 취소",
+                    [Action("cancel_pre", order_id=leg.pre_order_id, reason="선주문 가격 없음")])
     if leg.pre_order_id is not None and leg.pre_price != price:
         leg.replace_pending = True
         return hold(f"역산가 변경 {leg.pre_price:,.0f}→{price:,.0f} → 취소 후 재발주 ({basis})",

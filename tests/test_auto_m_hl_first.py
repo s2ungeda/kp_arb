@@ -82,35 +82,21 @@ def test_hl_first_pre_price_guarantees_threshold() -> None:
     assert (FX * px - s) / s - (bid1 - theory) / theory <= thr_x + 1e-12
 
 
-def test_g5_s_spread_filter_applies_to_both_directions() -> None:
-    # 결정 54(사용자 2026-09-30): HL선도 주식선물과 같은 G5 S괴리 필터 — 정방향 진입 S괴리 > 진입S,
-    # 역방향 진입 S괴리 < 진입S. 미달이면 안 내고 걸어둔 선주문은 취소. 청산은 비교 없음.
+def test_g5_has_no_s_spread_filter_in_hl_first() -> None:
+    # 결정 54(HL선도 주식선물과 같은 G5 S괴리 필터)는 결정 71(2026-10-14, 주식선물 S괴리 필터
+    # 삭제)과
+    # 함께 삭제 — "주식선물과 같음"을 유지. 정·역방향 모두 S괴리 값과 무관하게 기준값만 있으면 낸다.
     s = _set()
     set_running(s, Block.ENTRY, True)
-    assert evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.004), SETTINGS, U) == []  # 0.4% < 0.5%
-    assert s.entry.block_reason.startswith("G5 미달 S괴리 < 진입S 0.500%")
-    assert evaluate(s, Block.ENTRY, _sig(s_spread_entry=None), SETTINGS, U) == []   # 값 없음
-    acts = evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.006), SETTINGS, U)
+    acts = evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.004), SETTINGS, U)  # 옛 기준 미달값
     assert [a.kind for a in acts] == ["place_pre"]
     on_pre_ack(s, Block.ENTRY, "hl-1")
-    acts = evaluate(s, Block.ENTRY, _sig(mono=101.0, s_spread_entry=0.004), SETTINGS, U)
-    assert [a.kind for a in acts] == ["cancel_pre"]                                 # 미달 → 취소
-    # 역방향 진입: 매도호가창 est 기준 S괴리가 진입S(0.4%)보다 작아야 낸다
+    acts = evaluate(s, Block.ENTRY, _sig(mono=101.0, s_spread_entry=None), SETTINGS, U)
+    assert acts == [] and "G5" not in s.entry.block_reason  # 값 없음 → 그대로 유지(취소 없음)
     r = _rev_set()
     set_running(r, Block.ENTRY, True)
-    assert evaluate(r, Block.ENTRY, _sig(s_spread_exit=0.005), SETTINGS, U) == []
-    assert r.entry.block_reason.startswith("G5 미달 S괴리 > 진입S 0.400%")
-    assert evaluate(r, Block.ENTRY, _sig(s_spread_exit=0.003), SETTINGS, U)[0].kind == "place_pre"
-    # 진입S 기준값이 없으면 안 낸다(코어 실행 검사와 같은 뜻)
-    s2 = _set(en_s=None)
-    set_running(s2, Block.ENTRY, True)
-    assert evaluate(s2, Block.ENTRY, _sig(), SETTINGS, U) == []
-    assert s2.entry.block_reason == "G5 진입S 기준값 없음"
-    # 청산은 S괴리를 보지 않는다
-    x = _set(rt=1, sf_net=1, hl_net=-10.0, ex_sf=0.002)  # 청산 역산가 1292.5(범위 안)
-    set_running(x, Block.EXIT, True)
-    acts = evaluate(x, Block.EXIT, _sig(s_spread_entry=None, s_spread_exit=None), SETTINGS, U)
-    assert [a.kind for a in acts] == ["place_pre"]
+    assert evaluate(r, Block.ENTRY, _sig(s_spread_exit=0.005), SETTINGS, U)[0].kind \
+        == "place_pre"
 
 
 def test_entry_places_hl_sell_alo_qty_10_at_reverse_price() -> None:
@@ -445,17 +431,11 @@ def test_book_propagates_product_to_legs_and_restore() -> None:
     assert parse_book_key(book_key(U, PRODUCT_SF_HL_FIRST)) == (U, PRODUCT_SF_HL_FIRST)
 
 
-def test_stock_auction_skips_s_spread_filter_in_hl_first() -> None:
-    # 결정 57: HL선도 같은 S괴리를 쓰므로 주식 동시호가엔 필터를 건너뛴다(정·역방향)
+def test_stock_auction_not_special_in_hl_first() -> None:
+    # 결정 57(동시호가 땐 S괴리 필터 생략)은 필터 삭제(결정 71)로 뜻이 없어짐 — 동시호가 표시와
+    # 무관하게 같은 결과, 근거 문구에 '필터 생략' 없음
     s = _set()
     set_running(s, Block.ENTRY, True)
-    assert evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.004), SETTINGS, U) == []
-    acts = evaluate(s, Block.ENTRY, _sig(mono=101.0, s_spread_entry=0.004, stock_auction=True),
-                    SETTINGS, U)
+    acts = evaluate(s, Block.ENTRY, _sig(s_spread_entry=0.004, stock_auction=True), SETTINGS, U)
     assert [a.kind for a in acts] == ["place_pre"]
-    assert "동시호가: S괴리 필터 생략" in s.entry.block_reason
-    r = _rev_set()
-    set_running(r, Block.ENTRY, True)
-    assert evaluate(r, Block.ENTRY, _sig(s_spread_exit=0.005), SETTINGS, U) == []
-    assert evaluate(r, Block.ENTRY, _sig(mono=101.0, s_spread_exit=0.005, stock_auction=True),
-                    SETTINGS, U)[0].kind == "place_pre"
+    assert "필터 생략" not in s.entry.block_reason

@@ -52,7 +52,7 @@ from .auto_m import (
 )
 from .auto_m import _halt_set as halt_set
 from .disparity import disp, est_price
-from .domain.enums import Block, Instrument, OrderType, Side, Underlying, Venue
+from .domain.enums import Account, Block, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import InstrumentInfo, OrderIntent, Quote
 from .gateways.base import PlaceResult
 from .gateways.ls import OrderGoneError
@@ -60,6 +60,7 @@ from .gateways.ls_rest import RestTimeoutError
 from .hl_merge import merge_tick_options
 from .hl_price import hl_price_step, hl_round_price
 from .logs import attach_daily_file
+from .routing import account_for
 from .ticks import tick_for
 
 if TYPE_CHECKING:
@@ -128,7 +129,7 @@ class _SystemLike(Protocol):
     def ls_feed_ok(self) -> bool: ...  # LS 채널 연결(끊김·COM 정지면 False) — G0-1
     def hl_feed_ok(self) -> bool: ...  # HL 채널 연결 — G0-1(결정 60)
     async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str: ...
-    async def cancel(self, order_id: str) -> None: ...
+    async def cancel(self, order_id: str, account: Account | None = None) -> None: ...
     # 묶음 전송(exec §7D, 사용자 2026-09-30) — HL 주문 여러 건을 한 요청으로, 결과는 건별
     async def place_many(self, intents: Sequence[OrderIntent],
                          cloids: Sequence[str | None] | None = None) -> list[PlaceResult]: ...
@@ -436,7 +437,8 @@ class AutoMEngine:
                             and not leg.cancel_wait_alarmed
                             and mono - leg.cancel_sent_mono >= CANCEL_WAIT_ALARM_S):
                         leg.cancel_wait_alarmed = True
-                        order = self._system.order_book.order(leg.pre_order_id)
+                        order = self._system.order_book.order(
+                            leg.pre_order_id, None if s.hl_first else self._ls_account_pre())
                         if order is not None and order.cancelled_qty > 0:
                             # 취소는 확정됐는데 셈이 안 맞아 체결 통보를 기다리는 중(결정 69)
                             what = (f"부분 취소 확정(취소 {order.cancelled_qty:g}) 뒤 체결 "
@@ -914,7 +916,9 @@ class AutoMEngine:
         # 다음 판정이 다시 보낸다(이미 체결/취소된 주문의 거부도 통보로 정리된다).
         for attempt in range(3):
             try:
-                await self._system.cancel(order_id)
+                await self._system.cancel(
+                    order_id,
+                    account=None if self._book(u).hl_first else self._ls_account_pre())
                 return
             except RestTimeoutError as exc:
                 # 응답 없음 = 결과 모름(첫 요청이 접수됐을 수 있다) — 다시 보내지 않고 통보를
@@ -1061,6 +1065,14 @@ class AutoMEngine:
     def _on_fill_applied(self, order: TrackedOrder, qty: float, price: float,
                          _fill_id: str) -> None:
         ref = self._orders.get(order.order_id)
+        if ref is not None and order.intent.venue is Venue.LS:
+            # 같은 번호의 다른 계좌 주문(주식↔선물)의 체결이 아닌지(결정 73, 운영 사고 2026-10-14)
+            expect = self._ls_account(ref)
+            actual = order.intent.account or account_for(order.intent.instrument)
+            if expect is None or actual != expect:
+                self._log.warning("[자동M] 체결 #%s는 계좌 %s 주문 — 이 세트의 주문(%s) 아님, 무시",
+                                  order.order_id, actual, expect)
+                return
         if ref is None:
             # 취소로 닫은 선주문의 체결은 이제 오지 않는다 — 장부가 취소 확정 수량으로 닫으므로
             # (결정 69) 셈이 안 끝난 체결은 선주문이 열린 채 보통 체결로 온다
@@ -1242,10 +1254,22 @@ class AutoMEngine:
             self._log.warning("[자동M] 상태 저장 실패 — %s", exc)
         self._persist_ms = (time.perf_counter() - t0) * 1000
 
+    def _ls_account_pre(self) -> Account:
+        """이 엔진 상품의 선주문(LS) 계좌 — 주식선물·HL선 후주문은 선물옵션, 주식은 주식 계좌."""
+        return Account.KR_STOCK if self.product == "stock" else Account.KR_DERIV
+
+    def _ls_account(self, ref: _OrderRef) -> Account | None:
+        """이 참조 주문의 LS 계좌(결정 73 — 장부는 (계좌, 번호)로 찾는다). HL 다리면 None.
+        선주문은 LS(HL선이면 HL), 후주문은 HL(HL선이면 LS)."""
+        on_ls = (ref.leg == "pre") != bool(self._book(ref.underlying).hl_first)
+        if not on_ls:
+            return None
+        return Account.KR_STOCK if self.product == "stock" else Account.KR_DERIV
+
     def _on_book_change(self) -> None:
         """취소·거부는 상태 변화로 온다 — 추적 주문의 상태 전이를 한 번씩 처리."""
         for oid, ref in list(self._orders.items()):
-            order = self._system.order_book.order(oid)
+            order = self._system.order_book.order(oid, self._ls_account(ref))
             if order is None:
                 # 장부에서 사라진 추적 주문(재동기 유령 정리 등) — 그대로 두면 "걸려 있다"고
                 # 믿고 없는 주문 취소를 되풀이한다(실측 2026-09-09 #20851). 선주문은 취소된 것으로

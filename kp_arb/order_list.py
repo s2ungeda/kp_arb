@@ -316,6 +316,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     row_vals: dict[str, tuple[Any, ...]] = {}  # iid → 값 튜플(선택 편의용)
     sel: dict[str, str | None] = {"iid": None}
+    inst_by_oid: dict[str, str] = {}  # 미체결 행의 상품(취소 명령에 동봉 — 결정 73)
 
     def _on_select(_e: object = None) -> None:
         chosen = tree.selection()
@@ -333,12 +334,18 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         iid = sel["iid"]
         return None if not iid or iid.startswith("__") else iid  # 체결·취소행 제외
 
+    def _selected_instrument() -> str | None:
+        oid = _selected_oid()
+        return inst_by_oid.get(oid) if oid else None
+
     def do_cancel() -> None:
         oid = _selected_oid()
         if oid is None:
             set_status("취소할 미체결을 선택하세요", err=True)
             return
-        send({"cmd": "manual_cancel", "order_id": oid}, "취소")
+        # 상품을 같이 보내 코어가 계좌로 푼다(결정 73 — 주식·선물 번호가 겹침)
+        send({"cmd": "manual_cancel", "order_id": oid,
+              "instrument": _selected_instrument() or ""}, "취소")
 
     # 정정(정정가 입력·선택 정정)은 화면에서 뺐다(사용자 2026-09-11: 쓸 일이 거의 없음). 코어 명령
     # manual_amend는 그대로 있어 필요하면 다시 붙일 수 있다. 취소 버튼은 출처·세트 콤보 바로 옆
@@ -430,6 +437,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     continue
                 buy = o.get("side") == "buy"
                 inst = str(o.get("instrument"))
+                inst_by_oid[str(o.get("order_id"))] = inst
                 stk = _ST_KR.get(str(o.get("status")), o.get("status"))
                 cxl = o.get("cancelled") or 0
                 if cxl:  # 부분 취소 확정 뒤 체결 통보 대기(결정 69) — 왜 남아 있는지 보이게

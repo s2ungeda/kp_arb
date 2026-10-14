@@ -94,7 +94,7 @@ class _FakeSystem:
     def bump_error(self) -> None:
         self.errors = getattr(self, "errors", 0) + 1  # 발주 실패 알람 카운터(테스트용)
 
-    async def cancel(self, order_id: str) -> None:
+    async def cancel(self, order_id: str, account: Any = None) -> None:
         if self._fail is not None:
             raise self._fail
         self.cancelled.append(order_id)
