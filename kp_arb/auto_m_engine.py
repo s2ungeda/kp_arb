@@ -1328,7 +1328,7 @@ class AutoMEngine:
         self._persist_ms = (time.perf_counter() - t0) * 1000
 
     def _enforce_next_month(self) -> None:
-        """차근으로 둔 종목이 구간 밖(최근월물 만기 3영업일 전, 결정 75)이면 최근으로 되돌린다 —
+        """차근으로 둔 종목이 구간 밖(최근월물 만기 5영업일 전, 결정 75)이면 최근으로 되돌린다 —
         어제 골라 둔 차근이 오늘 구간 밖인 채 시동·복원되는 경우(사용자 2026-10-14). 감시 틱(1초)
         마다."""
         check = getattr(self._system, "next_month_allowed", None)

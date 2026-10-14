@@ -46,14 +46,14 @@ def business_days_until(today: date, target: date) -> int:
                if (today + timedelta(days=k)).weekday() < 5)
 
 
-# 차근월물 선택 가능 구간 — 최근월물 만기 3영업일 전부터(사용자 2026-10-14, 결정 75; 처음 5일로
-# 정했다가 같은 날 3일로)
-NEXT_MONTH_WINDOW_DAYS = 3
+# 차근월물 선택 가능 구간 — 최근월물 만기 5영업일 전부터(사용자 2026-10-14, 결정 75;
+# 5일 → 3일 → 같은 날 다시 5일로 정정)
+NEXT_MONTH_WINDOW_DAYS = 5
 
 
 def next_month_window(yyyymm: int, product: str, today: date,
                       window: int = NEXT_MONTH_WINDOW_DAYS) -> tuple[bool, str]:
-    """차근월물을 고를 수 있는가(결정 75): 최근월물 만기(최종거래일) **3영업일 전부터** 만기일까지.
+    """차근월물을 고를 수 있는가(결정 75): 최근월물 만기(최종거래일) **5영업일 전부터** 만기일까지.
     (허용 여부, 설명) — 설명은 화면·거부 사유용. product: "EQ" 주식선물 / "USD" 원달러선물."""
     exp = expiry_date(yyyymm, product)
     left = business_days_until(today, exp)

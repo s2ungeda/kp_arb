@@ -615,7 +615,7 @@ async def _autom_command(
             month = str(body["month"]).strip()
             if month not in ("near", "next"):
                 return _fail([f"월물 값 오류: {month!r}"])
-            if month == "next":  # 차근은 최근월물 만기 3영업일 전부터(결정 75)
+            if month == "next":  # 차근은 최근월물 만기 5영업일 전부터(결정 75)
                 system = getattr(engine, "_system", None)
                 check = getattr(system, "next_month_allowed", None)
                 if callable(check):
@@ -1291,7 +1291,7 @@ def make_app(
             return web.json_response(result, dumps=_dumps)
         if (cmd == "settings_global" and system is not None
                 and hasattr(system, "next_month_allowed") and payload.get("fx_futures_code")):
-            # 원달러선물 차근은 최근월물 만기 3영업일 전부터(결정 75) — 밖이면 저장 거부
+            # 원달러선물 차근은 최근월물 만기 5영업일 전부터(결정 75) — 밖이면 저장 거부
             months = system.fx_futures_months()
             if len(months) > 1 and str(payload["fx_futures_code"]) == months[1][0]:
                 ok_next, why_next = system.next_month_allowed(None, "USD")

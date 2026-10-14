@@ -509,7 +509,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         cb_month.pack(side="left", padx=(0, 4))
 
     def _guard_next_month() -> bool:
-        """차근을 골랐는데 구간 밖(최근월물 만기 3영업일 전, 결정 75)이면 알림 + 최근으로 되돌림.
+        """차근을 골랐는데 구간 밖(최근월물 만기 5영업일 전, 결정 75)이면 알림 + 최근으로 되돌림.
         콤보를 바꾸는 순간('적' 전)에도 부른다(사용자 2026-10-14). 되돌렸으면 True."""
         if not spec.has_month or MONTH_MAP.get(cb_month.get()) != "next":
             return False
