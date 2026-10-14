@@ -516,7 +516,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     def apply_market() -> None:
         u = cur_under()
         if spec.has_month and MONTH_MAP.get(cb_month.get()) == "next":
-            # 차근월물은 최근월물 만기 5영업일 전부터(결정 75) — 코어 판단을 따르고 아니면 최근으로
+            # 차근월물은 최근월물 만기 3영업일 전부터(결정 75) — 코어 판단을 따르고 아니면 최근으로
             info = _live_book().get("next_month") or {}
             if info and not info.get("allowed", True):
                 warn_center(str(info.get("note") or "차근월물은 아직 선택할 수 없습니다"))

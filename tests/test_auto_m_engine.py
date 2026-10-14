@@ -419,11 +419,11 @@ async def test_books_run_independently_per_underlying() -> None:
                                             "month": "far"})
     assert not bad["ok"]
     # 결정 75: 시스템이 "차근은 아직"이라 하면 코어가 거부하고 월물은 그대로
-    sys_.next_month_allowed = lambda u, product: (False, "차근월물은 만기 5영업일 전부터")
+    sys_.next_month_allowed = lambda u, product: (False, "차근월물은 만기 3영업일 전부터")
     ob.future_month = "near"
     late = await _autom_command(eng, state, {"cmd": "autom_month", "underlying": other.value,
                                              "month": "next"})
-    assert not late["ok"] and "5영업일" in late["errors"][0] and ob.future_month == "near"
+    assert not late["ok"] and "3영업일" in late["errors"][0] and ob.future_month == "near"
     assert (await _autom_command(eng, state, {"cmd": "autom_month", "underlying": other.value,
                                               "month": "near"}))["ok"]
 

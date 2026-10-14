@@ -626,7 +626,7 @@ class LiveSystem:
 
     def next_month_allowed(self, u: Underlying | None = None, product: str = "EQ",
                            today: date | None = None) -> tuple[bool, str]:
-        """차근월물 선택 가능?(결정 75, 사용자 2026-10-14: 영업일 기준 잔존만기 5일 전부터).
+        """차근월물 선택 가능?(결정 75, 사용자 2026-10-14: 영업일 기준 잔존만기 3일 전부터).
         product "EQ" = 그 종목 주식선물 최근월물 만기 / "USD" = 원달러선물 최근월물 만기.
         만기를 모르면(시동 조회 실패 등) 막지 않는다 — 사유에 적는다."""
         from .theory import next_month_window
