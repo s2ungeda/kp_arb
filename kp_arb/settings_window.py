@@ -21,7 +21,7 @@ _ALARMS: tuple[tuple[str, str], ...] = (
 _DISCONNECT_ACTIONS: tuple[tuple[str, str], ...] = (
     ("popup", "팝업(재접속 안내)"),
     ("telegram", "텔레그램"),
-    ("sound", "사운드"),
+    ("sound", "사운드 (WS끊김)"),  # 알람 'WS 끊김' 줄의 wav를 쓴다는 뜻(사용자 2026-10-14)
 )
 
 
