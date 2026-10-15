@@ -144,3 +144,4 @@ def test_next_month_window_opens_five_business_days_before_expiry() -> None:
     assert next_month_window(202610, "USD", date(2026, 10, 9))[0] is False
     assert next_month_window(202610, "USD", date(2026, 10, 12))[0] is True
     assert next_month_window(202610, "USD", date(2026, 10, 14))[0] is True
+

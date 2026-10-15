@@ -1179,8 +1179,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             tk.Checkbutton(win, text="신용 (진입 신용매수 · 청산 신용상환)",
                            variable=credit_var).grid(
                 row=base + 2, column=0, columnspan=2, sticky="w", padx=6)
-            # 주의(사용자 2026-09-18): 신용 상환은 한 주문에 대출일 하나라 1회주문수량은 1주만
-            tk.Label(win, text="※ 신용 세트는 1회주문수량 1주만 (상환은 대출일 하나씩)",
+            # 결정 78(2026-10-15): 상환은 코어가 대출일 잔량에 맞춰 수량을 줄여 낸다 — 1주 제한 없음
+            tk.Label(win, text="※ 신용 상환은 오래된 대출일부터 잔량만큼 나눠 냅니다",
                      fg="#a05000", font=T.FONT_LABEL).grid(
                 row=base + 3, column=0, columnspan=2, sticky="w", padx=24)
             extra_rows = 2
@@ -1196,9 +1196,6 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 errs.append("목표수량을 입력하세요")
             if per <= 0:
                 errs.append("1회주문수량을 입력하세요")
-            if spec.credit_boxes and credit_var.get() and per > 1:
-                # 신용 상환은 한 주문에 대출일 하나 — 1주씩만(사용자 2026-09-18)
-                errs.append(f"신용 세트는 1회주문수량이 1주여야 합니다 (입력 {per})")
             if en_sf is None and spec.has_en_sf:
                 errs.append("진입SF를 입력하세요")
             if en_s is None and not spec.has_en_sf:  # 주식만 — 주식선물 진입S는 표시용(결정 71)

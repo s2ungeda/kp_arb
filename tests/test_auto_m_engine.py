@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from kp_arb.auto_m import LegStatus
-from kp_arb.auto_m_engine import AutoMEngine
+from kp_arb.auto_m_engine import AutoMEngine, _OrderRef
 from kp_arb.core_server import _autom_command
 from kp_arb.domain.enums import Block, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent, Quote
@@ -1283,6 +1283,12 @@ async def test_stock_product_commands_route_to_stock_book() -> None:
     assert not bad["ok"]
 
 
+async def _warm_loans(eng: AutoMEngine) -> None:
+    """시동 때 1회 신용융자 잔고 조회(결정 78) — 감시 틱이 띄우는 조회가 끝날 때까지."""
+    eng.tick(datetime(2026, 9, 4, 9, 59, 0), 90.0)
+    await _settle()
+
+
 def _stock_engine() -> tuple[AutoMEngine, FakeSystem, CoreState]:
     state = CoreState()
     sys_ = FakeSystem()
@@ -1372,13 +1378,15 @@ async def test_stock_engine_uses_selected_market_only() -> None:
 
 async def test_stock_credit_repay_carries_loan_date() -> None:
     # 운영 실측 2026-09-18: 신용 진입(003) 통과, 상환(101)은 대출일 없이 내면 01486 거부 → 상환
-    # 선주문은 잔고 조회의 (대출일, 수량) 중 오래된 것부터 수량이 되는 첫 대출일을 LoanDt로.
-    # 조회는 캐시(20초).
+    # 선주문은 잔고 조회의 (대출일, 수량)을 LoanDt로. 결정 78(사용자 2026-10-15): 오래된 대출일부터
+    # 그
+    # 잔량만큼 수량을 줄여 내고 pre_qty도 같이. 조회는 캐시(20초).
     eng, sys_, state = _stock_engine()
     s = state.autom.book(U, "stock").sets[0]
     s.credit, s.rt = True, 4  # 청산할 RT 4주
     s.ex_sf = 0.005  # 청산 주문가 = H/(1+0.5%) = 100,400 — 허용범위(매수1호가+1틱)×1.004 안
     sys_.loans = [("20260915", 2.0), ("20260917", 10.0)]
+    await _warm_loans(eng)                                 # 시동 때 1회 조회(결정 78)
     await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": 0,
                                       "block": "exit", "value": True, "product": "stock"})
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
@@ -1386,15 +1394,19 @@ async def test_stock_credit_repay_carries_loan_date() -> None:
     assert len(sys_.placed) == 1
     pre = sys_.placed[0]
     assert pre.side is Side.SELL and pre.credit_code == "101"
-    # 수량은 1회주문수량 그대로(사용자 2026-09-18: 신용 세트는 1주씩), 대출일은 오래된 것부터 수량이
-    # 되는 첫 대출일 — 20260915는 2주뿐이라 20260917
-    assert pre.loan_date == "20260917" and pre.qty == 4 and s.exit.pre_qty == 4
+    # 오래된 대출일 20260915의 잔량 2만큼 — 판정 수량 4를 2로 줄이고 pre_qty도 2(체결·잔량 판단
+    # 일치)
+    assert pre.loan_date == "20260915" and pre.qty == 2 and s.exit.pre_qty == 2
     assert sys_.loan_queries == 1
-    sys_.order_book.on_fill(Fill(fill_id="r1", order_id="O1", qty=4, price=100_400.0, ts=0))
+    assert eng._repay_inflight == {}                      # 응답이 왔으니 예약은 풀림(장부가 듦)
+    sys_.order_book.on_fill(Fill(fill_id="r1", order_id="O1", qty=2, price=100_400.0, ts=0))
     await _settle()
-    assert sys_.placed[1].instrument is Instrument.HL_PERP and sys_.placed[1].qty == 4  # 1:1
-    assert s.rt == 0 and U not in eng._loan_cache  # 체결 뒤 다음 상환 때 잔고 재조회
-    # 진입(신용매수)은 대출일 없음, 잔고 조회도 안 함
+    assert s.exit.status is LegStatus.POST_PENDING  # 줄인 수량 전량 체결 = 선주문 끝(취소 없음)
+    assert sys_.cancelled == []
+    assert sys_.placed[1].instrument is Instrument.HL_PERP and sys_.placed[1].qty == 2  # 1:1
+    assert s.rt == 2 and sys_.loan_queries == 1    # 발주·체결 때 조회 없음 — 스냅샷에서 차감
+    assert eng._loans[U] == [("20260915", 0.0), ("20260917", 10.0)]
+    # 진입(신용매수)은 대출일 없음. 잔고 조회는 시동 때 1회뿐(발주 때 조회 없음, 결정 78)
     eng2, sys2, state2 = _stock_engine()
     state2.autom.book(U, "stock").sets[0].credit = True
     await _autom_command(eng2, state2, {"cmd": "autom_run", "underlying": U.value, "set": 0,
@@ -1402,16 +1414,33 @@ async def test_stock_credit_repay_carries_loan_date() -> None:
     eng2.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
     assert sys2.placed[0].credit_code == "003" and sys2.placed[0].loan_date == ""
-    assert sys2.loan_queries == 0
-    # 잔고 없음 → 빈칸(LS 거부 → 거부내역), 조회 실패 → 마지막 조회값
+    assert sys2.loan_queries == 1
+    # 잔고 없음 → 주문을 내지 않고 대기(사용자 2026-10-15 "주문 내지 않고 대기로 변경"), 거부에
+    # 안 셈. 20초 뒤 재조회에서 대출일이 생기면 대기가 풀리고 다음 판정에서 낸다.
     eng3, sys3, state3 = _stock_engine()
     s3 = state3.autom.book(U, "stock").sets[0]
     s3.credit, s3.rt, s3.ex_sf = True, 1, 0.005
+    await _warm_loans(eng3)                                # 시동 조회: 대출일 없음
     await _autom_command(eng3, state3, {"cmd": "autom_run", "underlying": U.value, "set": 0,
                                         "block": "exit", "value": True, "product": "stock"})
     eng3.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
-    assert sys3.placed[0].loan_date == ""
+    assert sys3.placed == [] and s3.exit.status is LegStatus.ARMED and s3.exit.running
+    assert s3.exit.reject_streak == 0 and s3.exit.pre_qty == 0
+    assert U in eng3._repay_wait
+    eng3.tick(datetime(2026, 9, 4, 10, 0, 1), 101.0)         # 대기 중 — 판정 G7이 막음
+    await _settle()
+    assert sys3.placed == [] and "G7 신용 잔고 없음" in s3.exit.block_reason
+    sys3.loans = [("20260920", 5.0)]                           # 잔고가 생김
+    eng3.tick(datetime(2026, 9, 4, 10, 0, 30), 130.0)        # 아직 1시간 전 — 조회 없음
+    await _settle()
+    assert sys3.loan_queries == 1 and U in eng3._repay_wait
+    eng3.tick(datetime(2026, 9, 4, 11, 0, 1), 3701.0)        # 1시간 지남 → 주기 조회
+    await _settle()
+    assert sys3.loan_queries == 2 and U not in eng3._repay_wait
+    eng3.tick(datetime(2026, 9, 4, 11, 0, 2), 3702.0)
+    await _settle()
+    assert [(p.loan_date, p.qty) for p in sys3.placed] == [("20260920", 1)]
 
 
 async def test_stock_engine_holds_during_stock_vi_then_resumes() -> None:
@@ -1852,3 +1881,99 @@ async def test_hl_first_batch_communication_failure_halts_sets_without_replacing
     eng.tick(datetime(2026, 9, 30, 10, 0, 5), 105.0)   # 다음 판정에서도 재발주 없음
     await _settle()
     assert len(sys_.batches) == 1 and not sys_.placed
+
+
+async def test_stock_credit_repay_two_sets_share_loan_date_without_overlap() -> None:
+    # 사용자 지적 2026-10-15: 신용 2세트가 같은 틱에 상환을 내면 같은 대출일 잔량을 두 번 쓰면 안
+    # 된다 —
+    # 첫 세트가 발주 중인 수량을 예약하고, 걸려 있는 상환 미체결(장부)도 뺀다(결정 78).
+    eng, sys_, state = _stock_engine()
+    book = state.autom.book(U, "stock")
+    s1, s2 = book.sets[0], book.sets[1]
+    for s in (s1, s2):
+        s.credit, s.rt, s.ex_sf = True, 2, 0.005
+        s.target_qty, s.per_qty, s.pre_tick = 100, 10, 100  # 2세트는 기본값이 비어 있어 채움
+    sys_.loans = [("20260915", 3.0), ("20260917", 5.0)]
+    await _warm_loans(eng)
+    for i in (0, 1):
+        await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": i,
+                                          "block": "exit", "value": True, "product": "stock"})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert [(p.loan_date, p.qty) for p in sys_.placed] == [("20260915", 2), ("20260915", 1)]
+    assert (s1.exit.pre_qty, s2.exit.pre_qty) == (2, 1)
+    assert eng._repay_inflight == {}
+    # 걸려 있는 상환 미체결 3이 20260915를 다 차지하면 다음 대출일로 — 장부 기준(세트 구분 없음)
+    eng2, sys2, state2 = _stock_engine()
+    s = state2.autom.book(U, "stock").sets[0]
+    s.credit, s.rt, s.ex_sf = True, 2, 0.005
+    sys2.loans = [("20260915", 3.0), ("20260917", 5.0)]
+    await _warm_loans(eng2)
+    from kp_arb.domain.enums import Account as _Acct
+    from kp_arb.domain.models import OrderIntent as _OI
+    sys2.order_book.track("X9", _OI(
+        venue=Venue.LS, underlying=U, instrument=Instrument.KR_STOCK, side=Side.SELL, qty=3,
+        order_type=OrderType.LIMIT, price=100_400.0, credit_code="101", loan_date="20260915",
+        account=_Acct.KR_STOCK))
+    await _autom_command(eng2, state2, {"cmd": "autom_run", "underlying": U.value, "set": 0,
+                                        "block": "exit", "value": True, "product": "stock"})
+    eng2.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    mine = [p for p in sys2.placed if p.loan_date]
+    assert [(p.loan_date, p.qty) for p in mine] == [("20260917", 2)]
+
+
+async def test_stock_credit_repay_query_failure_uses_last_loans() -> None:
+    # 주기 조회가 실패하면 옛 스냅샷을 그대로 쓰고 60초 뒤 다시 시도. 처음부터 실패면 스냅샷 없음 →
+    # 대기.
+    from kp_arb.auto_m_engine import LOAN_REFRESH_S, LOAN_RETRY_S
+
+    eng, sys_, _state = _stock_engine()
+    sys_.loans = [("20260915", 2.0)]
+    await _warm_loans(eng)
+    assert eng._pick_loan(U, 5) == ("20260915", 2)
+    sys_.query_fail = True
+    eng._mono = 3700.0
+    await eng._refresh_loans(U, "1시간 주기")                 # 실패 → 옛 값 유지
+    assert eng._pick_loan(U, 5) == ("20260915", 2)
+    assert eng._loans_at[U] == 3700.0 - LOAN_REFRESH_S + LOAN_RETRY_S  # 60초 뒤 재시도 예약
+    eng4, sys4, _ = _stock_engine()
+    sys4.query_fail = True
+    await _warm_loans(eng4)                                 # 시동 조회부터 실패
+    assert eng4._pick_loan(U, 5) == ("", 5) and "조회 전" in eng4._repay_hold_reason(U)
+
+
+async def test_stock_credit_entry_fill_learns_loan_date_with_one_query() -> None:
+    # 사용자 2026-10-15 "당일 신용매수가 한 건이라도 있을 때는 한 번만 조회하면 대출일을 알 수
+    # 있잖아": 그날 첫 진입(003) 체결 때 잔고를 1회 조회해 LS가 매긴 대출일(오늘보다 뒤, 가장 늦은
+    # 것)을 배우고, 그 뒤 진입 체결은 조회 없이 그 대출일에 더한다. 상환 대기 중이면 풀림. 코어가
+    # 날짜를 계산하지 않는다.
+    from datetime import date as _date
+    from datetime import timedelta
+
+    eng, sys_, state = _stock_engine()
+    s = state.autom.book(U, "stock").sets[0]
+    s.credit = True
+    await _warm_loans(eng)                                  # 시동 조회: 대출일 없음
+    assert eng._loans[U] == [] and sys_.loan_queries == 1
+    eng._repay_wait[U] = "쓸 수 있는 대출일 없음"           # 상환 대기 중이었다고 치고
+    await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": 0,
+                                      "block": "entry", "value": True, "product": "stock"})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert sys_.placed[0].credit_code == "003"
+    loan = (_date.today() + timedelta(days=4)).strftime("%Y%m%d")   # LS가 매긴 대출일(오늘보다 뒤)
+    sys_.loans = [(loan, 10.0)]                             # 조회하면 이 체결까지 품은 잔고가 온다
+    sys_.order_book.on_fill(Fill(fill_id="e1", order_id="O1", qty=10, price=100_100.0, ts=0))
+    await _settle()
+    assert sys_.loan_queries == 2                           # 첫 신용매수 → 1회 조회
+    assert eng._today_loan[U][1] == loan and eng._loans[U] == [(loan, 10.0)]
+    assert U not in eng._repay_wait
+    # 같은 날 두 번째 진입 체결 — 조회 없이 그 대출일에 더함
+    sys_.order_book.track("O9", OrderIntent(
+        venue=Venue.LS, underlying=U, instrument=Instrument.KR_STOCK, side=Side.BUY, qty=5,
+        order_type=OrderType.LIMIT, price=100_100.0, credit_code="003"))
+    eng._register("O9", _OrderRef(U, 0, Block.ENTRY, "pre"))
+    sys_.order_book.on_fill(Fill(fill_id="e2", order_id="O9", qty=5, price=100_100.0, ts=0))
+    await _settle()
+    assert sys_.loan_queries == 2 and eng._loans[U] == [(loan, 15.0)]

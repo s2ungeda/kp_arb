@@ -45,11 +45,15 @@ def test_classify_time_phase() -> None:
 
 
 def test_classify_stock_halt_and_resume() -> None:
-    assert classify_jstatus("1", "64") == ("halt", "사이드카매도")
-    assert classify_jstatus("1", "66") == ("halt", "사이드카매수")
+    # 결정 79(2026-10-15): 주식 사이드카(64·66, 해제 65·67)는 정지가 아니라 정보 — 프로그램매매
+    # 호가만
+    # 5분 정지라 일반 주문은 계속(운영 실측 같은 날 09:07:42 사이드카에 주식 세트가 5분 멈춤)
+    assert classify_jstatus("1", "64")[0] == "info"
+    assert classify_jstatus("1", "66")[0] == "info"
+    assert classify_jstatus("1", "65")[0] == "info"
+    assert classify_jstatus("1", "67")[0] == "info"
     assert classify_jstatus("1", "61") == ("halt", "서킷1")
     assert classify_jstatus("1", "68") == ("halt", "서킷2")
-    assert classify_jstatus("1", "65") == ("resume", None)  # 사이드카 해제
     assert classify_jstatus("1", "63") == ("resume", None)  # 서킷1 동시호가종료
     assert classify_jstatus("1", "69") == ("phase", SessionPhase.DEAD)  # 서킷3=당일종료
 
@@ -78,10 +82,15 @@ def test_halt_overlay_set_and_clear() -> None:
     svc = SessionService()
     svc.on_market_status(jif("21"))
     assert svc.halt_for("1") is None
-    svc.on_market_status(jif("64"))  # 사이드카 매도발동
-    assert svc.halt_for("1") == "사이드카매도"
-    svc.on_market_status(jif("65"))  # 사이드카 매도해제
+    svc.on_market_status(jif("64"))  # 사이드카 매도발동 — 주식은 정지 아님(결정 79)
     assert svc.halt_for("1") is None
+    svc.on_market_status(jif("61"))  # 서킷1 발동 → 정지
+    assert svc.halt_for("1") == "서킷1"
+    svc.on_market_status(jif("65"))  # 사이드카 해제는 서킷 정지를 풀지 않는다
+    assert svc.halt_for("1") == "서킷1"
+    svc.on_market_status(jif("63"))  # 서킷1 동시호가종료 → 재개
+    assert svc.halt_for("1") is None
+    assert svc.phase_for_market("1") is SessionPhase.REGULAR  # 정지 코드가 phase를 안 건드림
 
 
 def test_futures_halt_isolated_from_stock() -> None:
@@ -90,9 +99,9 @@ def test_futures_halt_isolated_from_stock() -> None:
     svc.on_market_status(jif("63", jangubun="5"))  # 선물 서킷
     assert svc.halt_for("5") == "서킷"
     assert svc.halt_for("1") is None
-    svc.on_market_status(jif("64", jangubun="1"))  # 주식 사이드카
-    assert svc.halt_for("1") == "사이드카매도"
-    assert svc.halt_for("5") == "서킷"  # 선물엔 그대로, 사이드카 안 옮음
+    svc.on_market_status(jif("61", jangubun="1"))  # 주식 서킷1
+    assert svc.halt_for("1") == "서킷1"
+    assert svc.halt_for("5") == "서킷"  # 선물엔 그대로, 주식 정지가 안 옮음
 
 
 # --- 2단계: 시장 라우팅 + is_tradeable (정지-인지 게이트, §8) ---
@@ -107,15 +116,16 @@ def test_is_tradeable_regular_and_halt() -> None:
     svc = SessionService()
     svc.on_market_status(jif("21"))       # 장시작(주식)
     assert svc.is_tradeable("1") is True
-    svc.on_market_status(jif("64"))       # 사이드카 발동
+    svc.on_market_status(jif("61"))       # 서킷1 발동(사이드카는 결정 79로 정지 아님)
     assert svc.is_tradeable("1") is False  # 정지 → 발주 불가
 
 
 def test_stock_sidecar_does_not_block_futures() -> None:
-    # 결정3: 주식 사이드카 중에도 선물(5)은 발주 가능(공용 phase=REGULAR, 선물 정지 없음).
+    # 결정3: 주식 정지(서킷1) 중에도 선물(5)은 발주 가능(공용 phase=REGULAR, 선물 정지 없음).
+    # 사이드카는 결정 79로 주식도 정지가 아니라 서킷으로 바꿔 검사.
     svc = SessionService()
     svc.on_market_status(jif("21"))       # 주식 REGULAR
-    svc.on_market_status(jif("64"))       # 주식 사이드카
+    svc.on_market_status(jif("61"))       # 주식 서킷1
     assert svc.is_tradeable("1") is False
     assert svc.is_tradeable("5") is True
 
@@ -124,9 +134,9 @@ def test_halt_does_not_clobber_phase_and_resumes() -> None:
     # 버그 방지: 정지가 phase를 DEAD로 만들지 않아, 해제되면 바로 다시 거래 가능.
     svc = SessionService()
     svc.on_market_status(jif("21"))
-    svc.on_market_status(jif("64"))       # 사이드카 발동
+    svc.on_market_status(jif("61"))       # 서킷1 발동(사이드카는 결정 79로 정지 아님)
     assert svc.phase_for(SAMSUNG) is SessionPhase.REGULAR  # phase 유지
-    svc.on_market_status(jif("65"))       # 사이드카 해제
+    svc.on_market_status(jif("63"))       # 서킷1 동시호가종료 → 재개
     assert svc.is_tradeable("1") is True   # DEAD에 안 갇힘
 
 

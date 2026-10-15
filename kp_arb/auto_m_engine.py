@@ -18,7 +18,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -104,6 +104,9 @@ FEED_WATCH_S = 1.0
 # 값은 Claude가 고름(사용자 확인 2026-10-13 예정)
 CANCEL_WAIT_ALARM_S = 30.0
 CANCEL_RETRY_S = 0.6  # 취소가 거부된 뒤 다시 보내기까지(한 건 취소·묶음 취소 공통, exec ㅂ3)
+# 신용융자 잔고(대출일별) 조회 주기 — 시동 때 1회 + 1시간마다(사용자 2026-10-15)
+LOAN_REFRESH_S = 3600.0
+LOAN_RETRY_S = 60.0      # 조회 실패 뒤 다시 시도까지
 
 
 def _is_comm_error(exc: BaseException) -> bool:
@@ -209,7 +212,21 @@ class AutoMEngine:
         self._vi_resumed: dict[Underlying, float] = {}
         # 신용융자 (대출일, 수량) 캐시(종목별, 2026-09-18) — 상환 선주문마다 조회하면 CSPAQ12300
         # 초당 한도에 걸린다(재발주 왕복). 20초 재사용, 이 종목의 주식 선주문 체결 뒤엔 다시 조회
-        self._loan_cache: dict[Underlying, tuple[float, list[tuple[str, float]]]] = {}
+        # 신용융자 잔고 스냅샷(결정 78, 사용자 2026-10-15 "시동 때 한 번, 한 시간에 한 번, 상환 낼
+        # 때는
+        # 안 함"): 종목 → [(대출일, 수량)]. 상환 체결은 코어가 여기서 바로 차감한다
+        self._loans: dict[Underlying, list[tuple[str, float]]] = {}
+        self._loans_at: dict[Underlying, float] = {}  # 마지막 조회 시도 mono(다음 조회 시각 계산)
+        # 당일 신용매수의 대출일 — 그날 첫 진입 체결 때 1회 조회해 LS가 매긴 값을 배운다(결정 78):
+        # 종목 → (오늘 날짜, 대출일). 배운 뒤 그날 진입 체결은 조회 없이 그 대출일에 더한다
+        self._today_loan: dict[Underlying, tuple[str, str]] = {}
+        self._learning_loan: set[Underlying] = set()  # 당일 대출일 조회 진행 중
+        # 발주 중(응답 전)인 상환 선주문의 (종목, 대출일) → 수량 — 같은 틱에 두 세트가 같은 대출일을
+        # 고르지
+        # 않게 예약한다(결정 78). 응답이 오면 장부가 그 주문을 들고 있으니 뺀다
+        self._repay_inflight: dict[tuple[Underlying, str], int] = {}
+        # 상환 대기(결정 78): 종목 → 사유. 다음 잔고 조회에서 쓸 수 있는 대출일이 생기면 빠진다
+        self._repay_wait: dict[Underlying, str] = {}
         # 묶음 전송(exec §7D, 사용자 2026-09-30) — HL선 엔진이 판정 한 바퀴 동안만 모으는 바구니.
         # 바퀴 밖(체결·통보 처리)에서는 None이라 그 자리에서 한 건씩 나간다.
         self._tick_pre: list[_PreItem] | None = None
@@ -476,6 +493,7 @@ class AutoMEngine:
         """세트·진입/청산 1회 판정(now/mono 주입 — 테스트 가능). only가 있으면 그 종목들만,
         없으면 전 종목."""
         self._mono = mono
+        self._refresh_loans_due(mono)  # 신용융자 잔고 — 시동 1회 + 1시간마다(결정 78)
         # 시장 정지 — 주식선물은 선물시장, 주식은 주식시장 오버레이(사용자 확정 2026-09-17)
         halted = (self._system.stock_halted() if self.product == "stock"
                   else self._system.futures_halted())
@@ -586,7 +604,8 @@ class AutoMEngine:
             hl_bids=hl_bids, hl_asks=hl_asks,
             hl_sz_decimals=hl_info.sz_decimals if hl_info is not None else None,
             ls_feed_ok=self._system.ls_feed_ok(), hl_feed_ok=self._hl_feed_ok(),
-            stock_auction=self._system.stock_auction())
+            stock_auction=self._system.stock_auction(),
+            repay_wait=self._repay_wait_note(u, mono))
 
     # ------------------------------------------------------------ 행동 실행 ---
     def _apply(self, u: Underlying, index: int, block: Block, actions: list[Action],
@@ -658,20 +677,37 @@ class AutoMEngine:
 
         stock = book.product == "stock"
         loan_date = ""
+        qty = act.qty
+        inflight: tuple[Underlying, str] | None = None
         if stock and s.credit and block is Block.EXIT:
-            # 신용 상환은 대출일이 필수(실측 2026-09-18 LS 01486) — 잔고 조회의 대출일 중 고름.
-            # 수량은 1회주문수량 그대로(사용자 2026-09-18: 신용 세트는 1주씩 낸다 — 한 대출일 잔량을
-            # 넘는 수량은 LS가 거부해 거부내역에 남는다)
-            loan_date = await self._pick_loan_date(u, act.qty)
+            # 신용 상환은 대출일이 필수(실측 2026-09-18 LS 01486). 결정 78(사용자 2026-10-15):
+            # 오래된
+            # 대출일부터 그 대출일의 쓸 수 있는 잔량만큼 수량을 줄여 낸다 — 줄인 수량은 pre_qty에도
+            # 적어 체결·잔량·취소 판단이 같은 수량을 보게 한다. 대출일이 없으면 빈칸(LS 거부 → 결정
+            # 29)
+            loan_date, qty = self._pick_loan(u, act.qty)  # 조회 없이 스냅샷만(결정 78)
+            if not loan_date:
+                self._hold_repay(u, index, block, s, reverse, self._repay_hold_reason(u))
+                return
+            if loan_date:
+                inflight = (u, loan_date)
+                self._repay_inflight[inflight] = self._repay_inflight.get(inflight, 0) + qty
+            if qty != act.qty:
+                self._log.info("[자동M] %s 상환 수량 %d → %d %s (대출일 %s 쓸 수 있는 잔량)",
+                               u.value, act.qty, qty, self._tag(u, index, block, reverse),
+                               loan_date)
+                self.ulog(u).info("상환 %s: 수량 %d → %d (대출일 %s 잔량에 맞춤)",
+                                  self._tag(u, index, block, reverse), act.qty, qty, loan_date)
+                s.leg(block).pre_qty = qty
         intent = OrderIntent(venue=Venue.LS, underlying=u, instrument=inst, side=act.side,
-                             qty=act.qty, order_type=OrderType.LIMIT, price=act.price,
+                             qty=qty, order_type=OrderType.LIMIT, price=act.price,
                              source=SOURCE,
                              tag=self._set_tag(index, block, reverse, self._tag_letter),
                              # 주식(exec §7C): 신용 세트 코드(진입 003·청산 101), 고른 거래소
                              credit_code=credit_code_for(block, s.credit) if stock else "000",
                              market=book.market if stock else "", loan_date=loan_date)
         try:
-            oid = await self._system.place(intent)
+            oid = await self._place_ls_pre_order(intent)
         except RestTimeoutError as exc:
             # 응답 없음은 거부가 아니다 — LS가 접수했을 수 있어 재발주하면 두 장(실증 09-16 #3326).
             # 쌍이 맞는 게 최우선이라 **바로 세트 중지**(사용자 확정 2026-09-16). 사람이 LS
@@ -708,7 +744,7 @@ class AutoMEngine:
                               u.value, self._tag(u, index, block, reverse), oid)
             self._apply(u, index, block, late, reverse)
         self._log.info("[자동M] %s 선주문 %s %s %d @ %s → #%s",
-                       u.value, self._tag(u, index, block, reverse), act.side.value, act.qty,
+                       u.value, self._tag(u, index, block, reverse), act.side.value, qty,
                        f"{act.price:,.0f}", oid)
 
     async def _place_hl_pre(self, u: Underlying, index: int, block: Block, act: Action,
@@ -937,27 +973,175 @@ class AutoMEngine:
                        f"{price:,.0f}", oid,
                        self._settings.rel_buy if act.side is Side.BUY else self._settings.rel_sell)
 
-    async def _pick_loan_date(self, u: Underlying, qty: int) -> str:
-        """상환 선주문에 실을 대출일 — 신용융자 잔고(대출일별 수량) 중 **오래된 것부터** 수량이 되는
-        첫 대출일, 없으면 수량이 가장 많은 대출일. 잔고가 없으면 빈칸(LS가 거부 → 거부내역에 남음).
-        조회가 실패하면 마지막 조회값을 그대로 쓴다."""
-        now = time.monotonic()
-        cached = self._loan_cache.get(u)
-        loans = cached[1] if cached is not None else []
-        if cached is None or now - cached[0] > 20.0:
-            try:
-                loans = sorted(await self._system.query_credit_loans(u))
-                self._loan_cache[u] = (now, loans)
-            except Exception as exc:  # noqa: BLE001 - 조회 실패면 옛 값으로(없으면 빈칸)
-                self._log.warning("[자동M] %s 신용융자 잔고 조회 실패 — 대출일 %s: %s", u.value,
-                                  "마지막 조회값 사용" if loans else "없음", exc)
+    async def _place_ls_pre_order(self, intent: OrderIntent) -> str:
+        """LS 선주문 발주 — 상환 선주문이면 응답(성공·실패 모두)이 온 뒤 발주 중 예약을 푼다(장부가
+        들거나
+        거부로 끝났으니). 예약 가감에 await가 없어 다른 세트의 _pick_loan과 섞이지 않는다."""
+        key = (intent.underlying, intent.loan_date) if intent.loan_date else None
+        try:
+            return await self._system.place(intent)
+        finally:
+            if key is not None:
+                left = self._repay_inflight.get(key, 0) - int(intent.qty)
+                if left > 0:
+                    self._repay_inflight[key] = left
+                else:
+                    self._repay_inflight.pop(key, None)
+
+    def _repay_reserved(self, u: Underlying) -> dict[str, float]:
+        """대출일별로 이미 차지한 수량 — 장부에 걸린 우리 상환 미체결(세트 구분 없이, 일반주문창
+        상환 포함)의
+        남은 수량 + 같은 순간 발주 중인 상환 수량(결정 78)."""
+        from .auto_m import CREDIT_EXIT_CODE
+
+        out: dict[str, float] = {}
+        for o in self._system.order_book.open_orders():
+            it = o.intent
+            if (it.venue is Venue.LS and it.underlying is u and it.loan_date
+                    and it.credit_code == CREDIT_EXIT_CODE
+                    and it.instrument is Instrument.KR_STOCK):
+                out[it.loan_date] = out.get(it.loan_date, 0.0) + max(0.0, o.remaining_qty)
+        for (iu, loan), n in self._repay_inflight.items():
+            if iu is u:
+                out[loan] = out.get(loan, 0.0) + n
+        return out
+
+    def _hold_repay(self, u: Underlying, index: int, block: Block, s: AutoMSet,
+                    reverse: bool, reason: str) -> None:
+        """쓸 수 있는 대출일이 없다 — 상환 선주문을 내지 않고 대기(결정 78, 사용자 2026-10-15).
+        판정이 넣어 둔 선주문 값을 걷고 ARMED로 되돌리며, 그 종목을 대기로 표시해 판정 G7이
+        막는다. 다음 잔고 조회(시동 1회 + 1시간마다)에서 생기면 풀린다. 거부 횟수에 세지 않는다."""
+        first = u not in self._repay_wait
+        self._repay_wait[u] = reason
+        leg = s.leg(block)
+        leg._clear_pre()
+        leg.status = LegStatus.ARMED
+        leg.block_reason = f"G7 신용 잔고 없음 — 상환 대기 ({reason})"
+        if first:
+            self._log.warning("[자동M] %s 상환 선주문 안 냄 %s — %s, 다음 잔고 조회까지 대기",
+                              u.value, self._tag(u, index, block, reverse), reason)
+        self.ulog(u).info("상환 %s: 안 냄 — %s", self._tag(u, index, block, reverse), reason)
+        self._trace(u, index, block, leg, reverse)
+
+    def _repay_wait_note(self, u: Underlying, mono: float) -> str:
+        """판정 입력용 상환 대기 사유("" = 정상)."""
+        return self._repay_wait.get(u, "")
+
+    def _refresh_loans_due(self, mono: float) -> None:
+        """감시 틱(1초)마다: 주식 종목의 신용융자 잔고를 시동 때 1회, 그 뒤 1시간마다 조회(결정 78).
+        실패하면 60초 뒤 다시. 상환 발주 때는 조회하지 않는다(사용자 2026-10-15)."""
+        if self.product != "stock":
+            return
+        for u, _book in self.screen.books_of(self.product):
+            at = self._loans_at.get(u)
+            if at is None or mono - at >= LOAN_REFRESH_S:
+                self._loans_at[u] = mono
+                self._spawn(self._refresh_loans(u, "시동" if at is None else "1시간 주기"))
+
+    async def _refresh_loans(self, u: Underlying, why: str) -> None:
+        """신용융자 잔고(대출일별 수량) 조회 → 스냅샷. 실패면 옛 값 유지 + 60초 뒤 재시도. 상환
+        대기 중이던 종목에 쓸 수 있는 대출일이 생기면 대기를 푼다."""
+        from .auto_m import pick_repay_loan
+
+        try:
+            loans = sorted(await self._system.query_credit_loans(u))
+        except Exception as exc:  # noqa: BLE001 - 조회 실패면 옛 값으로, 60초 뒤 다시
+            self._loans_at[u] = self._mono - LOAN_REFRESH_S + LOAN_RETRY_S
+            self._log.warning("[자동M] %s 신용융자 잔고 조회 실패(%s) — %s, %.0f초 뒤 다시: %s",
+                              u.value, why, "옛 값 유지" if u in self._loans else "없음",
+                              LOAN_RETRY_S, exc)
+            return
+        self._loans[u] = loans
+        self._log.info("[자동M] %s 신용융자 잔고 조회(%s) — 대출일 %d건 %s", u.value, why,
+                       len(loans), ", ".join(f"{d} {q:g}" for d, q in loans) or "없음")
+        if u in self._repay_wait:
+            loan, _n = pick_repay_loan(loans, self._repay_reserved(u), 1)
+            if loan:
+                self._repay_wait.pop(u, None)
+                self._log.info("[자동M] %s 신용융자 잔고 생김(대출일 %s) — 상환 대기 해제",
+                               u.value, loan)
+                self.ulog(u).info("상환 대기 해제 — 대출일 %s", loan)
+                self._dirty.add(u)
+                if self._wake is not None:
+                    self._wake.set()
+
+    def _note_credit_fill(self, u: Underlying, order: TrackedOrder, qty: float) -> None:
+        """신용 선주문 체결 → 대출일 잔고 스냅샷 갱신(결정 78). 상환(101) 체결: 그 대출일 수량을
+        뺀다. 진입(003) 체결: 그날 대출일을 아직 모르면 **1회 조회**해 LS가 매긴 값을 배우고(조회
+        응답이 이 체결까지 품는다), 알면 조회 없이 그 대출일에 더한다. 상환 대기 중이면 푼다."""
+        from .auto_m import CREDIT_ENTRY_CODE, CREDIT_EXIT_CODE
+
+        it = order.intent
+        if it.credit_code == CREDIT_EXIT_CODE and it.loan_date and u in self._loans:
+            self._loans[u] = [(d, max(0.0, q - qty) if d == it.loan_date else q)
+                              for d, q in self._loans[u]]
+            return
+        if it.credit_code != CREDIT_ENTRY_CODE or qty <= 0:
+            return
+        today = date.today().strftime("%Y%m%d")
+        known = self._today_loan.get(u)
+        if known is None or known[0] != today:
+            if u not in self._learning_loan:  # 그날 첫 신용매수 — 대출일을 LS에 한 번 묻는다
+                self._learning_loan.add(u)
+                self._spawn(self._learn_today_loan(u, today))
+            return
+        loan = known[1]
+        loans = dict(self._loans.get(u, []))
+        loans[loan] = loans.get(loan, 0.0) + qty
+        self._loans[u] = sorted(loans.items())
+        self.ulog(u).info("신용매수 체결 %g → 대출일 %s 잔고 스냅샷 %g(조회 없이 더함)", qty, loan,
+                          loans[loan])
+        self._release_repay_wait(u, loan)
+
+    async def _learn_today_loan(self, u: Underlying, today: str) -> None:
+        """당일 첫 신용매수 뒤 잔고 1회 조회 — 오늘보다 뒤인 대출일 중 가장 늦은 것이 그날 매수분의
+        대출일(운영 로그 09-18: 목요일 매수 → LoanDt 월요일). 조회 응답이 그 체결 수량까지 품으므로
+        따로 더하지 않는다. 안 보이면 다음 진입 체결 때 다시 묻는다."""
+        try:
+            await self._refresh_loans(u, "당일 신용매수")
+            future = [d for d, q in self._loans.get(u, []) if d > today and q > 0]
+            if not future:
+                self._log.warning("[자동M] %s 당일 신용매수 뒤 조회에 새 대출일이 아직 없음 — 다음"
+                                  " 체결 때 다시 조회", u.value)
+                return
+            loan = max(future)
+            self._today_loan[u] = (today, loan)
+            self._log.info("[자동M] %s 당일 신용매수 대출일 %s (조회 1회로 확인) — 이후 체결은"
+                           " 조회 없이 더함", u.value, loan)
+            self._release_repay_wait(u, loan)
+        finally:
+            self._learning_loan.discard(u)
+
+    def _release_repay_wait(self, u: Underlying, loan: str) -> None:
+        if u not in self._repay_wait:
+            return
+        self._repay_wait.pop(u, None)
+        self._log.info("[자동M] %s 당일 신용매수로 대출일 %s 생김 — 상환 대기 해제", u.value, loan)
+        self._dirty.add(u)
+        if self._wake is not None:
+            self._wake.set()
+
+    def _pick_loan(self, u: Underlying, qty: int) -> tuple[str, int]:
+        """상환 선주문의 (대출일, 낼 수량) — 결정 78. 잔고 스냅샷(시동 1회 + 1시간마다 조회)에서
+        걸린
+        미체결·발주 중 수량(_repay_reserved)을 뺀 뒤 오래된 대출일부터 그 잔량만큼. 스냅샷이 아직
+        없거나 쓸 수 있는 대출일이 없으면 ("", qty) — 호출한 쪽이 주문을 내지 않고 대기한다."""
+        from .auto_m import pick_repay_loan
+
+        loans = self._loans.get(u)
+        if loans is None:
+            return "", qty
         if not loans:
-            self._log.warning("[자동M] %s 신용융자 잔고 없음 — 상환 선주문 대출일 빈칸", u.value)
-            return ""
-        for loan, avail in loans:  # 오래된 대출일부터 수량이 되는 것
-            if avail + 1e-9 >= qty:
-                return loan
-        return max(loans, key=lambda x: x[1])[0]
+            return "", qty
+        loan, send = pick_repay_loan(loans, self._repay_reserved(u), qty)
+        return loan, send
+
+    def _repay_hold_reason(self, u: Underlying) -> str:
+        if u not in self._loans:
+            return "신용융자 잔고 조회 전(시동 조회 대기 또는 실패)"
+        if not self._loans[u]:
+            return "신용융자 잔고 없음(현금 매수분·결제 전)"
+        return "쓸 수 있는 대출일 없음(전부 걸린 상환에 잡힘)"
 
     async def _cancel_pre(self, u: Underlying, index: int, block: Block,
                           order_id: str, reason: str, reverse: bool = False) -> None:
@@ -1162,7 +1346,7 @@ class AutoMEngine:
         leg = s.leg(ref.block)
         if ref.leg == "pre":
             self._fill_perf[(u, ref.index, ref.block, ref.reverse)] = time.perf_counter()
-            self._loan_cache.pop(u, None)  # 주식 체결로 신용융자 잔고가 바뀜 → 다음 상환 때 재조회
+            self._note_credit_fill(u, order, qty)  # 신용 체결 → 대출일 잔고 스냅샷 갱신(결정 78)
         # 체결 줄을 먼저 찍고 행동(후주문 발주·중지)을 적용한다 — 행동 줄이 체결 줄보다 앞에 찍혀
         # "체결 전에 판단했다"로 읽힌 실측(2026-09-10 10:45:47.536/537)을 막는다.
         tag = self._tag(u, ref.index, ref.block, ref.reverse)

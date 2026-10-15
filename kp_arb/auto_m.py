@@ -13,7 +13,7 @@ POST_PENDING 후주문대기 · SETTLE_DELAY 딜레이대기 · HALTED 중지(�
 from __future__ import annotations
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from datetime import time as dtime
@@ -134,6 +134,10 @@ class Signals:
     # 주식시장 동시호가 중(결정 57, 사용자 2026-09-30) — 현물이 예상체결가로 움직여 S괴리가
     # 이상하므로 주식선물·HL선의 G5 S괴리 필터를 건너뛴다(정·역방향). 기준값은 여전히 있어야 한다
     stock_auction: bool = False
+    # 신용 상환 대기(결정 78, 사용자 2026-10-15 "주문 내지 않고 대기") — 그 종목의 신용융자
+    # 잔고에 쓸 수 있는 대출일이 없을 때 엔진이 사유를 넣는다(빈 문자열 = 정상). 신용 세트의
+    # 청산 선주문만 막는다
+    repay_wait: str = ""
 
 
 # --------------------------------------------------------------- 행동(출력) ---
@@ -922,6 +926,9 @@ def evaluate(
     if leg.pre_order_id is None and leg.status is LegStatus.ARMED:
         if qty < 1:
             return hold(f"G4 여유 없음 (목표 {s.target_qty} RT {s.rt})")
+        if block is Block.EXIT and s.credit and sig.repay_wait:
+            # 신용 상환인데 쓸 수 있는 대출일이 없다(결정 78) — 내지 않고 대기, 거부에 안 셈
+            return hold(f"G7 신용 잔고 없음 — 상환 대기 ({sig.repay_wait})")
         leg.pre_price, leg.pre_qty, leg.pre_filled = price, qty, 0
         leg.pre_est = hl_est  # 후주문 체결가 비교 기준(발주 시점 est)
         leg.cancel_sent = False
@@ -1520,6 +1527,20 @@ def credit_code_for(block: Block, credit: bool) -> str:
     if not credit:
         return "000"
     return CREDIT_ENTRY_CODE if block is Block.ENTRY else CREDIT_EXIT_CODE
+
+
+def pick_repay_loan(loans: Sequence[tuple[str, float]], reserved: Mapping[str, float],
+                    qty: int) -> tuple[str, int]:
+    """상환 선주문의 (대출일, 낼 수량) — 결정 78(사용자 2026-10-15). 오래된 대출일부터, 쓸 수 있는
+    잔량
+    (조회 잔량 − 그 대출일로 걸린 우리 상환 미체결·발주 중 수량 = reserved) ≥ 1인 첫 대출일, 수량 =
+    min(판정 수량, 그 잔량). 없으면 ("", qty) — 대출일 빈칸으로 내고 LS 거부(결정 29)에 맡긴다(종전
+    동작)."""
+    for loan, avail in sorted(loans):
+        free = int(avail - float(reserved.get(loan, 0.0)) + 1e-9)
+        if free >= 1:
+            return loan, max(1, min(qty, free))
+    return "", qty
 
 
 def book_key(u: Underlying, product: str = "sf") -> str:

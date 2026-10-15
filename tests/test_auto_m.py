@@ -1041,3 +1041,22 @@ def test_maker_correction_snaps_to_order_unit_and_respects_limit() -> None:
     set_running(c, Block.EXIT, True)
     assert evaluate(c, Block.EXIT, sig, SETTINGS, U) == []
     assert "G6 범위 밖 역산가 198,000 메이커 보정 198,000→200,000" in c.exit.block_reason
+
+
+def test_pick_repay_loan_oldest_first_minus_reserved() -> None:
+    # 결정 78(사용자 2026-10-15): 상환은 오래된 대출일부터 그 대출일의 쓸 수 있는 잔량만큼. 쓸 수
+    # 있는 잔량 =
+    # 조회 잔량 − 걸린 상환 미체결·발주 중 수량(reserved). 전부 0 이하면 빈칸(LS 거부 → 결정 29).
+    from kp_arb.auto_m import pick_repay_loan
+
+    loans = [("20260917", 10.0), ("20260915", 2.0)]          # 정렬 전 순서는 무관
+    assert pick_repay_loan(loans, {}, 4) == ("20260915", 2)   # 오래된 것부터, 잔량 2만큼
+    assert pick_repay_loan(loans, {}, 1) == ("20260915", 1)   # 잔량이 넉넉하면 판정 수량 그대로
+    assert pick_repay_loan(loans, {"20260915": 2}, 4) == ("20260917", 4)   # 미체결이 다 차지 → 다음
+    assert pick_repay_loan(loans, {"20260915": 1}, 4) == ("20260915", 1)   # 남은 1만
+    assert pick_repay_loan(loans, {"20260915": 2, "20260917": 10}, 4) == ("", 4)  # 전부 참 → 대기
+    assert pick_repay_loan([], {}, 3) == ("", 3)
+    assert pick_repay_loan([("20260915", 0.0)], {}, 3) == ("", 3)
+    # 두 세트가 같은 틱에 잔량 3을 나눠 갖는 모양: 첫 세트 2 예약 → 둘째는 1
+    assert pick_repay_loan([("20260915", 3.0)], {}, 2) == ("20260915", 2)
+    assert pick_repay_loan([("20260915", 3.0)], {"20260915": 2}, 2) == ("20260915", 1)
