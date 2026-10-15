@@ -1342,14 +1342,19 @@ async def test_stock_engine_round_one_share_one_contract() -> None:
 
 
 async def test_stock_engine_uses_selected_market_only() -> None:
-    # 2026-09-17: 주식 API는 통합 미지원 → 화면 거래소 콤보(KRX/NXT)가 autom_market으로 오고,
-    # 주식 종목 상태는 그 거래소 시세만 본다(통합·다른 거래소로 대체하지 않음). NXT 주문 코드는
-    # [OPEN]이라 거래소가 NXT면 실행을 거부한다.
+    # 2026-09-17: 주식 API는 통합 미지원 → 거래소를 골라야 한다. 결정 80(2026-10-15): 거래소는
+    # 주식 설정의 주문가능시간 구간이 정한다(autom_settings slots) — 판정 틱이 종목 상태 market을
+    # 구간 거래소로 맞추고, 주식 종목 상태는 그 거래소 시세만 본다.
     from kp_arb.domain.models import Quote
     eng, sys_, state = _stock_engine()
-    res = await _autom_command(eng, state, {"cmd": "autom_market", "underlying": U.value,
-                                            "market": "NXT", "product": "stock"})
-    assert res["ok"] and state.autom.book(U, "stock").market == "nxt"
+    res = await _autom_command(eng, state, {
+        "cmd": "autom_settings", "product": "stock",
+        "slots": [{"enabled": True, "start": "09:00:00", "end": "15:20:00",
+                   "market": "nxt"}]})
+    assert res["ok"]
+    eng.tick(datetime(2026, 9, 4, 9, 59, 0), 90.0)         # 판정 틱이 구간 거래소로 맞춤
+    await _settle()
+    assert state.autom.book(U, "stock").market == "nxt"
     assert state.autom.book(U).market == "krx"  # 주식선물 종목 상태는 무관
     snap = eng.live_snapshot()[f"{U.value}|stock"]
     assert snap["market"] == "nxt"
@@ -1977,3 +1982,36 @@ async def test_stock_credit_entry_fill_learns_loan_date_with_one_query() -> None
     sys_.order_book.on_fill(Fill(fill_id="e2", order_id="O9", qty=5, price=100_100.0, ts=0))
     await _settle()
     assert sys_.loan_queries == 2 and eng._loans[U] == [(loan, 15.0)]
+
+
+async def test_stock_slot_change_cancels_and_replaces_on_new_market() -> None:
+    # 결정 80: 주문가능시간 구간이 바뀌어 거래소가 달라지면 걸린 선주문을 취소하고 새 거래소로 다시
+    # 낸다.
+    # 겹치는 구간은 코어가 저장을 거부한다.
+    eng, sys_, state = _stock_engine()
+    bad = await _autom_command(eng, state, {
+        "cmd": "autom_settings", "product": "stock",
+        "slots": [{"enabled": True, "start": "09:00:00", "end": "15:20:00", "market": "krx"},
+                  {"enabled": True, "start": "10:00:00", "end": "11:00:00", "market": "nxt"}]})
+    assert not bad["ok"] and "겹침" in bad["errors"][0]
+    res = await _autom_command(eng, state, {
+        "cmd": "autom_settings", "product": "stock",
+        "slots": [{"enabled": True, "start": "09:00:00", "end": "10:00:30", "market": "krx"},
+                  {"enabled": True, "start": "10:00:30", "end": "15:20:00", "market": "nxt"}]})
+    assert res["ok"]
+    sys_.quotes[(U, Instrument.KR_STOCK, "nxt")] = sys_.quotes[(U, Instrument.KR_STOCK, "krx")]
+    sys_.trades[(U, Instrument.KR_STOCK, "nxt")] = 100_000.0
+    await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": 0,
+                                      "block": "entry", "value": True, "product": "stock"})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)         # 1구간(KRX)
+    await _settle()
+    s = state.autom.book(U, "stock").sets[0]
+    assert sys_.placed[0].market == "krx" and s.entry.pre_market == "krx"
+    eng.tick(datetime(2026, 9, 4, 10, 0, 31), 131.0)        # 2구간(NXT)으로 넘어감
+    await _settle()
+    assert state.autom.book(U, "stock").market == "nxt"
+    assert sys_.cancelled == ["O1"] and "거래소 변경" in s.entry.block_reason
+    s.entry.delay_until = None                               # 딜레이(실시계 기준) 지난 것으로
+    eng.tick(datetime(2026, 9, 4, 10, 0, 33), 133.0)
+    await _settle()
+    assert [p.market for p in sys_.placed] == ["krx", "nxt"]

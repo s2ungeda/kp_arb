@@ -60,10 +60,67 @@ def parse_hms(text: str) -> dtime:
 
 
 @dataclass
+class TradeSlot:
+    """주식 체결쏴 주문가능시간 한 구간(결정 80, 사용자 2026-10-15): 사용 여부·시작~끝·거래소."""
+
+    enabled: bool = False
+    start: str = "09:00:00"
+    end: str = "15:20:00"
+    market: str = "krx"  # krx | nxt
+
+
+STOCK_SLOT_COUNT = 4  # 주식 설정창 구간 수(사용자 2026-10-15)
+
+
+def default_stock_slots() -> tuple[TradeSlot, ...]:
+    """주식 기본 4구간 — 1구간만 사용(정규장 KRX), 나머지는 칸만 채워 두고 끔."""
+    return (TradeSlot(True, "09:00:00", "15:20:00", "krx"),
+            TradeSlot(False, "08:00:05", "08:50:00", "nxt"),
+            TradeSlot(False, "15:40:00", "20:00:00", "nxt"),
+            TradeSlot(False, "09:00:00", "15:20:00", "krx"))
+
+
+def slot_conflicts(slots: Sequence[TradeSlot]) -> list[str]:
+    """사용 구간의 문제 목록(비면 정상, 순수): 시각 형식 오류 · 시작 ≥ 끝 · 사용 구간끼리 겹침
+    (거래소가 다르면 어디로 낼지 모른다 — 사용자 2026-10-15, 같은 거래소여도 겹침은 거부)."""
+    out: list[str] = []
+    spans: list[tuple[int, dtime, dtime]] = []
+    for i, sl in enumerate(slots, start=1):
+        if not sl.enabled:
+            continue
+        try:
+            a, b = parse_hms(sl.start), parse_hms(sl.end)
+        except ValueError:
+            out.append(f"{i}구간 시각 형식 오류 ({sl.start}~{sl.end})")
+            continue
+        if a >= b:
+            out.append(f"{i}구간 시작이 끝보다 늦거나 같음 ({sl.start}~{sl.end})")
+            continue
+        if sl.market not in ("krx", "nxt"):
+            out.append(f"{i}구간 거래소 값 오류 ({sl.market!r})")
+            continue
+        for j, c, d in spans:
+            if a < d and c < b:
+                out.append(f"{j}구간과 {i}구간이 겹침 — 거래소가 다르면 어디로 낼지 모름")
+        spans.append((i, a, b))
+    return out
+
+
+def active_slot(slots: Sequence[TradeSlot], now: dtime) -> TradeSlot | None:
+    """지금 시각이 든 사용 구간(겹침은 저장 때 막으므로 첫 것)."""
+    for sl in slots:
+        if sl.enabled and in_time_window(now, parse_hms(sl.start), parse_hms(sl.end)):
+            return sl
+    return None
+
+
+@dataclass
 class AutoMSettings:
     """공통설정(체결쏴 설정) — DESIGN-auto-m §9 공통설정 창."""
 
     windows: tuple[tuple[str, str], ...] = (("08:30:10", "08:46:20"), ("15:35:30", "15:46:55"))
+    # 주식 설정(결정 80): 4구간(사용·시작~끝·거래소). 비어 있으면 옛 windows를 쓴다(주식선물)
+    slots: tuple[TradeSlot, ...] = ()
     pre_tick: dict[Underlying, int] = field(default_factory=lambda: {
         Underlying.SK_HYNIX: 3000, Underlying.SAMSUNG: 500, Underlying.HYUNDAI: 1000})
     pre_delay_ms: int = 1000     # 선주문 딜레이(ms) — 후주문 체결·거부·재발주 뒤 대기
@@ -86,14 +143,34 @@ class AutoMSettings:
             return hl_ask * (1.0 + self.hl_margin_buy)
         return hl_bid * (1.0 - self.hl_margin_sell)
 
+    def effective_slots(self) -> tuple[TradeSlot, ...]:
+        """화면·판정이 보는 구간 — slots가 있으면 그대로, 없으면 옛 windows를 사용 구간으로
+        (주식선물이 설정창에서 한 번 저장하기 전)."""
+        if self.slots:
+            return self.slots
+        return tuple(TradeSlot(True, a, b, "krx") for a, b in self.windows)
+
+    def _spans(self) -> list[tuple[str, str]]:
+        """판정에 쓰는 시간 구간 — slots가 있으면 사용 구간만, 없으면 windows."""
+        if self.slots:
+            return [(sl.start, sl.end) for sl in self.slots if sl.enabled]
+        return list(self.windows)
+
     def in_window(self, now: dtime) -> bool:
-        return any(in_time_window(now, parse_hms(s), parse_hms(e)) for s, e in self.windows)
+        return any(in_time_window(now, parse_hms(s), parse_hms(e)) for s, e in self._spans())
+
+    def market_at(self, now: dtime) -> str | None:
+        """지금 시각의 거래소(결정 80) — slots가 있을 때만, 사용 구간 밖이면 None."""
+        if not self.slots:
+            return None
+        sl = active_slot(self.slots, now)
+        return sl.market if sl is not None else None
 
     def next_edge_s(self, now: datetime) -> float | None:
         """오늘 남은 주문가능시간 경계(시작·끝) 중 가장 가까운 것까지 남은 초 — 엔진이 그 시각에
         타이머로 판정한다(exec §4 판정 계기). 오늘 남은 경계가 없으면 None."""
         ahead = [(datetime.combine(now.date(), parse_hms(t)) - now).total_seconds()
-                 for window in self.windows for t in window]
+                 for window in self._spans() for t in window]
         return min((s for s in ahead if s > 0), default=None)
 
 
@@ -134,6 +211,9 @@ class Signals:
     # 주식시장 동시호가 중(결정 57, 사용자 2026-09-30) — 현물이 예상체결가로 움직여 S괴리가
     # 이상하므로 주식선물·HL선의 G5 S괴리 필터를 건너뛴다(정·역방향). 기준값은 여전히 있어야 한다
     stock_auction: bool = False
+    # 주식 선주문이 나갈 거래소(결정 80: 주문가능시간 구간의 거래소; 주식선물은 ""). 걸린 선주문의
+    # 거래소와 다르면 취소 뒤 재발주
+    stock_market: str = ""
     # 신용 상환 대기(결정 78, 사용자 2026-10-15 "주문 내지 않고 대기") — 그 종목의 신용융자
     # 잔고에 쓸 수 있는 대출일이 없을 때 엔진이 사유를 넣는다(빈 문자열 = 정상). 신용 세트의
     # 청산 선주문만 막는다
@@ -286,6 +366,7 @@ class Leg:
     # 비교해 "판정 때 본 값대로 잡혔나"를 본다(사용자 2026-09-14). 재발주 때 새 값으로 덮인다.
     pre_est: float | None = None
     pre_qty: int = 0            # 이번 선주문 계약수(HL선은 HL 계약 = SF계약×10)
+    pre_market: str = ""       # 이번 선주문이 나간 거래소(주식, 결정 80) — 구간이 바뀌면 재발주
     pre_filled: int = 0         # 이번 선주문 체결 계약수(HL선은 소수 체결의 내림값 — 취소 판단용)
     post_pending: float = 0.0   # 후주문(HL) 체결 대기 계약수 — HL은 소수 체결(0.588 등, 실측 09-07)
     # HL선(§7D) 전용 — HL 선주문 체결은 소수라 따로 센다. hl_unhedged = LS 후주문을 아직 안 낸 HL
@@ -341,6 +422,7 @@ class Leg:
 
     def _clear_pre(self) -> None:
         self.pre_order_id = self.pre_price = None
+        self.pre_market = ""
         self.pre_qty = self.pre_filled = 0
         self.pre_filled_f = 0.0
         self.cancel_sent = False
@@ -930,6 +1012,7 @@ def evaluate(
             # 신용 상환인데 쓸 수 있는 대출일이 없다(결정 78) — 내지 않고 대기, 거부에 안 셈
             return hold(f"G7 신용 잔고 없음 — 상환 대기 ({sig.repay_wait})")
         leg.pre_price, leg.pre_qty, leg.pre_filled = price, qty, 0
+        leg.pre_market = sig.stock_market  # 주식: 이 구간의 거래소(결정 80)
         leg.pre_est = hl_est  # 후주문 체결가 비교 기준(발주 시점 est)
         leg.cancel_sent = False
         leg.status = LegStatus.PRE_RESTING
@@ -940,6 +1023,13 @@ def evaluate(
         # 죽기를 되풀이). 예외 대신 걸린 주문을 취소해 정리한다
         return hold("선주문 가격 없음(상태 꼬임) → 취소",
                     [Action("cancel_pre", order_id=leg.pre_order_id, reason="선주문 가격 없음")])
+    if (leg.pre_order_id is not None and sig.stock_market and leg.pre_market
+            and leg.pre_market != sig.stock_market):
+        # 주문가능시간 구간이 바뀌어 거래소가 달라짐(결정 80) — 옛 거래소 주문은 취소 후 새 거래소로
+        leg.replace_pending = True
+        why = f"거래소 변경 {leg.pre_market.upper()}→{sig.stock_market.upper()}"
+        return hold(f"{why} → 취소 후 재발주",
+                    [Action("cancel_pre", order_id=leg.pre_order_id, reason=why)])
     if leg.pre_order_id is not None and leg.pre_price != price:
         leg.replace_pending = True
         return hold(f"역산가 변경 {leg.pre_price:,.0f}→{price:,.0f} → 취소 후 재발주 ({basis})",
@@ -1571,7 +1661,8 @@ class AutoMScreen:
         default_factory=lambda: {u.value: AutoMBook() for u in Underlying})
     settings: AutoMSettings = field(default_factory=AutoMSettings)
     # 주식 체결쏴(exec §7C, 2026-09-17): 종목 상태 키 "종목|stock", 공통설정·리스크방지는 따로
-    settings_stock: AutoMSettings = field(default_factory=lambda: AutoMSettings(pre_tick={
+    settings_stock: AutoMSettings = field(default_factory=lambda: AutoMSettings(
+        slots=default_stock_slots(), pre_tick={
         Underlying.SK_HYNIX: 1000, Underlying.SAMSUNG: 100, Underlying.HYUNDAI: 500}))
     risk_stock_en: float = 0.0
     risk_stock_ex: float = 0.005
@@ -1612,6 +1703,23 @@ def _opt_float(raw: object) -> float | None:
     if raw is None or raw == "":
         return None
     return float(raw)  # type: ignore[arg-type]
+
+
+def slots_from_dicts(raw: Sequence[object]) -> tuple[TradeSlot, ...]:
+    """[{enabled, start, end, market}] → TradeSlot들(시각 형식·거래소 값 검사, 틀리면
+    ValueError)."""
+    out: list[TradeSlot] = []
+    for d in raw:
+        if not isinstance(d, dict):
+            raise ValueError("구간은 dict")
+        start, end = str(d.get("start", "")).strip(), str(d.get("end", "")).strip()
+        parse_hms(start)
+        parse_hms(end)
+        market = str(d.get("market", "krx")).strip().lower()
+        if market not in ("krx", "nxt"):
+            raise ValueError(f"거래소 값 오류: {market!r}")
+        out.append(TradeSlot(bool(d.get("enabled", False)), start, end, market))
+    return tuple(out)
 
 
 def _book_from_dict(book: AutoMBook, raw: object) -> None:
@@ -1733,6 +1841,9 @@ def autom_from_dict(screen: AutoMScreen, raw: object, legacy_underlying: str = "
                     parse_hms(a)
                     parse_hms(b)
                 s.windows = parsed
+            raw_slots = st.get("slots")
+            if isinstance(raw_slots, list) and raw_slots:  # 주식 4구간(결정 80)
+                s.slots = slots_from_dicts(raw_slots)
             ticks = st.get("pre_tick")
             if isinstance(ticks, dict):
                 s.pre_tick = {Underlying(str(k)): int(v) for k, v in ticks.items()}

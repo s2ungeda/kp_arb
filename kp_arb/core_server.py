@@ -605,12 +605,6 @@ async def _autom_command(
         if cmd == "autom_set":
             _autom_set_from_body(_sets()[int(body["set"])], body)
             return _ok()
-        if cmd == "autom_market":  # 주식 거래소 KRX/NXT — 종목별(exec §7C, 2026-09-17)
-            market = str(body["market"]).strip().lower()
-            if market not in ("krx", "nxt"):
-                return _fail([f"거래소 값 오류: {market!r}"])
-            _book().market = market
-            return _ok()
         if cmd == "autom_month":  # 선물 월물(근/차근) — 종목별(exec §11.9)
             month = str(body["month"]).strip()
             if month not in ("near", "next"):
@@ -626,6 +620,14 @@ async def _autom_command(
             return _ok()
         if cmd == "autom_settings":
             st = am.settings_for(product)
+            if "slots" in body:  # 주식 4구간(결정 80) — 사용 구간 겹침·시각 오류면 저장 거부
+                from .auto_m import slot_conflicts, slots_from_dicts
+
+                slots = slots_from_dicts(list(body["slots"]))
+                problems = slot_conflicts(slots)
+                if problems:
+                    return _fail(problems)
+                st.slots = slots
             if "windows" in body:
                 wins = tuple((str(a), str(b)) for a, b in body["windows"])
                 for a, b in wins:
@@ -658,7 +660,8 @@ async def _autom_command(
                 "[자동M] 체결쏴 설정 변경: 주문가능시간 %s 선주문딜레이 %dms 재개 %ds 범위 %.3f%% "
                 "상대호가 매수%d/매도%d 후주문HP 매수%.2f%%/매도%.2f%% HL체결판정 %s 주문단위 %s "
                 "리스크 정 %s/%s/%s 역 %s/%s/%s",
-                st.windows, st.pre_delay_ms, st.resume_delay_s, st.pre_range * 100,
+                ([(sl.enabled, sl.start, sl.end, sl.market) for sl in st.slots] if st.slots
+                 else st.windows), st.pre_delay_ms, st.resume_delay_s, st.pre_range * 100,
                 st.rel_buy, st.rel_sell, st.hl_margin_buy * 100, st.hl_margin_sell * 100,
                 "켬" if st.hl_trade_trigger else "끔",
                 {u.value: t for u, t in st.pre_tick.items()},

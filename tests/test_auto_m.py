@@ -1060,3 +1060,46 @@ def test_pick_repay_loan_oldest_first_minus_reserved() -> None:
     # 두 세트가 같은 틱에 잔량 3을 나눠 갖는 모양: 첫 세트 2 예약 → 둘째는 1
     assert pick_repay_loan([("20260915", 3.0)], {}, 2) == ("20260915", 2)
     assert pick_repay_loan([("20260915", 3.0)], {"20260915": 2}, 2) == ("20260915", 1)
+
+
+def test_stock_trade_slots_market_and_conflicts() -> None:
+    # 결정 80(사용자 2026-10-15): 주식 주문가능시간 4구간 — 구간마다 사용·시작~끝·거래소. 지금
+    # 시각이 든 사용 구간의 거래소로 선주문이 나간다. 사용 구간이 겹치면(거래소가 달라 어디로 낼지
+    # 모름) 저장 거부.
+    from datetime import time as _t
+
+    from kp_arb.auto_m import TradeSlot, active_slot, default_stock_slots, slot_conflicts
+
+    slots = (TradeSlot(True, "08:00:05", "08:50:00", "nxt"),
+             TradeSlot(True, "09:00:00", "15:20:00", "krx"),
+             TradeSlot(False, "15:40:00", "20:00:00", "nxt"),   # 꺼진 구간은 무시
+             TradeSlot(True, "15:40:00", "20:00:00", "nxt"))
+    st = AutoMSettings(slots=slots)
+    assert st.market_at(_t(8, 30)) == "nxt" and st.market_at(_t(10, 0)) == "krx"
+    assert st.market_at(_t(15, 30)) is None and st.market_at(_t(16, 0)) == "nxt"
+    assert st.in_window(_t(10, 0)) and not st.in_window(_t(15, 30))
+    assert active_slot(slots, _t(16, 0)) is slots[3]
+    assert st.next_edge_s(datetime(2026, 10, 15, 8, 59, 50)) == 10.0     # 2구간 시작
+    assert slot_conflicts(slots) == []
+    bad = (TradeSlot(True, "09:00:00", "15:20:00", "krx"),
+           TradeSlot(True, "15:00:00", "16:00:00", "nxt"))
+    assert any("1구간과 2구간이 겹침" in p for p in slot_conflicts(bad))
+    assert any("시작이 끝보다" in p
+               for p in slot_conflicts((TradeSlot(True, "10:00:00", "09:00:00"),)))
+    assert any("형식 오류" in p for p in slot_conflicts((TradeSlot(True, "25:00", "x"),)))
+    assert slot_conflicts((TradeSlot(False, "10:00:00", "09:00:00"),)) == []  # 꺼진 구간은 안 봄
+    # slots가 없으면 옛 windows 규칙(주식선물)
+    old = AutoMSettings(windows=(("09:00:00", "15:20:00"),))
+    assert old.market_at(_t(10, 0)) is None and old.in_window(_t(10, 0))
+    assert [sl.enabled for sl in default_stock_slots()] == [True, False, False, False]
+
+
+def test_effective_slots_falls_back_to_windows() -> None:
+    # 주식선물이 설정창에서 아직 저장하지 않았으면 옛 2구간(windows)을 사용 구간으로 본다(결정 80).
+    from kp_arb.auto_m import TradeSlot
+
+    st = AutoMSettings(windows=(("08:30:10", "08:46:20"), ("15:35:30", "15:46:55")))
+    assert st.effective_slots() == (TradeSlot(True, "08:30:10", "08:46:20", "krx"),
+                                    TradeSlot(True, "15:35:30", "15:46:55", "krx"))
+    st.slots = (TradeSlot(False, "09:00:00", "10:00:00", "krx"),)
+    assert st.effective_slots() == st.slots

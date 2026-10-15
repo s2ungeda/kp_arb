@@ -618,9 +618,9 @@ def main() -> None:
 
     root = tk.Tk()
     root.title("Meme")
-    root.resizable(False, False)
+    root.resizable(True, True)  # 크기 조절 허용(사용자 2026-10-15) — 크기도 저장·복원
     root.option_add("*Font", ("Malgun Gothic", 9))
-    win_state.attach(root, "main")  # 메인창 위치 저장·복원(슬롯 없음 — 단일 인스턴스)
+    win_state.attach(root, "main", keep_size=True)  # 메인창 위치·크기 저장·복원(단일 인스턴스)
     # 메인 창 핸들을 자식 화면에 넘긴다(KP_MAIN_HWND) — 화면들이 메인 최소화·복원을 따라감
     # (win_state.follow_main_minimize, 사용자 2026-09-17). 화면은 별도 프로세스라 OS가 안 묶어 줌.
     if sys.platform == "win32":
@@ -634,16 +634,31 @@ def main() -> None:
         except (AttributeError, OSError, tk.TclError):
             pass
 
-    lbl_core = tk.Label(root, text="코어: 확인 중 ...", anchor="w", width=42)
+    # width=1: 글 길이가 창 폭을 정하지 않게(크기 조절 허용 뒤, 2026-10-15) — 남는 폭은 fill로
+    lbl_core = tk.Label(root, text="코어: 확인 중 ...", anchor="w", width=1)
     lbl_core.pack(fill="x", padx=8, pady=(8, 2))
-    status = tk.Label(root, text="-", anchor="w", relief="groove")
-    status.pack(fill="x", padx=8, pady=(2, 8))
+    bottom = tk.Frame(root)
+    bottom.pack(fill="x", padx=8, pady=(2, 8))
+    status = tk.Label(bottom, text="-", anchor="w", relief="groove", width=1)
+    status.pack(side="left", fill="x", expand=True)
+    # 현재 시각(사용자 2026-10-15) — 체결쏴 주문가능시간 구간이 시각으로 바뀌니 한눈에 보게
+    lbl_clock = tk.Label(bottom, text="00:00:00", anchor="e", relief="groove", width=8)
+    lbl_clock.pack(side="right", padx=(4, 0))
+
+    def tick_clock() -> None:
+        try:
+            lbl_clock.config(text=time.strftime("%H:%M:%S"))
+            root.after(1000, tick_clock)
+        except tk.TclError:
+            pass  # 창 닫힘
+
+    tick_clock()
 
     # WS 세션 현황(Phase 8-3) — 코어 /state의 ws를 2초마다 읽어 표시.
     from tkinter import ttk
 
     ws_frame = tk.LabelFrame(root, text="WS 세션")
-    ws_frame.pack(fill="x", padx=8, pady=(0, 8))
+    ws_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))  # 창 크기를 따라 늘고 줄어듦
     # 끊김 누적(WsStatus.disconnects)은 열을 늘리지 않고 이름 옆에 'LS xing(4)'처럼 붙인다
     # (사용자 2026-09-29: 창 폭 유지, 0이어도 '(0)'으로 보이게).
     ws_tree = ttk.Treeview(ws_frame, columns=("no", "venue", "name", "state", "rx"),
@@ -652,10 +667,13 @@ def main() -> None:
                                  ("name", "이름", 96, "w"), ("state", "상태", 54, "center"),
                                  ("rx", "수신", 84, "e")):
         ws_tree.heading(col, text=title)
-        ws_tree.column(col, width=wid, anchor=cast(Any, anc), stretch=False)
+        # 이름·수신 열이 창 폭을 따라 늘고 줄어든다(크기 조절 허용, 2026-10-15); 나머지는 고정.
+        # minwidth를 줄여 창을 좁혀도 열이 따라 줄게(기본 20)
+        ws_tree.column(col, width=wid, minwidth=min(wid, 40), anchor=cast(Any, anc),
+                       stretch=col in ("name", "rx"))
     ws_tree.tag_configure("up", foreground="dark green")
     ws_tree.tag_configure("down", foreground="#8b0000")
-    ws_tree.pack(fill="x", padx=4, pady=4)
+    ws_tree.pack(fill="both", expand=True, padx=4, pady=4)
     ws_box: dict[str, Any] = {"sig": None}
 
     def render_ws() -> None:
@@ -858,6 +876,10 @@ def main() -> None:
     root.protocol("WM_DELETE_WINDOW", on_close)
 
     refresh()
+    # 크기 조절 하한 — 내용 요구 크기를 하한으로 두면 처음 열린 크기에서 못 줄인다(사용자 2026-10-15
+    # "늘리는 건 되지만 줄이는 게 안 됨") → 작은 고정값(300×180의 절반 — 사용자 "더 줄여도 돼").
+    # 더 좁히면 표 열이 줄고 상태 글은 잘린다
+    root.minsize(150, 90)
     # 콘솔로 Ctrl-C 신호가 흘러들어도 화면을 죽이지 않는다 (monitor와 동일)
     while True:
         try:

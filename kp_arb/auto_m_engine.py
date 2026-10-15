@@ -514,6 +514,8 @@ class AutoMEngine:
                 # 정지와 같다.
                 vi_on = self.product == "stock" and not halted and self._vi_halted(u)
                 self._track_vi(u, vi_on, mono)
+                if self.product == "stock":  # 주문가능시간 구간의 거래소로(결정 80)
+                    self._follow_slot_market(u, book, now)
                 for reverse, index, s in book.all_sets():
                     for block in (Block.ENTRY, Block.EXIT):
                         leg = s.leg(block)
@@ -598,6 +600,7 @@ class AutoMEngine:
             sf_theory=self._system.stock_futures_theory(u, inst), stock_last=stock,
             sf_asks=asks, sf_bids=bids, s_spread_exit=s_exit, market_halted=halted,
             resumed_mono=self._resumed_for(u), fx=fx, product=book.product,
+            stock_market=book.market if book.product == "stock" else "",
             hl_bid1=hl.bid if hl is not None else None,
             hl_ask1=hl.ask if hl is not None else None,
             hl_est_bid=est_bid, hl_est_ask=est_ask,
@@ -1022,6 +1025,17 @@ class AutoMEngine:
                               u.value, self._tag(u, index, block, reverse), reason)
         self.ulog(u).info("상환 %s: 안 냄 — %s", self._tag(u, index, block, reverse), reason)
         self._trace(u, index, block, leg, reverse)
+
+    def _follow_slot_market(self, u: Underlying, book: AutoMBook, now: datetime) -> None:
+        """주식 종목 상태의 거래소를 지금 시각의 주문가능시간 구간 거래소로(결정 80). 구간 밖이면
+        유지(G2가 막는다). 바뀌면 로그 — 걸린 선주문은 판정이 '거래소 변경'으로 취소 후 재발주."""
+        market = self._settings.market_at(now.time())
+        if market is None or market == book.market:
+            return
+        self._log.info("[자동M] %s 거래소 %s → %s (주문가능시간 구간)", u.value,
+                       book.market.upper(), market.upper())
+        self.ulog(u).info("거래소 %s → %s (주문가능시간 구간)", book.market.upper(), market.upper())
+        book.market = market
 
     def _repay_wait_note(self, u: Underlying, mono: float) -> str:
         """판정 입력용 상환 대기 사유("" = 정상)."""

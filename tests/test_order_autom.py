@@ -70,3 +70,30 @@ def test_s_auction_bg_green_only_during_stock_auction() -> None:
     assert s_auction_bg("regular") == C_S_NORMAL
     assert s_auction_bg("dead") == C_S_NORMAL
     assert s_auction_bg(None) == C_S_NORMAL
+
+
+def test_slot_bar_text_shows_current_or_next_slot_only() -> None:
+    # 결정 80 + 사용자 2026-10-15 "1번": 상단 시간 표시는 지금 든 구간 하나
+    # 'HH:MM:SS~HH:MM:SS KRX (i/n)',
+    # 구간 밖이면 '다음 …', 사용 구간 없으면 '주문가능시간 없음'. 전체 목록은 마우스 올리면 팝업.
+    from datetime import time as _t
+
+    from kp_arb.order_autom import slot_bar_text
+
+    slots = [{"enabled": True, "start": "09:00:00", "end": "10:20:00", "market": "krx"},
+             {"enabled": False, "start": "10:30:00", "end": "11:00:00", "market": "nxt"},
+             {"enabled": True, "start": "12:00:05", "end": "13:50:00", "market": "nxt"},
+             {"enabled": True, "start": "15:40:00", "end": "20:00:00", "market": "nxt"}]
+    short, full = slot_bar_text(slots, _t(9, 30))
+    assert short == "09:00:00~10:20:00 KRX (1/3)"
+    assert full == "1: 09:00:00~10:20:00 KRX\n2: 12:00:05~13:50:00 NXT\n3: 15:40:00~20:00:00 NXT"
+    assert slot_bar_text(slots, _t(11, 0))[0] == "다음 12:00:05~13:50:00 NXT (2/3)"
+    assert slot_bar_text(slots, _t(13, 0))[0] == "12:00:05~13:50:00 NXT (2/3)"
+    assert slot_bar_text(slots, _t(21, 0))[0] == "다음 09:00:00~10:20:00 KRX (1/3)"  # 오늘 끝 → 첫
+    off = [dict(s, enabled=False) for s in slots]
+    assert slot_bar_text(off, _t(9, 0)) == ("주문가능시간 없음", "")
+    # 주식선물: 거래소 없이(사용자 2026-10-15 "2구간, 거래소 콤보 제외")
+    sf = [{"enabled": True, "start": "08:30:10", "end": "08:46:20", "market": "krx"},
+          {"enabled": True, "start": "15:35:30", "end": "15:46:55", "market": "krx"}]
+    assert slot_bar_text(sf, _t(8, 40), with_market=False) == (
+        "08:30:10~08:46:20 (1/2)", "1: 08:30:10~08:46:20\n2: 15:35:30~15:46:55")

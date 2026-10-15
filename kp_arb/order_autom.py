@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
+from datetime import datetime
+from datetime import time as dtime
 from functools import partial
 from typing import Any
 
@@ -22,9 +25,14 @@ from .auto_m import (
     SET_COUNT_REV,
     STOCK_CREDIT_DEFAULT_ROWS,
     STOCK_SET_ROWS,
+    STOCK_SLOT_COUNT,
+    TradeSlot,
     hl_unit_errors,
+    parse_hms,
     price_offset_errors,
+    slot_conflicts,
 )
+from .theory import in_time_window
 from .ui_fields import (
     UNDER_MAP,
     UNDERLYINGS,
@@ -81,7 +89,10 @@ class ScreenSpec:
     set_rows: dict[str, int] | None = None  # 방향별 세트 줄 수(None = 코어 SET_ROWS, 주식은 4)
     alt_row_bg: bool = False      # 짝수 세트 행 하늘색 바탕(주식선물 8세트, 사용자 09-16)
     snapshot_rows: int = 0        # 마지막 판 스냅샷 줄 수(4 = Sprd·HP·SF·환, 1 = Sprd만, 0 = 없음)
-    market_combo: bool = False    # 거래소 콤보 KRX/NXT — 종목 콤보 왼쪽(주식, 사용자 09-17)
+    # 주식(결정 80, 2026-10-15): 주문가능시간 4구간(사용·시작~끝·거래소)과 '지금 거래소' 라벨(옛
+    # 거래소 콤보 자리). 코어가 구간에 맞춰 거래소를 정하므로 화면은 표시만
+    market_combo: bool = False
+    slot_count: int = 2           # 설정창 주문가능시간 구간 수(주식선물 2, 주식 4 — 결정 80)
     # HL선(exec §7D 결정 55): 세트설정의 선주문 주문단위·시작호가를 USD(HL 격자 배수)로 받는다 —
     # 화면 호가단위 콤보는 다른 창과 공유돼 주문 규칙에 안 쓴다(사용자 2026-09-30)
     hl_unit_usd: bool = False
@@ -121,7 +132,8 @@ STOCK_SPEC = ScreenSpec(
     credit_boxes=True, credit_default_rows=STOCK_CREDIT_DEFAULT_ROWS,
     set_rows={"fwd": STOCK_SET_ROWS},
     snapshot_rows=1,  # 누적 블록은 위, 남는 줄에 마지막 판 Sprd 한 줄
-    market_combo=True)  # 주식 API는 통합 미지원 → 거래소 KRX/NXT 선택(사용자 2026-09-17)
+    market_combo=True,  # 주식 API는 통합 미지원 → 구간별 거래소 KRX/NXT(결정 80)
+    slot_count=STOCK_SLOT_COUNT)
 
 _CREDIT_BG = "#d9f2d9"  # 신용 세트 행 바탕(옅은 초록, 사용자 2026-09-16) — 중지(검정)가 우선
 # 짝수 세트 행 바탕(하늘, 사용자 2026-09-16 — 주식선물 8세트는 줄이 많아 헷갈림) + 스냅샷 Sprd 칸
@@ -187,10 +199,40 @@ def set_payload(index: int, w: dict[str, Any], underlying: str,
     }
 
 
+def slot_bar_text(slots: Sequence[Mapping[str, Any]], now: dtime,
+                  with_market: bool = True) -> tuple[str, str]:
+    """주식 상단 주문가능시간 표시(결정 80, 사용자 2026-10-15 1번 선택): (짧은 글, 전체 목록).
+    짧은 글 = 지금 든 사용 구간 'HH:MM:SS~HH:MM:SS KRX (i/n)', 구간 밖이면 '다음 …(i/n)', 사용
+    구간이 없으면 '주문가능시간 없음'. 전체 목록 = 사용 구간 전부(마우스 올리면 팝업). 순수."""
+    used = [sl for sl in slots if sl.get("enabled")]
+    if not used:
+        return "주문가능시간 없음", ""
+    def _mk(sl: Mapping[str, Any]) -> str:
+        return f" {str(sl.get('market', '')).upper()}" if with_market else ""
+
+    lines = [f"{i}: {sl['start']}~{sl['end']}{_mk(sl)}" for i, sl in enumerate(used, start=1)]
+    full = "\n".join(lines)
+    n = len(used)
+
+    def _text(i: int, sl: Mapping[str, Any], prefix: str = "") -> str:
+        return f"{prefix}{sl['start']}~{sl['end']}{_mk(sl)} ({i}/{n})"
+
+    try:
+        for i, sl in enumerate(used, start=1):
+            if in_time_window(now, parse_hms(str(sl["start"])), parse_hms(str(sl["end"]))):
+                return _text(i, sl), full
+        coming = [(parse_hms(str(sl["start"])), i, sl) for i, sl in enumerate(used, start=1)]
+        later = [c for c in coming if c[0] > now]
+        start, i, sl = min(later or coming, key=lambda c: c[0])
+    except ValueError:  # 시각 형식이 틀린 칸이 있으면 첫 구간만
+        return _text(1, used[0]), full
+    return _text(i, sl, "다음 "), full
+
+
 def settings_payload(common: dict[str, Any]) -> dict[str, Any]:
     """체결쏴 설정 화면 상태 → 코어 autom_settings 명령. 범위·리스크는 %→소수."""
     win = common["windows"]
-    return {
+    out: dict[str, Any] = {
         "cmd": "autom_settings",
         "windows": [[win[0], win[1]], [win[2], win[3]]],
         "pre_tick": dict(common["pre_tick"]),
@@ -209,6 +251,9 @@ def settings_payload(common: dict[str, Any]) -> dict[str, Any]:
         "risk_rev_ex": float(common["risk"].get("rev_ex", 0.0)) / 100.0,
         "risk_rev_gap": float(common["risk"].get("rev_gap", 0.1)) / 100.0,
     }
+    if common.get("slots"):  # 구간(결정 80 — 주식 4·주식선물 2)
+        out["slots"] = [dict(sl) for sl in common["slots"]]
+    return out
 
 
 C_AUCTION = "#2e8b57"  # 진입S 칸 바탕 — 주식 동시호가 중(초록, 사용자 2026-09-30)
@@ -453,6 +498,12 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     # 화면 상태(로컬) — v1은 표시·입력만. 공통설정(체결쏴 설정) 기본값은 목업 기준.
     common: dict[str, Any] = {
         "windows": ["08:30:10", "08:46:20", "15:35:30", "15:46:55"],
+        # 주식 4구간(결정 80) — 코어 스냅샷(settings_stock.slots)이 오면 그 값으로
+        "slots": ([{"enabled": i == 0, "start": "09:00:00", "end": "15:20:00",
+                    "market": "krx"} for i in range(STOCK_SLOT_COUNT)]
+                  if spec.market_combo else
+                  [{"enabled": True, "start": "08:30:10", "end": "08:46:20", "market": "krx"},
+                   {"enabled": True, "start": "15:35:30", "end": "15:46:55", "market": "krx"}]),
         "pre_tick": dict(spec.pre_tick),
         "pre_delay": 1000, "resume_delay": 10, "pre_range": 0.4,
         "rel_buy": 1, "rel_sell": 1,
@@ -482,13 +533,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     # 앞의 '종목' 제목 라벨은 뺐다(사용자 2026-09-11, 상단 공간 확보).
     # 거래소 콤보(주식, 사용자 2026-09-17) — 종목 콤보 왼쪽. 실행 중에도 잠그지 않으며('적'은
     # 잠기므로) 고르면 바로 코어의 종목 상태에 보낸다. '적'도 같은 값을 다시 보낸다.
-    cb_market = ttk.Combobox(top, values=list(MARKET_MAP), width=5, state="readonly")
-    cb_market.set("NXT")  # 기본 NXT(사용자 2026-09-17) — 코어 종목 상태 기본값과 같다
+    # 지금 선주문이 나갈 거래소 — 주문가능시간 구간의 거래소(결정 80), 코어 스냅샷 market을 표시만
+    lbl_market = tk.Label(top, text="-", fg="gray25", width=4, anchor="w")  # 'KRX'/'NXT'만(사용자)
     if spec.market_combo:
-        cb_market.pack(side="left", padx=(0, 4))
-        cb_market.bind("<<ComboboxSelected>>", lambda _e: send(
-            {"cmd": "autom_market", "underlying": cur_under(),
-             "market": MARKET_MAP[cb_market.get()]}, "거래소"))
+        lbl_market.pack(side="left", padx=(0, 4))
     cb_under = ttk.Combobox(top, values=[u for u in UNDERLYINGS if u != "현대차"],
                             width=7, state="readonly")
     cb_under.set("하이닉스")
@@ -537,9 +585,6 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         if spec.has_month:
             send({"cmd": "autom_month", "underlying": u, "month": MONTH_MAP[cb_month.get()]},
                  "선물 월물")
-        if spec.market_combo:
-            send({"cmd": "autom_market", "underlying": u, "market": MARKET_MAP[cb_market.get()]},
-                 "거래소")
         send_ref_qty(force=True)
         state_box["_applied"] = True  # 모니터 수치는 '적'을 누른 뒤부터 표시(사용자 2026-09-04)
 
@@ -705,8 +750,50 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         fg_state["cur"] = color
 
     def refresh_windows_bar() -> None:
-        w = common["windows"]
-        lbl_windows.config(text=f"{w[0]}~{w[1]}  /  {w[2]}~{w[3]}")
+        # 지금(또는 다음) 구간만, 전체는 마우스 올리면(결정 80) — 거래소는 주식만
+        short, full = slot_bar_text(common["slots"], datetime.now().time(),
+                                    with_market=spec.market_combo)
+        if lbl_windows.cget("text") != short:
+            lbl_windows.config(text=short)
+        state_box["_slots_full"] = full
+
+    def _bar_hover_popup() -> None:
+        """상단 시간 표시에 마우스를 올리면 사용 구간 전체를 힌트 창으로(주식)."""
+        from .ui_dialog import hint_position, monitor_work_area
+
+        box: dict[str, Any] = {"win": None}
+
+        def close(_e: object = None) -> None:
+            win = box.pop("win", None)
+            box["win"] = None
+            if win is not None:
+                try:
+                    win.destroy()
+                except tk.TclError:
+                    pass
+
+        def show(_e: object = None) -> None:
+            close()
+            text = str(state_box.get("_slots_full") or "")
+            if not text:
+                return
+            win = tk.Toplevel(root)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            tk.Label(win, text=text, justify="left", anchor="w", bg="#ffffe0", relief="solid",
+                     bd=1, padx=8, pady=6, font=T.FONT_BASE).pack()
+            win.update_idletasks()
+            x, y = hint_position(lbl_windows.winfo_rootx(), lbl_windows.winfo_rooty(),
+                                 lbl_windows.winfo_height(), win.winfo_reqwidth(),
+                                 win.winfo_reqheight(), monitor_work_area(lbl_windows))
+            win.geometry(f"+{x}+{y}")
+            box["win"] = win
+
+        lbl_windows.bind("<Enter>", show)
+        lbl_windows.bind("<Leave>", close)
+        lbl_windows.bind("<Destroy>", close)
+
+    _bar_hover_popup()
 
     # ===================== 방향 섹션 2개 =====================
     def build_section(grid: Any, rbase: int, dtag: str, name: str, en_sf: str,
@@ -1323,21 +1410,31 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         win.title(spec.settings_title)
         win.resizable(False, False)
         win.transient(root)
-        # 주문가능시간 2구간(초 단위)
-        tk.Label(win, text="주문가능시간").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        # 주문가능시간 — 구간마다 [사용] [시작] ~ [끝] (주식은 거래소 콤보까지; 주식선물 2구간·주식
+        # 4구간, 결정 80 — 사용자 2026-10-15 "주식선물도 주식처럼, 대신 2구간이고 거래소 콤보 제외")
+        tk.Label(win, text="주문가능시간").grid(row=0, column=0, sticky="nw", padx=6, pady=4)
         wframe = tk.Frame(win)
         wframe.grid(row=0, column=1, columnspan=3, sticky="w", pady=4)
-        w_ents: list[tk.Entry] = []
-        for idx in range(4):
-            if idx == 2:
-                tk.Label(wframe, text="  /  ").pack(side="left")
-            elif idx in (1, 3):
-                tk.Label(wframe, text="~").pack(side="left")
-            e = tk.Entry(wframe, width=9, justify="center", validate="key",
-                         validatecommand=vcmd_time)
-            e.insert(0, common["windows"][idx])
-            e.pack(side="left", padx=1)
-            w_ents.append(e)
+        slot_rows: list[tuple[tk.BooleanVar, tk.Entry, tk.Entry, ttk.Combobox | None]] = []
+        for r, sl in enumerate(common["slots"]):
+            var = tk.BooleanVar(win, value=bool(sl.get("enabled")))
+            tk.Checkbutton(wframe, text=f"{r + 1}구간 사용", variable=var).grid(
+                row=r, column=0, sticky="w", padx=(0, 6))
+            e_s = tk.Entry(wframe, width=9, justify="center", validate="key",
+                           validatecommand=vcmd_time)
+            e_s.insert(0, str(sl.get("start", "")))
+            e_s.grid(row=r, column=1)
+            tk.Label(wframe, text="~").grid(row=r, column=2)
+            e_e = tk.Entry(wframe, width=9, justify="center", validate="key",
+                           validatecommand=vcmd_time)
+            e_e.insert(0, str(sl.get("end", "")))
+            e_e.grid(row=r, column=3)
+            cb_m: ttk.Combobox | None = None
+            if spec.market_combo:
+                cb_m = ttk.Combobox(wframe, values=list(MARKET_MAP), width=5, state="readonly")
+                cb_m.set(next((k for k, v in MARKET_MAP.items() if v == sl.get("market")), "KRX"))
+                cb_m.grid(row=r, column=4, padx=(6, 0))
+            slot_rows.append((var, e_s, e_e, cb_m))
 
         # 배치(사용자 확정 2026-09-04, 2026-09-16 정리): 한 그리드에 두 줄 — 줄1 [선주문(딜레이·
         # 재개·범위) | 후주문 HP], 줄2 [상대호가]. '선주문 주문단위'(종목별) 틀은 세트설정으로
@@ -1421,7 +1518,18 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                         (("진입", "<", "en"), ("청산", ">", "ex"), ("청산-진입", ">", "gap")))
 
         def save() -> None:
-            common["windows"] = [e.get().strip() for e in w_ents]
+            # 구간 겹침·시각 오류는 저장 전에 경고(코어도 같은 검사로 거부)
+            new_slots = [{"enabled": bool(v.get()), "start": e_s.get().strip(),
+                          "end": e_e.get().strip(),
+                          "market": MARKET_MAP[cb_m.get()] if cb_m is not None else "krx"}
+                         for v, e_s, e_e, cb_m in slot_rows]
+            problems = slot_conflicts([
+                TradeSlot(bool(d["enabled"]), str(d["start"]), str(d["end"]), str(d["market"]))
+                for d in new_slots])
+            if problems:
+                warn_center("주문가능시간 저장 안 함:\n" + "\n".join(problems), win)
+                return
+            common["slots"] = new_slots
             common["pre_delay"] = parse_qty(e_delay.get())
             common["resume_delay"] = parse_qty(e_resume.get())
             common["pre_range"] = parse_threshold(e_range.get()) or 0.0
@@ -1557,10 +1665,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # 창은 종목·호가단위·기준수량 표시값과 체결쏴 설정(공통)만 저장한다.
         return {
             "under": cb_under.get(), "agg": cb_agg.get(), "refqty": ent_refqty.get(),
-            "market": cb_market.get(),
             "bg": bg_state["name"],  # 콤보 이름 또는 '#rrggbb'
             "fg": fg_state["cur"],   # 글자색 '#rrggbb' 또는 None(기본)
             "common": {"windows": list(common["windows"]),
+                       "slots": [dict(sl) for sl in common.get("slots", [])],
                        "pre_tick": dict(common["pre_tick"]),
                        "pre_delay": common["pre_delay"], "resume_delay": common["resume_delay"],
                        "pre_range": common["pre_range"],
@@ -1576,8 +1684,6 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             return
         if saved.get("under") in cb_under["values"]:  # 현대차 등 제외된 종목은 복원 안 함
             cb_under.set(saved["under"])
-        if saved.get("market") in MARKET_MAP:
-            cb_market.set(saved["market"])
         if isinstance(saved.get("agg"), str):
             state_box["_want_agg"] = saved["agg"]  # 틱 목록이 오면 그때 고른다
         if isinstance(saved.get("refqty"), str):
@@ -1596,6 +1702,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         if isinstance(sc, dict):
             if isinstance(sc.get("windows"), list) and len(sc["windows"]) == 4:
                 common["windows"] = [str(x) for x in sc["windows"]]
+            if isinstance(sc.get("slots"), list) and len(sc["slots"]) == spec.slot_count:
+                common["slots"] = [dict(x) for x in sc["slots"] if isinstance(x, dict)]
             if isinstance(sc.get("pre_tick"), dict):
                 for k in common["pre_tick"]:
                     if isinstance(sc["pre_tick"].get(k), int):
@@ -1767,8 +1875,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         if month_label and spec.has_month:
             cb_month.set(month_label)
         market_label = next((k for k, v in MARKET_MAP.items() if v == book.get("market")), None)
-        if market_label and spec.market_combo:
-            cb_market.set(market_label)
+        if spec.market_combo:
+            lbl_market.config(text=market_label or "-")
         ref = book.get("ref_qty")
         if isinstance(ref, int):
             ent_refqty.delete(0, "end")
@@ -1861,6 +1969,16 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         wins = st.get("windows")
         if isinstance(wins, list) and len(wins) == 2:
             common["windows"] = [str(x) for pair in wins for x in pair]
+        raw_slots = st.get("slots")
+        if not raw_slots and isinstance(wins, list) and len(wins) == 2 and not spec.market_combo:
+            # 주식선물이 설정창에서 아직 저장하지 않았으면 옛 2구간을 사용 구간으로 보인다
+            raw_slots = [{"enabled": True, "start": str(a), "end": str(b), "market": "krx"}
+                         for a, b in wins]
+        if isinstance(raw_slots, list) and len(raw_slots) == spec.slot_count:
+            common["slots"] = [{"enabled": bool(d.get("enabled")), "start": str(d.get("start")),
+                                "end": str(d.get("end")), "market": str(d.get("market"))}
+                               for d in raw_slots if isinstance(d, dict)]
+            refresh_windows_bar()
         if isinstance(st.get("pre_tick"), dict):
             for k in common["pre_tick"]:
                 v = st["pre_tick"].get(k)
@@ -2040,6 +2158,9 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 for key, lbl in mon.items():
                     lbl.config(text=preview_mon.get(key, "-"))
                 return
+            if time.time() - float(state_box.get("_bar_at", 0.0)) >= 1.0:
+                state_box["_bar_at"] = time.time()
+                refresh_windows_bar()  # 지금/다음 구간 표시는 시각을 따라간다
             connected = box_is_live(state_box, time.time())  # 데이터 있고 3초 안에 성공
             if not connected:
                 for lbl in mon.values():
