@@ -1800,7 +1800,11 @@ class AutoMEngine:
                    if ref else None) or None
         return {"sets": out, "rev_sets": rev_out, "any_running": book.any_running(),
                 "monitor": monitor, "sf_tick": sf_tick, "hl_step": hl_step,
-                "fx": {"used": fx_used, "src": fx_src},  # 사용 환율(값, 출처 현물|선물역산)
+                # 사용 환율(값, 출처 현물|선물역산) + 현물 원천(LS|하나고시, 결정 70 표시 —
+                # 체결쏴 화면은 /state 상단 fx가 아니라 이 스냅샷을 읽는다: 10-16 실측 "(현물)"만
+                # 보임)
+                "fx": {"used": fx_used, "src": fx_src,
+                       "spot_src": getattr(self._system, "usdkrw_spot_src", None)},
                 "ref_qty": book.ref_qty, "future_month": book.future_month,
                 # 차근월물 선택 가능 여부·사유(결정 75) — 화면 월물 콤보가 '적' 때 확인
                 "next_month": self._next_month_info(u),

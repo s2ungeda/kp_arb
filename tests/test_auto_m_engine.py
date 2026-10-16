@@ -346,6 +346,12 @@ async def test_engine_reverse_round_sells_sf_then_buys_hl() -> None:
     assert snap["rev_sets"][0]["rt"] == -10 and snap["rev_sets"][0]["reverse"] is True
     assert snap["sf_tick"] == 1000  # 세트설정 시작호가 검사용 SF 호가단위(2026-09-15, 160만 원대)
     assert snap["sets"][0]["rt"] == 0
+    # 환율 표시(결정 70, 10-16 실측 "(현물)"만 보임): 체결쏴 화면은 이 스냅샷의 fx를 읽으므로 현물
+    # 원천(LS|하나고시)도 실어야 "(LS)"가 보인다. 가짜 시스템엔 속성이 없으면 None.
+    assert snap["fx"]["used"] == 1356.0 and snap["fx"]["src"] == "현물"
+    assert snap["fx"]["spot_src"] is None
+    sys_.usdkrw_spot_src = "LS"
+    assert eng.live_snapshot()[U.value]["fx"]["spot_src"] == "LS"
     assert eng._tag(U, 0, Block.ENTRY, True) == "역방향 1세트 진입"
 
 
