@@ -1505,6 +1505,12 @@ async def _serve() -> None:
             tasks.append(asyncio.create_task(autom_engine.run()))
             tasks.append(asyncio.create_task(autom_engine_stock.run()))
             tasks.append(asyncio.create_task(autom_engine_hl_first.run()))
+            # 쌍 대조 로그(결정 83, 2026-10-16): 국내 포지션 ↔ HL 포지션 ↔ 세트 장부를 1분마다 재고
+            # 바뀌면(또는 10분마다) 코어 로그에 — 잔고 쌍이 어긋난 시각·세트를 로그로 짚기 위해
+            from .pair_check import pair_check_loop
+
+            tasks.append(asyncio.create_task(pair_check_loop(
+                system.order_book.positions, lambda: state.autom.books)))
             # 텔레그램 수신(2026-09-21, 수신만) — 봇에 온 글을 로그에 남기고 "수신: …" 답장.
             # 명령 실행은 아직 없다. 토큰·chat_id 미설정이면 바로 끝난다.
             from .telegram_rx import TelegramReceiver, log_and_ack
