@@ -200,3 +200,37 @@ def test_core_down_event_once_per_transition() -> None:
     assert core_down_event(box, False) is False   # 계속 없음은 다시 안 알림
     assert core_down_event(box, True) is False
     assert core_down_event(box, False) is True
+
+
+def test_close_screens_gracefully_waits_then_forces() -> None:
+    # 결정 82(2026-10-16): 메인 종료 때 플래그 파일을 세운 뒤 체결쏴 화면들이 세트 값을 코어에
+    # 저장하고 스스로 닫힐 때까지 기다린다. 닫힌 화면은 두고, wait_s 안에 안 닫힌 화면만 종전처럼
+    # 강제 종료.
+    from kp_arb.main_window import close_screens_gracefully
+
+    class _Proc:
+        def __init__(self, pid: int, closes: bool) -> None:
+            self.pid, self.closes, self.rc, self.terminated = pid, closes, None, False
+
+        def poll(self) -> int | None:
+            return self.rc
+
+        def terminate(self) -> None:
+            self.terminated, self.rc = True, -1
+
+    clock = {"t": 0.0}
+    procs = [_Proc(11, True), _Proc(12, False), _Proc(13, True)]
+    procs[2].rc = 0  # 이미 닫힌 창 — 센 대상 아님
+
+    def _sleep(s: float) -> None:
+        clock["t"] += s
+        for p in procs:  # 플래그 파일을 본 착한 창은 다음 틱에 저장하고 닫힌다
+            if p.closes and p.rc is None:
+                p.rc = 0
+
+    text = close_screens_gracefully(procs, wait_s=1.0, sleep=_sleep, now=lambda: clock["t"])
+    assert procs[0].rc == 0 and not procs[0].terminated          # 저장하고 스스로 닫힘
+    assert procs[1].terminated                                    # 안 닫혀 강제 종료
+    assert not procs[2].terminated                                # 이미 닫힌 창은 건드리지 않음
+    assert clock["t"] >= 1.0                                      # 고집쟁이 때문에 끝까지 기다림
+    assert text == "저장 후 닫힘 1/2, 강제 종료 1"

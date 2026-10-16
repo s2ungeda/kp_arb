@@ -158,9 +158,9 @@ def select_months(
 
 # 환율 계산 시작 시각 — 이 전에는 판정용·정산용 환율을 만들지 않는다(exec 결정 47, 2026-09-28).
 FX_CALC_START = time(7, 30)
-# 하나은행 고시환율(네이버 경유)을 현물환으로 쓰는 시각 경계(사용자 2026-10-14, exec 결정 70):
-# 이 전엔 언제나 하나고시, 이 뒤엔 LS CUR를 받은 뒤부터 LS. 받기 전엔 하나고시
-FX_HANA_UNTIL = time(9, 0)
+# 하나은행 고시환율(네이버 경유)은 시동 뒤 LS CUR를 받기 전까지만 현물환으로 쓴다(결정 70 —
+# 사용자 2026-10-16 정정: "LS CUR가 들어오면 9시 이전이라도 LS". 옛 09:00 경계 FX_HANA_UNTIL은
+# 오독이라 폐지)
 FX_HANA_POLL_S = 10.0  # 하나고시가 현물환 출처인 동안의 조회 간격(사용자 2026-10-14: 10초)
 
 
@@ -321,9 +321,9 @@ class LiveSystem:
         self.usdkrw_futures: float | None = None  # 원달러선물 현재가 원값(표시용)
         # 외환현물 — 지금 쓰는 값(usdkrw_spot)과 출처(usdkrw_spot_src "LS"|"하나고시"). LS CUR 최종
         # 체결가는 유효기간 없이 현재가(exec 결정 47). 하나고시(네이버 경유 하나은행 고시 매매
-        # 기준율)는 09:00 전·시동 직후·LS CUR를 받기 전에 쓴다(사용자 2026-10-14, 결정 70 —
-        # 09-28 폐지했다가 복원).
-        # 두 원천은 따로 들고(_spot_ls·_spot_hana) _resolve_spot이 시각·수신 여부로 고른다
+        # 기준율)는 시동 직후 LS CUR를 받기 전에만 쓴다(사용자 2026-10-14 결정 70, 10-16 정정: CUR가
+        # 오면 09:00 전이라도 LS — 09-28 폐지했다가 복원).
+        # 두 원천은 따로 들고(_spot_ls·_spot_hana) _resolve_spot이 수신 여부로 고른다
         self.usdkrw_spot: float | None = None
         self._fx_spot_ts = 0.0  # 마지막 LS 현물환율(CUR) 수신 시각(로그·진단용)
         self.usdkrw_spot_src: str | None = None
@@ -1708,20 +1708,17 @@ class LiveSystem:
         for handler in self.on_fx:
             handler()
 
-    def _resolve_spot(self, now: datetime | None = None) -> None:
-        """현물환 출처 고르기(사용자 2026-10-14, exec 결정 70): ① 09:00 전 ② 시동 직후 ③ LS CUR를
-        받을 때까지 = 하나고시. 09:00 뒤 LS CUR를 받았으면 LS — **한 번 LS로 넘어가면 그 뒤로는 계속
-        LS**(하나고시 조회도 끝, 사용자 같은 날). 하나고시 조회가 안 됐으면 있는 쪽. 출처가 바뀔
-        때만 로그."""
-        moment = now if now is not None else datetime.now()
-        if self._spot_ls is not None and (self._spot_ls_took_over
-                                          or moment.time() >= FX_HANA_UNTIL):
+    def _resolve_spot(self) -> None:
+        """현물환 출처 고르기(사용자 2026-10-14 exec 결정 70, 2026-10-16 정정): 시동 뒤 LS CUR를
+        받기 전까지 = 하나고시, **CUR를 받는 순간부터 LS — 09:00 전이라도**. 한 번 LS로 넘어가면 그
+        뒤로는 계속 LS(하나고시 조회도 끝). 둘 다 없으면 없음. 출처가 바뀔 때만 로그.
+        (옛 "09:00 전엔 CUR를 받아도 하나고시"는 결정 70 ①의 오독 — 사용자: "9시 이전까지는 LS CUR가
+        들어올 때까지 하나고시를 사용하란 거였지".)"""
+        if self._spot_ls is not None:
             self._spot_ls_took_over = True
             value, src = self._spot_ls, "LS"
         elif self._spot_hana is not None:
             value, src = self._spot_hana, "하나고시"
-        elif self._spot_ls is not None:  # 09:00 전인데 하나고시 조회가 안 됨 — LS 값이라도
-            value, src = self._spot_ls, "LS"
         else:
             value, src = None, None
         if src != self.usdkrw_spot_src:
@@ -1738,7 +1735,7 @@ class LiveSystem:
 
     async def _hana_spot_loop(self) -> None:
         """하나고시 조회 루프(결정 70) — 시동 직후 한 번, 그 뒤 하나고시가 출처인 동안 10초마다.
-        LS가 출처가 되면(09:00 뒤 CUR 수신) 조회를 그만두고 끝난다(사용자: "LS로 넘어가면 하나고시
+        LS가 출처가 되면(CUR 첫 수신) 조회를 그만두고 끝난다(사용자: "LS로 넘어가면 하나고시
         조회는 하지 않는다" — 재시동 전까지 다시 안 씀). 조회 실패는 첫 번만 기록."""
         import logging
 
@@ -1747,7 +1744,7 @@ class LiveSystem:
         log = logging.getLogger("kp_arb.bootstrap")
         failed = False
         while True:
-            self._resolve_spot()  # 09:00을 지나며 LS로 넘어가는 전환은 여기서(CUR 틱 없이도)
+            self._resolve_spot()  # LS 전환은 CUR 틱에서 — 여기선 "이미 LS면 조회 종료" 판정만
             if not self.hana_spot_needed():
                 log.info("현물환 출처가 LS로 넘어감 — 하나고시 조회 종료")
                 return

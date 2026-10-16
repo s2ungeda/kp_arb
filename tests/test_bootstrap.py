@@ -1268,41 +1268,35 @@ def test_usdkrw_effective_priority_by_futures_window() -> None:
     assert system.usdkrw_effective(datetime(2026, 7, 20, 7, 29, 59)) == (None, "계산불가")
 
 
-def test_spot_source_hana_before_nine_and_until_ls_cur_arrives() -> None:
-    # 사용자 2026-10-14(exec 결정 70, 09-28 폐지분 복원): 하나고시 환율을 ① 09:00 전 ② 시동 직후
-    # ③ LS
-    # CUR 시세를 받을 때까지 쓴다. 09:00 뒤 LS CUR를 받았으면 LS. 하나고시가 없으면 있는 쪽.
-    from datetime import datetime
-
+def test_spot_source_hana_only_until_ls_cur_arrives() -> None:
+    # 사용자 2026-10-14(exec 결정 70) + 2026-10-16 정정: 하나고시는 시동 뒤 LS CUR를 받기 전까지만.
+    # CUR가 오면 09:00 전이라도 LS("9시 이전까지는 LS CUR가 들어올 때까지 하나고시를 사용하란
+    # 거였지"). 한 번 LS면 계속 LS(하나고시 조회 종료). 옛 09:00 경계(FX_HANA_UNTIL)는 오독이라
+    # 폐지.
     system, _, _ = _system([])
-    early, late = datetime(2026, 10, 14, 8, 30), datetime(2026, 10, 14, 9, 0)
     assert system.hana_spot_needed()                       # 아직 LS가 출처가 된 적 없음
-    system._resolve_spot(late)
+    system._resolve_spot()
     assert system.usdkrw_spot is None and system.usdkrw_spot_src is None
-    system._apply_hana_spot(1_380.0)                       # ② 시동 직후 하나고시
+    system._apply_hana_spot(1_380.0)                       # 시동 직후 하나고시
     assert (system.usdkrw_spot, system.usdkrw_spot_src) == (1_380.0, "하나고시")
-    # LS CUR 첫 수신 — _apply_fx_spot은 벽시계로 판정하므로 여기선 값만 넣고 시각을 주입한다
-    system._spot_ls = 1_381.5
-    system._resolve_spot(early)
-    assert (system.usdkrw_spot, system.usdkrw_spot_src) == (1_380.0, "하나고시")  # ①
     assert system.hana_spot_needed()
-    system._resolve_spot(late)                             # 09:00 뒤 + LS 있음 → LS
+    system._apply_fx_spot(1_381.5)                         # LS CUR 첫 수신(언제든) → 즉시 LS
     assert (system.usdkrw_spot, system.usdkrw_spot_src) == (1_381.5, "LS")
     assert not system.hana_spot_needed()                   # 조회 끝
     system._apply_hana_spot(1_379.0)                       # 뒤늦은 하나고시 값은 LS를 못 밀어냄
-    system._resolve_spot(late)
     assert system.usdkrw_spot_src == "LS"
-    system._resolve_spot(early)                            # 한 번 넘어가면 09:00 전(다음 날)에도 LS
-    assert system.usdkrw_spot_src == "LS"
-    # 하나고시 조회가 안 되는 상태에서 09:00 전이면 LS 값이라도 쓴다
+    system._apply_fx_spot(1_381.7)                         # 이후 CUR 틱은 값만 갱신
+    assert (system.usdkrw_spot, system.usdkrw_spot_src) == (1_381.7, "LS")
+    # 하나고시 조회가 안 되는 상태라도 CUR가 있으면 LS
     other, _, _ = _system([])
     other._apply_fx_spot(1_382.0)
-    other._resolve_spot(early)
     assert (other.usdkrw_spot, other.usdkrw_spot_src) == (1_382.0, "LS")
     # 판정용(결정 47)·정산용은 그대로 usdkrw_spot을 본다 — 08:30은 우선시간(08:45~) 전 = "밖" → 현물
+    from datetime import datetime
+
+    early = datetime(2026, 10, 14, 8, 30)
     fresh, _, _ = _system([])
     fresh._apply_hana_spot(1_379.0)
-    fresh._resolve_spot(early)
     assert fresh.usdkrw_effective(early) == (1_379.0, "현물")
     assert fresh.fx_entry_rate(early) == 1_379.0
 

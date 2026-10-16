@@ -82,7 +82,6 @@ class ScreenSpec:
     pre_tick: dict[str, int]      # 선주문 주문단위 기본값(종목별)
     diff_head: str = "체결차(HP)"  # 체결차 컬럼 머리(주식은 단위 표기 없이 "체결차", 09-16)
     entry_s_label: str = "진입S"   # 세트설정 창 진입 S 칸 라벨(주식은 "진입" — SF 칸이 없으니)
-    color_dialog: bool = False    # 바탕색: 콤보(기본) 대신 색 고르기 대화상자(주식, 09-16)
     qty_commas: bool = False      # 세트설정 목표수량·1회주문수량 천 단위 쉼표 표시(주식, 09-16)
     credit_boxes: bool = False    # 세트설정 '신용' 체크(주식, 09-16) — 진입 신용매수·청산 신용상환
     credit_default_rows: int = 0  # 아래쪽 n개 세트는 기본 신용 체크(주식 2, 사용자 09-16)
@@ -127,7 +126,7 @@ STOCK_SPEC = ScreenSpec(
     acc_rows={"fwd": (("진입", ("-HP", "+S", "-환")), ("청산", ("+HP", "-S", "+환")))},
     has_en_sf=False, has_month=False, qty_unit="주", settings_title="체결쏴 설정(주식)",
     pre_tick={"sk_hynix": 1000, "samsung": 100, "hyundai": 500},
-    diff_head="체결차", entry_s_label="진입", color_dialog=True, qty_commas=True,
+    diff_head="체결차", entry_s_label="진입", qty_commas=True,
     # 주식 5세트·아래 2개 기본 신용(09-16: 4→6→5) — 값은 코어 상수(코어 기본값과 한 값)
     credit_boxes=True, credit_default_rows=STOCK_CREDIT_DEFAULT_ROWS,
     set_rows={"fwd": STOCK_SET_ROWS},
@@ -199,6 +198,15 @@ def set_payload(index: int, w: dict[str, Any], underlying: str,
     }
 
 
+def save_payload(payload: dict[str, Any], rt_manual: int | None = None) -> dict[str, Any]:
+    """닫을 때 저장(결정 82)이 보내는 세트 설정 — 체결차 Clear는 절대 안 실리고, RT는 **행 RT 칸을
+    고쳐 둔 세트만**(rt_manual) 실린다. 행 RT 칸은 실행 중이면 잠겨 못 고치므로 고쳐 둔 값은 언제나
+    실행 중이 아닌 세트의 것 — 실행 중 코어 RT를 덮을 길이 없다(사용자 2026-10-16 "실행 중에는 RT가
+    바뀔 수 있는데 덮어쓸 수 있다" → 같은 날 "RT도 저장 안 되는 듯"). 세트설정 창의 RT 수동 입력
+    체크값은 그 창 확인에서만. 순수."""
+    return {**payload, "rt_manual": rt_manual, "clear_diff": False}
+
+
 def slot_bar_text(slots: Sequence[Mapping[str, Any]], now: dtime,
                   with_market: bool = True) -> tuple[str, str]:
     """주식 상단 주문가능시간 표시(결정 80, 사용자 2026-10-15 1번 선택): (짧은 글, 전체 목록).
@@ -266,15 +274,22 @@ def s_auction_bg(phase: object) -> str:
     return C_AUCTION if str(phase or "") == "pre_open" else C_S_NORMAL
 
 
-def fx_caption(used: object, src: object) -> str:
-    """정방향 모니터 옆 환율 표시 — '환율 1,349.60 (현물)'. 값이 없으면 '환율 -'. 순수 로직."""
+def fx_caption(used: object, src: object, spot_src: object = None) -> str:
+    """정방향 모니터 옆 환율 표시 — '환율 1,349.60 (LS)' / '(하나고시)' / '(선물역산)'. 값이 없으면
+    '환율 -'. 순수 로직. 현물이면 '현물' 대신 그 원천(LS CUR / 하나고시, 결정 70)을 쓴다 — 괴리
+    모니터의 '현물CUR(하나고시)'와 맞춤(사용자 2026-10-16: 두 화면이 달라 보여 CUR 미수신으로 오해;
+    '현물·하나고시'는 길어서 원천만). 선물역산은 종전 그대로."""
     if not isinstance(used, int | float) or used <= 0:
         return "환율 -"
-    tail = f" ({src})" if src else ""
+    label = str(src) if src else ""
+    if label == "현물" and spot_src:
+        label = str(spot_src)
+    tail = f" ({label})" if label else ""
     return f"환율 {float(used):,.2f}{tail}"
 
 
 ACC_CLEAR_WAIT_S = 3.0  # 누적 clear 뒤 코어 스냅샷이 지워진 값을 실어 올 때까지 "-" 유지 상한
+CLOSE_SAVE_WAIT_S = 3.0  # 닫을 때 세트 저장 전송이 끝나길 기다리는 상한(결정 82)
 
 
 def acc_clear_pending(pending: dict[tuple[str, str], float], key: tuple[str, str],
@@ -446,7 +461,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         screen_log,
         watch_parent_exit,
     )
-    from .ui_close import attach_auto_close
+    from .ui_close import attach_auto_close, main_closing
     from .ui_dialog import center_on_parent
 
     preview = "--preview" in sys.argv  # UI만 확인 — 코어 접속·부모감시 없이 레이아웃만
@@ -479,6 +494,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         while True:
             payload, label = jobs.get()
             results.put((label, core_request("/command", payload, timeout=10.0)))
+            jobs.task_done()  # 닫을 때 저장이 '다 보냈나'를 unfinished_tasks로 본다
 
     def poller() -> None:
         # 실시간(DESIGN §12.1 state 채널): 공유메모리 0.1초 읽기, 없거나 낡으면 HTTP 폴백.
@@ -659,50 +675,48 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     # 오른쪽 끝 = 설정, 그 왼쪽 = 주문가능시간 표시 (모니터 수치는 방향 제목 옆으로 이동)
     tk.Button(top, text="설정", command=lambda: open_common_dialog()).pack(side="right")
     mon: dict[str, tk.Label] = {}  # 방향 제목 옆 모니터 라벨 — build_section에서 채움
-    # 바탕색 콤보(사용자 2026-09-10) — 설정 버튼 왼쪽. 창 구분용으로 바탕(창·프레임·헤더 라벨)만
-    # 물들이고 입력칸·모니터 칸·중지 행 색은 그대로. 선택은 창 저장(win_state)에 남긴다.
+    # 바탕색(사용자 2026-09-10) — 설정 버튼 왼쪽 '색상' 버튼. 창 구분용으로 바탕(창·프레임·헤더
+    # 라벨)만 물들이고 입력칸·모니터 칸·중지 행 색은 그대로. 선택은 창 저장(win_state)에 남긴다.
+    # (옛 콤보 이름 '하늘'·'민트' 등은 저장본 복원을 위해 _BG_CHOICES로 계속 읽는다.)
     default_bg = root.cget("bg")
-    bg_state = {"cur": default_bg, "name": "기본"}  # name = 콤보 이름 또는 '#rrggbb'(대화상자)
-    cb_bg = ttk.Combobox(top, values=list(_BG_CHOICES), width=5, state="readonly")
-    cb_bg.set("기본")
+    bg_state = {"cur": default_bg, "name": "기본"}  # name = 옛 콤보 이름 또는 '#rrggbb'
     fg_state: dict[str, str | None] = {"cur": None}  # 글자색('#rrggbb', None=기본)
-    if spec.color_dialog:  # 주식 화면(사용자 2026-09-16): 콤보 대신 색 고르기 대화상자
-        def pick_color(kind: str) -> None:
-            from tkinter import colorchooser
+    # 색 고르기 대화상자('색상' 버튼) — 주식(사용자 2026-09-16)에 이어 주식선물도(사용자 2026-10-16:
+    # 바탕색 콤보 대신 주식처럼 버튼). 바탕색·글자색 두 가지.
+    def pick_color(kind: str) -> None:
+        from tkinter import colorchooser
 
-            start = bg_state["cur"] if kind == "bg" else (fg_state["cur"] or "black")
-            title = "바탕색 선택" if kind == "bg" else "글자색 선택"
-            _rgb, hexv = colorchooser.askcolor(color=start, parent=root, title=title)
-            if hexv:
-                (apply_bg if kind == "bg" else apply_fg)(str(hexv))
+        start = bg_state["cur"] if kind == "bg" else (fg_state["cur"] or "black")
+        title = "바탕색 선택" if kind == "bg" else "글자색 선택"
+        _rgb, hexv = colorchooser.askcolor(color=start, parent=root, title=title)
+        if hexv:
+            (apply_bg if kind == "bg" else apply_fg)(str(hexv))
 
-        color_box: dict[str, tk.Toplevel | None] = {"win": None}
+    color_box: dict[str, tk.Toplevel | None] = {"win": None}
 
-        def open_color_menu() -> None:
-            # 바탕색·글자색 두 가지(사용자 2026-09-16) — 작은 창에서 고른다. '기본'은 글자색 되돌림.
-            # 한 번에 하나만(연속 클릭으로 여러 개 뜨던 것, 사용자 2026-09-16): 열려 있으면 앞으로.
-            cur = color_box["win"]
-            if cur is not None and cur.winfo_exists():
-                cur.lift()
-                cur.focus_set()
-                return
-            win = tk.Toplevel(root)
-            color_box["win"] = win
-            win.title("색상")
-            win.resizable(False, False)
-            win.transient(root)
-            for text, cmd in (("바탕색", lambda: pick_color("bg")),
-                              ("글자색", lambda: pick_color("fg")),
-                              ("글자색 기본", lambda: apply_fg(None))):
-                tk.Button(win, text=text, width=12, command=cmd).pack(padx=10, pady=4)
-            tk.Button(win, text="닫기", width=12, command=win.destroy).pack(padx=10, pady=(4, 10))
-            center_on_parent(win, root)
-            win.grab_set()  # 색상 창이 떠 있는 동안 본창 클릭 차단(설정 창들과 같은 규칙)
+    def open_color_menu() -> None:
+        # 바탕색·글자색 두 가지(사용자 2026-09-16) — 작은 창에서 고른다. '기본'은 글자색 되돌림.
+        # 한 번에 하나만(연속 클릭으로 여러 개 뜨던 것, 사용자 2026-09-16): 열려 있으면 앞으로.
+        cur = color_box["win"]
+        if cur is not None and cur.winfo_exists():
+            cur.lift()
+            cur.focus_set()
+            return
+        win = tk.Toplevel(root)
+        color_box["win"] = win
+        win.title("색상")
+        win.resizable(False, False)
+        win.transient(root)
+        for text, cmd in (("바탕색", lambda: pick_color("bg")),
+                          ("글자색", lambda: pick_color("fg")),
+                          ("글자색 기본", lambda: apply_fg(None))):
+            tk.Button(win, text=text, width=12, command=cmd).pack(padx=10, pady=4)
+        tk.Button(win, text="닫기", width=12, command=win.destroy).pack(padx=10, pady=(4, 10))
+        center_on_parent(win, root)
+        win.grab_set()  # 색상 창이 떠 있는 동안 본창 클릭 차단(설정 창들과 같은 규칙)
 
-        tk.Button(top, text="색상", command=open_color_menu).pack(side="right", padx=(0, 6))
-    else:
-        cb_bg.pack(side="right", padx=(0, 6))
-    # 주문가능시간 표시 — '주문가능' 글자는 뺀다(콤보 자리 확보, 사용자 2026-09-10)
+    tk.Button(top, text="색상", command=open_color_menu).pack(side="right", padx=(0, 6))
+    # 주문가능시간 표시 — '주문가능' 글자는 뺀다(버튼 자리 확보, 사용자 2026-09-10)
     lbl_windows = tk.Label(top, text="", fg="gray25")
     lbl_windows.pack(side="right", padx=(0, 8))
 
@@ -726,8 +740,6 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         root.config(bg=target)
         walk(root)
         bg_state["cur"] = target
-
-    cb_bg.bind("<<ComboboxSelected>>", lambda _e: apply_bg(cb_bg.get()))
 
     def apply_fg(color: str | None) -> None:
         """글자색 적용(사용자 2026-09-16) — 바탕 위에 바로 놓인 라벨(제목·컬럼 머리·매매결과 항목
@@ -1650,14 +1662,62 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     def _set_status(text: str) -> None:
         status.config(text=text)
 
+    def _save_sets_on_close() -> None:
+        """닫을 때 세트 행 값을 코어에(결정 82, 사용자 2026-10-16 "메인창 닫을 때 저장하자 —
+        사용자 입장에선 변한 게 없는 것처럼"). 행에 친 값은 실행 켬·설정창 확인 때만 나가서(결정 72)
+        재접속하면 되돌아갔다. 모든 세트(실행 중 포함 — 잠긴 칸은 코어 값 그대로)를 **검사 없이 값
+        그대로** 보낸다 — 리스크방지 검사는 실행 켤 때·세트설정 확인 때 몫(처음 닫기 저장에도
+        걸었다가 10-16 10:46 주식 5세트 청산 2가 조용히 버려짐 → 사용자 "저장 안 되는 듯"). 행 RT
+        칸을 고쳐 둔 세트는 RT도 함께(부호 오류면 그 세트의 RT만 뺌), 체결차 Clear는 안 실린다
+        (save_payload).
+        전송이 끝날 때까지 잠깐 기다린다 — 창과 함께 전송 스레드가 죽어 유실되지 않게."""
+        if not box_is_live(state_box, time.time()):
+            screen_log().warning("%s 닫기 — 코어 미접속, 세트 행 값을 저장하지 못함", spec.log_tag)
+            return
+        rt_bad: list[str] = []
+        n = 0
+        for (dtag, i), w in sets.items():
+            _sync_qty_from_row(w)  # 목표·1회·초(결정 72)
+            w["en_sf"] = parse_threshold(w["e_en_sf"].get())
+            w["en_s"] = parse_threshold(w["e_en_s"].get())
+            w["ex_sf"] = parse_threshold(w["e_ex_sf"].get())
+            rt_override, rt_errs = rt_override_on_run(dtag, i)  # 행 RT 칸 고친 값(결정 74·82)
+            if rt_errs:
+                tag = "정방향" if dtag == "fwd" else "역방향"
+                rt_bad.append(f"{tag} {i + 1}세트 RT {' / '.join(rt_errs)}")
+            send(save_payload(set_payload(i, w, cur_under(), dtag), rt_override), "닫기 저장")
+            n += 1
+        deadline = time.monotonic() + CLOSE_SAVE_WAIT_S
+        while jobs.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.05)
+        left = jobs.unfinished_tasks
+        msg = (f"{spec.log_tag} 닫기 — 세트 {n}건 코어 저장"
+               + (f", 전송 못 마침 {left}건" if left else "")
+               + (", RT 안 실음: " + "; ".join(rt_bad) if rt_bad else ""))
+        (screen_log().warning if (left or rt_bad) else screen_log().info)(msg)
+
     # 창 닫기(X) — 자동주문 화면 공통 규칙(DESIGN-ui §6): 실행 중이면 확인 뒤 정지하고 닫기.
     # 정지 대상은 **이 창이 보여주는 종목**뿐 — 다른 종목은 다른 창/코어에서 계속(2026-09-08).
+    # 닫기 전 세트 행 값 저장(결정 82); 메인 종료 중이면 확인창 없이 저장만 하고 닫는다.
+    close_box: dict[str, Any] = {"fn": None, "done": False}
     if not preview:
-        attach_auto_close(
+        close_box["fn"] = attach_auto_close(
             root, title=spec.title, is_running=_any_running,
             send_stop=lambda: send({"cmd": "autom_stop_all", "underlying": cur_under()},
                                    "이 종목 전 세트 정지"),
-            set_status=_set_status)
+            set_status=_set_status, before_close=_save_sets_on_close,
+            skip_confirm=main_closing)
+
+    def _close_if_main_closing() -> bool:
+        """메인 종료 플래그 파일(.win_state/main_closing)을 보면 스스로 저장 후 닫는다(결정 82).
+        갱신 루프가 0.3초마다 부른다 — 메인이 창에 닫기를 보내는 대신(venv python.exe가 껍데기라
+        창이 손자 프로세스 소유, PID로 못 찾음 — 실측 2026-10-16) 화면이 알아챈다. 닫았으면 True."""
+        if close_box["done"] or close_box["fn"] is None or not main_closing():
+            return False
+        close_box["done"] = True
+        screen_log().info("%s 메인 종료 플래그 파일 — 세트 저장 후 닫음", spec.log_tag)
+        close_box["fn"]()
+        return True
 
     # --- 화면 저장/복원 (win_state.autoM — 2초 자동저장, order_hl과 동일 방식) ---
     def _collect_fields() -> dict[str, Any]:
@@ -1692,9 +1752,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         bg_saved = saved.get("bg")
         if isinstance(bg_saved, str) and (bg_saved in _BG_CHOICES
                                           or re.fullmatch(r"#[0-9a-fA-F]{6}", bg_saved)):
-            if bg_saved in _BG_CHOICES:
-                cb_bg.set(bg_saved)
-            apply_bg(bg_saved)  # 바탕색 — 창을 다 그린 뒤 적용(콤보 이름 또는 대화상자 색)
+            apply_bg(bg_saved)  # 바탕색 — 창을 다 그린 뒤 적용(옛 콤보 이름 또는 대화상자 색)
         fg_saved = saved.get("fg")
         if isinstance(fg_saved, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", fg_saved):
             apply_fg(fg_saved)  # 글자색(주식 화면 색 고르기, 2026-09-16)
@@ -1731,8 +1789,6 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             if f"{d}_en_s" in mon:
                 mon[f"{d}_en_s"].config(bg=s_auction_bg("pre_open"))
     if preview and os.environ.get("KP_PREVIEW_BG"):  # 미리보기 캡처용 바탕색(이름 또는 #rrggbb)
-        if os.environ["KP_PREVIEW_BG"] in _BG_CHOICES:
-            cb_bg.set(os.environ["KP_PREVIEW_BG"])
         apply_bg(os.environ["KP_PREVIEW_BG"])
     if preview and os.environ.get("KP_PREVIEW_FG"):  # 미리보기 캡처용 글자색(#rrggbb)
         apply_fg(os.environ["KP_PREVIEW_FG"])
@@ -1766,7 +1822,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     # 목업 대조용 모니터 샘플 (정 -0.82/-0.82/-0.52, 역 0.12/0.12/0.23)
     preview_mon = {"fwd_en_sf": "-0.82", "fwd_en_s": "-0.82", "fwd_ex_sf": "-0.52",
                    "rev_en_sf": "0.12", "rev_en_s": "0.12", "rev_ex_sf": "0.23",
-                   "fx": fx_caption(1349.6, "현물")}
+                   "fx": fx_caption(1349.6, "현물", "하나고시")}
 
     def _fmt_num(v: Any, d: int = 0) -> str:
         return f"{float(v):,.{d}f}" if isinstance(v, int | float) else "-"
@@ -2058,7 +2114,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # '적'을 누른 뒤부터 표시(종목·호가단위·기준수량이 코어에 적용된 값이라야 뜻이 있음).
         monitor = _live_book().get("monitor") or {}
         fx = _live_book().get("fx") or {}
-        mon["fx"].config(text=fx_caption(fx.get("used"), fx.get("src")))
+        mon["fx"].config(text=fx_caption(fx.get("used"), fx.get("src"), fx.get("spot_src")))
 
         def _paint_auction(bg: str) -> None:
             if state_box.get("_s_bg") == bg:
@@ -2157,6 +2213,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             if preview:
                 for key, lbl in mon.items():
                     lbl.config(text=preview_mon.get(key, "-"))
+                return
+            if _close_if_main_closing():  # 메인 종료 중 — 저장하고 닫았으니 갱신 예약 안 함
                 return
             if time.time() - float(state_box.get("_bar_at", 0.0)) >= 1.0:
                 state_box["_bar_at"] = time.time()

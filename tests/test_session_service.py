@@ -274,3 +274,36 @@ def test_close_auction_code_31_is_auction_and_30_is_info() -> None:
     svc.on_market_status(jif("41"))               # 15:30 장마감
     assert svc.stock_auction() is False
     assert svc.phase_for_market("1") is SessionPhase.DEAD
+
+
+def test_close_auction_countdown_codes_keep_auction_until_41() -> None:
+    # 결정 81(2026-10-15, 사용자: 장마감 동시호가 내내 진입S 초록). 실측 2026-09-30 운영 로그
+    # 코스피(1): 15:19:59 `31` → 15:24:59 `44` → 15:28:59 `43` → 15:29:49 `42` → 15:29:58 `41`.
+    # 44·43·42는 장개시 24·23·22와 같은 간격의 카운트다운이라 동시호가 단계 유지(전엔 미지 → DEAD라
+    # 15:25에 초록이 꺼졌다).
+    svc = SessionService()
+    svc.on_market_status(jif("21"))
+    svc.on_market_status(jif("31"))
+    assert svc.stock_auction() is True
+    for code in ("44", "43", "42"):
+        assert classify_jstatus("1", code) == ("phase", SessionPhase.PRE_OPEN)
+        svc.on_market_status(jif(code))
+        assert svc.stock_auction() is True, code
+        assert svc.is_tradeable("1") is True, code
+    svc.on_market_status(jif("41"))
+    assert svc.stock_auction() is False
+    assert svc.is_tradeable("1") is False
+
+
+def test_open_auction_code_12_at_0840_is_info() -> None:
+    # 실측 2026-10-14 운영 로그: 08:30 코스피·코스닥 `11` → 08:40 `12` → 08:50 `25` → 09:00 `21`.
+    # 12는 장전 동시호가 안의 정보 코드(결정 81) — 전엔 미지 → DEAD라 08:40~08:50 초록이 꺼지고
+    # 발주도 막혔다.
+    svc = SessionService()
+    svc.on_market_status(jif("11"))
+    svc.on_market_status(jif("12"))
+    assert classify_jstatus("2", "12")[0] == "info"
+    assert svc.stock_auction() is True
+    assert svc.phase_for_market("1") is SessionPhase.PRE_OPEN
+    svc.on_market_status(jif("25"))
+    assert svc.stock_auction() is True

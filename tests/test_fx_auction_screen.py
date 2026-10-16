@@ -79,3 +79,53 @@ def test_attach_auto_close_timeout_and_stay(monkeypatch) -> None:  # type: ignor
     root = _FakeRoot()
     attach_auto_close(root, title="t", is_running=lambda: False, send_stop=lambda: None)()
     assert root.destroyed
+
+
+def test_attach_auto_close_before_close_and_forced(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # 결정 82(2026-10-16): before_close는 닫기로 정해진 뒤 destroy 전에 한 번. 메인 종료 중
+    # (skip_confirm)이면 실행 중이어도 묻지 않고(확인창 금지) 정지 명령 없이 저장만 하고 닫는다.
+    from kp_arb import ui_close
+
+    def _no_ask(*_a, **_k):  # type: ignore[no-untyped-def]
+        raise AssertionError("메인 종료 중엔 확인창을 띄우면 안 된다")
+
+    monkeypatch.setattr(ui_close, "ask_yes_no", _no_ask)
+    root = _FakeRoot()
+    saved: list[int] = []
+    stops: list[int] = []
+    on_close = attach_auto_close(
+        root, title="t", is_running=lambda: True, send_stop=lambda: stops.append(1),
+        before_close=lambda: saved.append(1), skip_confirm=lambda: True)
+    on_close()
+    assert saved == [1] and stops == [] and root.destroyed
+
+    # 실행 중 아님 + 메인 종료 아님: 저장하고 그냥 닫기. 저장이 터져도 닫힌다.
+    root2 = _FakeRoot()
+
+    def _boom() -> None:
+        raise RuntimeError("저장 실패")
+
+    on_close2 = attach_auto_close(root2, title="t", is_running=lambda: False,
+                                  send_stop=lambda: None, before_close=_boom,
+                                  skip_confirm=lambda: False)
+    on_close2()
+    assert root2.destroyed
+
+
+def test_main_closing_flag(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # 플래그 파일: 세우면 True, 치우면 False, 너무 오래됐으면(메인이 죽어 못 치움) False.
+    from kp_arb.ui_close import (
+        MAIN_CLOSING_MAX_AGE_S,
+        clear_main_closing,
+        main_closing,
+        mark_main_closing,
+    )
+
+    p = tmp_path / ".win_state" / "main_closing"
+    assert main_closing(p) is False
+    mark_main_closing(p)
+    assert main_closing(p) is True
+    assert main_closing(p, now=p.stat().st_mtime + MAIN_CLOSING_MAX_AGE_S + 1) is False
+    clear_main_closing(p)
+    assert main_closing(p) is False
+    clear_main_closing(p)  # 없어도 조용히

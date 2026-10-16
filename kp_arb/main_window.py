@@ -15,6 +15,7 @@ import logging
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -112,6 +113,33 @@ def force_kill_core() -> int:
 
         screen_log().exception("코어 강제 종료 실패")
         return 0
+
+
+def close_screens_gracefully(
+    procs: list[Any], *, wait_s: float = 4.0,
+    sleep: Callable[[float], None] | None = None, now: Callable[[], float] | None = None,
+) -> str:
+    """메인 종료 때 체결쏴 화면들이 세트 값을 코어에 저장하고 스스로 닫힐 때까지 기다린다(결정 82,
+    사용자 2026-10-16) — 그래서 코어를 내리기 **전에**, 플래그 파일(`mark_main_closing`)을 세운 뒤
+    부른다. 화면은 갱신 루프(0.3초)에서 플래그 파일을 보고 저장 후 닫는다. (창에 WM_CLOSE를 보내는
+    방식은 버림 —
+    개발 venv의 python.exe가 껍데기라 창이 손자 프로세스 소유, PID로 못 찾음 — 실측 2026-10-16.)
+    wait_s 안에 안 닫힌 화면은 강제 종료(종전 동작). 결과 문구를 돌려준다. sleep·now는 주입
+    (테스트)."""
+    import time
+
+    sleep = sleep or time.sleep
+    now = now or time.monotonic
+    live = [p for p in procs if p.poll() is None]
+    deadline = now() + wait_s
+    while now() < deadline and any(p.poll() is None for p in live):
+        sleep(0.1)
+    forced = 0
+    for p in live:
+        if p.poll() is None:
+            p.terminate()
+            forced += 1
+    return f"저장 후 닫힘 {len(live) - forced}/{len(live)}, 강제 종료 {forced}"
 
 
 def ensure_core_down(wait_s: float = 6.0) -> str:
@@ -356,11 +384,13 @@ def main() -> None:
 
     from . import since_start
     from .core_client import screen_log as _slog
+    from .ui_close import clear_main_closing, mark_main_closing
 
     # 시동 계측(2026-09-14): "메인 창 뒤 저장 화면까지 2분+"의 구간을 잡는다 — 메인 시작·창 표시·
     # 코어 실행·코어 첫 연결·화면 복원 시작을 screen 로그에 프로세스 시작 기준 초로 남긴다.
     t_main0 = time.perf_counter()
     _slog().info("메인 시작 — 프로세스 시작 후 %.1fs", since_start())
+    clear_main_closing()  # 지난 종료가 못 치운 플래그 파일(결정 82) — 창 닫기가 조용히 되지 않게
     timing = {"core_seen": False}
 
     # 마지막 상태는 **스레드 시작 전에** 읽는다 — 감시 스레드가 ui_state.json을
@@ -863,11 +893,23 @@ def main() -> None:
         save_ui_state()  # 닫기 직전 화면 목록 저장 — 다음 실행 때 다시 열림
         closing["flag"] = True
         restart["intentional"] = True  # 자동 재기동 금지
+        # 체결쏴 화면들 먼저(결정 82): 플래그 파일(main_closing)을 세우면 각 화면이 갱신 루프에서
+        # 알아채 세트 행 값을 코어에 저장하고 확인창 없이 닫힌다 — 그래서 코어보다 앞. 다른 화면
+        # (주문리스트
+        #
+        # 시세 등)은 저장할 게 없어 기다리지 않고 종전처럼 강제 종료. 안 닫히면 강제 종료.
+        mark_main_closing()
+        status.config(text="화면 저장·종료 중 …")
+        root.update_idletasks()
+        _slog().info("메인 종료 — 체결쏴 화면 %s", close_screens_gracefully(
+            [proc for tok, _slot, proc in launched
+             if tok.split(" ", 1)[0].startswith("kp_arb.order_autom")]))
         # 메인 종료 = 전부 멈춤. 안전종료가 확인되지 않으면 강제 종료(2026-09-29 사고: 코어 HTTP가
         # 막혀 종료 명령이 안 닿아 메인을 닫아도 자동M이 계속 발주).
         status.config(text="코어 종료 중 …")
         root.update_idletasks()
         _slog().info("메인 종료 — %s", ensure_core_down())
+        clear_main_closing()
         for _tok, _slot, proc in launched:
             if proc.poll() is None:
                 proc.terminate()

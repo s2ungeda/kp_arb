@@ -97,3 +97,37 @@ def test_slot_bar_text_shows_current_or_next_slot_only() -> None:
           {"enabled": True, "start": "15:35:30", "end": "15:46:55", "market": "krx"}]
     assert slot_bar_text(sf, _t(8, 40), with_market=False) == (
         "08:30:10~08:46:20 (1/2)", "1: 08:30:10~08:46:20\n2: 15:35:30~15:46:55")
+
+
+def test_fx_caption_shows_spot_source() -> None:
+    # 사용자 2026-10-16: 괴리 모니터는 '현물CUR(하나고시)'인데 체결쏴는 '(현물)'뿐이라 CUR
+    # 미수신으로 오해 → 현물이면 원천(하나고시/LS, 결정 70)까지. 선물역산·값 없음은 종전 그대로.
+    from kp_arb.order_autom import fx_caption
+
+    assert fx_caption(None, "현물", "LS") == "환율 -"
+    assert fx_caption(0, "현물") == "환율 -"
+    assert fx_caption(1340.0, "현물", "하나고시") == "환율 1,340.00 (하나고시)"  # '현물·' 없이
+    assert fx_caption(1339.5, "현물", "LS") == "환율 1,339.50 (LS)"
+    assert fx_caption(1339.5, "현물") == "환율 1,339.50 (현물)"           # 출처 미상(옛 코어)
+    assert fx_caption(1338.29, "선물역산", "LS") == "환율 1,338.29 (선물역산)"
+    assert fx_caption(1338.29, None) == "환율 1,338.29"
+
+
+
+def test_save_payload_rt_only_when_row_edited_and_never_clear() -> None:
+    # 결정 82(2026-10-16, 사용자): 닫을 때 저장은 실행 중인 세트도 보내므로 세트설정 창의 RT 수동
+    # 입력값·체결차 Clear는 안 실린다("실행 중에는 RT가 바뀔 수 있는데 저장 때 덮어쓸 수 있다").
+    # 행 RT 칸을 고쳐 둔 값(실행 중엔 잠겨 못 고침 → 실행 중 아닌 세트뿐)만 rt_manual로 실린다
+    # ("RT도 저장 안 되는 듯"). 나머지는 그대로.
+    from kp_arb.order_autom import save_payload, set_payload
+
+    w = {"target": 10, "per": 2, "delay": 30, "en_sf": 0.5, "en_s": 0.4, "ex_sf": -0.1,
+         "rt_manual": 7, "clear_diff": True, "credit": True, "tick": 500}
+    raw = set_payload(2, w, "samsung", "fwd")
+    assert raw["rt_manual"] == 7 and raw["clear_diff"] is True
+    out = save_payload(raw)                      # 행 RT 안 고침 → RT 안 실림
+    assert out["rt_manual"] is None and out["clear_diff"] is False
+    assert save_payload(raw, 3)["rt_manual"] == 3  # 행 RT를 3으로 고쳐 둠 → 그 값
+    rest = {k: v for k, v in out.items() if k not in ("rt_manual", "clear_diff")}
+    assert rest == {k: v for k, v in raw.items() if k not in ("rt_manual", "clear_diff")}
+    assert raw["rt_manual"] == 7  # 원본은 안 건드림

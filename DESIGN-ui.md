@@ -58,7 +58,11 @@
   - **예** → 코어에 정지 명령 → 코어 상태에서 실행이 풀린 것을 확인한 뒤(최대 3초) 닫는다.
     (창을 바로 닫으면 전송 스레드가 같이 죽어 정지 명령이 유실될 수 있다.)
   - **아니오** → 창 유지. 실수 클릭 방지용 확인이며, "닫으면서 실행을 남기는" 선택지는 없다.
-- 구현: `kp_arb/ui_close.py` — `attach_auto_close(root, title, is_running, send_stop, set_status)` 한 줄.
+- **메인 종료 중**(메인이 코어를 내리기 전에 `.win_state/main_closing` 플래그 파일을 세움, exec 결정 82 2026-10-16) →
+  자동M 화면은 갱신 루프에서 플래그 파일을 보고 스스로 닫되 확인창 없이(실행은 코어가 메인 종료로 멈춤). 닫기로 정해지면
+  destroy 전에 `before_close`를 한 번 부른다 — 자동M은 세트 행 값을 코어에 저장(실패해도 닫힘, 로그만).
+- 구현: `kp_arb/ui_close.py` — `attach_auto_close(root, title, is_running, send_stop, set_status, before_close,
+  skip_confirm)` 한 줄.
   판정은 순수 함수 `close_plan(running, confirmed)`. 적용: ✅ 동시호가 창 · ✅ 자동M(2026-09-04,
   실행 중 = 정방향 세트 중 하나라도 running, '예'면 `autom_stop_all`) · ⬜ 자동T(실행 상태변화와 함께).
 
