@@ -131,3 +131,13 @@ def test_save_payload_rt_only_when_row_edited_and_never_clear() -> None:
     rest = {k: v for k, v in out.items() if k not in ("rt_manual", "clear_diff")}
     assert rest == {k: v for k, v in raw.items() if k not in ("rt_manual", "clear_diff")}
     assert raw["rt_manual"] == 7  # 원본은 안 건드림
+
+
+def test_market_label_maps_core_value_to_screen_text() -> None:
+    # 결정 80: 지금 거래소 라벨은 코어 종목 상태의 market을 따라간다(운영 실측 2026-10-19: 구간이
+    # NXT로 바뀌어 주문은 NXT로 나가는데 라벨은 창 열 때의 'KRX'에 머묾 → 갱신 루프에서 따라가게).
+    from kp_arb.order_autom import market_label
+
+    assert market_label("krx") == "KRX"
+    assert market_label("nxt") == "NXT"
+    assert market_label(None) == "-" and market_label("uni") == "-"

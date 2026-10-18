@@ -1231,6 +1231,11 @@ def make_app(
         """/state 본문 — HTTP와 WS `state` 채널(§12.1)이 같은 함수를 쓴다."""
         payload = snapshot(state)
         payload["live"] = live_snapshot(state, system, engine)
+        # 주식시장 장운영 단계(pre_open 등) — 체결쏴 화면의 진입S 초록(결정 57)이 여기서 읽는다.
+        # 09-30엔 monitor_snapshot(시세 모니터)에만 실려 화면이 늘 None을 봤다(실측 2026-10-16
+        # 15:20: 코어는 31 → pre_open인데 초록이 안 켜짐).
+        payload["phase"] = (system.session.phase_for(Underlying.SAMSUNG).value
+                            if system is not None else None)
         payload["fx"] = (fx_service.snapshot() if fx_service is not None
                          else {"connected": False})
         payload["ws"] = ([s.to_dict() for s in system.ws_statuses()]

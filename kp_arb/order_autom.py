@@ -173,6 +173,11 @@ MONTH_MAP = {"최근": "near", "차근": "next"}  # 표시는 '최근/차근'(�
 MARKET_MAP = {"KRX": "krx", "NXT": "nxt"}
 
 
+def market_label(market: object) -> str:
+    """코어 종목 상태의 거래소 값("krx"/"nxt") → 화면 라벨 "KRX"/"NXT", 모르면 "-". 순수."""
+    return next((k for k, v in MARKET_MAP.items() if v == market), "-")
+
+
 def pct_to_frac(value: float | None) -> float | None:
     """화면 %(0.5) → 코어 소수(0.005). 빈값은 None 그대로."""
     return None if value is None else value / 100.0
@@ -1930,9 +1935,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         month_label = next((k for k, v in MONTH_MAP.items() if v == book.get("future_month")), None)
         if month_label and spec.has_month:
             cb_month.set(month_label)
-        market_label = next((k for k, v in MARKET_MAP.items() if v == book.get("market")), None)
         if spec.market_combo:
-            lbl_market.config(text=market_label or "-")
+            lbl_market.config(text=market_label(book.get("market")))
         ref = book.get("ref_qty")
         if isinstance(ref, int):
             ent_refqty.delete(0, "end")
@@ -2141,6 +2145,12 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # 현물이 예상체결가라 S괴리를 판정에 안 쓴다는 표시. 끝나면 다시 빨강. 코어 /state의 장운영
         # 단계로.
         _paint_auction(s_auction_bg(data.get("phase")))
+        if spec.market_combo:  # 지금 거래소 라벨은 코어 스냅샷을 따라간다(결정 80 — 구간이 바뀌면
+            # 코어가 거래소를 옮기는데 라벨은 창 열 때 값에 머물렀음, 운영 실측 2026-10-19 08:3x:
+            # 주문은 NXT로 나가는데 'KRX' 표시)
+            mk_label = market_label(_live_book().get("market"))
+            if mk_label != "-" and lbl_market.cget("text") != mk_label:
+                lbl_market.config(text=mk_label)
         if spec.has_month:  # 코어가 월물을 되돌리면(결정 75) 콤보도 — 코어 값이 바뀔 때만
             core_month = _live_book().get("future_month")
             if core_month and core_month != state_box.get("_month_seen"):

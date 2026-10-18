@@ -416,6 +416,9 @@ async def test_http_roundtrip_and_shutdown_hook() -> None:
         assert resp.status == 200
         data = await resp.json()
         assert set(data["screens"]) == {"autoT", "autoM"}
+        # 장운영 단계는 /state 본문에 실려야 한다(결정 57 초록 — 10-16 실측: monitor_snapshot에만
+        # 있어 체결쏴 화면이 늘 None을 봤음). 시스템 없으면 None.
+        assert "phase" in data and data["phase"] is None
 
         resp = await client.post("/command", json={
             "cmd": "per_qty", "screen": "autoT", "block": "entry", "qty": 30})
