@@ -608,6 +608,13 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                  "선물 월물")
         send_ref_qty(force=True)
         state_box["_applied"] = True  # 모니터 수치는 '적'을 누른 뒤부터 표시(사용자 2026-09-04)
+        # 눌렀는데 수치가 안 뜨는 일(개발 2026-10-19 주식 화면, 새 창으론 재현 안 됨)을 다음엔
+        # 로그로 짚게 — 화면이 보는 코어 종목 상태(기준수량·모니터)와 상태 수신 여부를 함께 남긴다
+        live = _live_book()
+        screen_log().info("%s 적 — 종목 %s 호가단위 %s 기준수량칸 %r | 코어 ref_qty %s monitor %s "
+                          "| 상태 수신 %s", spec.log_tag, u, cb_agg.get(), ent_refqty.get(),
+                          live.get("ref_qty"), live.get("monitor"),
+                          box_is_live(state_box, time.time()))
 
     def on_under_change(_e: object = None) -> None:
         """종목 콤보 — 그 종목의 종목 상태(세트·RT·체결차·기준수량·월물)을 코어에서 다시 보여준다.
@@ -1429,7 +1436,14 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         win.transient(root)
         # 주문가능시간 — 구간마다 [사용] [시작] ~ [끝] (주식은 거래소 콤보까지; 주식선물 2구간·주식
         # 4구간, 결정 80 — 사용자 2026-10-15 "주식선물도 주식처럼, 대신 2구간이고 거래소 콤보 제외")
-        tk.Label(win, text="주문가능시간").grid(row=0, column=0, sticky="nw", padx=6, pady=4)
+        lframe = tk.Frame(win)  # 왼쪽 칸: 제목 + (주식) 주의 문구
+        lframe.grid(row=0, column=0, sticky="nw", padx=6, pady=4)
+        tk.Label(lframe, text="주문가능시간").pack(anchor="w")
+        if spec.market_combo:
+            # 사용자 2026-10-19: 구간 거래소가 KRX면 KRX 호가가 나오기 전(장전 08:30~08:50)엔
+            # 모니터 수치가 "-" — 수치가 선택한 거래소 시세로 계산된다는 것을 설정창에 밝힌다
+            tk.Label(lframe, text="※ 선택한 거래소의\n시세로 수치 계산됨", fg="gray35",
+                     justify="left", font=T.FONT_SMALL).pack(anchor="w", pady=(10, 0))
         wframe = tk.Frame(win)
         wframe.grid(row=0, column=1, columnspan=3, sticky="w", pady=4)
         slot_rows: list[tuple[tk.BooleanVar, tk.Entry, tk.Entry, ttk.Combobox | None]] = []
