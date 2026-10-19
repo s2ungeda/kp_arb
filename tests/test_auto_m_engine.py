@@ -2049,3 +2049,34 @@ def test_orphan_fill_from_other_account_is_not_kept_or_applied() -> None:
         price=1_212_000.0, account=Account.KR_DERIV, source=SOURCE))
     eng._on_fill_applied(fut_order, 2, 1_212_000.0, "f-fut")
     assert "1872" in eng._orphan_fills
+
+
+async def test_pre_fill_over_order_qty_is_rejected_and_set_halted() -> None:
+    # 결정 85(사용자 2026-10-19 "거부+중지"): 선주문 체결 수량이 주문 잔량을 넘으면(10-19 사고
+    # "누적 20/2") 반영하지 않고 세트 중지. 결정 84(계좌 대조) 뒤에 남는 마지막 안전장치.
+    from kp_arb.domain.enums import Account
+
+    eng, sys_, state = _engine()
+    s = state.autom.book(U).sets[0]
+    await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert len(sys_.placed) == 1 and s.entry.pre_qty == 10          # 선주문 10계약
+    order = sys_.order_book.order("O1", Account.KR_DERIV)
+    assert order is not None
+    eng._on_fill_applied(order, 20, 1_602_000.0, "f-over")          # 잔량 10인데 20 체결 통보
+    await _settle()
+    assert s.entry.pre_filled == 0 and s.entry.post_pending == 0    # 반영 안 함
+    assert len(sys_.placed) == 1                                     # HL 후주문 안 나감
+    assert s.entry.status is LegStatus.HALTED and "체결 수량 초과" in s.entry.halt_reason
+    # 잔량 안의 체결은 지금처럼 반영된다
+    eng2, sys2, state2 = _engine()
+    s2 = state2.autom.book(U).sets[0]
+    await _autom_command(eng2, state2, {**RUN, "set": 0, "block": "entry", "value": True})
+    eng2.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    order2 = sys2.order_book.order("O1", Account.KR_DERIV)
+    assert order2 is not None
+    eng2._on_fill_applied(order2, 4, 1_602_000.0, "f-ok")
+    await _settle()
+    assert s2.entry.pre_filled == 4 and s2.entry.status is not LegStatus.HALTED

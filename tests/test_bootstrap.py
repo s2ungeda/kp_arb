@@ -1813,3 +1813,21 @@ async def test_refresh_snapshot_requeries_once_when_fill_lands_during_round_trip
     await system.refresh_snapshot(scope={Account.KR_STOCK})
     assert calls[0] == 2                                   # 한 번 더 조회(그 뒤는 안 함)
     assert system.order_book.position_qty(SAMSUNG, Instrument.KR_STOCK, Account.KR_STOCK) == 100
+
+
+async def test_ls_place_replays_pending_with_account() -> None:
+    # 검토 2026-10-19 §A: LS 발주 뒤 track 전 이벤트 되돌리기(replay_pending)는 라우팅 계좌를 넘겨야
+    # 한다 — 같은 번호가 다른 계좌에 열려 있으면 장부가 계좌를 못 골라 선주문 체결이 유실된다.
+    system, _, _ = _system([])
+    calls: list[tuple[str, object]] = []
+    orig = system.order_book.replay_pending
+
+    def _spy(order_id: str, account: object = None) -> None:
+        calls.append((order_id, account))
+        orig(order_id, account=account)  # type: ignore[arg-type]
+
+    system.order_book.replay_pending = _spy  # type: ignore[method-assign]
+    oid = await system.place(OrderIntent(
+        venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=1, order_type=OrderType.LIMIT, price=1_212_000.0))
+    assert calls == [(oid, Account.KR_DERIV)]  # 계좌 없이 보낸 intent도 라우팅 계좌로 채워 넘김

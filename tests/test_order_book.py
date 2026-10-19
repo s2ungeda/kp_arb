@@ -635,3 +635,28 @@ def test_untracked_fill_logs_a_warning_once(caplog: pytest.LogCaptureFixture) ->
         assert ob.on_fill(fill("X9", 1, 1_717_000.0)) is None
     msgs = [r.getMessage() for r in caplog.records if "미추적 주문 #X9" in r.getMessage()]
     assert len(msgs) == 1 and "1 @ 1.717e+06" in msgs[0]
+
+
+def test_replay_pending_needs_account_when_same_number_open_on_both_accounts(
+        caplog: pytest.LogCaptureFixture) -> None:
+    # 검토 2026-10-19 §A(결정 84 뒤 남은 구멍): 주식 #1871이 **열린 채** 있는데 선물 #1871 체결
+    # 통보가 발주 응답보다 먼저 와 (KR_DERIV, "1871")에 보관 → 선물 track 뒤 계좌 없이 되돌리면
+    # 장부가 계좌를 못 골라(둘 다 열림) 보관 체결이 그대로 남는다(= 선주문 체결 유실·헤지 없음).
+    # 계좌를 넘기면 반영.
+    ob = OrderBook()
+    stock = ob.track("1871", OrderIntent(
+        venue=Venue.LS, underlying=Underlying.SK_HYNIX, instrument=Instrument.KR_STOCK,
+        side=Side.BUY, qty=20, order_type=OrderType.LIMIT, price=1_184_000.0,
+        account=Account.KR_STOCK))
+    ob.on_fill(Fill(fill_id="d1", order_id="1871", qty=2, price=1_212_000.0, ts=0,
+                    account=Account.KR_DERIV))                       # 선물 체결, 등록 전 → 보관
+    fut = ob.track("1871", OrderIntent(
+        venue=Venue.LS, underlying=Underlying.SK_HYNIX, instrument=Instrument.KR_STOCK_FUTURE,
+        side=Side.SELL, qty=2, order_type=OrderType.LIMIT, price=1_212_000.0,
+        account=Account.KR_DERIV))
+    with caplog.at_level(logging.WARNING, logger="kp_arb.order"):
+        ob.replay_pending("1871")                                    # 계좌 없이 — 못 고름
+    assert fut.filled_qty == 0 and stock.filled_qty == 0
+    assert any("보관 통보 미반영" in r.getMessage() for r in caplog.records)
+    ob.replay_pending("1871", account=Account.KR_DERIV)              # 계좌를 넘기면 반영
+    assert fut.filled_qty == 2 and not fut.is_open and stock.filled_qty == 0

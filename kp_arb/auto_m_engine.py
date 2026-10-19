@@ -1371,12 +1371,30 @@ class AutoMEngine:
         s = self._set(u, ref.index, ref.reverse)
         mono = time.monotonic()
         leg = s.leg(ref.block)
+        tag = self._tag(u, ref.index, ref.block, ref.reverse)
+        over = (ref.leg == "pre" and order.order_id == leg.pre_order_id and leg.pre_qty > 0
+                and leg.pre_filled + qty > leg.pre_qty + 1e-9)  # 지금 선주문의 체결만 잰다
+        if over:
+            # 결정 85(사용자 2026-10-19 "거부+중지"): 선주문 체결이 주문 잔량을 넘으면 이 세트
+            # 주문의 체결일 수 없다(10-19 사고: 주식 #1871 20주가 선물 2계약 선주문에 붙어 "누적
+            # 20/2"). 반영하지 않고 세트를 중지해 사람이 미체결·잔고를 확인하게 한다(결정 84의
+            # 계좌 대조 뒤에 남는 마지막 안전장치).
+            remain = leg.pre_qty - leg.pre_filled
+            reason = (f"선주문 체결 수량 초과 — #{order.order_id} 체결 {qty:g} > 남은 {remain:g}"
+                      f"(누적 {leg.pre_filled:g}/{leg.pre_qty:g}) — 다른 계좌·종목의 통보가 섞였을"
+                      " 수 있음, 미체결·잔고 확인 뒤 해제")
+            self._log.error("[자동M] %s %s 선주문 체결 거부 → 세트 중지: %s", u.value, tag,
+                            reason)
+            self.ulog(u).error("체결 거부 %s: %s", tag, reason)
+            self._apply(u, ref.index, ref.block, halt_set(s, ref.block, reason), ref.reverse)
+            leg.last_reject_at = time.strftime("%H:%M:%S")
+            self._trace(u, ref.index, ref.block, leg, ref.reverse)
+            return
         if ref.leg == "pre":
             self._fill_perf[(u, ref.index, ref.block, ref.reverse)] = time.perf_counter()
             self._note_credit_fill(u, order, qty)  # 신용 체결 → 대출일 잔고 스냅샷 갱신(결정 78)
         # 체결 줄을 먼저 찍고 행동(후주문 발주·중지)을 적용한다 — 행동 줄이 체결 줄보다 앞에 찍혀
         # "체결 전에 판단했다"로 읽힌 실측(2026-09-10 10:45:47.536/537)을 막는다.
-        tag = self._tag(u, ref.index, ref.block, ref.reverse)
         if s.hl_first:
             self._apply_fill_hl_first(ref, s, leg, order, qty, price, mono, tag)
             return

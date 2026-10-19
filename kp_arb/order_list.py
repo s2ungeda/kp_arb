@@ -109,6 +109,21 @@ def window_title(age: float | None, fails: int, hidden: int) -> str:
     return " — ".join(parts)
 
 
+def open_row_iid(order_id: str, instrument: str) -> str:
+    """미체결 행의 표 식별자 — 번호만 쓰면 주식 #1871과 선물 #1871이 한 줄로 합쳐져(둘째 줄은 자동
+    식별자, 상품 사전은 뒤 행으로 덮임) 취소 명령이 다른 계좌 주문을 가리켰다(검토 2026-10-19).
+    상품을 같이 묶어 (계좌, 번호) 단위로 유일하게(결정 73)."""
+    return f"{order_id}|{instrument}"
+
+
+def split_row_iid(iid: str | None) -> tuple[str, str] | None:
+    """표 식별자 → (주문번호, 상품). 체결·취소 행("__…")·빈 값·자동 식별자는 None."""
+    if not iid or iid.startswith("__") or "|" not in iid:
+        return None
+    oid, inst = iid.split("|", 1)
+    return (oid, inst) if oid else None
+
+
 _ST_KR = {"new": "신규", "accepted": "접수", "partial": "부분", "filled": "체결",
           "cancelled": "취소", "rejected": "거부"}
 
@@ -316,7 +331,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     row_vals: dict[str, tuple[Any, ...]] = {}  # iid → 값 튜플(선택 편의용)
     sel: dict[str, str | None] = {"iid": None}
-    inst_by_oid: dict[str, str] = {}  # 미체결 행의 상품(취소 명령에 동봉 — 결정 73)
 
     def _on_select(_e: object = None) -> None:
         chosen = tree.selection()
@@ -331,12 +345,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         status.config(text=text[:90], fg=T.C_ERR if err else T.C_ZERO)
 
     def _selected_oid() -> str | None:
-        iid = sel["iid"]
-        return None if not iid or iid.startswith("__") else iid  # 체결·취소행 제외
+        picked = split_row_iid(sel["iid"])  # 체결·취소행 제외
+        return picked[0] if picked else None
 
     def _selected_instrument() -> str | None:
-        oid = _selected_oid()
-        return inst_by_oid.get(oid) if oid else None
+        picked = split_row_iid(sel["iid"])  # 번호와 같은 행의 상품(취소 명령에 동봉 — 결정 73)
+        return picked[1] if picked else None
 
     def do_cancel() -> None:
         oid = _selected_oid()
@@ -437,12 +451,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     continue
                 buy = o.get("side") == "buy"
                 inst = str(o.get("instrument"))
-                inst_by_oid[str(o.get("order_id"))] = inst
                 stk = _ST_KR.get(str(o.get("status")), o.get("status"))
                 cxl = o.get("cancelled") or 0
                 if cxl:  # 부분 취소 확정 뒤 체결 통보 대기(결정 69) — 왜 남아 있는지 보이게
                     stk = f"취소 {_fmt_qty(cxl)} / 체결대기 {_fmt_qty(o.get('remaining'))}"
-                out.append((str(o.get("order_id")), "buy" if buy else "sell",
+                out.append((open_row_iid(str(o.get("order_id")), inst), "buy" if buy else "sell",
                             (_venue(inst), _sym(o.get("underlying"), inst),
                              "매수" if buy else "매도",
                              _fmt_px(o.get("price")), _fmt_qty(o.get("qty")),
@@ -539,7 +552,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         for iid, side, vals in rows:
             try:
                 tree.insert("", "end", iid=iid, values=vals, tags=(side,))
-            except tk.TclError:  # 같은 iid가 두 줄(주문번호 중복) — 자동 iid로
+            except tk.TclError:  # 같은 (번호, 상품)이 두 줄(있을 수 없음) — 자동 iid로, 취소 불가
                 iid = tree.insert("", "end", values=vals, tags=(side,))
             row_vals[iid] = vals
         state_box["_nvis"] = len(rows)

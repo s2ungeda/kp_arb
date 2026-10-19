@@ -476,6 +476,13 @@ class OrderBook:
         if account is None:  # 등록된 주문의 계좌로 — 같은 번호의 다른 계좌 통보는 건드리지 않는다
             order = self._find(order_id)
             account = self._acct_of(order.intent) if order is not None else None
+            if account is None and any(k[1] == order_id and k[0] is not None
+                                       for k in self._pending):
+                # 같은 번호가 두 계좌에 다 열려 있어 계좌를 못 골랐는데 LS 보관 통보가 있다 —
+                # 그대로 두면 유실(검토 2026-10-19 §A). 호출자가 계좌를 넘겨야 한다.
+                logging.getLogger("kp_arb.order").warning(
+                    "주문 #%s 보관 통보 미반영 — 계좌 없이 되돌리기를 불렀는데 같은 번호가 여러 "
+                    "계좌에 열려 있음(호출자가 계좌를 넘겨야 함)", order_id)
         events = list(self._pending.pop((account, order_id), []))
         if account is not None:
             # 계좌 없이 보관된 이벤트(계좌를 안 싣는 호출자 — 실제 LS 통보는 항상 계좌가 있다)도

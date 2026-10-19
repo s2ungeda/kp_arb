@@ -1093,7 +1093,9 @@ class LiveSystem:
             if intent.account is None:  # 장부 키 (계좌, 번호) — 라우팅 계좌를 채워 둔다(결정 73)
                 intent = intent.model_copy(update={"account": account_for(intent.instrument)})
             self.order_book.track(order_id, intent)
-            self.order_book.replay_pending(order_id)  # track 전에 온 이벤트 반영(역전 대비)
+            # track 전에 온 이벤트 반영(역전 대비) — **계좌를 넘긴다**(검토 2026-10-19 §A): 같은
+            # 번호가 다른 계좌에 열려 있으면 장부가 계좌를 못 골라 보관 체결이 유실된다
+            self.order_book.replay_pending(order_id, account=intent.account)
             return order_id
         if self._hl is None:
             raise RuntimeError("HL gateway not configured")
@@ -1234,7 +1236,8 @@ class LiveSystem:
             update={"price": price, "qty": qty,
                     "reduce_only": reduce_only, "post_only": post_only})
         self.order_book.track(new_id, new_intent)
-        self.order_book.replay_pending(new_id)  # 새 주문번호로 track 전에 온 이벤트 반영
+        # 새 주문번호로 track 전에 온 이벤트 반영 — 계좌 명시(검토 2026-10-19 §A)
+        self.order_book.replay_pending(new_id, account=new_intent.account)
         if new_id != order_id:
             self.order_book.on_cancel(order_id, account=order.intent.account)  # 원주문 소멸
         return new_id

@@ -1,7 +1,13 @@
 """주문 리스트 화면 순수 부분 — 필터(거래소·종목·매매·출처)와 출처 표시(사용자 2026-09-11)."""
 from __future__ import annotations
 
-from kp_arb.order_list import _src_label, row_visible, window_title
+from kp_arb.order_list import (
+    _src_label,
+    open_row_iid,
+    row_visible,
+    split_row_iid,
+    window_title,
+)
 
 
 def test_row_visible_all_passes_everything() -> None:
@@ -62,3 +68,19 @@ def test_set_filter_and_choices() -> None:
     assert not row_visible(f, "LS", "sk_hynix", "sell", "자동M", "선정1진")
     assert not row_visible(f, "LS", "sk_hynix", "sell", "일반주문창", "")
     assert row_visible({"set": "전체"}, "LS", "sk_hynix", "sell", "일반주문창", "")
+
+
+def test_open_row_iid_keeps_same_number_on_two_accounts_apart() -> None:
+    # 검토 2026-10-19: 주식 #1871과 선물 #1871이 같이 열리면 번호만 쓴 행 식별자가 겹쳐 취소 명령이
+    # 뒤 행의 상품(=다른 계좌)을 실었다. 번호+상품으로 행을 가르고, 선택 행에서 둘을 같이 푼다.
+    stock = open_row_iid("1871", "kr_stock")
+    fut = open_row_iid("1871", "kr_stock_future")
+    assert stock != fut
+    assert split_row_iid(stock) == ("1871", "kr_stock")
+    assert split_row_iid(fut) == ("1871", "kr_stock_future")
+    assert split_row_iid(open_row_iid("123456789012", "hl_perp")) == ("123456789012", "hl_perp")
+    # 체결·취소 행, 빈 값, 표가 만든 자동 식별자(I001)는 취소 대상이 아니다
+    assert split_row_iid("__fill3") is None
+    assert split_row_iid(None) is None
+    assert split_row_iid("") is None
+    assert split_row_iid("I001") is None
