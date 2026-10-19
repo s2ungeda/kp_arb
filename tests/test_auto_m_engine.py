@@ -2021,3 +2021,31 @@ async def test_stock_slot_change_cancels_and_replaces_on_new_market() -> None:
     eng.tick(datetime(2026, 9, 4, 10, 0, 33), 133.0)
     await _settle()
     assert [p.market for p in sys_.placed] == ["krx", "nxt"]
+
+
+def test_orphan_fill_from_other_account_is_not_kept_or_applied() -> None:
+    # 결정 84(운영 사고 2026-10-19): 주식 계좌 주문 #1871의 체결이 08:17에 주식선물 엔진에도 흘러
+    # 들어와 "주인 모르는 체결"로 번호만으로 보관됐다가, 08:59 선물 계좌가 같은 번호 #1871을 받자
+    # 그 세트의 선주문 체결(20계약!)로 반영 → HL 200 반대 헤지 + 실제 선물 주문은 미추적 잔류.
+    # 다른 계좌의 번호는 보관하지 않고, 등록 때도 계좌가 다르면 버린다.
+    from kp_arb.auto_m_engine import SOURCE
+    from kp_arb.domain.enums import Account
+    from kp_arb.order_book import TrackedOrder
+
+    eng, sys_, state = _engine()
+    stock_order = TrackedOrder("1871", OrderIntent(
+        venue=Venue.LS, underlying=U, instrument=Instrument.KR_STOCK, side=Side.BUY, qty=20,
+        price=1_184_000.0, account=Account.KR_STOCK, source=SOURCE))
+    eng._on_fill_applied(stock_order, 20, 1_184_000.0, "f-stock")   # 등록 전 — 보관 대상 아님
+    assert eng._orphan_fills == {}
+    # 설령 보관돼 있었더라도(옛 코드 경로) 등록 때 계좌가 다르면 버린다
+    eng._orphan_fills["1871"] = [(stock_order, 20, 1_184_000.0)]
+    eng._register("1871", _OrderRef(U, 0, Block.EXIT, "pre"))
+    leg = state.autom.book(U).sets[0].exit
+    assert leg.pre_filled == 0 and sys_.placed == []
+    # 같은 계좌(선물옵션)의 우리 주문 체결은 지금처럼 보관된다
+    fut_order = TrackedOrder("1872", OrderIntent(
+        venue=Venue.LS, underlying=U, instrument=SF, side=Side.SELL, qty=2,
+        price=1_212_000.0, account=Account.KR_DERIV, source=SOURCE))
+    eng._on_fill_applied(fut_order, 2, 1_212_000.0, "f-fut")
+    assert "1872" in eng._orphan_fills

@@ -80,6 +80,8 @@ SNAPSHOT_RETRY_DELAY_S = 1.0  # 재동기 왕복 중 체결이 끼면 한 번 �
 _STOCK_CODE = re.compile(r"^A?\d{6}$")
 _STOCK_ISIN = re.compile(r"^KR7\d{9}$")        # 주식 통보(SC1) Isuno는 ISIN
 _FUTURE_CODE = re.compile(r"^A?[1-4][0-9A-Z]{6,7}$")  # 파생 코드(1 선물·2/3 옵션·4 스프레드)
+# 파생 통보(C01) shcode/expcode는 ISIN "KR4" + 종목코드 8자 + 검사숫자(실측 2026-10-19 KR4A506B0002)
+_FUTURE_ISIN = re.compile(r"^KR4([A-Z0-9]{8})\d$")
 
 
 def code_kind(code: str) -> tuple[str | None, str]:
@@ -90,6 +92,9 @@ def code_kind(code: str) -> tuple[str | None, str]:
     c = code.strip()
     if _STOCK_ISIN.match(c):
         return "stock", c[3:9]
+    fut_isin = _FUTURE_ISIN.match(c)
+    if fut_isin:  # 선물 체결 통보의 ISIN — 전엔 모르는 코드라 종목 대조 없이 반영됐다(10-19 실측)
+        return "future", fut_isin.group(1)
     if _STOCK_CODE.match(c):
         return "stock", c.lstrip("A")
     if _FUTURE_CODE.match(c):

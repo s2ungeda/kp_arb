@@ -1291,6 +1291,15 @@ class AutoMEngine:
             return
         self._orders[oid] = ref
         for order, qty, price in self._orphan_fills.pop(oid, []):
+            # 보관 때 걸렀어도 한 번 더(결정 84) — 이 참조 주문의 계좌와 보관된 체결의 계좌가 달라선
+            # 안 된다(주식↔선물 같은 번호)
+            if order.intent.venue is Venue.LS:
+                expect = self._ls_account(ref)
+                actual = order.intent.account or account_for(order.intent.instrument)
+                if expect is None or actual != expect:
+                    self._log.warning("[자동M] 보관 체결 #%s는 계좌 %s 주문 — 이 세트의 주문(%s)"
+                                      " 아님, 무시", order.order_id, actual, expect)
+                    continue
             self._apply_fill(ref, order, qty, price)
         # 상태 통보(취소·잔량 버림 종료)도 발주 응답보다 먼저 올 수 있다 — 장부는 replay로 이미
         # 상태를 바꿨는데 그때는 주인을 몰라 _on_book_change가 지나쳤다(실측 2026-09-11 10:18:35:
@@ -1347,7 +1356,11 @@ class AutoMEngine:
         if ref is None:
             # 취소로 닫은 선주문의 체결은 이제 오지 않는다 — 장부가 취소 확정 수량으로 닫으므로
             # (결정 69) 셈이 안 끝난 체결은 선주문이 열린 채 보통 체결로 온다
-            if order.intent.source == SOURCE:  # 우리 주문인데 아직 등록 전 — 등록 때 되돌려 반영
+            if order.intent.source == SOURCE and self._fill_could_be_mine(order):
+                # 우리 주문인데 아직 등록 전 — 등록 때 되돌려 반영. **다른 계좌의 번호는 보관하지
+                # 않는다**(결정 84, 운영 사고 2026-10-19: 주식 엔진의 체결 #1871(주식 계좌)이 이
+                # 보관함에 번호만으로 남았다가 42분 뒤 선물 계좌 #1871이 등록되자 그 세트 체결로
+                # 반영 → 20계약 허위 체결·HL 200 반대 헤지·실제 선물 주문은 미추적으로 잔류)
                 self._orphan_fills.setdefault(order.order_id, []).append((order, qty, price))
             return
         self._apply_fill(ref, order, qty, price)
@@ -1552,6 +1565,16 @@ class AutoMEngine:
     def _ls_account_pre(self) -> Account:
         """이 엔진 상품의 선주문(LS) 계좌 — 주식선물·HL선 후주문은 선물옵션, 주식은 주식 계좌."""
         return Account.KR_STOCK if self.product == "stock" else Account.KR_DERIV
+
+    def _fill_could_be_mine(self, order: TrackedOrder) -> bool:
+        """등록 전 체결을 보관해도 되는 주문인가(결정 84) — LS 주문이면 이 엔진 상품의 LS 계좌
+        (주식: 주식계좌, 주식선물·HL선: 선물옵션계좌)여야 한다. LS 주문번호는 계좌마다 따로
+        매겨져 주식·선물이 겹치므로(결정 73) 다른 계좌의 번호는 이 엔진 것일 수 없다. HL은 번호가
+        전역이라 통과."""
+        if order.intent.venue is not Venue.LS:
+            return True
+        actual = order.intent.account or account_for(order.intent.instrument)
+        return actual == self._ls_account_pre()
 
     def _ls_account(self, ref: _OrderRef) -> Account | None:
         """이 참조 주문의 LS 계좌(결정 73 — 장부는 (계좌, 번호)로 찾는다). HL 다리면 None.

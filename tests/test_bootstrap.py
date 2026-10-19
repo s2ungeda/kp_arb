@@ -1726,6 +1726,9 @@ def test_code_kind_tells_stock_from_derivative() -> None:
     assert code_kind("A1167000") == ("future", "A1167000")    # 주식선물(테스트 표기)
     assert code_kind("111V9000") == ("future", "111V9000")
     assert code_kind("175X9000") == ("future", "175X9000")    # 원달러선물
+    # 선물 체결 통보(C01) shcode는 ISIN(KR4+코드+검사숫자) — 10-19 실측 전엔 모르는 코드로
+    # 통과돼 종목 대조가 비어 있었다
+    assert code_kind("KR4A506B0002") == ("future", "A506B000")
     assert code_kind("") == (None, "") and code_kind("XYZ") == (None, "XYZ")
 
 
