@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from .core_engine import RehearsalEngine
     from .fx_service import FxReportService
     from .gateways.ls_ws import TradeTick
+    from .nxt_open_engine import NxtOpenEngine
     from .order_book import TrackedOrder
 
 HOST = "127.0.0.1"
@@ -566,6 +567,46 @@ def _autom_set_from_body(target: Any, body: dict[str, Any]) -> None:
     if body.get("clear_diff"):
         target.fill_diff = 0
         target.sf_net, target.hl_net = 0, 0.0
+
+
+def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
+                      body: dict[str, Any]) -> dict[str, Any]:
+    """오전 NXT 개장 매매 명령(DESIGN-nxt-open.md §6) — nxt_open_settings(종목 설정 저장) ·
+    nxt_open_run(실행 켜기/끄기 — block entry|exit). 설정은 엔진 없이도 저장되고, 실행은 엔진이
+    있어야 한다."""
+    from .nxt_open import apply_settings
+
+    cmd = body.get("cmd")
+    try:
+        u = Underlying(str(body["underlying"]))
+    except (KeyError, ValueError):
+        return _fail(["underlying 필요"])
+    st = state.nxt_open.of(u)
+    if cmd == "nxt_open_settings":
+        errors = apply_settings(st, {k: v for k, v in body.items()
+                                     if k in ("start_s", "end_s", "open_hms", "ref_qty",
+                                              "entries", "exits")})
+        if errors:
+            return _fail(errors)
+        logging.getLogger("kp_arb.nxt_open").info(
+            "[NXT개장] %s 설정 저장: 창 +%.1f~+%.1f초 개장 %s 진입 %s 청산 %s",
+            u.value, st.start_s, st.end_s, st.open_hms,
+            [(t.spread, t.qty, t.price_spread) for t in st.entries],
+            [(t.spread, t.qty, t.price_spread) for t in st.exits])
+        return _ok()
+    if cmd == "nxt_open_run":
+        if engine is None:
+            return _fail(["코어 시세 미접속 — 실행 불가"])
+        value = bool(body.get("value", False))
+        block = str(body.get("block", "entry"))
+        if block not in ("entry", "exit"):
+            return _fail([f"block은 entry|exit: {block!r}"])
+        tiers = st.entries if block == "entry" else st.exits
+        if value and not any(t.valid() for t in tiers):
+            return _fail([f"{'진입' if block == 'entry' else '청산'} 단 없음"])
+        engine.set_enabled(u, block, value)
+        return _ok()
+    return _fail([f"알 수 없는 명령: {cmd!r}"])
 
 
 async def _autom_command(
@@ -1210,6 +1251,7 @@ def make_app(
     autom: AutoMEngine | None = None,
     autom_stock: AutoMEngine | None = None,  # 주식 체결쏴 엔진(exec §7C, 2026-09-17)
     autom_hl_first: AutoMEngine | None = None,  # 주식선물 HL선 엔진(exec §7D 시험, 2026-09-22)
+    nxt_open: NxtOpenEngine | None = None,  # 오전 NXT 개장 매매 엔진(DESIGN-nxt-open, 2026-10-20)
 ) -> web.Application:
     """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅.
 
@@ -1256,6 +1298,8 @@ def make_app(
             **(autom.live_snapshot() if autom is not None else {}),
             **(autom_stock.live_snapshot() if autom_stock is not None else {}),
             **(autom_hl_first.live_snapshot() if autom_hl_first is not None else {})}
+        # 오전 NXT 개장 매매 실시간(괴리·창·판정 결과) — 설정은 payload["nxt_open"](CoreState)
+        payload["nxt_open_live"] = nxt_open.live_snapshot() if nxt_open is not None else {}
         return payload
 
     if hub is not None and hub.state_provider is None:
@@ -1281,6 +1325,11 @@ def make_app(
             return web.json_response(result, dumps=_dumps)
         if isinstance(cmd, str) and cmd.startswith("fx_"):
             result = _fx_command(fx_service, payload)
+            return web.json_response(result, dumps=_dumps)
+        if isinstance(cmd, str) and cmd.startswith("nxt_open_"):
+            result = _nxt_open_command(nxt_open, state, payload)
+            if result.get("ok") and save:
+                save()  # 종목 설정 저장(실행 켜짐은 저장돼도 복원 안 함)
             return web.json_response(result, dumps=_dumps)
         if isinstance(cmd, str) and cmd.startswith("autom_"):
             sent_at = payload.get("sent_at")  # 화면이 보낸 시각 — 전송·대기 지연 계측(2026-10-14)
@@ -1466,6 +1515,7 @@ async def _serve() -> None:
         autom_engine = None
         autom_engine_stock = None
         autom_engine_hl_first = None
+        nxt_open_engine = None
         tasks: list[asyncio.Task[None]] = []
         boot_errors: list[str] = []  # 코어 조립 실패 사유 → /state load_errors → 메인창 팝업
         try:
@@ -1505,6 +1555,11 @@ async def _serve() -> None:
                 state, system, log_dir=_base_dir() / "logs",
                 save=lambda: save_state(STATE_PATH, state), product="sf_hl_first",
                 alert=halt_alert)
+            # 오전 NXT 개장 매매(DESIGN-nxt-open.md) — 이벤트 주도라 별도 태스크 없음
+            from .nxt_open_engine import NxtOpenEngine as _NxtOpenEngine
+
+            nxt_open_engine = _NxtOpenEngine(
+                state.nxt_open, system, save=lambda: save_state(STATE_PATH, state))
             tasks.append(asyncio.create_task(engine.run()))
             tasks.append(asyncio.create_task(fx_service.run()))
             tasks.append(asyncio.create_task(autom_engine.run()))
@@ -1535,7 +1590,8 @@ async def _serve() -> None:
             save=lambda: save_state(STATE_PATH, state),
             system=system, engine=engine, fx_service=fx_service,
             boot_errors=boot_errors, hub=hub, autom=autom_engine,
-            autom_stock=autom_engine_stock, autom_hl_first=autom_engine_hl_first),
+            autom_stock=autom_engine_stock, autom_hl_first=autom_engine_hl_first,
+            nxt_open=nxt_open_engine),
             access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, HOST, DEFAULT_PORT)

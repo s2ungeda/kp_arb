@@ -14,6 +14,8 @@ from enum import StrEnum
 
 from .auto_m import AutoMScreen, autom_from_dict
 from .domain.enums import Block, Instrument, Side, Underlying, Venue
+from .nxt_open import NxtOpenScreen
+from .nxt_open import screen_from_dict as nxt_open_from_dict
 from .theory import in_time_window, parse_hhmm
 
 FUTURES_SHARES_PER_CONTRACT = 10  # 주식선물 1계약 = 10주 = HL 10계약 (§6.2-3)
@@ -202,6 +204,8 @@ class CoreState:
     # HL 호가단위 머지(종목별 [nSigFigs, mantissa]) — 단일 진실=코어. 코어 재시동 때 다시
     # 적용해 시세·일반주문·자동M 콤보가 마지막 선택을 유지한다(사용자 2026-09-07). 원시는 항목 없음.
     hl_merge: dict[str, list[int | None]] = field(default_factory=dict)
+    # 오전 NXT 개장 매매(DESIGN-nxt-open.md) — 종목별 설정. 실행 상태는 복원 안 함.
+    nxt_open: NxtOpenScreen = field(default_factory=NxtOpenScreen)
 
 
 # --- 검증 ---
@@ -395,6 +399,7 @@ def state_from_dict(data: dict[str, object]) -> CoreState:
     if isinstance(raw_screens, dict) and isinstance(raw_screens.get("autoM"), dict):
         legacy_u = str(raw_screens["autoM"].get("underlying", legacy_u))
     autom_from_dict(state.autom, data.get("autom"), legacy_underlying=legacy_u)
+    nxt_open_from_dict(state.nxt_open, data.get("nxt_open"))
     merges = data.get("hl_merge")
     if isinstance(merges, dict):  # 종목별 [nSigFigs, mantissa] — 형식 틀린 항목만 버림
         valid = {u.value for u in Underlying}
