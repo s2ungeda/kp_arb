@@ -509,3 +509,25 @@ def test_manual_snapshot_carries_rejects() -> None:
     except AttributeError:
         return  # 가짜 시스템이 종목 조립까지 흉내 내지 않음 — 키 존재는 None 경로로 확인됨
     assert snap["rejects"] == [{"kind": "발주", "reason": "LS 02297"}]
+
+
+def test_settings_global_risk_limits_roundtrip() -> None:
+    # DESIGN-settings §1a — 리스크 한도 저장·복원, 음수는 거부, 키 없으면 기존 값
+    state = CoreState()
+    ok = apply_command(state, {"cmd": "settings_global", "hl_price_limit_pct": 0.02,
+                               "hl_max_qty_per_order": 300})
+    assert ok["ok"] and state.settings.hl_price_limit_pct == 0.02
+    assert state.settings.hl_max_qty_per_order == 300
+    bad = apply_command(state, {"cmd": "settings_global", "hl_price_limit_pct": -1})
+    assert not bad["ok"] and state.settings.hl_price_limit_pct == 0.02
+    keep = apply_command(state, {"cmd": "settings_global", "hl_daily_limit_usdc": 5})
+    assert keep["ok"] and state.settings.hl_max_qty_per_order == 300
+    assert state.settings.quote_stale_s == 1800.0  # 기본 30분(결정 86)
+    assert apply_command(state, {"cmd": "settings_global", "quote_stale_s": 600})["ok"]
+    assert state.settings.quote_stale_s == 600.0
+    assert not apply_command(state, {"cmd": "settings_global", "quote_stale_s": -1})["ok"]
+    restored = CoreState()
+    _global_settings_from_dict(restored.settings, {"hl_price_limit_pct": 0.01,
+                                                   "hl_max_qty_per_order": -5})
+    assert restored.settings.hl_price_limit_pct == 0.01
+    assert restored.settings.hl_max_qty_per_order == 0.0

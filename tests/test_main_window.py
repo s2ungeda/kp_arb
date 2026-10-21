@@ -234,3 +234,23 @@ def test_close_screens_gracefully_waits_then_forces() -> None:
     assert not procs[2].terminated                                # 이미 닫힌 창은 건드리지 않음
     assert clock["t"] >= 1.0                                      # 고집쟁이 때문에 끝까지 기다림
     assert text == "저장 후 닫힘 1/2, 강제 종료 1"
+
+
+def test_live_instance_finds_running_screen_process() -> None:
+    # 공통설정은 창 하나만(사용자 2026-10-21) — 살아 있는 같은 모듈 프로세스가 있으면 그걸 돌려준다
+    from kp_arb.main_window import _SINGLE_INSTANCE, live_instance
+
+    class _P:
+        def __init__(self, rc: int | None) -> None:
+            self.rc = rc
+
+        def poll(self) -> int | None:
+            return self.rc
+
+    dead, alive = _P(0), _P(None)
+    launched = [("kp_arb.settings_window", 0, dead), ("kp_arb.order_list", 0, alive),
+                ("kp_arb.settings_window", 1, alive)]
+    assert live_instance(launched, "kp_arb.settings_window") is alive
+    assert live_instance(launched[:2], "kp_arb.settings_window") is None
+    assert live_instance([], "kp_arb.settings_window") is None
+    assert _SINGLE_INSTANCE["kp_arb.settings_window"] == "공통설정"  # 창 제목으로 찾는다

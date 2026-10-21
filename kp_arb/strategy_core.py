@@ -168,6 +168,12 @@ class GlobalSettings:
     """전체 공통설정 — 일일 한도 + 알람 (DESIGN-settings). core_state.json에 저장."""
 
     hl_daily_limit_usdc: float = 0.0  # HL 당일 체결액 한도(USDC). 0=무제한
+    # 리스크 한도(DESIGN-settings §1a, 2026-10-21) — HL 주문 전용. 0 = 없음.
+    hl_price_limit_pct: float = 0.0     # 주문가격한도 x(소수; 0.02 = 2%) — 오라클 대비
+    hl_max_qty_per_order: float = 0.0   # 1회수량한도(HL 수량) — 이상이면 거부
+    # 시세 신선도(exec 결정 86, 2026-10-21) — 판정에 쓰는 호가·환율의 마지막 수신이 이 초를 넘으면
+    # "시세 없음"과 같이 취급(안 냄·선주문 취소·세트 유지). 0 = 검사 없음.
+    quote_stale_s: float = 1800.0
     fx_carry_rate: float = 0.010      # 환율이론가 연이자율(기본 1.0%) — 원달러선물→현물 환산
     eq_carry_rate: float = 0.030      # 주식선물 이론가 연이자율(기본 3.0%)
     # 외환선물 우선시간 "HH:MM:SS"(exec 결정 47, 2026-09-28) — 이 안은 원달러선물 역산현물가만,
@@ -347,6 +353,10 @@ def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
         return
     try:
         s.hl_daily_limit_usdc = float(raw.get("hl_daily_limit_usdc", s.hl_daily_limit_usdc))
+        s.hl_price_limit_pct = max(0.0, float(raw.get("hl_price_limit_pct", s.hl_price_limit_pct)))
+        s.hl_max_qty_per_order = max(0.0, float(raw.get("hl_max_qty_per_order",
+                                                       s.hl_max_qty_per_order)))
+        s.quote_stale_s = max(0.0, float(raw.get("quote_stale_s", s.quote_stale_s)))
         s.fx_carry_rate = float(raw.get("fx_carry_rate", s.fx_carry_rate))
         s.eq_carry_rate = float(raw.get("eq_carry_rate", s.eq_carry_rate))
     except (TypeError, ValueError):

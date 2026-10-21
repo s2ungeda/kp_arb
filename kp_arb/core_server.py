@@ -200,6 +200,16 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
             g = state.settings
             g.hl_daily_limit_usdc = float(
                 body.get("hl_daily_limit_usdc", g.hl_daily_limit_usdc))
+            # 리스크 한도(§1a, 2026-10-21) — 키 없으면 기존 값, 음수는 거부
+            pct = float(body.get("hl_price_limit_pct", g.hl_price_limit_pct))
+            max_qty = float(body.get("hl_max_qty_per_order", g.hl_max_qty_per_order))
+            if pct < 0 or max_qty < 0:
+                raise ValueError("리스크 한도는 0 이상")
+            g.hl_price_limit_pct, g.hl_max_qty_per_order = pct, max_qty
+            stale = float(body.get("quote_stale_s", g.quote_stale_s))  # 시세 신선도(결정 86)
+            if stale < 0:
+                raise ValueError("시세 신선도는 0 이상")
+            g.quote_stale_s = stale
             g.fx_carry_rate = float(body.get("fx_carry_rate", g.fx_carry_rate))
             g.eq_carry_rate = float(body.get("eq_carry_rate", g.eq_carry_rate))
             # 외환선물 우선시간(HH:MM:SS~HH:MM:SS, exec 결정 47) — 형식 틀리면 ValueError → 거부
@@ -1261,6 +1271,9 @@ def make_app(
     boot_errors = list(boot_errors or [])
     if system is not None:  # 저장된 공통설정을 시동 시 LiveSystem에 주입
         system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)
+        if hasattr(system, "set_hl_risk_limits"):  # 테스트용 가짜 시스템엔 없다
+            system.set_hl_risk_limits(state.settings.hl_price_limit_pct,
+                                      state.settings.hl_max_qty_per_order)
         # 시세 원문 기록(공통설정, 기본 끔) — 테스트용 가짜 시스템엔 없다
         if hasattr(system, "set_quote_probe"):
             system.set_quote_probe(state.settings.quote_probe)
@@ -1359,6 +1372,9 @@ def make_app(
             save()  # 입력값 저장 — 재시작 시 복원 (§6.2-0)
         if payload.get("cmd") == "settings_global" and result.get("ok") and system:
             system.set_hl_daily_limit(state.settings.hl_daily_limit_usdc)  # 한도 즉시 반영
+            if hasattr(system, "set_hl_risk_limits"):
+                system.set_hl_risk_limits(state.settings.hl_price_limit_pct,
+                                          state.settings.hl_max_qty_per_order)
             system.set_carry_rates(  # 이자율 즉시 반영(이론가 재계산에 반영)
                 state.settings.fx_carry_rate, state.settings.eq_carry_rate)
             system.set_fx_fut_window(  # 외환선물 우선시간(2구간) 즉시 반영

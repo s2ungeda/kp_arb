@@ -2080,3 +2080,28 @@ async def test_pre_fill_over_order_qty_is_rejected_and_set_halted() -> None:
     eng2._on_fill_applied(order2, 4, 1_602_000.0, "f-ok")
     await _settle()
     assert s2.entry.pre_filled == 4 and s2.entry.status is not LegStatus.HALTED
+
+
+async def test_stale_quote_is_treated_as_missing_dec86() -> None:
+    # exec 결정 86(2026-10-21): 호가·환율의 마지막 수신이 공통설정 quote_stale_s를 넘으면 "시세
+    # 없음"처럼 주문을 안 낸다(세트는 실행 유지). 한 번도 안 받은 것(None)은 "없음" 규칙대로.
+    eng, sys_, state = _engine()
+    state.settings.quote_stale_s = 1800.0
+    sys_.quote_age = lambda key: 1801.0 if key[1] is Instrument.HL_PERP else 1.0  # HL만 묵음
+    await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert sys_.placed == []                      # HL 호가가 묵어 역산 못 함 → 안 냄
+    sys_.quote_age = lambda key: 1.0              # 회복
+    eng.tick(datetime(2026, 9, 4, 10, 0, 1), 101.0)
+    await _settle()
+    assert len(sys_.placed) == 1                  # 재개
+    state.settings.quote_stale_s = 0.0            # 0 = 검사 없음
+    sys_.quote_age = lambda key: 99_999.0
+    eng2, sys2, state2 = _engine()
+    state2.settings.quote_stale_s = 0.0
+    sys2.quote_age = lambda key: 99_999.0
+    await _autom_command(eng2, state2, {**RUN, "set": 0, "block": "entry", "value": True})
+    eng2.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert len(sys2.placed) == 1

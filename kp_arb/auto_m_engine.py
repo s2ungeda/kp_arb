@@ -174,6 +174,7 @@ class AutoMEngine:
                  product: str = "sf",
                  alert: Callable[[str, str], object] | None = None) -> None:
         self._state = state
+        self._stale_marks: set[Any] = set()  # 시세 묵음 로그(결정 86) — 바뀔 때만
         self._system = system
         # 사람에게 미는 알림(텔레그램, 2026-09-21) — (문구, 수준). 코어가 alert.notify를 넣어 준다.
         # 없으면(테스트·미설정) 아무 것도 안 함. 전송은 스레드로 — 판정 루프를 막지 않는다.
@@ -556,6 +557,32 @@ class AutoMEngine:
         r, v = self._resumed_mono, self._vi_resumed.get(u)
         return v if r is None or (v is not None and v > r) else r
 
+    def _stale(self, u: Underlying, key: Any) -> bool:
+        """시세 신선도(exec 결정 86, 사용자 2026-10-21): 그 호가(key) 또는 환율("fx")의 마지막
+        수신이 공통설정 `quote_stale_s`(기본 30분)를 넘었으면 True → 호출자가 "없음"으로 취급
+        (안 냄·선주문 취소·세트 유지, 회복하면 재개). 0이면 검사 없음. 바뀔 때만 종목 로그."""
+        limit = float(getattr(self._state.settings, "quote_stale_s", 0.0) or 0.0)
+        if limit <= 0:
+            return False
+        if key == "fx":
+            fn = getattr(self._system, "fx_age", None)
+            age = fn() if callable(fn) else None
+        else:
+            fn = getattr(self._system, "quote_age", None)
+            age = fn(key) if callable(fn) else None
+        stale = age is not None and age > limit
+        mark = (u, key if key == "fx" else key[1:])
+        if stale and mark not in self._stale_marks:
+            self._stale_marks.add(mark)
+            self.ulog(u).warning("시세 묵음(결정 86) — %s 마지막 수신 %.0f초 전 > %.0f초 → 시세 "
+                                 "없음으로 봄(주문 안 냄·선주문 취소)",
+                                 "환율" if key == "fx" else key[1:], age or 0.0, limit)
+        elif not stale and mark in self._stale_marks:
+            self._stale_marks.discard(mark)
+            self.ulog(u).info("시세 회복(결정 86) — %s 다시 수신",
+                              "환율" if key == "fx" else key[1:])
+        return stale
+
     def build_signals(self, u: Underlying, book: AutoMBook, s: AutoMSet, block: Block,
                       now: datetime, mono: float, halted: bool) -> Signals:
         """세트의 진입(또는 청산) 하나의 판정 입력 — 수량은 이번에 낼 계약수(없으면 걸어둔 수량)."""
@@ -568,7 +595,11 @@ class AutoMEngine:
         s_entry, s_exit = self._system.pair_signal(u, Instrument.KR_STOCK, qty * ratio,
                                                    qty * ratio)
         hl = self._system.quotes.get((u, Instrument.HL_PERP, "hl"))
+        if hl is not None and self._stale(u, (u, Instrument.HL_PERP, "hl")):
+            hl = None  # 묵은 호가(결정 86) — 없는 것으로
         fx, _src = self._system.usdkrw_effective(now)
+        if fx is not None and self._stale(u, "fx"):
+            fx = None
         stock = self._stock_last_for(u, book)
         hl_bid_d = hl_ask_d = None
         est_bid = est_ask = None
@@ -578,7 +609,8 @@ class AutoMEngine:
             hl_bid_d = disp(est_bid * fx if est_bid else None, stock)
             hl_ask_d = disp(est_ask * fx if est_ask else None, stock)
         sf_quote = next((self._system.quotes.get((u, inst, m)) for m in self._markets(book)
-                         if self._system.quotes.get((u, inst, m)) is not None), None)
+                         if self._system.quotes.get((u, inst, m)) is not None
+                         and not self._stale(u, (u, inst, m))), None)
         asks: tuple[tuple[float, float], ...] = ()
         bids: tuple[tuple[float, float], ...] = ()
         if sf_quote is not None:

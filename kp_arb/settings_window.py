@@ -121,30 +121,54 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     e_limit.bind("<KeyRelease>", _reformat_limit)
 
+    # 리스크 한도(DESIGN-settings §1a, 사용자 2026-10-20) — HL 주문 전용. 가격한도는 오라클 대비 %,
+    # 1회수량한도는 HL 수량(주문 수량 그대로). 0 = 없음.
+    tk.Label(form, text="HL 리스크 한도").grid(row=1, column=0, sticky="w", pady=2)
+    risk_row = tk.Frame(form)
+    risk_row.grid(row=1, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    tk.Label(risk_row, text="주문가격한도").pack(side="left")
+    e_risk_pct = tk.Entry(risk_row, width=6, justify="right", font=T.FONT_NUM)
+    e_risk_pct.pack(side="left", padx=(4, 0))
+    tk.Label(risk_row, text="%  (오라클 대비)").pack(side="left", padx=(2, 12))
+    tk.Label(risk_row, text="1회수량한도").pack(side="left")
+    e_risk_qty = tk.Entry(risk_row, width=8, justify="right", font=T.FONT_NUM)
+    e_risk_qty.pack(side="left", padx=(4, 0))
+    tk.Label(risk_row, text="이상 거부 (HL 수량)  0 = 없음", fg=T.C_MUTED).pack(side="left",
+                                                                          padx=(2, 0))
+    # 시세 신선도(exec 결정 86, 2026-10-21) — 호가·환율 마지막 수신이 이 초를 넘으면 시세 없음으로
+    tk.Label(form, text="시세 신선도").grid(row=2, column=0, sticky="w", pady=2)
+    stale_row = tk.Frame(form)
+    stale_row.grid(row=2, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    e_stale = tk.Entry(stale_row, width=6, justify="right", font=T.FONT_NUM)
+    e_stale.pack(side="left")
+    tk.Label(stale_row, text="초  — 호가·환율 마지막 수신이 이보다 오래되면 시세 없음으로"
+                             "(자동M 안 냄)  0 = 검사 없음", fg=T.C_MUTED).pack(
+        side="left", padx=(4, 0))
+
     # 이론가 연이자율(공통설정) — 화면은 %, 저장은 비율(/100). 환율=fx / 주식선물=eq.
-    tk.Label(form, text="환율 이자율(%)").grid(row=1, column=0, sticky="w", pady=2)
+    tk.Label(form, text="환율 이자율(%)").grid(row=3, column=0, sticky="w", pady=2)
     e_fx_rate = tk.Entry(form, width=8, justify="right", font=T.FONT_NUM)
-    e_fx_rate.grid(row=1, column=1, sticky="w", padx=6, pady=2)
-    tk.Label(form, text="선물 역산현물가", fg=T.C_MUTED).grid(row=1, column=2, sticky="w")
+    e_fx_rate.grid(row=3, column=1, sticky="w", padx=6, pady=2)
+    tk.Label(form, text="선물 역산현물가", fg=T.C_MUTED).grid(row=3, column=2, sticky="w")
     # 환율 계산·동시호가 대응주문에 쓸 원달러선물 월물(사용자 2026-09-28) — 항목은 코어가 받아 온
     # 근·차근 월물. 만기일엔 사용자가 미리 차근으로 바꿔 둔다(코어는 월물을 스스로 안 바꿈).
-    tk.Label(form, text="원달러선물").grid(row=2, column=0, sticky="w", pady=2)
+    tk.Label(form, text="원달러선물").grid(row=4, column=0, sticky="w", pady=2)
     fx_row = tk.Frame(form)
-    fx_row.grid(row=2, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    fx_row.grid(row=4, column=1, columnspan=3, sticky="w", padx=6, pady=2)
     cb_fx = ttk.Combobox(fx_row, values=[], width=24, state="readonly")
     cb_fx.pack(side="left")
     tk.Label(fx_row, text="역산현물가·환진입가·동시호가 대응주문 월물",
              fg=T.C_MUTED).pack(side="left", padx=(8, 0))
-    tk.Label(form, text="주식선물 이자율(%)").grid(row=3, column=0, sticky="w", pady=2)
+    tk.Label(form, text="주식선물 이자율(%)").grid(row=5, column=0, sticky="w", pady=2)
     e_eq_rate = tk.Entry(form, width=8, justify="right", font=T.FONT_NUM)
-    e_eq_rate.grid(row=3, column=1, sticky="w", padx=6, pady=2)
-    tk.Label(form, text="주식선물 이론가", fg=T.C_MUTED).grid(row=3, column=2, sticky="w")
+    e_eq_rate.grid(row=5, column=1, sticky="w", padx=6, pady=2)
+    tk.Label(form, text="주식선물 이론가", fg=T.C_MUTED).grid(row=5, column=2, sticky="w")
 
     # 외환선물 우선시간(exec 결정 47, 2026-09-28) — 이 안은 원달러선물 역산현물가만, 밖은 LS 현물환
     # → 역산현물가. (옛 "현물환율 사용시간"은 뜻이 반대라 키까지 바꿨다.)
-    tk.Label(form, text="외환선물 우선시간").grid(row=4, column=0, sticky="w", pady=2)
+    tk.Label(form, text="외환선물 우선시간").grid(row=6, column=0, sticky="w", pady=2)
     spot_row = tk.Frame(form)
-    spot_row.grid(row=4, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    spot_row.grid(row=6, column=1, columnspan=3, sticky="w", padx=6, pady=2)
     e_spot_s = tk.Entry(spot_row, width=9, justify="center", font=T.FONT_NUM)
     e_spot_s.pack(side="left")
     tk.Label(spot_row, text="~").pack(side="left", padx=4)
@@ -153,9 +177,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(spot_row, text="HH:MM:SS · 안=선물역산, 밖=현물→선물역산",
              fg=T.C_MUTED).pack(side="left", padx=(8, 0))
     # 2구간 — 바로 아랫줄(옆에 붙이면 창 폭이 늘어남). 비우면 미사용, 어느 구간이든 안이면 "안".
-    tk.Label(form, text="  2구간").grid(row=5, column=0, sticky="w", pady=2)
+    tk.Label(form, text="  2구간").grid(row=7, column=0, sticky="w", pady=2)
     spot_row2 = tk.Frame(form)
-    spot_row2.grid(row=5, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    spot_row2.grid(row=7, column=1, columnspan=3, sticky="w", padx=6, pady=2)
     e_spot_s2 = tk.Entry(spot_row2, width=9, justify="center", font=T.FONT_NUM)
     e_spot_s2.pack(side="left")
     tk.Label(spot_row2, text="~").pack(side="left", padx=4)
@@ -167,14 +191,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 체결 TR 원문을 logs\probe\quote_trade_날짜.jsonl에 남긴다(하루 수백 MB, 5일 지나면 삭제).
     var_probe = tk.BooleanVar(value=False)
     tk.Checkbutton(form, text="시세 원문 기록", variable=var_probe, anchor="w").grid(
-        row=6, column=0, sticky="w", pady=(10, 2))
+        row=8, column=0, sticky="w", pady=(10, 2))
     tk.Label(form, text="호가·체결 TR 원문 → logs\probe (분석용, 하루 수백 MB)",
-             fg=T.C_MUTED).grid(row=6, column=1, columnspan=3, sticky="w", padx=6,
+             fg=T.C_MUTED).grid(row=8, column=1, columnspan=3, sticky="w", padx=6,
                                 pady=(10, 2))
     # 알람 3줄 — [체크박스] 이벤트명  [wav 경로]  [찾아보기] [듣기]
-    tk.Label(form, text="알람 (wav)").grid(row=7, column=0, sticky="w", pady=(10, 2))
+    tk.Label(form, text="알람 (wav)").grid(row=9, column=0, sticky="w", pady=(10, 2))
     rows: dict[str, dict[str, Any]] = {}
-    for i, (key, name) in enumerate(_ALARMS, start=8):
+    for i, (key, name) in enumerate(_ALARMS, start=10):
         var = tk.BooleanVar(value=False)
         tk.Checkbutton(form, text=name, variable=var, width=10, anchor="w").grid(
             row=i, column=0, sticky="w", pady=1)
@@ -201,7 +225,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # LS(xing) 접속 끊김 때 할 일 — 체크박스 3개(DESIGN-settings §2a, 사용자 2026-10-14).
     # 판정·행동은
     # 메인 창(코어가 죽어도 알리려고), 여기서는 켬/끔만 고른다. 사운드는 위 'WS 끊김' 줄의 wav.
-    dc_row = 8 + len(_ALARMS)
+    dc_row = 10 + len(_ALARMS)
     tk.Label(form, text="LS 끊김 때").grid(row=dc_row, column=0, sticky="w", pady=(10, 2))
     dc_frame = tk.Frame(form)
     dc_frame.grid(row=dc_row, column=1, columnspan=3, sticky="w", padx=6, pady=(10, 2))
@@ -217,6 +241,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def do_save() -> None:
         try:
             limit = float(e_limit.get().replace(",", "").strip() or "0")
+            risk_pct = float(e_risk_pct.get().strip() or "0") / 100.0  # % → 소수
+            risk_qty = float(e_risk_qty.get().replace(",", "").strip() or "0")
+            stale_s = float(e_stale.get().strip() or "0")
             fx_rate = float(e_fx_rate.get().strip() or "0") / 100.0   # % → 비율
             eq_rate = float(e_eq_rate.get().strip() or "0") / 100.0
         except ValueError:
@@ -232,6 +259,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             return
         payload: dict[str, Any] = {
             "cmd": "settings_global", "hl_daily_limit_usdc": limit,
+            "hl_price_limit_pct": risk_pct, "hl_max_qty_per_order": risk_qty,
+            "quote_stale_s": stale_s,
             "fx_carry_rate": fx_rate, "eq_carry_rate": eq_rate,
             "fx_fut_start": spot_s, "fx_fut_end": spot_e,
             "fx_fut_start2": spot_s2, "fx_fut_end2": spot_e2,
@@ -275,6 +304,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             state_box["loaded"] = True  # 최초 1회만 채움(사용자 편집 덮어쓰기 방지)
             e_limit.delete(0, "end")
             e_limit.insert(0, _fmt_amount(float(settings.get("hl_daily_limit_usdc", 0) or 0)))
+            e_risk_pct.delete(0, "end")
+            e_risk_pct.insert(0, f"{float(settings.get('hl_price_limit_pct', 0) or 0) * 100:g}")
+            e_risk_qty.delete(0, "end")
+            e_risk_qty.insert(0, f"{float(settings.get('hl_max_qty_per_order', 0) or 0):g}")
+            e_stale.delete(0, "end")
+            e_stale.insert(0, f"{float(settings.get('quote_stale_s', 1800) or 0):g}")
             e_fx_rate.delete(0, "end")
             e_fx_rate.insert(0, f"{float(settings.get('fx_carry_rate', 0.010) or 0) * 100:g}")
             e_eq_rate.delete(0, "end")

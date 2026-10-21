@@ -397,10 +397,13 @@ def set_inputs_sig(book: dict[str, Any]) -> str:
     return json.dumps(sorted((f"{d}:{i}", s) for (d, i), s in sigs.items())) if sigs else ""
 
 
-def monitor_ready(texts: list[str]) -> bool:
-    """실행 켜도 되는가 — 그 방향의 모니터 수치가 전부 떠 있어야(사용자 2026-09-16: 수치가 없는
-    상태에서 실수로 실행하면 안 됨). '적'을 안 눌렀거나 코어 시세가 없으면 "-"라 막힌다. 순수."""
-    return bool(texts) and all(t.strip() not in ("", "-") for t in texts)
+def run_gate_error(applied: bool) -> str | None:
+    """실행 켜도 되는가(exec 결정 86, 2026-10-21) — 이 종목에 '적'을 눌렀어야 한다. 모니터 수치
+    유무는 보지 않는다(장 전엔 시세가 없어 "-"라 미리 켜 둘 수 없었음 — 옛 결정 44). 수치가 없어도
+    코어는 시세·주문가능시간이 될 때까지 주문을 안 낸다. 순수."""
+    if applied:
+        return None
+    return "'적'을 눌러 종목·호가단위·기준수량을 적용한 뒤 실행하세요"
 
 
 def rt_manual_errors(dtag: str, text: str) -> list[str]:
@@ -620,6 +623,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         """종목 콤보 — 그 종목의 종목 상태(세트·RT·체결차·기준수량·월물)을 코어에서 다시 보여준다.
         실행 중에도 바꿀 수 있다(사용자 2026-10-01) — 실행 중이던 종목은 코어에서 계속 돈다."""
         state_box["_loaded_under"] = None  # 다음 갱신 때 그 종목 상태으로 입력값 다시 채움
+        state_box["_applied"] = False  # 종목을 바꾸면 '적'을 다시 눌러야(결정 86, 옛 44의 구멍)
         agg_shown["under"] = ""
         agg_map.clear()
         cb_agg.config(values=["-"])
@@ -1040,14 +1044,12 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                                       spec.log_tag, dtag, i + 1, side)
                     return
                 release = True
-        if turning_on:  # 모니터 수치가 안 떠 있으면 실행 금지(사용자 2026-09-16) — '적' 먼저
-            mon_texts = [str(lbl.cget("text")) for key, lbl in mon.items()
-                         if key.startswith(f"{dtag}_")]
-            if not monitor_ready(mon_texts):
-                screen_log().info("%s 버튼 %s %d세트 %s: 실행 안 함 — 모니터 수치 없음('적' 먼저)",
+        if turning_on:  # '적'을 안 눌렀으면 실행 금지(결정 86 — 수치 유무는 안 봄, 장 전 예약 가능)
+            gate = run_gate_error(bool(state_box.get("_applied")))
+            if gate:
+                screen_log().info("%s 버튼 %s %d세트 %s: 실행 안 함 — '적' 전",
                                   spec.log_tag, dtag, i + 1, side)
-                warn_center("모니터 수치가 없습니다 — '적'을 눌러 종목·호가단위·기준수량을\n"
-                            "적용하고 수치가 뜬 뒤 실행하세요")
+                warn_center(gate)
                 return
         if turning_on:  # 실행 시작 전 필수 입력 + 리스크방지 검증(인라인 현재값 확정)
             _sync_qty_from_row(w)  # 목표·1회·초 행 입력값(결정 72)

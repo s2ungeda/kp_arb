@@ -1014,6 +1014,47 @@ async def test_place_routes_hl_to_hl_gateway() -> None:
     assert oid.startswith("HL-") and len(hl_gw.placed) == 1
 
 
+async def test_hl_risk_limits_block_price_and_qty() -> None:
+    # DESIGN-settings §1a — 리스크 한도(HL 주문 전용): 1회수량한도·오라클 대비 주문가격한도, 걸리면
+    # 거부.
+    # 오라클 미수신이면 거부(사용자 2026-10-20). 수동·전략 공통 길목(place)에서.
+    from kp_arb.gateways.hl import Mark
+    from kp_arb.gateways.hl_ws import HLWebSocketClient
+    from kp_arb.gateways.mock_hl import MockHLGateway
+    from kp_arb.limits import RiskLimitExceeded
+
+    system = LiveSystem(
+        gateway=MockLSGateway(),  # type: ignore[arg-type]
+        order_book=OrderBook(),
+        session=SessionService(),
+        stock_ws=LSWebSocketClient(FakeConnector([])),
+        hl_gateway=MockHLGateway(),
+        hl_ws=HLWebSocketClient(FakeConnector([])),
+    )
+    await system.start()
+
+    def _order(side: Side, qty: float, price: float) -> OrderIntent:
+        return OrderIntent(venue=Venue.HYPERLIQUID, underlying=SAMSUNG,
+                           instrument=Instrument.HL_PERP, side=side, qty=qty,
+                           order_type=OrderType.LIMIT, price=price)
+
+    system.set_hl_risk_limits(0.02, 100)
+    with pytest.raises(RiskLimitExceeded, match="오라클"):   # 오라클 없음 → 거부
+        await system.place(_order(Side.SELL, 1, 1500.0))
+    system.hl_mark[SAMSUNG] = Mark(underlying=SAMSUNG, price=1500.0, oracle=1500.0)
+    assert await system.place(_order(Side.SELL, 1, 1480.0))   # 1480 > 1470 통과
+    with pytest.raises(RiskLimitExceeded, match="매도 주문가"):
+        await system.place(_order(Side.SELL, 1, 1460.0))      # 1460 ≤ 1470 거부
+    with pytest.raises(RiskLimitExceeded, match="매수 주문가"):
+        await system.place(_order(Side.BUY, 1, 1540.0))       # 1540 ≥ 1530 거부
+    with pytest.raises(RiskLimitExceeded, match="1회수량"):
+        await system.place(_order(Side.BUY, 100, 1500.0))     # 100 ≥ 100 거부(한도 값부터)
+    assert len(system.rejects) >= 4                            # 거부내역(주문 리스트 '거부' 행)
+    system.set_hl_risk_limits(0.0, 0.0)                        # 0 = 없음
+    assert await system.place(_order(Side.BUY, 101, 1540.0))
+    await system.wait()
+
+
 async def test_hl_daily_limit_blocks_over_limit() -> None:
     # DESIGN-settings §1 — place(길목)에서 당일 체결액 + 이 주문 금액 > 한도면 거부(수동·전략 공통).
     from kp_arb.gateways.hl_ws import HLWebSocketClient

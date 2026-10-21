@@ -190,11 +190,10 @@ def test_latest_round_picks_most_recent_across_sets() -> None:
     assert latest_round({"fwd": [], "rev": []}, "entry") is None
 
 
-def test_monitor_ready_blocks_run_without_numbers() -> None:
-    # 사용자 2026-09-16: 모니터 수치가 안 떠 있으면('적' 전·시세 없음) 실행을 켜지 못한다
-    from kp_arb.order_autom import monitor_ready
+def test_run_gate_needs_apply_not_numbers() -> None:
+    # exec 결정 86(2026-10-21): 실행 조건은 "'적'을 눌렀는가"뿐 — 수치가 "-"여도(장 전) 켤 수 있다.
+    # (옛 결정 44의 모니터 수치 검사는 장 전 예약 실행을 막아 폐기)
+    from kp_arb.order_autom import run_gate_error
 
-    assert monitor_ready(["-0.82", "-0.82", "-0.52"])
-    assert not monitor_ready(["-0.82", "-", "-0.52"])
-    assert not monitor_ready(["", "0.1"])
-    assert not monitor_ready([])
+    assert run_gate_error(True) is None
+    assert "'적'" in str(run_gate_error(False))

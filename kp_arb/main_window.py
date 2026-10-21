@@ -47,6 +47,35 @@ _SCREEN_NAMES = {
 _RETIRED_SCREENS = frozenset({"kp_arb.order_autom_hl_first"})
 
 
+# 창 하나만 띄우는 화면(모듈 → 창 제목). 이미 떠 있으면 새로 안 띄우고 그 창을 앞으로
+# (사용자 2026-10-21: 공통설정이 여러 개 뜨는 일이 있었음). 화면은 별도 프로세스라 창 제목으로
+# 찾는다(FindWindow).
+_SINGLE_INSTANCE: dict[str, str] = {"kp_arb.settings_window": "공통설정"}
+
+
+def live_instance(launched: list[tuple[str, int, Any]], module: str) -> Any | None:
+    """그 모듈로 띄운 화면 중 아직 살아 있는 프로세스(없으면 None). (순수 — poll()만 본다)"""
+    for tok, _slot, proc in launched:
+        if tok.split(" ", 1)[0] == module and proc.poll() is None:
+            return proc
+    return None
+
+
+def activate_window(title: str) -> bool:
+    """제목이 title인 최상위 창을 복원하고 앞으로 가져온다(Windows). 못 찾으면 False."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    hwnd = user32.FindWindowW(None, title)
+    if not hwnd:
+        return False
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE — 최소화돼 있으면 되살린다
+    user32.SetForegroundWindow(hwnd)
+    return True
+
+
 def restorable_screens(saved: dict[str, Any]) -> list[str]:
     """저장된 화면 목록(ui_state의 screens — "모듈 [인자…]") 중 다시 띄울 것. 메뉴에서 뺀 화면과
     모양이 틀린 항목은 버린다. (순수 함수)"""
@@ -645,6 +674,11 @@ def main() -> None:
                          "'코어: 연결됨'이 표시된 뒤 화면을 여세요.")
             return
         restore_box["done"] = True  # 창을 실제로 열기 시작 — 이제부터 열린 창 목록이 진실
+        if module in _SINGLE_INSTANCE and live_instance(launched, module) is not None:
+            # 이미 떠 있는 창을 앞으로(새 창 안 띄움). 창이 아직 안 만들어졌으면(막 띄운 직후)
+            # 그냥 둔다
+            activate_window(_SINGLE_INSTANCE[module])
+            return
         token = " ".join([module, *args])  # ui_state 저장/복원용 식별자
         slot = _next_slot(module)  # 인스턴스별 슬롯 → win_state 키 분리(각 창 위치 따로)
         launched.append((token, slot, launch_module(module, *args, slot=slot)))

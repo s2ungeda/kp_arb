@@ -21,6 +21,7 @@ import re
 from collections import deque
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from datetime import date, datetime, time
+from time import monotonic as _monotonic
 from typing import Any
 
 from . import order_log
@@ -52,7 +53,14 @@ from .gateways.ls_ws import (
     OrderEvent,
     TradeTick,
 )
-from .limits import DailyFilled, DailyLimitExceeded, would_exceed_daily_limit
+from .limits import (
+    DailyFilled,
+    DailyLimitExceeded,
+    RiskLimitExceeded,
+    price_limit_error,
+    qty_limit_error,
+    would_exceed_daily_limit,
+)
 from .order_book import OrderBook, TrackedOrder
 from .risk import RiskManager, RiskState
 from .routing import account_for
@@ -332,6 +340,9 @@ class LiveSystem:
         self.usdkrw_spot: float | None = None
         self._fx_spot_ts = 0.0  # 마지막 LS 현물환율(CUR) 수신 시각(로그·진단용)
         self.usdkrw_spot_src: str | None = None
+        # 시세 신선도(exec 결정 86) — 호가 키별·환율의 마지막 수신 단조시계. 한 번도 없으면 키 없음
+        self.quote_rx: dict[tuple[Underlying, Instrument, str], float] = {}
+        self.fx_rx: float | None = None
         self._spot_ls: float | None = None    # LS CUR 최종 체결가(시동 뒤 받은 것)
         self._spot_hana: float | None = None  # 하나고시 마지막 조회값
         # LS가 한 번 출처가 되면 그 뒤론 하나고시를 안 쓰고 조회도 안 한다
@@ -415,6 +426,9 @@ class LiveSystem:
             targets={Underlying.SAMSUNG, Underlying.SK_HYNIX})
         self._hl_filled = DailyFilled()  # HL 당일 체결액(USDC) — 일일 한도용(DESIGN-settings §1)
         self.hl_daily_limit_usdc = 0.0   # HL 일일 한도(USDC, 0=무제한) — 코어가 설정에서 주입
+        # 리스크 한도(DESIGN-settings §1a) — 주문가격한도 x(소수)·1회수량한도(HL 수량). 0 = 없음
+        self.hl_price_limit_pct = 0.0
+        self.hl_max_qty_per_order = 0.0
         # 알람용 이벤트 카운터(메인창이 증가 감지 → 사운드) — DESIGN-settings §2·4.
         self.fill_seq = 0    # 체결마다 +1
         self.error_seq = 0   # 발주 거부·실패마다 +1
@@ -661,6 +675,31 @@ class LiveSystem:
     def hl_daily_filled_today(self) -> float:
         """HL 당일 체결액(USDC) — 스냅샷·표시용."""
         return self._hl_filled.total(self._today())
+
+    def quote_age(self, key: tuple[Underlying, Instrument, str]) -> float | None:
+        """그 호가를 마지막으로 받은 지 몇 초인가(결정 86). 한 번도 없으면 None."""
+        rx = self.quote_rx.get(key)
+        return None if rx is None else _monotonic() - rx
+
+    def fx_age(self) -> float | None:
+        """환율(현물환 또는 원달러선물 체결)을 마지막으로 받은 지 몇 초인가. 없으면 None."""
+        return None if self.fx_rx is None else _monotonic() - self.fx_rx
+
+    def set_hl_risk_limits(self, price_pct: float, max_qty: float) -> None:
+        """리스크 한도 주입(공통설정 저장·시동 때) — DESIGN-settings §1a."""
+        self.hl_price_limit_pct = max(0.0, price_pct)
+        self.hl_max_qty_per_order = max(0.0, max_qty)
+
+    def _hl_risk_error(self, intent: OrderIntent) -> str | None:
+        """HL 주문 하나의 리스크 한도 위반 사유(없으면 None) — 1회수량 → 주문가격(오라클 대비).
+        시장가(가격 없음)는 마크가로 판정. 오라클은 HL WS activeAssetCtx로 받은 최신값."""
+        err = qty_limit_error(intent.qty, self.hl_max_qty_per_order)
+        if err:
+            return err
+        mark = self.hl_mark.get(intent.underlying)
+        price = intent.price if intent.price is not None else (mark.price if mark else None)
+        return price_limit_error(intent.side, price, mark.oracle if mark else None,
+                                 self.hl_price_limit_pct)
 
     def set_hl_daily_limit(self, usdc: float) -> None:
         """HL 일일 체결액 한도(USDC) 반영 — 코어가 설정 변경·시동 시 호출."""
@@ -1107,6 +1146,10 @@ class LiveSystem:
                          f"> 한도 {self.hl_daily_limit_usdc:,.0f} USDC")
             self._record_reject(intent, limit_msg)
             raise DailyLimitExceeded(limit_msg)
+        risk_msg = self._hl_risk_error(intent)  # 리스크 한도(§1a) — 모든 HL 주문, 걸리면 거부
+        if risk_msg:
+            self._record_reject(intent, risk_msg)
+            raise RiskLimitExceeded(risk_msg)
         if cloid is None:
             cloid = self._hl.new_cloid()
         if cloid:
@@ -1175,6 +1218,11 @@ class LiveSystem:
                              f"{notional:,.0f} > 한도 {self.hl_daily_limit_usdc:,.0f} USDC")
                 self._record_reject(intent, limit_msg)
                 out[i] = PlaceResult(None, error=limit_msg)
+                continue
+            risk_msg = self._hl_risk_error(intent)  # 리스크 한도(§1a)
+            if risk_msg:
+                self._record_reject(intent, risk_msg)
+                out[i] = PlaceResult(None, error=risk_msg)
                 continue
             queued += notional
             cloid = (cloids[i] if cloids is not None else None) or self._hl.new_cloid()
@@ -1356,6 +1404,7 @@ class LiveSystem:
         def fan_quote(quote: Quote) -> None:
             # 최신 호가판 보관(다단계 포함) 후 콜백 전달.
             self.quotes[(quote.underlying, quote.instrument, quote.market)] = quote
+            self.quote_rx[(quote.underlying, quote.instrument, quote.market)] = _monotonic()
             for handler in self.on_quote:
                 handler(quote)
 
@@ -1685,6 +1734,7 @@ class LiveSystem:
         if self._fx_futures is None or code != self._fx_futures[0]:
             return  # 차근월물 등은 환율이론가에 안 먹인다(최근월물 기준 유지)
         self.usdkrw_futures = price
+        self.fx_rx = _monotonic()  # 시세 신선도(결정 86)
         self._recompute_fx_theory()
         for handler in self.on_fx:
             handler()
@@ -1736,6 +1786,8 @@ class LiveSystem:
                 "현물환 출처 %s → %s (%s)", self.usdkrw_spot_src or "없음", src or "없음",
                 f"{value:.2f}" if value is not None else "-")
         self.usdkrw_spot, self.usdkrw_spot_src = value, src
+        if value is not None:
+            self.fx_rx = _monotonic()  # 시세 신선도(결정 86)
 
     def hana_spot_needed(self) -> bool:
         """지금 하나고시를 조회해야 하는가 — LS가 아직 출처가 된 적 없을 때(결정 70)."""
