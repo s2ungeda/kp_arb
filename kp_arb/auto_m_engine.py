@@ -1752,6 +1752,15 @@ class AutoMEngine:
         self._apply(u, index, block, set_running(s, block, value), reverse)
         self._trace(u, index, block, s.leg(block), reverse)
 
+    def log_set(self, u: Underlying, index: int, reverse: bool = False) -> None:
+        """세트 설정 변경을 종목 로그에 남긴다(사용자 2026-10-22 정산 보고서 '주문Sprd' 열) — 실행
+        켬·끔 줄에만 설정값이 찍히면 설정창으로 바꾼 값을 보고서가 놓친다. 꼬리표는 다리 없이."""
+        s = self._set(u, index, reverse)
+        tag = self._tag(u, index, Block.ENTRY, reverse).rsplit(" ", 1)[0]
+        self.ulog(u).info("세트 설정 %s: 목표 %d 1회 %d 전환 %ds 진입SF %s 진입S %s 청산 %s RT %d",
+                          tag, s.target_qty, s.per_qty, s.switch_delay_s, s.en_sf, s.en_s,
+                          s.ex_sf, s.rt)
+
     def release(self, u: Underlying, index: int, block: Block,
                 reverse: bool = False) -> None:
         """중지 해제 — 상태만 대기로. 세트 장부(SF·HL 순잔고·체결차)는 그대로 두고, 사람이 정리한 뒤

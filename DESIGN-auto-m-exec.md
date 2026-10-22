@@ -632,8 +632,11 @@ JIF `jstatus`는 성격이 셋으로 갈리고, **`jangubun`(시장)에 따라 �
 ### 10.1 로그 보고서 — 배포판 `report.bat` (사용자 2026-10-13)
 `report.bat [YYYYMMDD] [로그폴더]` = `meme-core.exe report …` → 그 날 자동M 로그에서 **후주문까지 끝난 판**을 읽어 두 파일을 만든다
 (날짜 생략 = 오늘, 폴더 생략 = exe 옆 `logs`): ① `report_날짜.md` 지연·밀림(`kp_arb.report_latency`, 09-14) ② `sprd_날짜.csv` 판별
-정산 Sprd(`kp_arb.report_sprd`, 09-28 — 열: 완료시각·종목·상품·방향·세트·다리·RT·선/후주문 수량·평균가·환진입가·S현재가·SF이론가·
-판Sprd·누적Sprd). 개발 PC에서는 `tools/round_latency.py`·`tools/round_sprd.py`(로그 폴더 인자로 `real_log/…`).
+정산 Sprd(`kp_arb.report_sprd`, 09-28 — 열: **완료일·완료시각**(따로 두 열 — 한 칸이면 엑셀이 초를 숨김, 사용자 2026-10-22)·종목·
+상품·방향·세트·다리·RT·선/후주문 수량·평균가·환진입가·S현재가·SF이론가·**주문Sprd**(그 판에 쓰인 세트 기준값: 진입은 주식 진입S·
+그 외 진입SF, 청산은 청산 — 로그의 실행 켬·끔 줄과 세트 설정 줄의 마지막 값)·판Sprd·**주문−판Sprd**·누적Sprd, 사용자 2026-10-22).
+코어는 세트 설정 저장(`autom_set`) 때도 종목 로그에 "세트 설정 …: … 진입SF … 진입S … 청산 …" 한 줄을 남긴다(보고서가 설정창으로
+바꾼 값을 놓치지 않게). 개발 PC에서는 `tools/round_latency.py`·`tools/round_sprd.py`(로그 폴더 인자로 `real_log/…`).
 
 ## 11. 전략·화면 스펙 (옛 `DESIGN-auto-m.md` 통합, 2026-09-07)
 

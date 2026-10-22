@@ -15,6 +15,9 @@
     주식:     (환 × HL평균 − S체결평균)/S체결평균          (S = 그 판의 주식 평균 체결가)
     HL선:     주식선물과 같은 식(HL평균 = HL 선주문, SF평균 = LS 후주문)
 '누적Sprd'는 로그에 찍힌 세트 누적값(장부 기준) — 판 값과 다른 게 정상(가중 평균).
+'주문Sprd'(사용자 2026-10-22)는 그 판에 쓰인 세트 기준값(진입: 주식 진입S·그 외 진입SF, 청산: 청산)
+— 로그의 실행 켬·끔 줄과 세트 설정 줄에서 마지막 값. '주문-판Sprd'는 그 차이.
+완료일·완료시각은 따로 두 열(엑셀이 초를 숨기지 않게).
 """
 from __future__ import annotations
 
@@ -29,7 +32,17 @@ from typing import Any
 _TAG = (r"(?P<tag>(?:(?P<head>주식|HL선) )?(?P<dir>정방향|역방향) (?P<set>\d+)세트 "
         r"(?P<leg>진입|청산))")
 _NUM = r"[-+]?[\d.,]+(?:[eE][-+]?\d+)?"
-_RE_TS = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ ")
+# 완료일·완료시각을 따로(사용자 2026-10-22 "초단위까지") — 한 칸에 "2026-09-28 10:03:53"로 두면
+# 엑셀이 날짜시각으로 읽어 "yyyy-mm-dd h:mm"으로 보여 초가 숨는다(COM으로 실측). "10:03:53"만 두면
+# "h:mm:ss"로 초가 보인다. 밀리초를 붙이면 "mm:ss.0"이 되어 더 나쁨.
+_RE_TS = re.compile(r"^(?P<day>\d{4}-\d{2}-\d{2}) (?P<hms>\d{2}:\d{2}:\d{2}),\d+ ")
+# 세트 설정값 — 실행 켬·끔 줄("명령 …: 실행 켬 | … 진입SF 0.003 진입S -0.01 청산 -0.0005 RT 16")과
+# 설정창 저장 줄("세트 설정 정방향 1세트: … 진입SF … 진입S … 청산 …", 코어 2026-10-22). 마지막 값이
+# 그 세트의 주문 Sprd(사용자 2026-10-22 '주문Sprd' 열) — 설정값은 세트 단위(진입·청산 다리 공통).
+_SETVALS = r".*?진입SF (?P<en_sf>\S+) 진입S (?P<en_s>\S+) 청산 (?P<ex_sf>\S+)"
+_RE_CMD = re.compile(rf"명령 {_TAG}: 실행 (?:켬|끔) \|{_SETVALS}")
+_RE_SET = re.compile(
+    rf"세트 설정 (?:(?:주식|HL선) )?(?P<dir>정방향|역방향) (?P<set>\d+)세트:{_SETVALS}")
 # 선주문 체결 — LS(주식선물·주식): "선주문 #123 1 @ 270000", HL선: "HL 선주문 #123 1 @ 201.5"
 _RE_PRE = re.compile(
     rf"체결 {_TAG}: (?P<hl>HL )?선주문 #\S+ (?P<qty>{_NUM}) @ (?P<px>{_NUM})")
@@ -44,10 +57,27 @@ _RE_HALT = re.compile(rf"행동 {_TAG}: halt\b")
 _RE_FILE = re.compile(
     r"^autom_(?P<under>.+?)(?P<suffix>_stock|_sf_hl_first)?_(?P<day>\d{8})\.log$")
 
-COLUMNS = ("완료시각", "종목", "상품", "방향", "세트", "다리", "RT", "선주문수량", "선주문평균가",
-           "후주문수량", "후주문평균가", "환진입가", "S현재가", "SF이론가", "판Sprd(%)",
-           "누적Sprd(%)", "파일")
+COLUMNS = ("완료일", "완료시각", "종목", "상품", "방향", "세트", "다리", "RT", "선주문수량",
+           "선주문평균가", "후주문수량", "후주문평균가", "환진입가", "S현재가", "SF이론가",
+           "주문Sprd(%)", "판Sprd(%)", "주문-판Sprd(%)", "누적Sprd(%)", "파일")
 _PRODUCT_NAME = {"stock": "주식", "sf_hl_first": "HL선"}
+
+
+def order_sprd(product: str, leg: str, setvals: dict[str, float | None] | None) -> float | None:
+    """그 판에 쓰인 세트 기준값(소수) — 진입은 주식이면 진입S, 아니면 진입SF; 청산은 청산
+    (auto_m.AutoMSet.threshold와 같은 규칙, 방향 무관). 설정 줄을 못 봤으면 None. 순수."""
+    if not setvals:
+        return None
+    if leg == "진입":
+        return setvals.get("en_s") if product == "stock" else setvals.get("en_sf")
+    return setvals.get("ex_sf")
+
+
+def sprd_gap(order_pct: float | None, round_pct: float | None) -> float | None:
+    """주문Sprd − 판Sprd(퍼센트). 하나라도 없으면 None. 순수."""
+    if order_pct is None or round_pct is None:
+        return None
+    return round(order_pct - round_pct, 4)
 
 
 def _num(text: str | None) -> float | None:
@@ -109,11 +139,17 @@ def parse_rounds(lines: Iterable[str], *, underlying: str, product: str,
     진행 중인 판은 버린다(미완).
     """
     open_rounds: dict[str, _Round] = {}
+    setvals: dict[tuple[str, str], dict[str, float | None]] = {}  # (방향, 세트) → 설정값
     out: list[dict[str, Any]] = []
     for raw in lines:
         line = raw.rstrip("\n")
         m_ts = _RE_TS.match(line)
         if m_ts is None:
+            continue
+        m = _RE_CMD.search(line) or _RE_SET.search(line)
+        if m is not None:
+            setvals[(m.group("dir"), m.group("set"))] = {
+                k: _num(m.group(k)) for k in ("en_sf", "en_s", "ex_sf")}
             continue
         m = _RE_PRE.search(line)
         if m is not None:
@@ -142,15 +178,19 @@ def parse_rounds(lines: Iterable[str], *, underlying: str, product: str,
                 post_avg = r.avg(r.post_px, r.post_qty)
                 fx, s_last, th = (r.avg(r.fx, r.fx_qty), r.avg(r.s, r.s_qty),
                                   r.avg(r.th, r.th_qty))
+                order_pct = _pct(order_sprd(product, m.group("leg"),
+                                            setvals.get((m.group("dir"), m.group("set")))))
+                round_pct = _pct(round_sprd(product, pre_avg, post_avg, fx, s_last, th))
                 out.append({
-                    "완료시각": m_ts.group("ts"), "종목": underlying,
-                    "상품": _PRODUCT_NAME.get(product, "주식선물"),
+                    "완료일": m_ts.group("day"), "완료시각": m_ts.group("hms"),
+                    "종목": underlying, "상품": _PRODUCT_NAME.get(product, "주식선물"),
                     "방향": m.group("dir"), "세트": int(m.group("set")), "다리": m.group("leg"),
                     "RT": int(m.group("rt")),
                     "선주문수량": r.pre_qty, "선주문평균가": pre_avg,
                     "후주문수량": r.post_qty, "후주문평균가": post_avg,
                     "환진입가": fx, "S현재가": s_last, "SF이론가": th,
-                    "판Sprd(%)": _pct(round_sprd(product, pre_avg, post_avg, fx, s_last, th)),
+                    "주문Sprd(%)": order_pct, "판Sprd(%)": round_pct,
+                    "주문-판Sprd(%)": sprd_gap(order_pct, round_pct),
                     "누적Sprd(%)": _cum_pct(m.group("sprd")),
                     "파일": source,
                 })
@@ -186,7 +226,7 @@ def collect(log_dir: Path, day: str) -> list[dict[str, Any]]:
             continue
         rows.extend(parse_rounds(text.splitlines(), underlying=m.group("under"),
                                  product=product, source=path.name))
-    rows.sort(key=lambda r: str(r["완료시각"]))
+    rows.sort(key=lambda r: (str(r["완료일"]), str(r["완료시각"])))
     return rows
 
 
@@ -219,11 +259,11 @@ def main(argv: list[str]) -> int:
     out = log_dir / f"sprd_{day}.csv"
     write_csv(rows, out)
     for r in rows:
-        print(f"{r['완료시각']} {r['종목']} {r['상품']} {r['방향']} {r['세트']}세트 {r['다리']} "
-              f"RT{r['RT']} 선 {r['선주문수량']:g}@{r['선주문평균가']} "
+        print(f"{r['완료일']} {r['완료시각']} {r['종목']} {r['상품']} {r['방향']} {r['세트']}세트 "
+              f"{r['다리']} RT{r['RT']} 선 {r['선주문수량']:g}@{r['선주문평균가']} "
               f"후 {r['후주문수량']:g}@{r['후주문평균가']} 환 {r['환진입가']} "
-              f"S {r['S현재가']} 이론 {r['SF이론가']} 판Sprd {r['판Sprd(%)']}% "
-              f"누적 {r['누적Sprd(%)']}%")
+              f"S {r['S현재가']} 이론 {r['SF이론가']} 주문Sprd {r['주문Sprd(%)']}% "
+              f"판Sprd {r['판Sprd(%)']}% 차이 {r['주문-판Sprd(%)']}% 누적 {r['누적Sprd(%)']}%")
     print(f"\n{len(rows)}판 저장: {out}")
     return 0
 

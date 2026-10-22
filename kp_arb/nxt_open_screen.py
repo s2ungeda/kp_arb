@@ -261,14 +261,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(top, text="초").pack(side="left", padx=(1, 0))
 
     # ===== 표(사용자 2026-10-20): 진입 세트 | 청산 세트를 좌우로, 구분 열 없음 =====
-    # 0행 = 모니터 수치(각 Sprd 헤더 위)·환율, 1행 = 헤더(Sprd 수량 주문가 실행), 2~4행 = 3단.
-    # 실행은 3행 병합 버튼(HL매도/HL매수). 역산가·결과 열은 없다.
+    # 0행 = 모니터 수치(각 Sprd 헤더 위)·환율, 1행 = 헤더(Sprd 수량 주문가 역산가 실행),
+    # 2~4행 = 3단. 실행은 3행 병합 버튼(HL매도/HL매수). 역산가는 주문가 옆 표시 열(사용자
+    # 2026-10-22 — 숨은 패널 대신), 결과 열은 없다.
     tbl = tk.Frame(root)
     tbl.grid(row=1, column=0, sticky="ew", padx=6, pady=(4, 0))
-    heads = ("Sprd", "수량", "주문가", "실행")  # Sprd = 체결쏴 표기
-    widths = (5, 6, 5, 7)   # 입력칸 폭은 체결쏴 세트 행과 같게(5·6·5)
-    head_w = (7, 7, 7, 7)   # 헤더 폭이 곧 칸 폭(입력칸은 nsew로 채움 — 체결쏴 세트 행과 같음)
-    gap_col = len(heads)    # 두 세트 사이 빈 열
+    heads = ("Sprd", "수량", "주문가", "역산가", "실행")  # Sprd = 체결쏴 표기
+    widths = (5, 6, 5, 8, 7)   # 입력칸 폭은 체결쏴 세트 행과 같게(5·6·5), 역산가 8(1,303.50)
+    head_w = (7, 7, 7, 8, 7)   # 헤더 폭이 곧 칸 폭(입력칸은 nsew로 채움 — 체결쏴 세트 행과 같음)
+    gap_col = len(heads)       # 두 세트 사이 빈 열
+    w["px"] = {}
     w["rows"] = {}
     w["run"] = {}
     w["run_painted"] = {}  # 마지막으로 칠한 상태 — 바뀔 때만 다시 칠한다(매 갱신 칠하면 깜박임)
@@ -289,9 +291,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         for c, (h, hw) in enumerate(zip(heads, head_w, strict=True)):  # 헤더 9pt 회색, 테두리 없음
             tk.Label(tbl, text=h, width=hw, fg="gray25", font=T.FONT_LABEL).grid(
                 row=1, column=base + c, padx=1, sticky="nsew")
-        btn = tk.Button(tbl, text=cond, width=widths[3], padx=0, pady=0, bd=1,
+        btn = tk.Button(tbl, text=cond, width=widths[4], padx=0, pady=0, bd=1,
                         highlightthickness=0)  # command는 toggle_run 정의 뒤에 붙인다
-        btn.grid(row=2, column=base + 3, rowspan=TIERS, padx=(4, 1), pady=1, sticky="nsew")
+        btn.grid(row=2, column=base + 4, rowspan=TIERS, padx=(4, 1), pady=1, sticky="nsew")
         w["run"][block] = btn
         for i in range(TIERS):
             r = 2 + i
@@ -306,40 +308,21 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 e.bind("<Return>", lambda _e: save_if_changed())
                 e.bind("<FocusOut>", lambda _e: save_if_changed())
                 cells[key] = e
+            # 역산가 — 주문가 옆 표시 칸(입력 아님, 테두리 없는 회색 글). 그 세트의 실행이 켜진
+            # 동안만 갱신하고 꺼지면 마지막 값을 둔다(사용자 2026-10-21·22).
+            lbl = tk.Label(tbl, text="-", width=widths[3], anchor="e", fg="gray25",
+                           font=T.FONT_NUM_LG)
+            lbl.grid(row=r, column=base + 3, padx=1, pady=1, sticky="nsew")
+            w["px"][(block, i)] = lbl
             tbl.grid_rowconfigure(r, minsize=row_h)
             w["rows"][(block, i)] = cells
     # 환율 — 0행 오른쪽 끝(체결쏴처럼 작은 회색 글씨)
     w["fx"] = tk.Label(tbl, text="환율 -", font=T.FONT_LABEL, fg="gray25", anchor="e")
-    # 청산 세트의 수량·주문가·실행 열 위에 걸쳐 오른쪽 정렬 — 빈 열 하나에만 두면 창을 안 넓힌 때
-    # 폭이 0이라 글이 잘린다(사용자 2026-10-21 "환율이 가려진다"). 늘어나는 빈 열(gap_col+5)은
-    # 걸치지 않는다 — 걸치면 창을 넓힐 때 환율이 오른쪽 끝으로 따라가 역산가 패널 밑에 깔린다
-    # (사용자 2026-10-21 "환율은 위치 고정 안 되나"). 세 열 폭(헤더 7자×3)이 글보다 넓어 안 늘림.
-    w["fx"].grid(row=0, column=gap_col + 2, columnspan=3, sticky="e", padx=(0, 2))
-    tbl.grid_columnconfigure(gap_col + 5, weight=1)  # 남는 폭은 여기로(입력칸은 안 늘어남)
-    # 역산가 패널(검증용, 사용자 2026-10-21) — 표 오른쪽 끝 바깥에 place()로 붙인다. place는 창의
-    # 요청 크기에 안 들어가 평소 크기에선 가려지고, 창을 넓히면 보인다. 진입·청산 단별 주문가.
-    px_panel = tk.Frame(tbl)
-    tk.Label(px_panel, text="역산가", fg="gray25", font=T.FONT_LABEL).grid(
-        row=0, column=0, columnspan=2, sticky="w")
-    w["px"] = {}
-    for c, (block, caption, fg) in enumerate((("entry", "진입", T.C_BUY),
-                                             ("exit", "청산", T.C_SELL))):
-        tk.Label(px_panel, text=caption, fg=fg, font=T.FONT_LABEL).grid(row=1, column=c, padx=2)
-        for i in range(TIERS):
-            lbl = tk.Label(px_panel, text="-", width=9, anchor="e", font=T.FONT_NUM_LG)
-            lbl.grid(row=2 + i, column=c, padx=2)
-            tbl.grid_rowconfigure(2 + i, minsize=row_h)
-            w["px"][(block, i)] = lbl
-
-    def place_px_panel() -> None:
-        """청산 실행 열 오른쪽에 패널 붙이기 — 배치가 끝난 뒤 열 위치를 재서."""
-        bbox = tbl.grid_bbox(column=gap_col + 4, row=1)  # 청산 세트의 실행 열
-        if not bbox or not bbox[2]:
-            root.after(200, place_px_panel)
-            return
-        px_panel.place(in_=tbl, x=bbox[0] + bbox[2] + 14, y=0)
-
-    root.after(200, place_px_panel)
+    # 청산 세트의 수량·주문가·역산가·실행 열 위에 걸쳐 오른쪽 정렬 — 빈 열 하나에만 두면 창을 안
+    # 넓힌 때 폭이 0이라 글이 잘린다(사용자 2026-10-21 "환율이 가려진다"). 늘어나는 빈 열은 걸치지
+    # 않는다 — 걸치면 창을 넓힐 때 환율이 오른쪽 끝으로 따라간다(사용자 2026-10-21 "위치 고정").
+    w["fx"].grid(row=0, column=gap_col + 2, columnspan=4, sticky="e", padx=(0, 2))
+    tbl.grid_columnconfigure(gap_col + 6, weight=1)  # 남는 폭은 여기로(입력칸은 안 늘어남)
 
     # ===== 상태줄: 창 상태 + 명령 결과 =====
     # width=1 + 가로 채움 — 긴 글이 창을 넓히지 않게(주문 리스트 상태줄과 같음, 사용자 2026-10-20)

@@ -3,7 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from kp_arb.report_sprd import collect, parse_rounds, round_sprd, write_csv
+from kp_arb.report_sprd import (
+    collect,
+    order_sprd,
+    parse_rounds,
+    round_sprd,
+    sprd_gap,
+    write_csv,
+)
 
 # 실측 로그 줄(2026-09-28)을 그대로 — 주식선물 삼성 10:15 판(HL 부분체결 → 대기 1.954, 미완)
 SF_PRE = ("2026-09-28 10:15:38,455 INFO 체결 정방향 1세트 진입: 선주문 #8293 1 @ 270000 "
@@ -69,7 +76,9 @@ def test_parse_rounds_closes_on_zero_wait_and_weights_partials() -> None:
                         product="sf", source="a.log")
     assert len(rows) == 1
     r = rows[0]
-    assert r["완료시각"] == "2026-09-28 10:15:40" and r["상품"] == "주식선물"
+    # 완료일·완료시각 두 열(사용자 2026-10-22 "초단위까지" — 한 칸이면 엑셀이 초를 숨김)
+    assert (r["완료일"], r["완료시각"]) == ("2026-09-28", "10:15:40") and r["상품"] == "주식선물"
+    assert r["주문Sprd(%)"] is None and r["주문-판Sprd(%)"] is None  # 설정 줄 없음
     assert r["방향"] == "정방향" and r["세트"] == 1 and r["다리"] == "진입" and r["RT"] == 8
     assert r["선주문수량"] == 1 and r["선주문평균가"] == 270_000.0
     assert r["후주문수량"] == pytest.approx(10.0)
@@ -127,11 +136,34 @@ def test_collect_reads_three_products_by_filename_and_writes_csv(tmp_path: Path)
     (tmp_path / "autom_samsung_20260927.log").write_text(SF_POST_REST, encoding="utf-8")
     rows = collect(tmp_path, "20260928")
     assert [(r["완료시각"], r["상품"]) for r in rows] == [
-        ("2026-09-28 10:03:53", "주식"), ("2026-09-28 10:15:40", "주식선물"),
-        ("2026-09-28 11:00:01", "HL선")]                      # 파일 무관, 완료시각순
+        ("10:03:53", "주식"), ("10:15:40", "주식선물"), ("11:00:01", "HL선")]  # 완료시각순
     out = tmp_path / "sprd.csv"
     write_csv(rows, out)
     text = out.read_text(encoding="utf-8-sig").splitlines()
-    assert text[0].startswith("완료시각,종목,상품,방향,세트,다리,RT,")
+    assert text[0].startswith("완료일,완료시각,종목,상품,방향,세트,다리,RT,")
+    assert ",주문Sprd(%),판Sprd(%),주문-판Sprd(%),누적Sprd(%),파일" in text[0]
     assert len(text) == 4 and "주식선물" in text[2]
+    assert text[1].startswith("2026-09-28,10:03:53,samsung,주식,")
     assert text[1].endswith("autom_samsung_stock_20260928.log")
+
+
+def test_order_sprd_from_run_and_set_lines() -> None:
+    # 사용자 2026-10-22: 판Sprd 왼쪽에 세트의 주문Sprd(설정값), 오른쪽에 주문−판. 설정값은 실행
+    # 켬·끔 줄(실측 2026-09-30 형식)과 세트 설정 줄(코어 2026-10-22) 중 마지막 것.
+    cmd = ("2026-09-28 10:00:00,100 INFO 명령 정방향 1세트 진입: 실행 켬 | 목표 12 1회 1 전환 5s "
+           "진입SF 0.003 진입S -0.01 청산 -0.0005 RT 16")
+    rows = parse_rounds([cmd, SF_PRE, SF_POST_PARTIAL, SF_POST_REST], underlying="samsung",
+                        product="sf")
+    r = rows[0]
+    assert r["주문Sprd(%)"] == 0.3  # 주식선물 진입 → 진입SF
+    assert r["주문-판Sprd(%)"] == pytest.approx(round(0.3 - r["판Sprd(%)"], 4))
+    # 설정창으로 바꾼 값이 뒤에 오면 그것(세트 단위 — 다리 무관), 주식은 진입S, 청산은 청산 값
+    set_line = ("2026-09-28 10:03:00,000 INFO 세트 설정 주식 정방향 1세트: 목표 12 1회 1 전환 5s "
+                "진입SF 0.003 진입S 0.012 청산 -0.004 RT 1")
+    st = parse_rounds([set_line, ST_C_PRE, ST_C_POST], underlying="samsung", product="stock")
+    assert st[0]["다리"] == "청산" and st[0]["주문Sprd(%)"] == -0.4
+    assert order_sprd("stock", "진입", {"en_sf": 0.003, "en_s": 0.012, "ex_sf": None}) == 0.012
+    assert order_sprd("sf", "진입", {"en_sf": 0.003, "en_s": 0.012, "ex_sf": None}) == 0.003
+    assert order_sprd("sf", "청산", {"en_sf": 0.003, "en_s": 0.012, "ex_sf": None}) is None
+    assert order_sprd("sf", "진입", None) is None
+    assert sprd_gap(0.3, 0.1234) == 0.1766 and sprd_gap(None, 0.1) is None

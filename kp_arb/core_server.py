@@ -663,6 +663,8 @@ async def _autom_command(
     try:
         if cmd == "autom_set":
             _autom_set_from_body(_sets()[int(body["set"])], body)
+            if engine is not None:  # 바뀐 설정값을 종목 로그에(정산 보고서 '주문Sprd' 열)
+                engine.log_set(Underlying(str(body["underlying"])), int(body["set"]), reverse)
             return _ok()
         if cmd == "autom_month":  # 선물 월물(근/차근) — 종목별(exec §11.9)
             month = str(body["month"]).strip()
