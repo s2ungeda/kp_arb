@@ -41,16 +41,37 @@ def int_of(text: str) -> int:
         return 0
 
 
+def qty_of(text: str) -> float:
+    """단 수량 칸 → 수(HL 주문이라 소수 가능, 사용자 2026-10-21). 빈칸·오타는 0."""
+    try:
+        return float(text.strip().replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
+def qty_text(qty: Any) -> str:
+    """수량 → 칸 글. 0·없음은 빈칸, 100.0은 "100", 0.5는 "0.5"(뒤 0 제거, 최대 소수 6자리)."""
+    if not qty:
+        return ""
+    return f"{float(qty):.6f}".rstrip("0").rstrip(".")
+
+
 def monitor_text(frac: Any) -> str:
     """모니터 수치 — 체결쏴처럼 퍼센트 소수 2자리(0.26). 없으면 '-'."""
     return "-" if frac is None else f"{float(frac) * 100:.2f}"
+
+
+def row_complete(spread: str, qty: str, price: str) -> bool:
+    """표 한 단의 세 칸이 다 채워졌나(Sprd·수량>0·주문가) — 실행 중 잠글 단 판정(사용자 2026-10-21:
+    완전한 단만 잠그고 반만 채운 단은 실행 중에도 고칠 수 있게)."""
+    return frac_of(spread) is not None and qty_of(qty) > 0 and frac_of(price) is not None
 
 
 def tiers_payload(rows: list[tuple[str, str, str]]) -> list[dict[str, Any]]:
     """표 입력(스프레드 %, 수량, 주문가격 %) 3행 → 코어 설정 dict 목록."""
     out: list[dict[str, Any]] = []
     for spread, qty, price in rows:
-        out.append({"spread": frac_of(spread), "qty": int_of(qty), "price_spread": frac_of(price)})
+        out.append({"spread": frac_of(spread), "qty": qty_of(qty), "price_spread": frac_of(price)})
     return out
 
 
@@ -115,6 +136,35 @@ def status_text(live: dict[str, Any]) -> str:
     return text
 
 
+def running_text(live_all: dict[str, dict[str, Any]]) -> str:
+    """켜진 종목·세트 글 — {"samsung": {"run_entry": True, "run_exit": True}, …} →
+    "삼성 진입·청산"(여러 종목은 쉼표). 아무것도 안 켜졌으면 빈 글. 순수."""
+    parts: list[str] = []
+    for u in UNDERLYINGS:
+        live = live_all.get(u.value) or {}
+        sets = [name for key, name in (("run_entry", "진입"), ("run_exit", "청산"))
+                if live.get(key)]
+        if sets:
+            parts.append(f"{NAMES[u]} {'·'.join(sets)}")
+    return ", ".join(parts)
+
+
+def saved_under(saved: dict[str, Any]) -> str | None:
+    """창 저장(win_state fields)의 보던 종목 이름 — 콤보에 있는 이름일 때만(제외된 종목 무시)."""
+    name = saved.get("under")
+    return name if isinstance(name, str) and name in BY_NAME else None
+
+
+def top_states(locked: bool) -> dict[str, str]:
+    """윗줄 칸의 잠금 상태(사용자 2026-10-21): 진입·청산 어느 쪽이든 실행 중이면 종목 콤보만 빼고
+    호가단위·적·기준수량·시간을 전부 잠근다. 콤보는 평소 readonly(고르기만), 버튼·입력칸은 normal.
+    순수 — 화면은 이 표대로 config(state=…)만 한다."""
+    combo = "disabled" if locked else "readonly"
+    plain = "disabled" if locked else "normal"
+    return {"agg": combo, "apply": plain, "ref": plain, "open": plain, "start": plain,
+            "end": plain}
+
+
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
     import queue
     import sys
@@ -122,13 +172,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     import time
     import tkinter as tk
     from functools import partial
-    from tkinter import ttk
+    from tkinter import messagebox, ttk
 
     from . import ui_theme as T
     from . import win_state
     from .core_client import core_request, run_state_feed, screen_log, watch_parent_exit
     from .ui_close import attach_auto_close, main_closing
-    from .ui_fields import is_decimal_text, is_int_text, is_time_text
+    from .ui_fields import is_decimal_text, is_int_text, is_time_text, is_unsigned_decimal_text
 
     preview = "--preview" in sys.argv
     if not preview:
@@ -136,11 +186,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     root = tk.Tk()
     root.title("NXT 개장 매매")
     root.resizable(True, True)
-    win_state.attach(root, "nxt_open")
+    if not preview:  # 미리보기(캡처용)는 창 위치·종목을 저장하지 않는다 — 실제 창 기록과 분리
+        win_state.attach(root, "nxt_open")
     T.apply_base(root)
     root.option_add("*Font", T.FONT_BASE_LG)  # 체결쏴와 같은 11pt
     vcmd_int = (root.register(is_int_text), "%P")
     vcmd_dec = (root.register(is_decimal_text), "%P")
+    vcmd_qty = (root.register(is_unsigned_decimal_text), "%P")  # 단 수량: 소수 가능(HL 주문)
     vcmd_time = (root.register(is_time_text), "%P")
     log = screen_log()
 
@@ -244,7 +296,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         for i in range(TIERS):
             r = 2 + i
             cells: dict[str, Any] = {}
-            for c, key, vc in ((0, "spread", vcmd_dec), (1, "qty", vcmd_int),
+            for c, key, vc in ((0, "spread", vcmd_dec), (1, "qty", vcmd_qty),
                                (2, "price", vcmd_dec)):
                 e = tk.Entry(tbl, width=widths[c], justify="right", validate="key",
                              validatecommand=vc, font=T.FONT_NUM_LG,
@@ -258,9 +310,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             w["rows"][(block, i)] = cells
     # 환율 — 0행 오른쪽 끝(체결쏴처럼 작은 회색 글씨)
     w["fx"] = tk.Label(tbl, text="환율 -", font=T.FONT_LABEL, fg="gray25", anchor="e")
-    # 청산 세트의 수량·주문가·실행 열(+늘어나는 빈 열) 위에 걸쳐 오른쪽 정렬 — 빈 열 하나에만 두면
-    # 창을 안 넓힌 때 폭이 0이라 글이 잘린다(사용자 2026-10-21 "환율이 가려진다")
-    w["fx"].grid(row=0, column=gap_col + 2, columnspan=4, sticky="e", padx=(0, 2))
+    # 청산 세트의 수량·주문가·실행 열 위에 걸쳐 오른쪽 정렬 — 빈 열 하나에만 두면 창을 안 넓힌 때
+    # 폭이 0이라 글이 잘린다(사용자 2026-10-21 "환율이 가려진다"). 늘어나는 빈 열(gap_col+5)은
+    # 걸치지 않는다 — 걸치면 창을 넓힐 때 환율이 오른쪽 끝으로 따라가 역산가 패널 밑에 깔린다
+    # (사용자 2026-10-21 "환율은 위치 고정 안 되나"). 세 열 폭(헤더 7자×3)이 글보다 넓어 안 늘림.
+    w["fx"].grid(row=0, column=gap_col + 2, columnspan=3, sticky="e", padx=(0, 2))
     tbl.grid_columnconfigure(gap_col + 5, weight=1)  # 남는 폭은 여기로(입력칸은 안 늘어남)
     # 역산가 패널(검증용, 사용자 2026-10-21) — 표 오른쪽 끝 바깥에 place()로 붙인다. place는 창의
     # 요청 크기에 안 들어가 평소 크기에선 가려지고, 창을 넓히면 보인다. 진입·청산 단별 주문가.
@@ -330,6 +384,22 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                   "n_sig_figs": nsf, "mantissa": mant}, "호가단위")
         send_ref_qty(force=True)
 
+    def set_entry(e: tk.Entry, val: str) -> None:
+        """입력칸 글 바꾸기 — 잠긴(disabled) 칸은 프로그램 쓰기도 막히므로 잠깐 풀고 쓴다."""
+        locked = str(e.cget("state")) == "disabled"
+        if locked:
+            e.config(state="normal")
+        e.delete(0, "end")
+        e.insert(0, val)
+        if locked:
+            e.config(state="disabled")
+
+    def lock_top(locked: bool) -> None:
+        """윗줄 잠금(사용자 2026-10-21) — 진입·청산 어느 쪽이든 켜져 있으면 호가단위·적·기준수량·
+        시간은 못 바꾸고 종목 콤보만 열어 둔다(다른 종목을 보러 갈 수는 있게)."""
+        for key, state in top_states(locked).items():
+            w[key].config(state=state)
+
     def paint_run(block: str, on: bool) -> None:
         """실행 버튼 색 — 바뀔 때만 칠한다(매 갱신 칠하면 깜박임). 진입 빨강·청산 파랑.
         마우스를 올리거나 누를 때 쓰는 활성 색(activebackground)도 같은 색으로 — 안 그러면 올려놓은
@@ -340,9 +410,19 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         bg = (T.C_BUY if block == "entry" else T.C_SELL) if on else "SystemButtonFace"
         fg = "white" if on else "black"
         w["run"][block].config(bg=bg, fg=fg, activebackground=bg, activeforeground=fg)
-        for i in range(TIERS):  # 켜진 동안 그 세트의 입력칸은 잠근다(사용자 2026-10-21)
+        lock_rows(block, on)
+        lock_top(any(bool(w["run_painted"].get(b)) for b in ("entry", "exit")))
+
+    def lock_rows(block: str, on: bool) -> None:
+        """켜진 동안 그 세트의 **완전한 단**만 잠근다(사용자 2026-10-21 "제대로 된 입력이
+        2세트뿐이면 2세트만 입력 불가로") — 반만 채운 단은 열어 두고, 채워서 저장하면 판정에
+        들어가며 잠긴다."""
+        for i in range(TIERS):
+            cells = w["rows"][(block, i)]
+            lock = on and row_complete(cells["spread"].get(), cells["qty"].get(),
+                                       cells["price"].get())
             for key in ("spread", "qty", "price"):
-                w["rows"][(block, i)][key].config(state="disabled" if on else "normal")
+                cells[key].config(state="disabled" if lock else "normal")
 
     def toggle_run(block: str) -> None:
         """표의 병합 실행 버튼(HL매도/HL매수) — 체결쏴 진입/청산 버튼과 같은 켜기/끄기.
@@ -350,6 +430,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         맞춘다."""
         u = cur["u"]
         value = not bool(w["run_painted"].get(block))
+        label = "진입" if block == "entry" else "청산"
+        if value and not any(row_complete(*row) for row in rows_of(block)):
+            # 완전한 단이 하나도 없으면 켜지 않고 알림(사용자 2026-10-21 "청산처럼 모든 세트가
+            # 조건에 안 맞으면 알림") — 상태줄 한 줄로는 지나치기 쉬움
+            set_status(f"{label} 켬 거부: 완전한 단 없음", err=True)
+            messagebox.showwarning("NXT 개장 매매", f"{label} 세트에 완전한 단이 없습니다.\n"
+                                   "Sprd·수량·주문가를 다 채운 단이 하나는 있어야 켤 수 있습니다.",
+                                   parent=root)
+            return
         if value:
             save_current()  # 켤 때 입력값부터 코어에
         paint_run(block, value)
@@ -365,6 +454,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         local[u] = payload_of(u)
         if not preview:
             send(local[u], "저장")
+        for block in ("entry", "exit"):  # 실행 중에 채운 단은 저장되는 순간 판정에 들어가며 잠긴다
+            if w["run_painted"].get(block):
+                lock_rows(block, True)
 
     def save_if_changed() -> None:
         """입력칸 Enter·이동 — 보낸 값과 다를 때만 저장(같은 값으로 매번 보내지 않게)."""
@@ -385,34 +477,26 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         cur["agg_under"] = cur["u"]
 
     def load_inputs(st: dict[str, Any]) -> None:
-        w["ref"].delete(0, "end")
-        w["ref"].insert(0, str(st.get("ref_qty", 1)))
+        set_entry(w["ref"], str(st.get("ref_qty", 1)))  # 윗줄도 잠겨 있을 수 있어 set_entry로
         ref_sent["qty"] = int_of(w["ref"].get())
         for key, val in (("open", st.get("open_hms") or DEFAULT_OPEN_HMS),
                          ("start", f"{float(st.get('start_s', DEFAULT_START_S)):g}"),
                          ("end", f"{float(st.get('end_s', DEFAULT_END_S)):g}")):
-            w[key].delete(0, "end")
-            w[key].insert(0, str(val))
+            set_entry(w[key], str(val))
         for block, key in (("entry", "entries"), ("exit", "exits")):
             tiers = list(st.get(key) or [])
             for i in range(TIERS):
                 t = tiers[i] if i < len(tiers) and isinstance(tiers[i], dict) else {}
                 cells = w["rows"][(block, i)]
                 for ck, val in (("spread", pct_text(t.get("spread"))),
-                                ("qty", "" if not t.get("qty") else str(t["qty"])),
+                                ("qty", qty_text(t.get("qty"))),
                                 ("price", pct_text(t.get("price_spread")))):
-                    e = cells[ck]
-                    locked = str(e.cget("state")) == "disabled"
-                    if locked:
-                        e.config(state="normal")
-                    e.delete(0, "end")
-                    e.insert(0, val)
-                    if locked:
-                        e.config(state="disabled")
+                    set_entry(cells[ck], val)
         cur["loaded"] = True
 
     def on_under_change(_e: object = None) -> None:
-        save_current()  # 보던 종목의 입력값을 코어에(미리보기면 화면에만) 남기고
+        if cur["loaded"]:  # 보던 종목의 입력값을 코어에(미리보기면 화면에만) 남기고
+            save_current()  # (아직 코어 값을 못 받았으면 빈 칸을 저장해 지우는 일이 없게)
         u = BY_NAME.get(w["under"].get(), UNDERLYINGS[0])
         cur["u"], cur["loaded"], cur["agg_under"] = u, False, None
         agg_map.clear()
@@ -465,20 +549,52 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             return
         root.after(150, refresh)
 
-    def is_running() -> bool:
+    # 닫기 규칙은 **보고 있는 종목만**(체결쏴와 같음, 사용자 2026-10-22 "안 그럼 한번 잘못 연
+    # 화면은 닫을 수가 없다") — 다른 종목이 켜져 있어도 묻지 않고 닫고, 그 실행은 코어에 남는다.
+    def cur_live() -> dict[str, Any]:
         live_all = (state_box.get("data") or {}).get("nxt_open_live") or {}
-        return any(bool((live_all.get(u.value) or {}).get("run_entry"))
-                   or bool((live_all.get(u.value) or {}).get("run_exit")) for u in UNDERLYINGS)
+        return dict(live_all.get(cur["u"].value) or {})
+
+    def is_running() -> bool:
+        live = cur_live()
+        return bool(live.get("run_entry")) or bool(live.get("run_exit"))
+
+    def describe_running() -> str:
+        """닫기 확인창용 — 켜진 종목·세트("삼성 진입·청산")."""
+        return running_text({cur["u"].value: cur_live()})
 
     def send_stop() -> None:
-        for u in UNDERLYINGS:
-            for block in ("entry", "exit"):
-                send({"cmd": "nxt_open_run", "underlying": u.value, "block": block,
-                      "value": False}, "실행 끔")
+        for block in ("entry", "exit"):
+            send({"cmd": "nxt_open_run", "underlying": cur["u"].value, "block": block,
+                  "value": False}, "실행 끔")
+
+    # --- 창 저장/복원(win_state, 체결쏴와 같은 요령) — 보던 종목(사용자 2026-10-21 "종목콤보
+    # 저장이 안 됨"). 위치는 attach가 2초마다. 단 값·기준수량은 코어가 종목별로 들고 있어 제외.
+    def collect_fields() -> dict[str, Any]:
+        return {"under": w["under"].get()}
+
+    def restore_saved() -> None:
+        name = saved_under(win_state.saved_fields("nxt_open"))
+        if name is None or name == w["under"].get():
+            return
+        w["under"].set(name)  # on_under_change를 부르지 않는다 — 아직 받은 값이 없어 저장할 게 없음
+        cur["u"], cur["loaded"], cur["agg_under"] = BY_NAME[name], False, None
+
+    def persist_fields() -> None:
+        try:
+            win_state.save_fields("nxt_open", collect_fields())
+            root.after(2000, persist_fields)
+        except tk.TclError:
+            pass  # 창 닫힘
+
+    if not preview:
+        restore_saved()
+        root.after(2000, persist_fields)
 
     def before_close() -> None:
         if preview:
             return
+        win_state.save_fields("nxt_open", collect_fields())
         if cur["loaded"]:  # 닫을 때 보던 종목의 입력값 저장(체결쏴 결정 82와 같은 요령)
             send(payload_of(cur["u"]), "저장")
         deadline = time.time() + 3.0
@@ -487,7 +603,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     on_close = attach_auto_close(root, title="NXT 개장 매매", is_running=is_running,
                                  send_stop=send_stop, set_status=set_status,
-                                 before_close=before_close, skip_confirm=main_closing)
+                                 before_close=before_close, skip_confirm=main_closing,
+                                 describe_running=describe_running)
     if preview:
         status.config(text="UI 미리보기 — 코어 미연결")
     root.after(150, refresh)

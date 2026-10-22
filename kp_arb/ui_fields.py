@@ -45,6 +45,12 @@ def is_decimal_text(text: str) -> bool:
     return re.fullmatch(r"-?\d*\.?\d*", text) is not None
 
 
+def is_unsigned_decimal_text(text: str) -> bool:
+    """부호 없는 소수 입력칸 — HL 수량처럼 소수는 되고 음수는 안 되는 칸(NXT 개장 매매 단 수량,
+    사용자 2026-10-21). 입력 중간 상태 허용."""
+    return re.fullmatch(r"\d*\.?\d*", text) is not None
+
+
 def is_time_text(text: str) -> bool:
     """시:분:초 입력 허용 — 숫자와 콜론만(입력 중간 상태 허용)."""
     return re.fullmatch(r"[\d:]*", text) is not None

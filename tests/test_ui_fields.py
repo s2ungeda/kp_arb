@@ -11,6 +11,7 @@ from kp_arb.ui_fields import (
     is_qty_text,
     is_signed_int_text,
     is_time_text,
+    is_unsigned_decimal_text,
     parse_qty,
     parse_threshold,
 )
@@ -25,6 +26,10 @@ def test_input_filters() -> None:
     assert is_signed_int_text("7") and not is_signed_int_text("1.5")
     assert not is_signed_int_text("--1")
     assert is_decimal_text("") and is_decimal_text("-") and is_decimal_text("0.075")
+    # 부호 없는 소수(NXT 개장 매매 단 수량 — HL 주문이라 소수 가능, 음수 불가)
+    assert is_unsigned_decimal_text("") and is_unsigned_decimal_text("0.5")
+    assert is_unsigned_decimal_text("12.") and is_unsigned_decimal_text(".5")
+    assert not is_unsigned_decimal_text("-1") and not is_unsigned_decimal_text("1,000")
     assert is_decimal_text("-.3") and is_decimal_text("12.")
     assert not is_decimal_text("1.2.3") and not is_decimal_text("1e3")
     assert is_time_text("") and is_time_text("08:30:10")

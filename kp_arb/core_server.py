@@ -584,7 +584,7 @@ def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
     """오전 NXT 개장 매매 명령(DESIGN-nxt-open.md §6) — nxt_open_settings(종목 설정 저장) ·
     nxt_open_run(실행 켜기/끄기 — block entry|exit). 설정은 엔진 없이도 저장되고, 실행은 엔진이
     있어야 한다."""
-    from .nxt_open import apply_settings
+    from .nxt_open import apply_settings, run_block_error
 
     cmd = body.get("cmd")
     try:
@@ -593,11 +593,15 @@ def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
         return _fail(["underlying 필요"])
     st = state.nxt_open.of(u)
     if cmd == "nxt_open_settings":
+        open_before = st.open_hms
         errors = apply_settings(st, {k: v for k, v in body.items()
                                      if k in ("start_s", "end_s", "open_hms", "ref_qty",
-                                              "entries", "exits")})
+                                              "entries", "exits")},
+                                sz_decimals=engine.sz_decimals(u) if engine else None)
         if errors:
             return _fail(errors)
+        if engine is not None and st.open_hms != open_before:
+            engine.reset_day(u)  # 개장 시각이 바뀌면 오늘 상태 다시(사용자 2026-10-21)
         logging.getLogger("kp_arb.nxt_open").info(
             "[NXT개장] %s 설정 저장: 창 +%.1f~+%.1f초 개장 %s 진입 %s 청산 %s",
             u.value, st.start_s, st.end_s, st.open_hms,
@@ -612,8 +616,12 @@ def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
         if block not in ("entry", "exit"):
             return _fail([f"block은 entry|exit: {block!r}"])
         tiers = st.entries if block == "entry" else st.exits
-        if value and not any(t.valid() for t in tiers):
-            return _fail([f"{'진입' if block == 'entry' else '청산'} 단 없음"])
+        why = run_block_error(tiers, "진입" if block == "entry" else "청산") if value else None
+        if why:
+            return _fail([why])
+        over = engine.chance_over(u) if value else None
+        if over:  # 기회가 지난 뒤 켜면 켜 둔 채 남으므로 거부(사용자 2026-10-21)
+            return _fail([f"{over} — 개장 시각을 고치거나 내일 켜세요"])
         engine.set_enabled(u, block, value)
         return _ok()
     return _fail([f"알 수 없는 명령: {cmd!r}"])

@@ -10,12 +10,15 @@ from kp_arb.nxt_open import (
     Tier,
     accept_t0,
     apply_settings,
+    day_over,
     disparity,
     judge,
     level_price,
     order_price,
+    run_block_error,
     screen_from_dict,
     settings_from_dict,
+    t0_verdict,
     window_state,
 )
 
@@ -71,6 +74,21 @@ def test_accept_t0_only_right_after_open_time() -> None:
     assert not accept_t0(wall(8, 0, 10.5), "08:00:00")
     assert not accept_t0(wall(7, 59, 59.9), "08:00:00")
     assert not accept_t0(wall(8, 41, 0), "08:00:00")
+    # 개장 전 체결은 거부가 아니라 무시(early) — 개장 시각을 앞으로 두고 시험할 때 그날을 안 죽임
+    assert t0_verdict(wall(7, 59, 59.9), "08:00:00") == "early"
+    assert t0_verdict(wall(8, 0, 3.2), "08:00:00") == "ok"
+    assert t0_verdict(wall(8, 0, 10.5), "08:00:00") == "late"
+
+    # 오늘 기회 끝(사용자 2026-10-21 "시간이 지나면 자동으로 꺼졌으면") — 발주·창 끝·개장 밖은
+    # 시각과 무관, 첫 체결이 없으면 개장+유예 10초+창 끝 5초를 넘겨야
+    assert day_over(wall(8, 0, 1), "08:00:00", "open", False, True, 5.0)
+    assert day_over(wall(8, 0, 6), "08:00:00", "closed", False, False, 5.0)
+    assert day_over(wall(8, 41, 0), "08:00:00", "none", True, False, 5.0)
+    assert not day_over(wall(8, 0, 1), "08:00:00", "open", False, False, 5.0)
+    assert not day_over(wall(8, 0, 0.2), "08:00:00", "before", False, False, 5.0)
+    assert not day_over(wall(7, 50, 0), "08:00:00", "none", False, False, 5.0)
+    assert not day_over(wall(8, 0, 15), "08:00:00", "none", False, False, 5.0)
+    assert day_over(wall(8, 0, 15.1), "08:00:00", "none", False, False, 5.0)
     assert accept_t0(wall(9, 0, 1), "09:00:00")  # 개장 시각은 설정값
 
 
@@ -131,8 +149,31 @@ def test_settings_roundtrip_and_validation() -> None:
     assert apply_settings(st2, {"entries": [{"spread": 0.01, "qty": 50,
                                             "price_spread": 0.008}]}) == []
     assert st2.entries[0] == Tier(0.01, 50, 0.008) and st2.entries[1] == Tier()
+    # 수량 소수(사용자 2026-10-21 "HL 주문이니 소수점 허용") — 종목 수량 자리(sz_decimals)까지만
+    assert apply_settings(st2, {"exits": [{"spread": -0.004, "qty": 0.5,
+                                          "price_spread": -0.002}]}, sz_decimals=1) == []
+    assert st2.exits[0] == Tier(-0.004, 0.5, -0.002) and st2.exits[0].valid()
+    assert apply_settings(st2, {"exits": [{"spread": -0.004, "qty": 0.25,
+                                          "price_spread": -0.002}]}, sz_decimals=1) == [
+        "수량은 소수 1자리까지(HL)"]
+    assert st2.exits[0].qty == 0.5  # 거부면 그대로
+    assert apply_settings(st2, {"exits": [{"spread": -0.004, "qty": 0.25,
+                                          "price_spread": -0.002}]}) == []  # 자리수 모르면 통과
     # 전 종목 복원 — 모르는 종목 키는 버림
     screen = NxtOpenScreen()
     screen_from_dict(screen, {"books": {"sk_hynix": asdict(st), "what": {}}})
     assert screen.of(Underlying.SK_HYNIX).start_s == 1.0 and "what" not in screen.books
     assert screen.of(Underlying.SAMSUNG).start_s == 0.5
+
+
+def test_run_guard_needs_one_complete_tier_only() -> None:
+    # 사용자 2026-10-21 "제대로 된 입력이 2세트뿐이면 2세트만 잠그자" — 반만 채운 단은 거부 사유가
+    # 아니라 판정에서 빠지는 단. 유효한 단이 하나도 없을 때만 "단 없음"
+    full, empty = Tier(0.002, 1, -0.005), Tier()
+    assert run_block_error([full, empty, empty], "진입") is None
+    assert run_block_error([Tier(0.002, 0, -0.005), full, empty], "진입") is None
+    assert run_block_error([empty, empty, empty], "진입") == "진입 단 없음"
+    assert run_block_error([Tier(0.001, 0, None), Tier(0.001, 0, None), empty], "청산") == (
+        "청산 단 없음")
+    assert Tier(0.002, 0, None).missing() == ["수량", "주문가"] and empty.missing() == [
+        "Sprd", "수량", "주문가"]

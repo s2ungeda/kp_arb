@@ -60,6 +60,12 @@ def main_closing(path: Path | None = None, now: float | None = None) -> bool:
     return 0 <= age <= MAIN_CLOSING_MAX_AGE_S
 
 
+def close_message(what: str = "") -> str:
+    """닫기 확인창 글 — what("삼성 진입·청산")이 있으면 앞에 붙인다. (순수 함수)"""
+    head = f"{what} 자동주문이 실행 중입니다." if what else "자동주문이 실행 중입니다."
+    return f"{head} 자동주문을 정지하고 화면을 닫을까요?"
+
+
 def close_plan(running: bool, confirmed: bool | None) -> str:
     """닫기 판정 — 순수 로직. "close" | "stop_and_close" | "stay".
 
@@ -77,6 +83,7 @@ def attach_auto_close(
     clock: Callable[[], float] | None = None,
     before_close: Callable[[], None] | None = None,
     skip_confirm: Callable[[], bool] | None = None,
+    describe_running: Callable[[], str] | None = None,
 ) -> Callable[[], None]:
     """tk 창에 공통 닫기 규칙을 붙인다. 돌려주는 on_close는 테스트·메뉴에서 직접 부를 수 있다.
 
@@ -84,7 +91,9 @@ def attach_auto_close(
     창과 함께 죽어 정지 명령이 유실되지 않게. timeout_s가 지나면 그냥 닫는다.
     before_close: 닫기로 정해진 뒤(정지 명령·destroy 전) 한 번 부른다 — 자동M은 세트 행 값을
     코어에 저장(결정 82). skip_confirm: True면 실행 중이어도 묻지 않고 정지 명령 없이 닫는다
-    (메인 종료 중 — 실행은 코어가 메인 종료로 멈춘다).
+    (메인 종료 중 — 실행은 코어가 메인 종료로 멈춘다). describe_running: 확인창에 무엇이 도는지
+    적어 줄 글("삼성 진입·청산") — 보고 있던 종목이 아닌 다른 종목이 켜져 있을 때 헷갈리지 않게
+    (NXT 개장 매매, 사용자 2026-10-22).
     """
     import tkinter as tk
 
@@ -108,8 +117,9 @@ def attach_auto_close(
         forced = bool(skip_confirm()) if skip_confirm is not None else False
         confirmed: bool | None = None
         if running and not forced:
+            what = describe_running() if describe_running is not None else ""
             confirmed = ask_yes_no(  # 모니터 중앙 팝업(ui_dialog)
-                root, title, "자동주문이 실행 중입니다. 자동주문을 정지하고 화면을 닫을까요?")
+                root, title, close_message(what))
         plan = "close" if forced else close_plan(running, confirmed)
         if plan == "stay":
             return

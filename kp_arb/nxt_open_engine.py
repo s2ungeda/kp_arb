@@ -24,11 +24,12 @@ from .nxt_open import (
     NxtOpenSettings,
     Plan,
     Tier,
-    accept_t0,
+    day_over,
     disparity,
     judge,
     level_price,
     order_price,
+    t0_verdict,
     window_state,
 )
 
@@ -53,7 +54,7 @@ class TierResult:
     block: str
     index: int
     side: str
-    qty: int
+    qty: float
     price: float
     order_id: str | None = None
     error: str | None = None
@@ -76,6 +77,7 @@ class DayState:
     entry_disp: float | None = None
     exit_disp: float | None = None
     note: str = ""                    # 마지막 판정 설명(미충족 사유 등)
+    over_seen: bool = False           # 오늘 기회 끝남을 한 번 처리함(실행 자동 끔은 하루 한 번)
 
 
 class NxtOpenEngine:
@@ -102,6 +104,12 @@ class NxtOpenEngine:
     def settings(self, u: Underlying) -> NxtOpenSettings:
         return self._screen.of(u)
 
+    def sz_decimals(self, u: Underlying) -> int | None:
+        """그 종목 HL 수량 소수 자리(종목 메타) — 설정 저장 때 단 수량 검사용. 메타 없으면 None."""
+        info = self._system.instruments.get((u, Instrument.HL_PERP))
+        dec = getattr(info, "sz_decimals", None) if info is not None else None
+        return int(dec) if isinstance(dec, int) else None
+
     def set_enabled(self, u: Underlying, block: str, value: bool) -> None:
         """실행 켜기/끄기 — block "entry"(HL매도) | "exit"(HL매수), 화면 표의 병합 버튼."""
         st = self.settings(u)
@@ -111,6 +119,59 @@ class NxtOpenEngine:
             st.run_exit = value
         self._log.info("[NXT개장] %s %s 실행 %s", u.value, "진입" if block == "entry" else "청산",
                        "켬" if value else "끔")
+
+    def chance_over(self, u: Underlying) -> str | None:
+        """오늘 기회가 끝났으면 그 사유(실행 켜기 거부 문구용), 아니면 None — 사용자 2026-10-21
+        "시간이 지났는데 안 꺼짐": 지난 뒤에 켜는 것도 막아야 켜 둔 채 남지 않는다."""
+        d, st = self._day(u), self.settings(u)
+        if not self._is_over(d, st):
+            return None
+        if d.fired:
+            return "오늘 발주 끝"
+        if d.t0_rejected:
+            return "오늘 판정 없음(개장 밖)"
+        if d.t0 is not None:
+            return "오늘 창 끝"
+        return f"개장 {st.open_hms} 지남"
+
+    def reset_day(self, u: Underlying) -> None:
+        """개장 시각이 바뀌면 그 종목의 오늘 상태(첫 체결·개장 밖 판정·발주 끝·자동 끔 처리)를 새로
+        시작(사용자 2026-10-21 시험: 14:18 개장 밖 판정이 남아 14:45로 바꿔도 창이 안 열리고 자동
+        끔도 안 걸림). 발주한 날도 되돌린다(사용자 2026-10-22 결정 1) — 개장 시각 변경은 사람이
+        일부러 하는 일이고 켜기도 다시 눌러야 하므로 "하루 한 번"은 '한 개장 시각에 한 번'으로."""
+        d = self._day(u)
+        if d.fired:
+            self._log.warning("[NXT개장] %s 개장 시각 변경 — 오늘 이미 발주(%s)했지만 상태를 "
+                              "되돌려 다시 켤 수 있게 함", u.value, _hms(d.fired_wall))
+        else:
+            self._log.info("[NXT개장] %s 개장 시각 변경 → 오늘 상태 초기화", u.value)
+        self._days[u] = DayState(day=d.day)
+
+    def _is_over(self, d: DayState, st: NxtOpenSettings) -> bool:
+        window = window_state(self._clock(), d.t0, st.start_s, st.end_s)
+        return day_over(self._wall(), st.open_hms, window, d.t0_rejected, d.fired, st.end_s)
+
+    def _auto_off(self, u: Underlying, d: DayState, st: NxtOpenSettings) -> None:
+        """오늘 기회가 끝나면 진입·청산 실행을 자동으로 끈다(사용자 2026-10-21) — 발주 뒤·창 끝
+        미충족·개장 밖·첫 체결 없이 시각 지남. 하루 한 번(over_seen). 기회가 끝난 뒤에 켜는 것은
+        코어가 chance_over로 거부하고, 개장 시각을 바꾸면 reset_day로 다시 시작한다."""
+        if d.over_seen or not self._is_over(d, st):
+            return
+        d.over_seen = True
+        if not (st.run_entry or st.run_exit):
+            return
+        st.run_entry = st.run_exit = False
+        if d.fired:
+            why = "발주 끝"
+        elif d.t0_rejected:
+            why = "오늘 판정 없음(개장 밖)"
+        elif d.t0 is not None:
+            why = "창 끝 미충족"
+        else:
+            why = "첫 체결 없음"
+        if not d.fired:  # 발주한 날은 상태줄이 발주 결과를 보여 주므로 비고를 안 바꾼다
+            d.note = f"{why} · 자동 끔"
+        self._log.info("[NXT개장] %s 오늘 기회 끝(%s) — 진입·청산 실행 자동 끔", u.value, why)
 
     # --- 이벤트 ---
 
@@ -132,7 +193,10 @@ class NxtOpenEngine:
         if d.t0 is None and not d.t0_rejected:
             now_wall = self._wall()
             st = self.settings(u)
-            if accept_t0(now_wall, st.open_hms):
+            verdict = t0_verdict(now_wall, st.open_hms)
+            if verdict == "early":
+                pass  # 개장 전 체결 — T0 후보 아님(무시), 개장 뒤 첫 체결을 기다린다
+            elif verdict == "ok":
                 d.t0, d.t0_wall = self._clock(), now_wall
                 self._log.info("[NXT개장] %s 첫 체결 %s @ %s — 창 +%.1f~+%.1f초", u.value,
                                _hms(now_wall), f"{d.s:,.0f}", st.start_s, st.end_s)
@@ -177,6 +241,7 @@ class NxtOpenEngine:
         d = self._day(u)
         self._compute(u, d)
         st = self.settings(u)
+        self._auto_off(u, d, st)
         if d.fired or not (st.run_entry or st.run_exit):
             return
         if window_state(self._clock(), d.t0, st.start_s, st.end_s) != "open":
@@ -228,9 +293,10 @@ class NxtOpenEngine:
         for r, out in zip(live, outs, strict=False):
             r.order_id = getattr(out, "order_id", None)
             r.error = getattr(out, "error", None)
-            self._log.info("[NXT개장] %s %s%d %s %d @ %s → %s", u.value,
+            self._log.info("[NXT개장] %s %s%d %s %s @ %s → %s", u.value,
                            "진입" if r.block == "entry" else "청산", r.index + 1, r.side,
                            r.qty, r.price, r.order_id or f"실패 {r.error}")
+        self._auto_off(u, d, self.settings(u))  # 발주했으니 오늘은 끝 — 실행 끔
 
     # --- 화면 ---
 
@@ -240,6 +306,7 @@ class NxtOpenEngine:
             d = self._day(u)
             self._compute(u, d)
             st = self.settings(u)
+            self._auto_off(u, d, st)  # 시세 이벤트가 없어도 화면 갱신 때 시각이 지났으면 끈다
             out[u.value] = {
                 "run_entry": st.run_entry, "run_exit": st.run_exit, "ref_qty": st.ref_qty,
                 "window": window_state(self._clock(), d.t0, st.start_s, st.end_s),

@@ -1,7 +1,7 @@
 """자동주문 화면 공통 닫기 규칙(ui_close) — 동시호가·자동T·자동M이 같이 쓴다."""
 from typing import Any
 
-from kp_arb.ui_close import attach_auto_close, close_plan
+from kp_arb.ui_close import attach_auto_close, close_message, close_plan
 
 
 def test_close_plan_rules() -> None:
@@ -12,6 +12,10 @@ def test_close_plan_rules() -> None:
     assert close_plan(True, True) == "stop_and_close"
     assert close_plan(True, False) == "stay"
     assert close_plan(True, None) == "stay"
+    # 확인창 글 — 무엇이 도는지 적어 주면 앞에 붙는다(NXT 개장 매매, 사용자 2026-10-22)
+    assert close_message() == "자동주문이 실행 중입니다. 자동주문을 정지하고 화면을 닫을까요?"
+    assert close_message("삼성 진입·청산") == (
+        "삼성 진입·청산 자동주문이 실행 중입니다. 자동주문을 정지하고 화면을 닫을까요?")
 
 
 class _FakeRoot:

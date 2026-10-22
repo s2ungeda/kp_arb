@@ -22,14 +22,36 @@ SOURCE = "NXT개장"             # OrderIntent.source(주문 리스트 출처·�
 
 @dataclass
 class Tier:
-    """한 단 — 조건 스프레드(진입: 이상, 청산: 이하)·주문 수량·주문가 역산용 스프레드(소수)."""
+    """한 단 — 조건 스프레드(진입: 이상, 청산: 이하)·주문 수량·주문가 역산용 스프레드(소수).
+    수량은 HL 주문이라 소수 가능 — 그 종목의 수량 소수 자리(sz_decimals)까지(사용자 2026-10-21)."""
 
     spread: float | None = None
-    qty: int = 0
+    qty: float = 0.0
     price_spread: float | None = None
 
     def valid(self) -> bool:
         return self.spread is not None and self.qty > 0 and self.price_spread is not None
+
+    def missing(self) -> list[str]:
+        """비어 있는 칸 이름(화면 헤더 글) — 셋 다 비면 "안 쓰는 단", 일부만 비면 "입력 미완"."""
+        out: list[str] = []
+        if self.spread is None:
+            out.append("Sprd")
+        if self.qty <= 0:
+            out.append("수량")
+        if self.price_spread is None:
+            out.append("주문가")
+        return out
+
+
+def run_block_error(tiers: list[Tier], label: str) -> str | None:
+    """실행 켜기 가드(코어 nxt_open_run) — 거부 사유 또는 None. 유효한 단이 하나도 없으면 "단 없음".
+    반만 채운 단(예: 수량이 빈 단)은 거부 사유가 아니라 **판정에서 빠지는 단**(사용자 2026-10-21
+    "제대로 된 입력이 2세트뿐이면 2세트만 잠그자") — 화면은 그 단을 열어 두고, 실행 중 채워 저장하면
+    그때부터 판정에 들어간다(judge가 valid()만 본다)."""
+    if not any(t.valid() for t in tiers):
+        return f"{label} 단 없음"
+    return None
 
 
 def _tiers() -> list[Tier]:
@@ -71,7 +93,7 @@ class Plan:
     block: str        # "entry" | "exit"
     index: int        # 단 번호(0~2)
     side: Side        # entry → SELL, exit → BUY
-    qty: int
+    qty: float
     price_spread: float
 
 
@@ -118,16 +140,46 @@ def window_state(now: float, t0: float | None, start_s: float, end_s: float) -> 
     return "closed"
 
 
-def accept_t0(first_wall: float, open_hms: str, grace_s: float = OPEN_GRACE_S) -> bool:
-    """그날 첫 NXT 체결의 PC 시각이 개장 시각 ~ +grace 안이면 T0로 받아들인다. 밖이면(코어를
-    늦게 켠 날 등) 오늘 창은 없다 — 뒤늦은 첫 수신을 개장으로 오인하지 않기 위한 안전장치."""
+def _sec_of_day(wall: float) -> float:
+    """PC 시각(epoch) → 그날 0시부터의 초(소수 포함)."""
     import time as _t
 
-    lt = _t.localtime(first_wall)
-    h, m, s = (int(x) for x in open_hms.split(":"))
-    open_sec = h * 3600 + m * 60 + s
-    now_sec = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec + (first_wall % 1.0)
-    return open_sec <= now_sec <= open_sec + grace_s
+    lt = _t.localtime(wall)
+    return lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec + (wall % 1.0)
+
+
+def _hms_sec(hms: str) -> int:
+    h, m, s = (int(x) for x in hms.split(":"))
+    return h * 3600 + m * 60 + s
+
+
+def t0_verdict(first_wall: float, open_hms: str, grace_s: float = OPEN_GRACE_S) -> str:
+    """NXT 체결의 PC 시각을 개장 시각과 견준 판정 — "early"(개장 전: 무시, T0 후보 아님) /
+    "ok"(개장 ~ +grace: T0) / "late"(그 뒤: 오늘 창 없음 — 코어를 늦게 켠 날 등).
+    개장 전 체결을 거부가 아니라 무시로 두는 건 개장 시각을 앞으로 당겨 놓고 시험할 때(사용자
+    2026-10-21) 개장 전 체결이 그날을 죽이지 않게 — 실운영 08:00 전엔 NXT 체결이 없어 영향 없음."""
+    open_sec = _hms_sec(open_hms)
+    now_sec = _sec_of_day(first_wall)
+    if now_sec < open_sec:
+        return "early"
+    return "ok" if now_sec <= open_sec + grace_s else "late"
+
+
+def accept_t0(first_wall: float, open_hms: str, grace_s: float = OPEN_GRACE_S) -> bool:
+    """그날 첫 NXT 체결의 PC 시각이 개장 시각 ~ +grace 안이면 T0로 받아들인다(t0_verdict "ok")."""
+    return t0_verdict(first_wall, open_hms, grace_s) == "ok"
+
+
+def day_over(now_wall: float, open_hms: str, window: str, t0_rejected: bool, fired: bool,
+             end_s: float, grace_s: float = OPEN_GRACE_S) -> bool:
+    """오늘 발주 기회가 끝났는가(사용자 2026-10-21 "시간이 지나면 자동으로 꺼졌으면") — 발주했거나,
+    창이 닫혔거나, 첫 체결이 개장 밖이었거나, 첫 체결 없이 개장+유예+창 끝 시각을 넘겼으면 True.
+    엔진은 이때 진입·청산 실행을 끈다. 순수."""
+    if fired or t0_rejected or window == "closed":
+        return True
+    if window == "none":
+        return _sec_of_day(now_wall) > _hms_sec(open_hms) + grace_s + end_s
+    return False
 
 
 # --- 판정 ---
@@ -161,9 +213,16 @@ def _tier_from(raw: object) -> Tier:
         if isinstance(v, int | float) and not isinstance(v, bool):
             setattr(out, key, float(v))
     q = raw.get("qty")
-    if isinstance(q, int) and not isinstance(q, bool) and q >= 0:
-        out.qty = q
+    if isinstance(q, int | float) and not isinstance(q, bool) and q >= 0:
+        out.qty = float(q)
     return out
+
+
+def qty_decimals_ok(qty: float, sz_decimals: int | None) -> bool:
+    """수량이 HL 종목의 수량 소수 자리(sz_decimals) 안인가. 자리수를 모르면(None) 통과."""
+    if sz_decimals is None:
+        return True
+    return abs(round(qty, sz_decimals) - qty) < 1e-9
 
 
 def settings_from_dict(raw: object) -> NxtOpenSettings:
@@ -205,10 +264,15 @@ def screen_from_dict(screen: NxtOpenScreen, raw: object) -> None:
             screen.books[str(key)] = settings_from_dict(val)
 
 
-def apply_settings(st: NxtOpenSettings, body: dict[str, Any]) -> list[str]:
-    """화면 명령(nxt_open_settings) → 설정 반영. 틀린 값은 사유 목록으로 거부(아무 것도 안 바꿈)."""
+def apply_settings(st: NxtOpenSettings, body: dict[str, Any],
+                   sz_decimals: int | None = None) -> list[str]:
+    """화면 명령(nxt_open_settings) → 설정 반영. 틀린 값은 사유 목록으로 거부(아무 것도 안 바꿈).
+    sz_decimals = 그 종목 HL 수량 소수 자리 — 단 수량이 이보다 잘게 적혔으면 거부(사용자
+    2026-10-21)."""
     errors: list[str] = []
     new = settings_from_dict({**_as_dict(st), **body})
+    if any(not qty_decimals_ok(t.qty, sz_decimals) for t in new.entries + new.exits):
+        errors.append(f"수량은 소수 {sz_decimals}자리까지(HL)")
     if "start_s" in body or "end_s" in body:
         start, end = body.get("start_s", st.start_s), body.get("end_s", st.end_s)
         if not (isinstance(start, int | float) and isinstance(end, int | float)

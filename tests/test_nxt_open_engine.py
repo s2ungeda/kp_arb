@@ -143,7 +143,62 @@ async def test_late_core_start_does_not_treat_first_tick_as_open() -> None:
     await _settle()
     snap = eng.live_snapshot()[U.value]
     assert snap["t0"] is None and snap["t0_rejected"] and snap["window"] == "none"
-    assert not sys_.placed and snap["note"] == "오늘 판정 없음(개장 밖)"
+    assert not sys_.placed
+    # 미리 켜 둔 실행은 오늘 기회가 없으니 자동으로 꺼진다(사용자 2026-10-21)
+    assert snap["note"] == "오늘 판정 없음(개장 밖) · 자동 끔"
+    assert not snap["run_entry"] and not snap["run_exit"]
+
+
+async def test_run_turns_off_by_itself_when_today_is_over() -> None:
+    # 사용자 2026-10-21 "시간이 지나면 자동으로 자동주문 꺼졌으면" — 창이 끝났는데 조건이
+    # 안 맞았으면 끔
+    eng, sys_, clk, screen = _engine(_wall(8, 0, 0.5))
+    st = screen.of(U)
+    st.entries = [Tier(0.05, 100, 0.009)]  # 괴리 1.4%로는 안 맞는 단
+    st.exits = []
+    eng._on_trade(_nxt(1_729_000.0))  # T0
+    clk.advance(3.0)
+    eng._on_trade(_nxt(1_729_000.0))
+    assert st.run_entry  # 창 안 — 아직 켜져 있음
+    clk.advance(3.0)  # 창 끝(+6초)
+    snap = eng.live_snapshot()[U.value]
+    assert snap["window"] == "closed" and not sys_.placed
+    assert not st.run_entry and not st.run_exit and snap["note"] == "창 끝 미충족 · 자동 끔"
+    # 기회가 지난 뒤엔 켜기 거부 사유가 나온다(코어가 이걸로 거부) — 켜 둔 채 남지 않게
+    assert eng.chance_over(U) == "오늘 창 끝"
+    # 개장 시각을 바꾸면 오늘 상태를 새로 시작 — 다시 켤 수 있고 개장 전 체결은 무시, 개장 뒤 첫
+    # 체결이 T0(사용자 2026-10-21 시험: 14:18 개장 밖 판정이 남아 14:45로 바꿔도 안 열리던 것)
+    st.open_hms = "08:01:00"
+    eng.reset_day(U)
+    assert eng.chance_over(U) is None and eng.live_snapshot()[U.value]["window"] == "none"
+    st.run_entry = True
+    eng._on_trade(_nxt(1_729_000.0))  # 08:00:06.5 — 개장 전, 무시
+    assert eng.live_snapshot()[U.value]["t0"] is None and not eng._day(U).t0_rejected
+    clk.advance(54.0)  # 08:01:00.5
+    eng._on_trade(_nxt(1_729_000.0))
+    assert eng.live_snapshot()[U.value]["t0"] == "08:01:00.500"
+
+    # 첫 체결이 아예 없는 날 — 개장 + 유예 10초 + 창 끝 5초가 지나면 끔
+    eng2, _, clk2, screen2 = _engine(_wall(7, 59, 0.0))
+    clk2.advance(60.0 + 15.0)
+    assert screen2.of(U).run_entry and eng2.live_snapshot()[U.value]["window"] == "none"
+    clk2.advance(0.2)
+    snap2 = eng2.live_snapshot()[U.value]
+    assert not screen2.of(U).run_entry and snap2["note"] == "첫 체결 없음 · 자동 끔"
+
+    # 발주한 날은 발주 뒤 끔(상태줄 비고는 발주 결과가 보이므로 그대로)
+    eng3, sys3, clk3, screen3 = _engine(_wall(8, 0, 0.5))
+    eng3._on_trade(_nxt(1_729_000.0))  # T0
+    clk3.advance(1.0)
+    eng3._on_trade(_nxt(1_729_000.0))  # 창 안 — 진입 세 단 다 맞아 발주
+    await _settle()
+    assert sys3.placed and eng3.live_snapshot()[U.value]["fired"]
+    assert not screen3.of(U).run_entry and not screen3.of(U).run_exit
+    assert eng3.chance_over(U) == "오늘 발주 끝"
+    # 발주한 뒤라도 개장 시각을 바꾸면 되돌린다(사용자 2026-10-22 결정 1) — 다시 켤 수 있음
+    screen3.of(U).open_hms = "08:30:00"
+    eng3.reset_day(U)
+    assert eng3.chance_over(U) is None and not eng3.live_snapshot()[U.value]["fired"]
 
 
 async def test_exit_tiers_buy_when_disparity_low() -> None:
@@ -170,9 +225,25 @@ def test_core_command_saves_settings_and_guards_run() -> None:
     # 실행: 엔진 없으면 거부, 단이 비어 있으면 거부
     run = {"cmd": "nxt_open_run", "underlying": "samsung", "block": "entry", "value": True}
     assert "미접속" in _nxt_open_command(None, state, run)["errors"][0]
-    eng = NxtOpenEngine(state.nxt_open, FakeSystem())
+    clk = Clock(_wall(7, 50, 0.0))  # 개장(08:00) 전 — 기회가 남아 있음
+    eng = NxtOpenEngine(state.nxt_open, FakeSystem(), clock=lambda: clk.mono,
+                        wall=lambda: clk.wall)
     assert _nxt_open_command(eng, state, run)["errors"] == ["진입 단 없음"]
     assert "block은" in _nxt_open_command(eng, state, {**run, "block": "x"})["errors"][0]
     assert _nxt_open_command(eng, state, {**run, "underlying": "sk_hynix"})["ok"]
     assert st.run_entry is True and st.run_exit is False
+    # 반만 채운 1단 + 완전한 2단 → 켜진다(사용자 2026-10-21: 반만 채운 단은 판정에서 빠질 뿐)
+    st.entries[0], st.entries[1] = Tier(0.002, 0, -0.005), Tier(0.001, 1, -0.004)
+    assert _nxt_open_command(eng, state, {**run, "underlying": "sk_hynix"})["ok"]
+    assert _nxt_open_command(eng, state, {**run, "underlying": "sk_hynix", "value": False})["ok"]
+    assert st.run_entry is False
+    # 기회가 지난 뒤(개장+10초+창 끝 지남) 켜면 거부 — 사용자 2026-10-21 "시간이 지났는데 안 꺼짐"
+    st.entries[0] = Tier(0.002, 1, -0.005)
+    clk.advance(10 * 60 + 20.0)  # 08:00:20
+    assert _nxt_open_command(eng, state, {**run, "underlying": "sk_hynix"})["errors"] == [
+        "개장 08:00:00 지남 — 개장 시각을 고치거나 내일 켜세요"]
+    # 개장 시각을 앞으로 옮겨 저장하면 오늘 상태를 새로 시작 → 다시 켤 수 있다
+    assert _nxt_open_command(eng, state, {**body, "open_hms": "08:05:00"})["ok"]
+    assert _nxt_open_command(eng, state, {**run, "underlying": "sk_hynix"})["ok"]
+    assert st.run_entry is True
     assert _nxt_open_command(None, state, {"cmd": "nxt_open_x"})["errors"] == ["underlying 필요"]
