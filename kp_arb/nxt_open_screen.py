@@ -61,6 +61,13 @@ def monitor_text(frac: Any) -> str:
     return "-" if frac is None else f"{float(frac) * 100:.2f}"
 
 
+def row_locked(running: bool, complete: bool, fired: bool) -> bool:
+    """단 입력칸을 잠글지 — 실행 중이고 완전한 단이면 잠그되, **오늘 이미 발주된 단은 푼다**(사용자
+    2026-10-23 "발주된 세트는 입력 막혀 있던 거 풀어주는 게 좋을 듯" — 그날은 다시 안 나가니 고쳐도
+    됨). 순수."""
+    return running and complete and not fired
+
+
 def row_complete(spread: str, qty: str, price: str) -> bool:
     """표 한 단의 세 칸이 다 채워졌나(Sprd·수량>0·주문가) — 실행 중 잠글 단 판정(사용자 2026-10-21:
     완전한 단만 잠그고 반만 채운 단은 실행 중에도 고칠 수 있게)."""
@@ -124,9 +131,11 @@ def results_summary(results: list[dict[str, Any]]) -> str:
 
 
 def status_text(live: dict[str, Any]) -> str:
-    """상태 줄 — 최대한 짧게(사용자 2026-10-20): 창 상태(+첫 체결 시각) / 발주 결과 / 비고."""
+    """상태 줄 — 최대한 짧게(사용자 2026-10-20): 창 상태(+첫 체결 시각) / 발주 결과 / 비고.
+    발주 결과는 **마지막 한 건만**(사용자 2026-10-23 "하나씩만 보여줘") — 앞 건들은 상태줄 콤보의
+    이력에 한 줄씩 남아 있다(ui_status.push_history)."""
     if live.get("fired"):
-        summary = results_summary(live.get("results") or [])
+        summary = results_summary((live.get("results") or [])[-1:])
         return f"발주 {live.get('fired_at') or ''} {summary}".strip()
     if live.get("note"):
         return str(live["note"])
@@ -179,6 +188,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     from .core_client import core_request, run_state_feed, screen_log, watch_parent_exit
     from .ui_close import attach_auto_close, main_closing
     from .ui_fields import is_decimal_text, is_int_text, is_time_text, is_unsigned_decimal_text
+    from .ui_status import StatusCombo
 
     preview = "--preview" in sys.argv
     if not preview:
@@ -275,6 +285,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     w["run"] = {}
     w["run_painted"] = {}  # 마지막으로 칠한 상태 — 바뀔 때만 다시 칠한다(매 갱신 칠하면 깜박임)
     w["run_hold"] = {}     # 버튼별 보류 시각 — 누른 뒤 이 시각까지는 코어 상태로 덮어쓰지 않는다
+    w["fired"] = set()     # 오늘 발주된 단(코어 fired_tiers) — 실행 중이어도 입력을 푼다
     # 행 높이 = 체결쏴 세트 행과 같게. 체결쏴는 같은 줄의 진입/청산 버튼(11pt)이 행 높이를 정하고
     # 입력칸이 거기 맞춰 늘어난다. 여기는 버튼이 3행 병합이라 같은 버튼의 높이를 재서 최소 높이로.
     probe = tk.Button(tbl, text="진입", width=3, padx=0, pady=0, bd=1, highlightthickness=0)
@@ -326,14 +337,17 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # ===== 상태줄: 창 상태 + 명령 결과 =====
     # width=1 + 가로 채움 — 긴 글이 창을 넓히지 않게(주문 리스트 상태줄과 같음, 사용자 2026-10-20)
-    status = tk.Label(root, text="-", anchor="w", relief="groove", fg=T.C_MUTED, width=1)
-    status.grid(row=2, column=0, sticky="ew", padx=6, pady=(4, 6))
+    # 상태줄 = 읽기 전용 콤보(사용자 2026-10-23): 최신 글을 보여 주고 펼치면 지난 글 50건. width=1 +
+    # 가로 채움 — 긴 글이 창을 넓히지 않게. 펼친 목록은 넓혀서 긴 글도 보이게(postcommand).
+    status_box = StatusCombo(root, T.FONT_LABEL)  # 체결쏴와 공용(ui_status)
+    status_box.widget.grid(row=2, column=0, sticky="ew", padx=6, pady=(4, 6))
+    show_status = status_box.show
     root.grid_columnconfigure(0, weight=1)
     note: dict[str, Any] = {"text": "", "until": 0.0}  # 명령 결과는 5초만 보여 주고 창 상태로
 
     def set_status(text: str, err: bool = False) -> None:
         note["text"], note["until"] = text, time.time() + 5.0
-        status.config(text=text[:120], fg=T.C_ERR if err else T.C_MUTED)
+        show_status(("거부 " if err and not text.startswith(("거부", "실패")) else "") + text)
         log.info("[NXT개장 화면] %s", text)
 
     def rows_of(block: str) -> list[tuple[str, str, str]]:
@@ -402,8 +416,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         들어가며 잠긴다."""
         for i in range(TIERS):
             cells = w["rows"][(block, i)]
-            lock = on and row_complete(cells["spread"].get(), cells["qty"].get(),
-                                       cells["price"].get())
+            complete = row_complete(cells["spread"].get(), cells["qty"].get(),
+                                    cells["price"].get())
+            lock = row_locked(on, complete, (block, i) in w["fired"])
             for key in ("spread", "qty", "price"):
                 cells[key].config(state="disabled" if lock else "normal")
 
@@ -514,6 +529,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     w["px"][(block, i)].config(text="-" if px is None else f"{px:,.2f}")
             if live and time.time() > w["run_hold"].get(block, 0.0):
                 paint_run(block, bool(live.get(f"run_{block}")))  # 보류 뒤엔 코어 상태가 진실
+        fired = {(str(b), int(i)) for b, i in (live.get("fired_tiers") or [])}
+        if fired != w["fired"]:  # 발주된 단이 생기면 그 단의 입력을 푼다(사용자 2026-10-23)
+            w["fired"] = fired
+            for block in ("entry", "exit"):
+                if w["run_painted"].get(block):
+                    lock_rows(block, True)
         try:
             while True:
                 label, result = results.get_nowait()
@@ -525,8 +546,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     set_status(label)
         except queue.Empty:
             pass
+        # 발주 결과는 단 하나당 한 줄씩 이력에(사용자 2026-10-23 "하나씩만") — 새로 늘어난 결과만
+        results_now = list(live.get("results") or []) if live else []
+        seen = int(state_box.get("_results_seen", 0))
+        if len(results_now) < seen:  # 오늘 상태 초기화(개장 시각 변경·날짜 바뀜) → 처음부터
+            seen = 0
+        for r in results_now[seen:]:
+            show_status(f"발주 {live.get('fired_at') or ''} {results_summary([r])}".strip())
+        state_box["_results_seen"] = len(results_now)
         if time.time() > note["until"] and not preview:
-            status.config(text=status_text(live) if live else "코어 미연결", fg=T.C_MUTED)
+            show_status(status_text(live) if live else "코어 미연결")
         if main_closing():
             root.after(50, on_close)
             return
@@ -589,7 +618,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                                  before_close=before_close, skip_confirm=main_closing,
                                  describe_running=describe_running)
     if preview:
-        status.config(text="UI 미리보기 — 코어 미연결")
+        show_status("UI 미리보기 — 코어 미연결")
     root.after(150, refresh)
     root.mainloop()
 

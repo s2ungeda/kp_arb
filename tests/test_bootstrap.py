@@ -629,10 +629,11 @@ async def test_start_loads_snapshot_then_streams() -> None:
     assert system.order_book.order(oid) is not None
     await system.wait()  # 프레임 소진 → 정상 종료
 
-    # 구독 등록 확인: 시세(3종)+JIF+주식 체결통보 (선물 통보는 파생 WS 몫)
+    # 구독 등록 확인: 고정분(JIF+CUR+주식 체결통보)만 — 종목 시세는 계획(refresh_quote_plan, §9)이
+    # 등록하므로 계획 없이는 없다 (선물 통보는 파생 WS 몫)
     trs = {json.loads(m)["body"]["tr_cd"] for m in connector.conn.sent}
-    assert {"H1_", "UH1", "JIF", "SC0", "SC1"} <= trs  # NXT는 통합(UH1)로 수신
-    assert "O01" not in trs
+    assert {"JIF", "CUR", "SC0", "SC1"} <= trs
+    assert not trs & {"H1_", "UH1", "US3", "JH0"} and "O01" not in trs
 
 
 async def test_prices_seeded_before_subscribe() -> None:
@@ -1653,34 +1654,58 @@ def test_monitor_snapshot_merges_krx_nxt() -> None:
     assert stock["bid"] == 292_550 and stock["bid_qty"] == 30   # 매수: NXT가 높음
 
 
-def test_spread_csv_rows() -> None:
-    # 코어가 상시 기록하는 괴리 분포 CSV — 진입/청산이 있는 쌍만, 13열 고정.
-    from kp_arb.domain.enums import SessionPhase
-    from kp_arb.domain.models import Quote
-    from kp_arb.etf_theory import EtfTheoryInputs
+async def test_refresh_quote_plan_registers_only_plan_and_fx_on_deriv_channel() -> None:
+    # DESIGN-ls-xing §9(2026-10-23): 종목·월물 시세는 계획(refresh_quote_plan)으로만 등록 — 주식
+    # WS엔
+    # 주식·선물 TR, 원달러(FC9/YF9)는 선물 토큰 WS가 따로 있으면 그쪽. 옛 전부 등록(H1_/UH1/S3_…)은
+    # 없다. 다시 불러도 차이 없으면 아무것도 안 보낸다.
+    from kp_arb.quote_plan import QuotePlanInput
+
+    system, stock_conn, deriv_conn = _system([], deriv_frames=[])
+    system.futures_symbols[SAMSUNG] = "A116B000"
+    system.next_futures_symbols[SAMSUNG] = "A116C000"
+    inp = QuotePlanInput(symbols_on=frozenset({SAMSUNG}), stock_market={SAMSUNG: "nxt"},
+                         futures_codes={(SAMSUNG, "near"): "A116B000",
+                                        (SAMSUNG, "next"): "A116C000"},
+                         fx_code="A756B000")
+    wanted = await system.refresh_quote_plan(inp)
+    assert system.quote_plan == wanted and ("FC9", "A756B000") in wanted
+    await system.start()
+    await system.wait()
+    assert deriv_conn is not None
+    stock_trs = {json.loads(m)["body"]["tr_cd"] for m in stock_conn.conn.sent}
+    deriv_trs = {json.loads(m)["body"]["tr_cd"] for m in deriv_conn.conn.sent}
+    assert {"US3", "UYS", "NH1", "VI_", "JH0", "YJC", "JIF", "SC1", "CUR"} <= stock_trs
+    assert not stock_trs & {"H1_", "UH1", "S3_", "NS3", "YS3", "JC0", "FC9", "DC0", "S2_", "NS2"}
+    assert {"FC9", "YF9", "C01"} <= deriv_trs and "US3" not in deriv_trs
+    keys = {json.loads(m)["body"]["tr_key"] for m in stock_conn.conn.sent
+            if json.loads(m)["body"]["tr_cd"] == "JH0"}
+    assert keys == {"A116B000"}  # 근월물만(종목 상태가 차근을 안 고름)
+    # 선물 코드 대응은 구독과 무관하게 등록돼 있어 차근 프레임도 해석된다
+    assert system._stock_ws._futures_underlying["A116C000"] == (
+        SAMSUNG, Instrument.KR_STOCK_FUTURE_NEXT)
+
+
+async def test_stock_trade_mirrors_to_uni_from_exchange_split_stream() -> None:
+    # §9: 주식 체결은 US3 하나 — 거래소명으로 krx/nxt로 갈려 오고, "통틀어 마지막"(uni)은 어느
+    # 거래소든 가장 최근 체결. stock_last·이론가 기초가는 그대로 uni를 읽는다.
+    from kp_arb.gateways.ls_ws import TradeTick
 
     system, _, _ = _system([])
-    assert system._spread_csv_rows("09:00:00") == []  # 데이터 없으면 빈 목록
-
-    system.futures_symbols[SAMSUNG] = "A1167000"
-    system.futures_expiry[(SAMSUNG, Instrument.KR_STOCK_FUTURE)] = 202612
-    system.usdkrw_theory = 1_500.0
-    system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] = 300_000.0
-    system.stock_change_pct[(SAMSUNG, "krx")] = 0.0
-    system.session.seed_phase(SessionPhase.REGULAR)
-    system.etf_theory[SAMSUNG] = EtfTheoryInputs(prev_nav=20_000.0, leverage=2.0)
-    system.quotes[(SAMSUNG, Instrument.HL_PERP, "hl")] = Quote(
-        underlying=SAMSUNG, instrument=Instrument.HL_PERP,
-        bid=201.0, ask=202.0, ts=0.0, market="hl")
-    system.quotes[(SAMSUNG, Instrument.KR_STOCK_FUTURE, "krx")] = Quote(
-        underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
-        bid=301_000.0, ask=302_000.0, ts=0.0)
-
-    rows = system._spread_csv_rows("09:00:00")
-    assert rows, "진입/청산이 있으면 최소 한 줄"
-    sf = next(r for r in rows if r[2] == "SF")
-    assert sf[0] == "09:00:00" and sf[1] == SAMSUNG.value  # 시각·기초
-    assert len(sf) == 13  # time..kr_last_d 13열
+    system._wire()
+    fan = system._stock_ws.on_trade[-1]
+    fan(TradeTick(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, price=70_000.0, ts=0.0,
+                  market="krx", change_pct=0.5))
+    fan(TradeTick(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, price=70_100.0, ts=0.0,
+                  market="nxt"))
+    assert system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] == 70_000.0
+    assert system.trades[(SAMSUNG, Instrument.KR_STOCK, "nxt")] == 70_100.0
+    assert system.trades[(SAMSUNG, Instrument.KR_STOCK, "uni")] == 70_100.0
+    assert system.stock_last(SAMSUNG) == 70_100.0
+    assert system.stock_change_pct[(SAMSUNG, "krx")] == 0.5
+    fan(TradeTick(underlying=SAMSUNG, instrument=Instrument.HL_PERP, price=50.0, ts=0.0,
+                  market="hl"))
+    assert system.trades[(SAMSUNG, Instrument.KR_STOCK, "uni")] == 70_100.0  # HL은 안 섞임
 
 
 def test_daily_logs_keep_whole_day_and_roll_at_midnight() -> None:

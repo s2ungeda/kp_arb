@@ -89,5 +89,24 @@ def test_to_dict_shape() -> None:
     d = s.to_dict()
     assert d == {
         "venue": "LS", "name": "LS 시세", "kind": "시세",
-        "connected": True, "rx_count": 1, "disconnects": 0, "last_rx": 3.0,
+        "connected": True, "stalled": False, "rx_count": 1, "disconnects": 0, "stalls": 0,
+        "last_rx": 3.0,
     }
+
+
+def test_stall_blocks_orders_but_is_not_a_disconnect() -> None:
+    # 사용자 2026-10-23: COM 스레드 멈춤(처리 밀림)은 끊김이 아니다 — 접속은 유지, 주문은 막고,
+    # 끊김 알림(connected 전이)에는 안 걸린다
+    q = _quote()
+    q.on_connect()
+    q.on_message(10.0)
+    q.on_stall()
+    assert q.connected and q.stalled and q.stalls == 1 and not q.usable
+    assert q.is_stale(now=10.5, max_idle_s=5.0)  # 멈춘 동안은 시세 신뢰 불가
+    reason = order_block_reason([q], now=10.5, max_idle_s=5.0)
+    assert reason is not None and "멈춤" in reason and "끊김" not in reason
+    assert q.to_dict()["stalled"] is True and q.to_dict()["connected"] is True
+    q.on_resume()
+    assert q.usable and order_block_reason([q], now=11.0, max_idle_s=5.0) is None
+    assert q.disconnects == 0  # 끊김 누적은 안 올라간다
+

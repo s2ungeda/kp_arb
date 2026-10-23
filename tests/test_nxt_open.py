@@ -15,6 +15,7 @@ from kp_arb.nxt_open import (
     judge,
     level_price,
     order_price,
+    remaining_tiers,
     run_block_error,
     screen_from_dict,
     settings_from_dict,
@@ -109,6 +110,10 @@ def test_judge_sends_every_matching_tier_at_once_entry_first() -> None:
         ("entry", 2, Side.SELL, 100, 0.005)]
     # 1.05% → 2·3단만
     assert [p.index for p in judge(0.0105, None, st)] == [1, 2]
+    # 이미 나간 단은 뺀다(사용자 2026-10-23 "나간 세트만 멈춤") — 2단이 나갔으면 3단만
+    assert [p.index for p in judge(0.0105, None, st, {("entry", 1)})] == [2]
+    assert remaining_tiers(st, set()) == 6 and remaining_tiers(st, {("entry", 1)}) == 5
+    assert remaining_tiers(st, {(b, i) for b in ("entry", "exit") for i in range(3)}) == 0
     # 0.5% → 없음
     assert judge(0.005, 0.001, st) == []
     # 청산: −0.9% → 1·2단(−0.4·−0.8 이하), 3단(−1.0)은 아님 → HL 매수

@@ -736,6 +736,69 @@ async def test_expected_price_for_futures_and_etf() -> None:
     assert stock.price == 70_100 and stock.change_pct == -1.5  # 부호 5=하한 → 음수
 
 
+async def test_us3_exchange_name_and_fx_expected_parse() -> None:
+    # DESIGN-ls-xing §9(2026-10-23): US3 체결은 거래소명(exchname)으로 krx/nxt를 가른다(모르면 uni),
+    # YF9는 (코드, 예상체결가). 주식 호가는 H1_/NH1 그대로(읽는 칸만 xing 쪽에서 1호가로 제한).
+    us3_k = json.dumps({"header": {"tr_cd": "US3", "tr_key": f"U{SAMSUNG_CODE}   "},
+                        "body": {"shcode": SAMSUNG_CODE, "price": "70150", "chetime": "090001",
+                                 "exchname": "KRX", "drate": "0.5"}})
+    us3_n = json.dumps({"header": {"tr_cd": "US3", "tr_key": f"U{SAMSUNG_CODE}   "},
+                        "body": {"shcode": SAMSUNG_CODE, "price": "70160", "chetime": "090002",
+                                 "exchname": "NXT"}})
+    us3_x = json.dumps({"header": {"tr_cd": "US3", "tr_key": f"U{SAMSUNG_CODE}   "},
+                        "body": {"shcode": SAMSUNG_CODE, "price": "70170", "chetime": "090003",
+                                 "exchname": "???"}})
+    yf9 = json.dumps({"header": {"tr_cd": "YF9", "tr_key": "A756B000"},
+                      "body": {"futcode": "A756B000", "yeprice": "1380.5", "ychetime": "084500"}})
+    session = FakeConnection([us3_k, us3_n, us3_x, yf9])
+    client = LSWebSocketClient(FakeConnector([session]))
+    quotes: list[Quote] = []
+    trades = []
+    fx_expected: list[tuple[str, float]] = []
+    client.on_quote.append(quotes.append)
+    client.on_trade.append(trades.append)
+    client.on_fx_expected.append(lambda code, px: fx_expected.append((code, px)))
+
+    await client.run()
+
+    assert quotes == []
+    assert [(t.market, t.price) for t in trades] == [("krx", 70_150), ("nxt", 70_160),
+                                                     ("uni", 70_170)]
+    assert trades[0].change_pct == 0.5
+    assert fx_expected == [("A756B000", 1380.5)]
+
+
+async def test_apply_plan_sends_only_changes_and_keeps_fixed_subs() -> None:
+    # §9: apply_plan은 계획 범위(PLAN_TRS)만 맞춘다 — 고정분(JIF·통보·CUR)은 건드리지 않고,
+    # 접속 전엔 희망 목록만, 접속 중엔 추가는 등록(3)·빠진 것은 해제(4)를 바로 보낸다. 같은 계획을
+    # 다시 넣으면 아무것도 안 보낸다. FC9 코드 필터(_fx_codes)도 계획을 따른다.
+    session = FakeConnection([])
+    client = LSWebSocketClient(FakeConnector([session]))
+    client.subscribe_market_status()
+    client.subscribe_fills()
+    add, remove = await client.apply_plan([("US3", f"U{SAMSUNG_CODE}   "), ("H1_", SAMSUNG_CODE),
+                                           ("FC9", "A756B000")])
+    assert len(add) == 3 and remove == [] and session.sent == []  # 접속 전 — 전송 없음
+    assert client._fx_codes == {"A756B000"}
+    await client.run()  # 접속 → 전부 등록 뒤 스트림 종료
+    trs = [json.loads(m)["body"]["tr_cd"] for m in session.sent]
+    assert trs.count("JIF") == 1 and "US3" in trs and "H1_" in trs and "FC9" in trs
+    # 접속 중 계획 변경 — 거래소 KRX→NXT, 원달러 월물 교체
+    session.sent.clear()
+    client._conn = session
+    client.status.on_connect()
+    add, remove = await client.apply_plan([("US3", f"U{SAMSUNG_CODE}   "),
+                                           ("NH1", f"N{SAMSUNG_CODE}   "), ("FC9", "A756C000")])
+    sent = [json.loads(m) for m in session.sent]
+    assert [(m["body"]["tr_cd"], m["header"]["tr_type"]) for m in sent] == [
+        ("NH1", "3"), ("FC9", "3"), ("H1_", "4"), ("FC9", "4")]
+    assert sent[2]["body"]["tr_key"] == SAMSUNG_CODE and sent[3]["body"]["tr_key"] == "A756B000"
+    assert client._fx_codes == {"A756C000"}
+    assert [tr for tr, _k, _t in client._subs if tr in ("JIF", "SC1")] == ["JIF", "SC1"]
+    session.sent.clear()
+    assert await client.apply_plan(client.planned()) == ([], []) and session.sent == []
+
+
 async def test_token_provider_refreshes_on_reconnect() -> None:
     # 재연결마다 새 토큰으로 구독 — 토큰 만료(약 1일) 후 재접속 거부 방지.
     s1 = FakeConnection([quote_frame(), quote_frame()], fail_after=1)

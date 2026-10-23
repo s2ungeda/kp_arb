@@ -38,8 +38,10 @@ from .fx_auction import FxAuctionSettings
 from .hl_merge import merge_tick_options
 from .logs import DailyFileHandler
 from .manual_order import is_spot_stock, sellable_qty, short_sale_error
+from .quote_plan import QuotePlanInput
 from .routing import account_for
 from .strategy_core import (
+    QUOTE_SYMBOL_KEYS,
     Block,
     CoreState,
     ScreenKind,
@@ -81,6 +83,82 @@ STATE_PATH = _base_dir() / "core_state.json"
 # "한 화면 개수를 정하고 '이전' 버튼으로 이전 데이터를 가져오는 방식"). 그 이전은 GET /history.
 SNAPSHOT_PAGE = 200
 HISTORY_LIMIT_MAX = 1000
+
+
+# --- LS 실시간 구독 계획(DESIGN-ls-xing §9, 2026-10-23 "전략이 쓰는 시세만") ---
+
+def quote_plan_input(state: CoreState, system: Any) -> QuotePlanInput:
+    """설정·종목 상태 → 구독 계획 재료(순수). 종목 = 공통설정 체크, 주식 거래소 = 체결쏴 주식 종목
+    상태, 주식선물 월물 = 주식선물·HL선 종목 상태의 월물 합집합(없으면 근월물), 원달러 = 공통설정이
+    고른 월물. system에서는 선물 코드·원달러 코드만 읽는다(없으면 빈 값)."""
+    from .auto_m import book_key
+
+    on = frozenset(u for u in Underlying if state.settings.quote_symbols.get(u.value, False))
+    stock_market: dict[Underlying, str] = {}
+    months: dict[Underlying, frozenset[str]] = {}
+    for u in Underlying:
+        stock = state.autom.books.get(book_key(u, "stock"))
+        if stock is not None:
+            stock_market[u] = stock.market
+        used = {bk.future_month for product in ("sf", "sf_hl_first")
+                if (bk := state.autom.books.get(book_key(u, product))) is not None}
+        if used:
+            months[u] = frozenset(used)
+    codes: dict[tuple[Underlying, str], str] = {}
+    for u, code in (getattr(system, "futures_symbols", None) or {}).items():
+        codes[(u, "near")] = code
+    for u, code in (getattr(system, "next_futures_symbols", None) or {}).items():
+        codes[(u, "next")] = code
+    fx_fn = getattr(system, "fx_futures_code", None)
+    fx_code = fx_fn() if callable(fx_fn) else None
+    return QuotePlanInput(symbols_on=on, stock_market=stock_market, futures_codes=codes,
+                          futures_months=months, fx_code=fx_code if isinstance(fx_code, str)
+                          else None)
+
+
+async def sync_quote_plan(state: CoreState, system: Any) -> None:
+    """지금 설정대로 LS 구독을 맞춘다(차이만 등록·해제). 가짜 시스템(테스트)은 건너뜀."""
+    if system is None or not hasattr(system, "refresh_quote_plan"):
+        return
+    try:
+        await system.refresh_quote_plan(quote_plan_input(state, system))
+    except Exception:  # noqa: BLE001 - 구독 조정 실패로 명령 처리를 막지 않는다
+        logging.getLogger("kp_arb.core").exception("LS 구독 계획 적용 실패")
+
+
+async def quote_plan_loop(state: CoreState, system: Any, every_s: float = 2.0) -> None:
+    """설정·거래소·월물이 어디서 바뀌든(주문가능시간 구간의 거래소 전환은 엔진 안에서 바뀐다)
+    계획을 따라잡는 상시 루프 — 차이가 없으면 아무것도 안 한다."""
+    while True:
+        await asyncio.sleep(every_s)
+        await sync_quote_plan(state, system)
+
+
+def auto_check_target(payload: dict[str, Any]) -> Underlying | None:
+    """종목 자동 체크 대상 명령인가(§9, 사용자 2026-10-23 "적만 눌러도 체크돼야") — 자동M·NXT 개장
+    명령 중 종목(underlying)을 다루는 것 전부(적·설정·세트·월물·실행 켬). 실행 끔(value False)·
+    종목 없는 명령·종목 오류는 None. 화면이 그 종목을 보여 주려면 시세가 있어야 하므로 실행 전이라도
+    켠다."""
+    cmd = str(payload.get("cmd", ""))
+    if not (cmd.startswith("autom_") or cmd.startswith("nxt_open_")):
+        return None
+    if cmd.endswith("_run") and not payload.get("value"):
+        return None
+    try:
+        return Underlying(str(payload.get("underlying", "")))
+    except ValueError:
+        return None
+
+
+def ensure_quote_symbol(state: CoreState, u: Underlying, who: str) -> bool:
+    """전략 실행을 켤 때 그 종목이 구독 체크 안 돼 있으면 자동으로 켠다(§9 — 거부하지 않는다).
+    바꿨으면 True(저장·재등록 필요)."""
+    if state.settings.quote_symbols.get(u.value, False):
+        return False
+    state.settings.quote_symbols[u.value] = True
+    logging.getLogger("kp_arb.core").info(
+        "시세 구독 종목 %s 자동 켬 — %s 실행(DESIGN-ls-xing §9)", u.value, who)
+    return True
 
 
 def snapshot(state: CoreState) -> dict[str, Any]:
@@ -233,6 +311,11 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
             g.fx_futures_code = str(body.get("fx_futures_code", g.fx_futures_code)).strip()
             if "quote_probe" in body:  # 시세 원문 기록 켬/끔(기본 끔)
                 g.quote_probe = bool(body["quote_probe"])
+            qs = body.get("quote_symbols")  # 시세 구독 종목(DESIGN-ls-xing §9) — 모르는 키 무시
+            if isinstance(qs, dict):
+                for key in QUOTE_SYMBOL_KEYS:
+                    if key in qs:
+                        g.quote_symbols[key] = bool(qs[key])
             for name, snd in (("sound_fill", g.sound_fill),
                               ("sound_error", g.sound_error), ("sound_ws", g.sound_ws)):
                 raw = body.get(name)
@@ -1339,6 +1422,15 @@ def make_app(
                 {"ok": False, "errors": ["JSON 본문 필요"]}, status=400, dumps=_dumps)
         payload = body if isinstance(body, dict) else {}
         cmd = payload.get("cmd")
+
+        async def _auto_check_symbol(body_: dict[str, Any], who: str) -> None:
+            u = auto_check_target(body_)
+            if u is None:
+                return  # 종목 없음·실행 끔·종목 오류(명령 처리가 거부)
+            if ensure_quote_symbol(state, u, who) and save:
+                save()
+            await sync_quote_plan(state, system)  # 차이 없으면 아무것도 안 함
+
         # fx_auction_* 는 fx_* 보다 **먼저** 검사(둘 다 "fx_"로 시작 — 순서 중요).
         if isinstance(cmd, str) and (cmd.startswith("manual_")
                                      or cmd.startswith("fx_auction_")):
@@ -1350,6 +1442,7 @@ def make_app(
             result = _fx_command(fx_service, payload)
             return web.json_response(result, dumps=_dumps)
         if isinstance(cmd, str) and cmd.startswith("nxt_open_"):
+            await _auto_check_symbol(payload, "NXT 개장")
             result = _nxt_open_command(nxt_open, state, payload)
             if result.get("ok") and save:
                 save()  # 종목 설정 저장(실행 켜짐은 저장돼도 복원 안 함)
@@ -1363,11 +1456,14 @@ def make_app(
                     "자동M 명령 %s 세트 %s %s value=%s — 화면 전송 뒤 %.0fms", cmd,
                     payload.get("set", "-"), payload.get("block", "-"),
                     payload.get("value", "-"), lag_ms)
+            await _auto_check_symbol(payload, "자동M")
             result = await _autom_command(
                 {"sf": autom, "stock": autom_stock, "sf_hl_first": autom_hl_first}, state,
                 payload)
             if result.get("ok") and save:
                 save()  # 세트 설정·공통설정·RT 저장
+            if result.get("ok") and cmd in ("autom_month", "autom_settings"):
+                await sync_quote_plan(state, system)  # 월물·주문가능시간(거래소) 바뀜 → 구독 맞춤
             return web.json_response(result, dumps=_dumps)
         if (cmd == "settings_global" and system is not None
                 and hasattr(system, "next_month_allowed") and payload.get("fx_futures_code")):
@@ -1394,6 +1490,7 @@ def make_app(
             system.set_fx_futures_code(state.settings.fx_futures_code)
             if hasattr(system, "set_quote_probe"):
                 system.set_quote_probe(state.settings.quote_probe)  # 시세 원문 기록 즉시 반영
+            await sync_quote_plan(state, system)  # 구독 종목·원달러 월물 바뀜 → 등록·해제(§9)
         if payload.get("cmd") == "shutdown" and result.get("ok") and on_shutdown:
             # 응답을 먼저 보내고 잠시 뒤 종료 (화면이 결과를 받을 시간)
             asyncio.get_running_loop().call_later(0.2, on_shutdown)
@@ -1620,6 +1717,9 @@ async def _serve() -> None:
             nxt_open=nxt_open_engine),
             access_log=None)
         await runner.setup()
+        if system is not None:  # LS 구독 계획(§9) — 저장된 설정(종목 체크·월물)대로 등록
+            await sync_quote_plan(state, system)
+            tasks.append(asyncio.create_task(quote_plan_loop(state, system)))
         site = web.TCPSite(runner, HOST, DEFAULT_PORT)
         await site.start()
         log.info("코어 시동: http://%s:%s (안전종료는 메인 화면에서)", HOST, DEFAULT_PORT)

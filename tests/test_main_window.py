@@ -254,3 +254,18 @@ def test_live_instance_finds_running_screen_process() -> None:
     assert live_instance(launched[:2], "kp_arb.settings_window") is None
     assert live_instance([], "kp_arb.settings_window") is None
     assert _SINGLE_INSTANCE["kp_arb.settings_window"] == "공통설정"  # 창 제목으로 찾는다
+
+
+def test_ws_state_text_and_stall_is_not_a_disconnect_event() -> None:
+    # 사용자 2026-10-23: 스레드 멈춤(stalled)은 표에 "멈춤", 끊김 알림은 connected 전이에만
+    from kp_arb.main_window import ls_disconnect_events, ws_state_text
+
+    assert ws_state_text({"connected": True}) == "연결"
+    assert ws_state_text({"connected": True, "stalled": True}) == "멈춤"
+    assert ws_state_text({"connected": False, "stalled": True}) == "끊김"
+    prev: dict[str, bool] = {}
+    up = {"venue": "LS", "name": "LS xing", "connected": True}
+    assert ls_disconnect_events(prev, [up]) == []
+    assert ls_disconnect_events(prev, [{**up, "stalled": True}]) == []   # 멈춤 — 알림 없음
+    assert ls_disconnect_events(prev, [{**up, "connected": False}]) == ["LS xing"]
+

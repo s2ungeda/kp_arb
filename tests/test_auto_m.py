@@ -23,10 +23,11 @@ from kp_arb.auto_m import (
     parse_hms,
     pre_order_price,
     rel_quote,
+    rel_quote_by_tick,
     release_halt,
     set_running,
 )
-from kp_arb.domain.enums import Side, Underlying
+from kp_arb.domain.enums import Instrument, Side, Underlying
 from kp_arb.strategy_core import Block
 
 U = Underlying.SK_HYNIX
@@ -60,6 +61,12 @@ def test_pure_pieces_match_exec_example() -> None:
     assert pre_order_price(Side.SELL, 200_000, 0.01, 0.005, 3000) == 201_000  # 매도는 올림
     assert pre_order_price(Side.SELL, 200_000, 0.011, 0.005, 3000) == 204_000
     assert rel_quote([(100.0, 1), (102.0, 1), (105.0, 1)], 2) == 102 and rel_quote([], 1) is None
+    # 국내 상대 N호가 = 1호가 ± (N−1)×시세 호가단위(§6.3 개정 2026-10-23 — LS 호가는 1호가만)
+    assert rel_quote_by_tick(201_500.0, 1, Instrument.KR_STOCK_FUTURE, Side.BUY) == 201_500
+    assert rel_quote_by_tick(201_500.0, 3, Instrument.KR_STOCK_FUTURE, Side.BUY) == 202_500
+    assert rel_quote_by_tick(198_500.0, 2, Instrument.KR_STOCK_FUTURE, Side.SELL) == 198_000
+    assert rel_quote_by_tick(70_000.0, 2, Instrument.KR_STOCK, Side.BUY) == 70_100  # 주식 100원
+    assert rel_quote_by_tick(None, 2, Instrument.KR_STOCK, Side.BUY) is None
     assert order_qty(Block.ENTRY, 10, 100, 95) == 5 and order_qty(Block.ENTRY, 10, 100, 100) == 0
     assert order_qty(Block.EXIT, 10, 100, 3) == 3
     # 역방향(§7A·§7B): RT는 0 또는 음수, 진입 Min(1회, 목표−(RT×−1)) / 청산 Min(1회, RT×−1)

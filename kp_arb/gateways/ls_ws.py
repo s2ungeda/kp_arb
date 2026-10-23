@@ -23,7 +23,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from typing import Any, Protocol
 
 from pydantic import BaseModel
@@ -38,12 +38,18 @@ _LOG = logging.getLogger("kp_arb.ls_ws")
 QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1", "UH1"})  # KRX/NXT/통합 호가
 FUTURES_QUOTE_TR = "JH0"   # 주식선물 호가 (body 필드는 H1_와 동일 가정 — 장중 실확인 예정)
 STOCK_TRADE_TRS: tuple[str, ...] = ("S3_", "NS3", "US3")  # 체결: KRX/NXT/통합
+# 종목·월물에 따라 바뀌는 시세 TR — apply_plan(§9)이 다루는 범위. 종목과 무관한 CUR·JIF·통보는 밖.
+# 주식 호가는 체결쏴 주식이 고른 거래소 하나(H1_ | NH1)만 — 읽는 칸은 xing_com.REAL_FIELD_LIMIT가
+# 1호가로 제한.
+PLAN_TRS: frozenset[str] = frozenset({"US3", "UYS", "H1_", "NH1", "VI_", "JH0", "YJC", "FC9",
+                                      "YF9"})
 FUTURES_TRADE_TR = "JC0"   # 주식선물 체결 (동일 가정)
 # 통화(원달러)선물 체결 — 명목상 "KOSPI200선물" TR이지만 tr_key에 USD선물 단축코드를 넣어 공용.
 # 구 FC0/FH0는 **2026-06-23 폐지**(LS 공식 답변) → 등록하면 rsp_cd 10002 거부.
 # 주간(08:45~15:45) FC9(체결)/FH9(호가)/YF9(예상), 야간 KRX파생(18:00~06:00) DC0/DH0/DYC.
 # (사용자 제공 정리표, 2026-09-03)
 FX_TRADE_TR = "FC9"          # 주간 통화선물 체결
+FX_EXPECTED_TR = "YF9"       # 주간 통화선물 예상체결(동시호가 주문 — DESIGN-auction-order)
 FX_NIGHT_TRADE_TR = "DC0"    # 야간 KRX파생 체결(같은 단축코드)
 FX_SPOT_TR = "CUR"         # 원달러 현물환율 실시간(투자정보)
 # CUR tr_key — LS 문서(현물정보USD실시간): tr_key Length 8, 샘플 "USD     "(USD+공백 패딩).
@@ -98,6 +104,11 @@ def _unified_key(code: str) -> str:
 def _nxt_key(code: str) -> str:
     """NXT 전용 TR(NH1/NS3) 구독 키 — "N"+6자리코드+공백3(LS 카탈로그 예시 "N000880   ")."""
     return f"N{code}   "
+
+
+def _subs_text(subs: Iterable[tuple[str, str]]) -> str:
+    """로그용 — "US3/'U005930   ', JH0/'A116B000'"."""
+    return ", ".join(f"{tr}/{key!r}" if key else tr for tr, key in subs)
 
 
 def _norm_code(raw: str) -> str:
@@ -292,6 +303,11 @@ class LSWebSocketClient:
         # 통화선물 1호가 — (월물코드, 매수1호가, 매도1호가). 자동M 환진입가(§9a)용.
         self.on_fx_quote: list[Callable[[str, float, float], None]] = []
         self.on_fx_spot: list[Callable[[float], None]] = []  # 원달러 현물환율(원/달러) 실시간
+        self.on_fx_expected: list[Callable[[str, float], None]] = []  # (코드, 예상체결가) YF9
+        # 구독 등록 전송과 계획 변경(apply_plan)이 겹치지 않게 — 접속 직후 전체 등록 중에 계획이
+        # 바뀌면 해제할 것을 등록 뒤에 해제하도록 순서를 지킨다(§9)
+        self._sub_lock = asyncio.Lock()
+        self._exchname_unknown_logged = False
         self.on_vi: list[Callable[[ViEvent], None]] = []  # 종목 VI 발동/해제(체결쏴 주식 정지)
         self._fx_codes: set[str] = set()
         self.on_raw: list[Callable[[str], None]] = []  # 진단: 모든 원시 프레임
@@ -325,6 +341,55 @@ class LSWebSocketClient:
             self._add(FUTURES_QUOTE_TR, code)
             self._add(FUTURES_TRADE_TR, code)
             self._add("YJC", code)
+
+    def register_futures_codes(
+        self, symbols: Mapping[Underlying, str],
+        instrument: Instrument = Instrument.KR_STOCK_FUTURE,
+    ) -> None:
+        """주식선물 코드 → (종목, 근/차근) 대응만 등록(구독 없음). 프레임 해석(JH0/YJC)에 필요하고
+        실제 등록은 apply_plan(§9)이 월물 선택에 따라 한다."""
+        for underlying, code in symbols.items():
+            self._futures_underlying[code] = (underlying, instrument)
+
+    def planned(self) -> list[tuple[str, str]]:
+        """지금 등록(희망) 중인 계획 범위(PLAN_TRS)의 (TR, 키) — 순서 유지."""
+        return [(tr, key) for tr, key, _t in self._subs if tr in PLAN_TRS]
+
+    async def apply_plan(self, wanted: Iterable[tuple[str, str]]) -> tuple[
+            list[tuple[str, str]], list[tuple[str, str]]]:
+        """구독 계획 적용(DESIGN-ls-xing §9) — 계획 범위(PLAN_TRS)의 (TR, 키)를 wanted로 맞춘다.
+
+        차이만 등록·해제: 접속 중이면 바로 보내고(WS는 tr_type 3/4, xing은 advise/unadvise), 접속
+        전이면 희망 목록만 바꿔 접속 때 한꺼번에 나간다. 돌려주는 값 = (추가, 해제).
+        """
+        from ..quote_plan import plan_diff
+
+        async with self._sub_lock:
+            want = list(wanted)
+            add, remove = plan_diff(self.planned(), want)
+            gone = set(remove)
+            self._subs = [sub for sub in self._subs
+                          if not (sub[0] in PLAN_TRS and (sub[0], sub[1]) in gone)]
+            for tr, key in add:
+                self._add(tr, key)
+            self._fx_codes = {key for tr, key, _t in self._subs if tr == FX_TRADE_TR}
+            if add or remove:
+                _LOG.info("%s 구독 계획 — 등록 %d건 %s / 해제 %d건 %s (계획 %d건)",
+                          self.status.name, len(add), _subs_text(add) or "-", len(remove),
+                          _subs_text(remove) or "-", len(want))
+                await self._send_plan_changes(add, remove)
+        return add, remove
+
+    async def _send_plan_changes(self, add: list[tuple[str, str]],
+                                 remove: list[tuple[str, str]]) -> None:
+        """접속 중이면 변경분을 바로 전송(WS: 등록 3 / 해제 4). 접속 전이면 아무것도 안 한다."""
+        conn = self._conn
+        if conn is None or not self.status.connected:
+            return
+        for tr, key in add:
+            await conn.send(self._register_msg(tr, key, "3"))
+        for tr, key in remove:
+            await conn.send(self._register_msg(tr, key, "4"))
 
     def subscribe_fx(self, code: str) -> None:
         """통화선물(원달러) 체결 구독 → on_fx_price. 환율이론가 계산용 (DESIGN §6.1)."""
@@ -453,6 +518,10 @@ class LSWebSocketClient:
                 return
 
     async def _resubscribe(self, conn: WSConnection) -> None:
+        async with self._sub_lock:
+            await self._register_all(conn)
+
+    async def _register_all(self, conn: WSConnection) -> None:
         self._ack_ok = 0  # 접속마다 응답 수 다시 셈
         for tr_cd, tr_key, tr_type in self._subs:
             await conn.send(self._register_msg(tr_cd, tr_key, tr_type))
@@ -565,6 +634,11 @@ class LSWebSocketClient:
                 if fxq is not None:
                     for fx_quote_handler in self.on_fx_quote:
                         fx_quote_handler(fx[0], *fxq)
+        elif tr_cd == FX_EXPECTED_TR:
+            fxe = self._parse_fx_expected(msg)
+            if fxe is not None:
+                for fx_expected_handler in self.on_fx_expected:
+                    fx_expected_handler(*fxe)
         elif tr_cd == FX_SPOT_TR:
             spot = self._parse_fx_spot(msg)
             if spot is not None:
@@ -627,6 +701,30 @@ class LSWebSocketClient:
         except (KeyError, TypeError, ValueError):
             return None
         return (bid, ask) if bid > 0 and ask > 0 else None
+
+    def _parse_fx_expected(self, msg: dict[str, Any]) -> tuple[str, float] | None:
+        """YF9(원달러선물 예상체결) body → (코드, 예상체결가). Res 실측: yeprice/futcode."""
+        body = msg.get("body") or {}
+        code = str(body.get("futcode") or body.get("shcode")
+                   or msg.get("header", {}).get("tr_key", "")).strip()
+        try:
+            price = float(body["yeprice"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return (code, price) if code and price > 0 else None
+
+    def _market_of_exchname(self, raw: object) -> str:
+        """US3 거래소명(exchname) → "krx"|"nxt". 모르는 값은 "uni"(한 번만 경고) — §9."""
+        name = str(raw or "").strip().upper()
+        if "NXT" in name or "넥스트" in name:
+            return "nxt"
+        if "KRX" in name or "한국" in name:
+            return "krx"
+        if not self._exchname_unknown_logged:
+            self._exchname_unknown_logged = True
+            _LOG.warning("%s US3 거래소명(exchname) 해석 불가 %r — 통합(uni)으로 둔다",
+                         self.status.name, raw)
+        return "uni"
 
     def _parse_quote(self, msg: dict[str, Any]) -> Quote | None:
         body = msg["body"]
@@ -703,7 +801,9 @@ class LSWebSocketClient:
             return TradeTick(underlying=underlying, instrument=instrument,
                              price=float(body["price"]),
                              ts=float(body.get("chetime", 0) or 0),
-                             market={"NS3": "nxt", "US3": "uni"}.get(tr_cd, "krx"),
+                             market=(self._market_of_exchname(body.get("exchname"))
+                                     if tr_cd == "US3" else
+                                     {"NS3": "nxt"}.get(tr_cd, "krx")),
                              change_pct=float(drate) if drate not in (None, "") else None)
         except ValueError:
             return None

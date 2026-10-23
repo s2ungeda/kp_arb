@@ -24,6 +24,11 @@ class WsStatus:
     last_rx: float | None = None   # 마지막 수신 시각(주입된 단조시계)
     connects: int = 0              # 연결 성공 누적
     disconnects: int = 0           # 끊김 누적
+    # 처리 멈춤(xing COM 스레드 심장박동 끊김) — 접속은 살아 있지만 조회·주문·실시간이 밀리는 상태.
+    # 끊김(connected=False)과 구분한다(사용자 2026-10-23 "LS 끊김 팝업은 진짜 통신이 끊겼을 때만").
+    # 주문 차단·자동M 대기에는 끊김과 똑같이 걸리고, 끊김 알림(팝업·텔레그램·소리)에는 안 걸린다.
+    stalled: bool = False
+    stalls: int = 0                # 멈춤 누적
 
     def on_connect(self) -> None:
         self.connected = True
@@ -33,6 +38,18 @@ class WsStatus:
         self.connected = False
         self.disconnects += 1
 
+    def on_stall(self) -> None:
+        self.stalled = True
+        self.stalls += 1
+
+    def on_resume(self) -> None:
+        self.stalled = False
+
+    @property
+    def usable(self) -> bool:
+        """연결돼 있고 멈추지도 않음 — 주문·자동M이 보는 '살아 있음'."""
+        return self.connected and not self.stalled
+
     def on_message(self, now: float) -> None:
         self.rx_count += 1
         self.last_rx = now
@@ -40,7 +57,7 @@ class WsStatus:
     def is_stale(self, now: float, max_idle_s: float) -> bool:
         """무데이터/끊김이면 True(주문 내면 위험). 주문 피드는 무데이터가 정상이라
         연결 여부만 본다 — 체결이 없어도 끊긴 게 아니다."""
-        if not self.connected:
+        if not self.usable:
             return True
         if not self.expects_stream:
             return False
@@ -55,8 +72,10 @@ class WsStatus:
             "name": self.name,
             "kind": self.kind,
             "connected": self.connected,
+            "stalled": self.stalled,
             "rx_count": self.rx_count,
             "disconnects": self.disconnects,
+            "stalls": self.stalls,
             "last_rx": self.last_rx,
         }
 
@@ -67,16 +86,19 @@ def order_block_reason(
     """주문을 막아야 하면 그 사유(문자열), 괜찮으면 None (Phase 8-6 주문 안전차단).
 
     - 채널이 하나도 없으면(접속 전) 막는다.
-    - 끊긴 채널이 있으면 막는다(하나라도).
+    - 끊긴 채널이 있으면 막는다(하나라도). 처리 멈춤(COM 스레드) 채널도 막는다 — 사유는 따로.
     - 시세 채널이 무데이터(N초 초과)면 막는다 — 데이터 없이 발주는 위험.
-    끊김과 지연을 구분해 사유를 돌려준다(로그·알림·화면 표시용).
+    끊김·멈춤·지연을 구분해 사유를 돌려준다(로그·알림·화면 표시용).
     """
     if not statuses:
         return "WS 미접속"
     down = [s.name for s in statuses if not s.connected]
     if down:
         return f"WS 끊김: {', '.join(down)}"
-    stale = [s.name for s in statuses if s.connected and s.is_stale(now, max_idle_s)]
+    stalled = [s.name for s in statuses if s.stalled]
+    if stalled:
+        return f"처리 멈춤(COM 스레드): {', '.join(stalled)}"
+    stale = [s.name for s in statuses if s.usable and s.is_stale(now, max_idle_s)]
     if stale:
         return f"시세 지연(무데이터 {max_idle_s:.0f}s+): {', '.join(stale)}"
     return None

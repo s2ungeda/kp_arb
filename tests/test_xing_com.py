@@ -11,11 +11,13 @@ import pytest
 from kp_arb.gateways.xing_com import (
     LANE_ORDER,
     LANE_QUERY,
+    REAL_FIELD_LIMIT,
     QueryResult,
     XingError,
     XingSession,
     XingTimeout,
     is_ok_code,
+    slow_iteration_text,
 )
 
 T1102 = ("BEGIN_FUNCTION_MAP\n.Func,현재가,t1102,attr;\nBEGIN_DATA_MAP\n"
@@ -34,6 +36,13 @@ CFOAT = ("BEGIN_FUNCTION_MAP\n.Func,선물주문,CFOAT00100,attr;\nBEGIN_DATA_MA
 H1 = ("BEGIN_FUNCTION_MAP\n.Func,호가,H1_,attr;\nBEGIN_DATA_MAP\nH1_InBlock,입력,input;\nbegin\n"
       "단축코드,shcode,shcode,char,6;\nend\nH1_OutBlock,출력,output;\nbegin\n"
       "종목코드,shcode,shcode,char,6;\n매수1,bidho1,bidho1,long,8;\nend\nEND_DATA_MAP\nEND_FUNCTION_MAP\n")
+JH0 = ("BEGIN_FUNCTION_MAP\n.Func,주식선물호가,JH0,attr;\nBEGIN_DATA_MAP\n"
+       "JH0_InBlock,입력,input;\nbegin\n단축코드,futcode,futcode,char,8;\nend\n"
+       "JH0_OutBlock,출력,output;\nbegin\n종목코드,futcode,futcode,char,8;\n"
+       "호가시간,hotime,hotime,char,6;\n매도1,offerho1,offerho1,double,8;\n"
+       "매수1,bidho1,bidho1,double,8;\n매도잔량1,offerrem1,offerrem1,long,8;\n"
+       "매수잔량1,bidrem1,bidrem1,long,8;\n매도2,offerho2,offerho2,double,8;\n"
+       "총매도잔량,totofferrem,totofferrem,long,8;\nend\nEND_DATA_MAP\nEND_FUNCTION_MAP\n\n")
 
 
 class FakeWaker:
@@ -145,6 +154,7 @@ class FakeReal:
         self.fac = fac
         self.keys: list[tuple[str, str, str]] = []
         self.advised = 0
+        self.unadvised: list[str] = []
         self.fields: dict[str, str] = {}
 
     def SetFieldData(self, block: str, fld: str, v: str) -> None:  # noqa: N802
@@ -155,6 +165,9 @@ class FakeReal:
 
     def UnadviseRealData(self) -> None:  # noqa: N802
         self.advised = 0
+
+    def UnadviseRealDataWithKey(self, key: str) -> None:  # noqa: N802
+        self.unadvised.append(key)
 
     def GetFieldData(self, block: str, fld: str) -> str:  # noqa: N802
         return self.fields.get(fld, "")
@@ -202,7 +215,8 @@ class FakeFactory:
 
 @pytest.fixture
 def res_dir(tmp_path: Path) -> Path:
-    for name, text in (("t1102", T1102), ("t0441", T0441), ("CFOAT00100", CFOAT), ("H1_", H1)):
+    for name, text in (("t1102", T1102), ("t0441", T0441), ("CFOAT00100", CFOAT), ("H1_", H1),
+                       ("JH0", JH0)):
         (tmp_path / f"{name}.res").write_bytes(text.encode("cp949"))
     return tmp_path
 
@@ -333,6 +347,39 @@ async def test_realtime_advise_and_event_to_asyncio(res_dir: Path) -> None:
         s.close()
 
 
+async def test_unadvise_one_key_and_jh0_reads_only_first_level(res_dir: Path) -> None:
+    # DESIGN-ls-xing §9(2026-10-23): 구독 계획이 바뀌면 키 하나만 해제(UnadviseRealDataWithKey),
+    # 안 등록한 키는 무시. JH0는 68칸 중 1호가 여섯 칸만 GetFieldData(COM 호출 절감).
+    s, fac = await _session(res_dir)
+    got: list[dict[str, str]] = []
+    s.on_real.append(lambda tr, key, f: got.append(f))
+    try:
+        await s.advise("JH0", "A116B000")
+        await s.advise("JH0", "A116C000")
+        r = fac._last_real
+        await s.unadvise("JH0", "A116C000")
+        await s.unadvise("JH0", "A999X000")  # 등록 안 한 키 — 아무것도 안 함
+        assert r.unadvised == ["A116C000"] and r.advised == 2
+        await s.advise("JH0", "A116C000")  # 해제한 키는 다시 등록된다
+        assert r.advised == 3
+        r.fields = {"futcode": "A116B000", "hotime": "090000", "offerho1": "301000",
+                    "bidho1": "300500", "offerrem1": "3", "bidrem1": "5",
+                    "offerho2": "301500", "totofferrem": "999"}
+        s._call(lambda: r.sink("real", "JH0"))
+        for _ in range(50):
+            if got:
+                break
+            await asyncio.sleep(0.01)
+        assert got == [{"futcode": "A116B000", "hotime": "090000", "offerho1": "301000",
+                        "bidho1": "300500", "offerrem1": "3", "bidrem1": "5"}]
+        # 주식 호가 H1_도 같은 제한(사용자 2026-10-23 "3" — 우선호가 대신 H1_/NH1, 1호가 칸만)
+        assert "H1_" in REAL_FIELD_LIMIT and "NH1" in REAL_FIELD_LIMIT
+        assert {"shcode", "ex_shcode", "hotime", "offerho1", "bidho1"} <= REAL_FIELD_LIMIT["NH1"]
+        assert "offerho2" not in REAL_FIELD_LIMIT["H1_"]
+    finally:
+        s.close()
+
+
 async def test_disconnect_clears_realtime_keys_so_relogin_readvises(res_dir: Path) -> None:
     # 검토 2026-10-13 ★5: 끊김(disconnect/logout) 뒤 재로그인하면 _advise_all이 같은 키를 다시
     # advise하는데,
@@ -358,3 +405,29 @@ async def test_disconnect_clears_realtime_keys_so_relogin_readvises(res_dir: Pat
         assert r.advised == 4 and r.ResFileName.endswith("H1_.res")
     finally:
         s.close()
+
+
+def test_slow_iteration_text_lists_top_kinds() -> None:
+    # COM 스레드 한 바퀴 진단 글(사용자 2026-10-23 "스레드가 왜 멈춘 거지") — 종류별 많은 순
+    text = slow_iteration_text(10.2, 9.9, {"JH0": 480, "US3": 700, "order응답": 6}, 0.3, 4, 2)
+    assert text == ("xing COM 스레드 한 바퀴 10.20s — 펌프 9.90s 이벤트 1186건"
+                    "(US3 700, JH0 480, order응답 6) 명령 0.30s 4개, 남은 명령 2개")
+    assert "이벤트 0건(없음)" in slow_iteration_text(1.5, 1.5, {}, 0.0, 0, 0)
+
+
+def test_note_iteration_warns_only_when_slow_and_rate_limited(
+    res_dir: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    s = XingSession(FakeFactory(), res_dir)
+    with caplog.at_level("WARNING", logger="kp_arb.xing"):
+        s._iter_counts.update({"JH0": 3})
+        s._note_iteration(0.0, 0.2, 0.3, 1)        # 0.3s — 정상
+        assert not caplog.records
+        s._note_iteration(0.0, 1.4, 1.6, 2)        # 1.6s — 경고
+        assert len(caplog.records) == 1 and "한 바퀴 1.60s" in caplog.records[0].message
+        msg = caplog.records[0].message
+        assert "JH0 3" in msg and "명령 0.20s 2개" in msg
+        s._note_iteration(2.0, 3.5, 4.0, 0)        # 느리지만 5초 안 — 경고 생략
+        assert len(caplog.records) == 1
+        s._note_iteration(7.0, 8.5, 9.0, 0)        # 5초 지남 — 다시 경고
+        assert len(caplog.records) == 2

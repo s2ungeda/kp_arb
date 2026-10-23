@@ -279,9 +279,18 @@ def _restart_step(
     return "restart"
 
 
+def ws_state_text(row: dict[str, Any]) -> str:
+    """채널 표의 상태 글 — 끊김 / 멈춤(접속은 살아 있는데 COM 스레드가 안 돎, 사용자 2026-10-23) /
+    연결. 순수."""
+    if not row.get("connected"):
+        return "끊김"
+    return "멈춤" if row.get("stalled") else "연결"
+
+
 def ls_disconnect_events(prev: dict[str, bool], rows: list[dict[str, Any]]) -> list[str]:
     """/state WS 현황에서 **LS(xing) 채널이 연결→끊김**으로 바뀐 이름 목록(순수, DESIGN-settings
-    §2a).
+    §2a). 처리 멈춤(`stalled`)은 끊김이 아니라 알리지 않는다(사용자 2026-10-23 "진짜 통신이 끊겼을
+    때만") — 세션의 접속 끊김 이벤트로 connected가 False가 될 때만.
     prev(이름 → 마지막 연결 여부)는 제자리 갱신. 첫 관측·HL 채널·끊김→연결은 알리지 않는다."""
     out: list[str] = []
     for row in rows:
@@ -748,7 +757,7 @@ def main() -> None:
         rows = list(alive_box.get("ws") or []) + [{  # 마지막 줄: 코어↔메인 실시간 채널
             "venue": "코어", "name": "메인 채널", "connected": mw["connected"],
             "rx_count": mw["rx"], "disconnects": mw["disconnects"]}]
-        sig = tuple((r.get("name"), r.get("connected"), r.get("rx_count"),
+        sig = tuple((r.get("name"), r.get("connected"), r.get("stalled"), r.get("rx_count"),
                      r.get("disconnects")) for r in rows)
         if sig == ws_box["sig"]:  # 변화 없으면 다시 그리지 않음(깜빡임 방지)
             return
@@ -758,8 +767,7 @@ def main() -> None:
             up = bool(r.get("connected"))
             name = f"{r.get('name')}({int(r.get('disconnects') or 0)})"  # 0도 표시(사용자)
             ws_tree.insert("", "end", tags=("up" if up else "down",), values=(
-                i, r.get("venue"), name, "연결" if up else "끊김",
-                f"{r.get('rx_count', 0):,}"))
+                i, r.get("venue"), name, ws_state_text(r), f"{r.get('rx_count', 0):,}"))
 
     def restore_layout() -> None:
         """화면 구성 되돌리기 — ui_state 세대(최대 5)를 골라 그 화면들을 다시 연다."""

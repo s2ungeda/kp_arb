@@ -397,6 +397,33 @@ def set_inputs_sig(book: dict[str, Any]) -> str:
     return json.dumps(sorted((f"{d}:{i}", s) for (d, i), s in sigs.items())) if sigs else ""
 
 
+STALL_TEXT = "LS 처리 멈춤 — 자동M 주문 안 냄(풀리면 재개)"
+RESUME_TEXT = "LS 처리 재개 — 자동M 주문 다시 냄"
+RESUME_SHOW_S = 5.0
+
+
+def ls_stalled(rows: Sequence[Mapping[str, Any]]) -> bool:
+    """/state 채널 현황에서 LS 채널이 '처리 멈춤'(접속은 살아 있는데 COM 스레드가 안 돎)인가.
+    체결쏴 상태줄 알림용(사용자 2026-10-23 "처리 지연이면 자동M 주문이 안 나간다는 걸 사용자가
+    알아야"). 끊김(connected False)은 다른 길(메인 끊김 알림)이 다룬다. 순수."""
+    return any(str(r.get("venue")) == "LS" and bool(r.get("connected")) and bool(r.get("stalled"))
+               for r in rows)
+
+
+def stall_notice(box: dict[str, Any], stalled: bool, now: float) -> tuple[str, str] | None:
+    """상태줄에 띄울 (글, 글자색) — 멈춘 동안은 빨간 STALL_TEXT, 풀린 뒤 RESUME_SHOW_S초는 초록
+    RESUME_TEXT, 그 밖엔 None(보통 상태줄). box에 멈춤 여부·재개 표시 시각을 든다. 순수."""
+    was = bool(box.get("_ls_stalled"))
+    box["_ls_stalled"] = stalled
+    if stalled:
+        return STALL_TEXT, "red"
+    if was:
+        box["_resume_until"] = now + RESUME_SHOW_S
+    if now < float(box.get("_resume_until", 0.0)):
+        return RESUME_TEXT, "dark green"
+    return None
+
+
 def run_gate_error(applied: bool) -> str | None:
     """실행 켜도 되는가(exec 결정 86, 2026-10-21) — 이 종목에 '적'을 눌렀어야 한다. 모니터 수치
     유무는 보지 않는다(장 전엔 시세가 없어 "-"라 미리 켜 둘 수 없었음 — 옛 결정 44). 수치가 없어도
@@ -1639,23 +1666,24 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                     n_lbl.config(text=comp)
                     v_lbl.config(text=acc_sample.get(comp, "-"))
 
-    # width=1: 상태줄 글이 길어도(중지 사유 등) 창 폭을 밀어 키우지 않게 — 라벨이 요구하는 폭을
-    # 1글자로 두고 pack(fill="x")로 창 폭만큼만 보인다(넘치는 글은 잘림, 전문은 로그에). 09-08.
+    # 상태줄 = 읽기 전용 콤보(사용자 2026-10-23, NXT 개장 화면과 같음 — ui_status.StatusCombo): 최신
+    # 글을 보여 주고 펼치면 지난 글 50건. width=1 + 가로 채움이라 긴 글(중지 사유 등)이 창 폭을 밀어
+    # 키우지 않는다(09-08). 옛 더블클릭 전문 힌트(09-15)는 펼침 목록이 대신한다.
+    from .ui_status import StatusCombo
+
     status_text = "UI 미리보기 — 코어 미연결" if preview else "코어 확인 중 ..."
     last_tag, last_rows = spec.directions[-1][0], rows_by[spec.directions[-1][0]]
     if last_rows < 3:
         # 마지막 방향의 세트가 3줄 미만이면 매매결과 블록 옆 빈 줄에 상태줄을 넣어 창 높이를 아낀다
         # (사용자 2026-09-15, 역방향 2세트 배치). 세트 컬럼(0~10) 폭만 차지.
-        status = tk.Label(board, anchor="w", relief="groove", width=1, text=status_text)
-        status.grid(row=rbase + 2 + last_rows, column=0, columnspan=11, sticky="ew",
-                    padx=1, pady=(3, 1))
+        status_box = StatusCombo(board, T.FONT_LABEL)
+        status_box.widget.grid(row=rbase + 2 + last_rows, column=0, columnspan=11, sticky="ew",
+                               padx=1, pady=(3, 1))
     else:
-        status = tk.Label(root, anchor="w", relief="groove", width=1, text=status_text)
-        status.pack(fill="x", padx=4, pady=(2, 4))
+        status_box = StatusCombo(root, T.FONT_LABEL)
+        status_box.widget.pack(fill="x", padx=4, pady=(2, 4))
+    status_box.show(status_text)
     del last_tag
-    from .ui_dialog import attach_full_text_popup
-
-    attach_full_text_popup(status, root)  # 더블클릭 → 잘린 상태줄 전문을 힌트 창으로(2026-09-15)
     refresh_windows_bar()  # 상단 주문가능시간 표시 초기화
 
     def _book_key() -> str:
@@ -1681,7 +1709,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                    for d in dirs for r in _live_sets(d))
 
     def _set_status(text: str) -> None:
-        status.config(text=text)
+        status_box.show(text)
 
     def _save_sets_on_close() -> None:
         """닫을 때 세트 행 값을 코어에(결정 82, 사용자 2026-10-16 "메인창 닫을 때 저장하자 —
@@ -1831,11 +1859,11 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             while True:
                 label, result = results.get_nowait()
                 if result is None:
-                    status.config(text=f"{label} 실패 — 코어 미접속")
+                    status_box.show(f"{label} 실패 — 코어 미접속")
                 elif not result.get("ok"):
-                    status.config(text=f"{label} 거부 — {'; '.join(result.get('errors', []))}")
+                    status_box.show(f"{label} 거부 — {'; '.join(result.get('errors', []))}")
                 else:
-                    status.config(text=f"{label}됨")
+                    status_box.show(f"{label}됨")
         except queue.Empty:
             pass
         _reschedule(drain, 200)
@@ -2232,7 +2260,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             seen = state_box.get("_detail_seen") or {}
             when = {text: t for text, t in seen.values()}
             details.sort(key=lambda d: when.get(d, 0.0), reverse=True)
-            status.config(text=" / ".join(details))
+            status_box.show(" / ".join(details))
 
     def refresh() -> None:
         try:
@@ -2249,9 +2277,18 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             if not connected:
                 for lbl in mon.values():
                     lbl.config(text="-")
-                status.config(text="코어 미접속 — 메인에서 코어 시작")
+                status_box.show("코어 미접속 — 메인에서 코어 시작")
             else:
                 apply_live()
+                # LS 처리 멈춤이면 상태줄을 덮어 알린다(사용자 2026-10-23 안 1) — 풀리면 재개 글
+                # 5초. 보통 때는 글자색을 되돌린다.
+                data = state_box.get("data") or {}
+                notice = stall_notice(state_box, ls_stalled(data.get("ws") or []), time.time())
+                if notice is not None:
+                    status_box.show(notice[0])
+                    status_box.color(notice[1])
+                else:
+                    status_box.color("black")
         except tk.TclError:
             return
         except Exception:  # noqa: BLE001 - 갱신 한 번의 오류로 화면이 죽은 것처럼 멈추면 안 됨

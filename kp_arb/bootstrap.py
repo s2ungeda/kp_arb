@@ -62,6 +62,7 @@ from .limits import (
     would_exceed_daily_limit,
 )
 from .order_book import OrderBook, TrackedOrder
+from .quote_plan import FX_EXPECTED_TR, FX_TRADE_TR, QuotePlanInput, plan
 from .risk import RiskManager, RiskState
 from .routing import account_for
 from .session import reference_instrument
@@ -79,6 +80,8 @@ from .theory import (
 )
 from .ticks import ceil_to_tick, floor_to_tick, maker_cap, tick_for
 from .ws_status import WsStatus
+
+FX_PLAN_TRS = frozenset({FX_TRADE_TR, FX_EXPECTED_TR})  # 원달러선물 채널로 가는 계획 TR
 
 # HL 발주가 통신 오류로 끝난 뒤 cloid를 기억해 두는 유예(초) — 살아 있는 주문의 늦은 통보를 받아
 # 주고, 끝에 orderStatus(cloid)로 한 번 더 확인한다(DESIGN §HL cloid ③, 검토 2026-09-11 §A).
@@ -323,6 +326,8 @@ class LiveSystem:
         if self._fx_futures is None and self._fx_months:
             self._fx_futures = self._fx_months[0]
         self.fx_futures_price: dict[str, float] = {}  # 월물코드 → 최근 현재가(근·차근)
+        self.fx_futures_expected: dict[str, float] = {}  # 월물코드 → 예상체결가(YF9, 동시호가)
+        self.quote_plan: list[tuple[str, str]] = []  # 마지막으로 적용한 LS 구독 계획(§9)
         # 월물코드 → (매수1호가, 매도1호가) — 자동M 환진입가(§9a: 진입 −환은 매수1호가)
         self.fx_futures_quote: dict[str, tuple[float, float]] = {}
         # 캐리 이론가 연이자율·왕복 수수료 — config.yaml 조정 대상
@@ -1412,6 +1417,11 @@ class LiveSystem:
             self.trades[(tick.underlying, tick.instrument, tick.market)] = tick.price
             if tick.instrument is Instrument.KR_STOCK and tick.change_pct is not None:
                 self.stock_change_pct[(tick.underlying, tick.market)] = tick.change_pct
+            if tick.instrument in (Instrument.KR_STOCK, Instrument.KR_ETF) and tick.market in (
+                    "krx", "nxt"):
+                # 통합 체결(US3) 한 스트림이 거래소명으로 krx/nxt로 갈려 온다(DESIGN-ls-xing §9) —
+                # "통틀어 마지막"(uni)은 어느 거래소든 가장 최근 체결
+                self.trades[(tick.underlying, tick.instrument, "uni")] = tick.price
             if tick.market == "hl":
                 self.hl_trades.setdefault(tick.underlying, deque(maxlen=HL_TRADES_KEEP)).append(
                     hl_trade_row(tick))
@@ -1479,26 +1489,21 @@ class LiveSystem:
                 self._bg.add(task)
                 task.add_done_callback(self._bg.discard)
 
-        for underlying in Underlying:
-            self._stock_ws.subscribe_quotes(underlying)
-            self._stock_ws.subscribe_trades(underlying)  # 현재가(S3_) + 예상체결(YS3)
-            self._stock_ws.subscribe_vi(underlying)      # 종목 VI 발동/해제(체결쏴 주식 정지)
-        if self.futures_symbols:
-            self._stock_ws.subscribe_futures_quotes(self.futures_symbols)
-        if self.next_futures_symbols:  # 차근월물 호가·체결·예상체결(§5.11)
-            self._stock_ws.subscribe_futures_quotes(
-                self.next_futures_symbols, instrument=Instrument.KR_STOCK_FUTURE_NEXT)
+        # 종목·월물 시세(주식 US3·UYS·호가 1·VI_, 주식선물 JH0·YJC, 원달러 FC9·YF9)는 전략이 쓰는
+        # 것만 refresh_quote_plan(DESIGN-ls-xing §9, 2026-10-23)이 등록·해제한다. 여기서는 프레임
+        # 해석용 선물 코드 대응과 종목과 무관한 고정분(JIF·통보·CUR)만.
+        self._stock_ws.register_futures_codes(self.futures_symbols)
+        self._stock_ws.register_futures_codes(
+            self.next_futures_symbols, instrument=Instrument.KR_STOCK_FUTURE_NEXT)
         self._stock_ws.subscribe_market_status()
         self._stock_ws.subscribe_stock_fills()
         if self._fx_months:
-            # 원달러선물 체결 실시간 — 주간 FC9 + 야간 DC0, 근·차근 월물 모두(§9.1). 최근월물만
-            # 환율이론가로 쓰고(차근은 저장만), 예비는 _fx_loop 30초 조회. 구 FC0는 2026-06-23
-            # 폐지돼 8/7~9/3 거부(10002)됐었음 — 선물계좌 토큰 WS(파생 그룹)로 등록한다.
-            fx_ws = self._deriv_ws if self._deriv_ws is not None else self._stock_ws
-            for code, _ in self._fx_months:
-                fx_ws.subscribe_fx(code)
+            # 원달러선물 체결(FC9, 1호가 포함) — 공통설정이 고른 월물 하나만(§9). 구 FC0는
+            # 2026-06-23 폐지돼 8/7~9/3 거부(10002)됐었음 — 선물계좌 토큰 WS(파생 그룹)로 등록한다.
+            fx_ws = self._fx_ws()
             fx_ws.on_fx_price.append(self._apply_fx_price)
             fx_ws.on_fx_quote.append(self._apply_fx_quote)  # 1호가 — 자동M 환진입가
+            fx_ws.on_fx_expected.append(self._apply_fx_expected)  # YF9 — 동시호가 주문
         # 원달러 현물환율(CUR) 실시간 — 주간 HL 환산 본선(엑셀 LS현물CUR). Naver는 백업.
         self._stock_ws.subscribe_fx_spot()
         self._stock_ws.on_fx_spot.append(self._apply_fx_spot)
@@ -1690,8 +1695,8 @@ class LiveSystem:
         # 걸려 일부(t1901 등)가 실패한다(운영 실측). 환율 폴링은 그 뒤에 시작.
         self._tasks = [asyncio.create_task(self._startup_queries())]
         # 무한 배경 기록/조회 — wait()(스트리밍 소진 대기) 대상이 아니라 aux로 둔다.
-        self._aux_tasks = [asyncio.create_task(self._spread_csv_loop()),
-                           asyncio.create_task(self._prev_funding_loop())]
+        # 괴리 CSV(1초 기록)는 2026-10-23 중단(DESIGN-ls-xing §9) — LS 호가창을 더 받지 않는다
+        self._aux_tasks = [asyncio.create_task(self._prev_funding_loop())]
         if self._fx_futures is not None:  # 라이브 구성 — 하나고시 현물환 조회(결정 70)
             self._aux_tasks.append(asyncio.create_task(self._hana_spot_loop()))
         # run 자체가 아니라 **팩토리(.run)**를 넘긴다 — 재시작 때 새 코루틴을 만들어야 하므로.
@@ -1723,6 +1728,29 @@ class LiveSystem:
         if self.usdkrw_theory is not None:
             return self.usdkrw_theory, "선물역산"
         return None, "계산불가"
+
+    def _fx_ws(self) -> LSWebSocketClient:
+        """원달러선물 실시간이 붙는 채널 — 선물 토큰 WS가 따로 있으면 그쪽, 아니면 주식(xing은 한
+        객체)."""
+        return self._deriv_ws if self._deriv_ws is not None else self._stock_ws
+
+    async def refresh_quote_plan(self, inp: QuotePlanInput) -> list[tuple[str, str]]:
+        """LS 실시간 구독을 계획(DESIGN-ls-xing §9)에 맞춘다 — 차이만 등록·해제. 돌려주는 값 =
+        지금 계획 전체. 원달러선물(FC9/YF9)은 그 채널이 따로면 그쪽에."""
+        wanted = plan(inp)
+        fx_ws = self._fx_ws()
+        if fx_ws is self._stock_ws:
+            await self._stock_ws.apply_plan(wanted)
+        else:
+            await self._stock_ws.apply_plan([sub for sub in wanted if sub[0] not in FX_PLAN_TRS])
+            await fx_ws.apply_plan([sub for sub in wanted if sub[0] in FX_PLAN_TRS])
+        self.quote_plan = wanted
+        return wanted
+
+    def _apply_fx_expected(self, code: str, price: float) -> None:
+        """원달러선물 예상체결가(YF9) 수신 → 월물별 보관(동시호가 주문이 읽는다)."""
+        if price > 0:
+            self.fx_futures_expected[code] = price
 
     def _apply_fx_price(self, code: str, price: float) -> None:
         """원달러선물 현재가 수신 → 월물별 저장 + **최근월물만** 환율이론가(현물환산) 갱신.
@@ -1933,10 +1961,10 @@ class LiveSystem:
     def ls_feed_ok(self) -> bool:
         """LS 채널(주식·선물 WS 또는 xing 세션)이 연결 상태인가 — 자동M G0-1(2026-09-29 운영 사고:
         xing COM 스레드가 멈춰 LS 조회·주문·실시간이 전부 섰는데 HL선이 계속 발주). 끊김·COM 정지
-        (xing_ws 심장박동 감시가 끊김으로 표시)면 False. 무데이터 유휴는 보지 않는다(점심·한산 구간
-        오판 방지) — 연결 여부만."""
+        (xing_ws 심장박동 감시가 '처리 멈춤'으로 표시 — 끊김과 구분, 사용자 2026-10-23)면 False.
+        무데이터 유휴는 보지 않는다(점심·한산 구간 오판 방지)."""
         clients = [c for c in (self._stock_ws, self._deriv_ws) if c is not None]
-        return bool(clients) and all(c.status.connected for c in clients)
+        return bool(clients) and all(c.status.usable for c in clients)
 
     def hl_feed_ok(self) -> bool:
         """HL 채널(WS)이 연결 상태인가 — 자동M G0-1(사용자 2026-10-01: 어느 한쪽이라도 끊기면 나가
@@ -2046,8 +2074,8 @@ class LiveSystem:
         """HL vs 국내 상대별 괴리·진입/청산 스프레드 (DESIGN §6.1). 신호는 **est-price 기반**.
 
         kr_qty = 발주 국내 수량(주식=주/선물=계약). HL 수량 = kr_qty × (SF 10 / 주식 1).
-        진입/청산 = 그 수량만큼 양쪽 호가창을 쓸어담은 est가의 괴리차. 수량 0이면 스프레드 None.
-        화면은 입력 수량, CSV 분포 기록은 config `disparity.ref_qty`를 넣는다.
+        진입/청산 = HL 쪽은 그 수량만큼 호가창을 쓸어담은 est가, 국내 쪽은 **1호가**(2026-10-23부터
+        LS 호가는 1호가만 받는다 — DESIGN-ls-xing §9)의 괴리차. 수량 0이면 스프레드 None.
         """
         board: dict[tuple[Underlying, Instrument], PairBoard] = {}
         fx, _ = self.usdkrw_effective()
@@ -2209,54 +2237,6 @@ class LiveSystem:
         base_after = self.trades.get((underlying, Instrument.KR_STOCK, "uni"))
         return theory_after(inputs, rate_krx, base_close, base_after)
 
-    # 괴리 분포 CSV — 임계값 결정용. 모니터 화면이 아니라 코어가 상시 기록(화면 무관).
-    def _spread_csv_rows(self, hhmmss: str) -> list[tuple[str, ...]]:
-        """CSV 한 줄씩(진입/청산 중 하나라도 있는 쌍만) — 파일 I/O 없는 순수 조립."""
-        kind = {Instrument.KR_STOCK: "S", Instrument.KR_STOCK_FUTURE: "SF",
-                Instrument.KR_STOCK_FUTURE_NEXT: "SFN", Instrument.KR_ETF: "ETF"}
-
-        def _pct(v: float | None) -> str:
-            return f"{v * 100:.3f}" if v is not None else "-"
-
-        board = self.disparity_board(self._board_ref_qty)  # 기준 수량(config) est 스프레드
-        fx, _ = self.usdkrw_effective()  # 환산에 실제 쓴 환율(주간 현물/야간 이론)
-        return [
-            (hhmmss, u.value, kind[inst],
-             _pct(p.hl.ask), _pct(p.hl.bid), _pct(p.kr.ask), _pct(p.kr.bid),
-             _pct(p.spread.entry), _pct(p.spread.exit),
-             f"{fx:.4f}" if fx is not None else "-",
-             (f"{s:.0f}" if (s := self.stock_last(u)) is not None else "-"),
-             _pct(p.hl_last), _pct(p.kr_last))
-            for (u, inst), p in board.items()
-            if p.spread.entry is not None or p.spread.exit is not None
-        ]
-
-    def _write_spread_csv(self) -> None:
-        """진입/청산 괴리 1줄씩을 logs/spread_YYYYMMDD.csv에 덧붙인다(있는 쌍만)."""
-        import csv
-        import time
-
-        lines = self._spread_csv_rows(time.strftime("%H:%M:%S"))
-        if not lines:
-            return
-        from .logs import base_dir
-
-        log_dir = base_dir() / "logs"  # 배포판은 exe 옆(전엔 __file__ 기준이라 _internal 안에 생김)
-        log_dir.mkdir(exist_ok=True)
-        path = log_dir / f"spread_{time.strftime('%Y%m%d')}.csv"
-        new_file = not path.exists()
-        try:
-            with path.open("a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                if new_file:
-                    writer.writerow(["time", "underlying", "pair",
-                                     "hl_ask_d", "hl_bid_d", "kr_ask_d", "kr_bid_d",
-                                     "entry", "exit", "usdkrw_used", "base_last",
-                                     "hl_last_d", "kr_last_d"])
-                writer.writerows(lines)
-        except OSError:
-            pass  # 엑셀 등이 파일을 잠근 상태 — 이번 기록만 건너뛰고 풀리면 재개
-
     async def _prev_funding_loop(self) -> None:
         """직전 확정 펀딩률을 15분 간격 REST 조회 — 모니터 '펀딩전' 표시용(코어 보관)."""
         hl = self._hl
@@ -2269,16 +2249,6 @@ class LiveSystem:
                 except Exception:  # noqa: BLE001 - 표시용, 실패해도 계속
                     pass
             await asyncio.sleep(900.0)  # 펀딩 주기(1시간)의 1/4
-
-    async def _spread_csv_loop(self) -> None:
-        """1초 간격 괴리 분포 기록. 어떤 예외도 루프를 멈추지 않는다."""
-        while True:
-            await asyncio.sleep(1.0)
-            try:
-                self._write_spread_csv()
-            except Exception:  # noqa: BLE001 - 기록 실패로 코어 루프를 죽이지 않는다
-                import logging
-                logging.getLogger("kp_arb.core").exception("괴리 CSV 기록 실패")
 
     async def _startup_queries(self) -> None:
         """시동 일괄 조회를 순서대로 — ETF 이론가 입력 → 초기 가격 → 상시 루프.

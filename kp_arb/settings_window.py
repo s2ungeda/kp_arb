@@ -12,6 +12,21 @@ from . import sound, win_state
 from . import ui_theme as T
 from .core_client import core_request, run_state_feed, watch_parent_exit
 
+
+def quote_symbol_changes(seen: dict[str, bool] | None, core: object) -> dict[str, bool]:
+    """코어 quote_symbols가 지난번(seen)과 달라진 종목만 — 처음(seen None)은 전부. 순수."""
+    if not isinstance(core, dict):
+        return {}
+    now = {k: bool(v) for k, v in core.items()}
+    if seen is None:
+        return now
+    return {k: v for k, v in now.items() if seen.get(k) is not v}
+
+
+# 시세 구독 종목 체크 — (설정 키 = Underlying.value, 표시 이름). 순서 = 화면 순서
+QUOTE_SYMBOLS: tuple[tuple[str, str], ...] = (("samsung", "삼성"), ("sk_hynix", "하이닉스"),
+                                             ("hyundai", "현대차"))
+
 _ALARMS: tuple[tuple[str, str], ...] = (
     ("sound_fill", "주문 체결 시"),
     ("sound_error", "에러 발생 시"),
@@ -192,11 +207,22 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     var_probe = tk.BooleanVar(value=False)
     tk.Checkbutton(form, text="시세 원문 기록", variable=var_probe, anchor="w").grid(
         row=8, column=0, sticky="w", pady=(10, 2))
-    tk.Label(form, text="호가·체결 TR 원문 → logs\probe (분석용, 하루 수백 MB)",
+    tk.Label(form, text="호가·체결 TR 원문 → logs\\probe (분석용, 하루 수백 MB)",
              fg=T.C_MUTED).grid(row=8, column=1, columnspan=3, sticky="w", padx=6,
                                 pady=(10, 2))
+    # 시세 구독 종목(DESIGN-ls-xing §9, DESIGN-settings §3 — 사용자 2026-10-23): 체크된 종목만 LS
+    # 실시간 등록, 끄면 바로 해제. 자동M·NXT 개장 화면에서 종목을 다루면(적·설정·실행) 코어가
+    # 자동으로 켜는데, 이 창이 열려 있어도 보이게 코어 값이 바뀌면 체크를 따라간다(refresh).
+    tk.Label(form, text="시세 구독 종목").grid(row=9, column=0, sticky="w", pady=2)
+    qs_frame = tk.Frame(form)
+    qs_frame.grid(row=9, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    qs_vars: dict[str, tk.BooleanVar] = {}
+    for key, name in QUOTE_SYMBOLS:
+        qs_vars[key] = tk.BooleanVar(value=False)
+        tk.Checkbutton(qs_frame, text=name, variable=qs_vars[key], anchor="w").pack(
+            side="left", padx=(0, 10))
     # 알람 3줄 — [체크박스] 이벤트명  [wav 경로]  [찾아보기] [듣기]
-    tk.Label(form, text="알람 (wav)").grid(row=9, column=0, sticky="w", pady=(10, 2))
+    tk.Label(form, text="알람 (wav)").grid(row=10, column=0, sticky="w", pady=(10, 2))
     rows: dict[str, dict[str, Any]] = {}
     for i, (key, name) in enumerate(_ALARMS, start=10):
         var = tk.BooleanVar(value=False)
@@ -225,7 +251,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # LS(xing) 접속 끊김 때 할 일 — 체크박스 3개(DESIGN-settings §2a, 사용자 2026-10-14).
     # 판정·행동은
     # 메인 창(코어가 죽어도 알리려고), 여기서는 켬/끔만 고른다. 사운드는 위 'WS 끊김' 줄의 wav.
-    dc_row = 10 + len(_ALARMS)
+    dc_row = 11 + len(_ALARMS)
     tk.Label(form, text="LS 끊김 때").grid(row=dc_row, column=0, sticky="w", pady=(10, 2))
     dc_frame = tk.Frame(form)
     dc_frame.grid(row=dc_row, column=1, columnspan=3, sticky="w", padx=6, pady=(10, 2))
@@ -271,6 +297,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             payload[key] = {"enabled": bool(r["var"].get()),
                             "path": r["entry"].get().strip()}
         payload["ls_disconnect"] = {k: bool(v.get()) for k, v in dc_vars.items()}
+        payload["quote_symbols"] = {k: bool(v.get()) for k, v in qs_vars.items()}
         send(payload, "저장")
 
     btn.config(command=do_save)
@@ -329,6 +356,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             dc = settings.get("ls_disconnect") or {}
             for key, v in dc_vars.items():
                 v.set(bool(dc.get(key, False)))
+        # 시세 구독 종목 — 코어가 자동으로 켠 것(다른 화면의 종목 선택)이 열린 창에도 보이게, 코어
+        # 값이 지난번과 다르면 그 종목 체크만 따라간다(사용자가 손대 둔 다른 종목은 안 덮음).
+        if isinstance(settings, dict):
+            qs = settings.get("quote_symbols") or {}
+            changed = quote_symbol_changes(state_box.get("qs_core"), qs)
+            for key, on in changed.items():
+                if key in qs_vars:
+                    qs_vars[key].set(on)
+            state_box["qs_core"] = {k: bool(v) for k, v in qs.items()} if isinstance(
+                qs, dict) else {}
         # 원달러선물 콤보 — 월물 목록은 시세 접속 뒤에야 오므로 설정값과 따로 채운다. 선택은
         # 최초 1회만 코어가 지금 쓰는 월물로 맞춘다(그 뒤엔 사용자 선택을 덮지 않음).
         fx = (data.get("live") or {}).get("fx_futures") or {}

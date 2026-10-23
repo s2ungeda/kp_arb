@@ -511,9 +511,22 @@ def order_qty(block: Block, per_qty: int, target_qty: int, rt: int,
 
 
 def rel_quote(levels: Levels, n: int) -> float | None:
-    """상대 N호가 = 호가창의 실제 N번째 호가(빈 단계 건너뜀, §6.3). 없으면 None."""
+    """상대 N호가 = 호가창의 실제 N번째 호가(빈 단계 건너뜀, §6.3) — HL 호가창용. 없으면 None."""
     prices = [px for px, _q in levels if px and px > 0]
     return prices[n - 1] if 0 < n <= len(prices) else None
+
+
+def rel_quote_by_tick(level1: float | None, n: int, instrument: Instrument,
+                      side: Side) -> float | None:
+    """국내(LS) 상대 N호가 = **1호가 ± (N−1)×시세 호가단위**(§6.3 개정, 사용자 2026-10-23
+    "틱사이즈를 알고 있으니 1호가만 알면 N호가 계산이 된다" — LS 호가는 1호가만 받는다,
+    DESIGN-ls-xing §9). 매수(상대 = 매도호가창)는 위로, 매도(매수호가창)는 아래로. N이 1 이하면
+    1호가. 1호가 없으면 None."""
+    if level1 is None or level1 <= 0:
+        return None
+    steps = max(0, n - 1)
+    tick = tick_for(instrument, level1)
+    return level1 + steps * tick if side is Side.BUY else level1 - steps * tick
 
 
 def range_start(side: Side, rel_px: float, tick: float) -> float:
@@ -964,8 +977,11 @@ def evaluate(
         mkt_inst = Instrument.KR_STOCK_FUTURE
         formula = (f"역산가 {price:,.0f} = 이론가 {sig.sf_theory:,.0f}"
                    f"×(1+{pct(hl_disp)}−{pct(thr)})")
-    rel = (rel_quote(sig.sf_asks, settings.rel_buy) if side is Side.BUY
-           else rel_quote(sig.sf_bids, settings.rel_sell))
+    # 상대 N호가 = 1호가 ± (N−1)×시세 호가단위(§6.3 개정 2026-10-23 — LS 호가는 1호가만 받는다)
+    rel = (rel_quote_by_tick(sig.sf_asks[0][0] if sig.sf_asks else None, settings.rel_buy,
+                             mkt_inst, Side.BUY) if side is Side.BUY
+           else rel_quote_by_tick(sig.sf_bids[0][0] if sig.sf_bids else None, settings.rel_sell,
+                                  mkt_inst, Side.SELL))
     if rel is None:
         return hold("G6 SF 호가 없음")
     # 한계의 "상대N호가 ∓ 1틱"에서 1틱은 **시세(호가창)의 호가단위** = 한 호가 옆(사용자 확정

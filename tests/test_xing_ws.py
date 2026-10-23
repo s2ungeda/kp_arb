@@ -15,12 +15,16 @@ class FakeSession:
         self.on_real: list[Any] = []
         self.on_session: list[Any] = []
         self.advised: list[tuple[str, str]] = []
+        self.unadvised: list[tuple[str, str]] = []
         self.fail_tr: set[str] = set()
 
     async def advise(self, tr: str, key: str) -> None:
         if tr in self.fail_tr:
             raise RuntimeError("Res 없음")
         self.advised.append((tr, key))
+
+    async def unadvise(self, tr: str, key: str) -> None:
+        self.unadvised.append((tr, key))
 
     def push(self, tr: str, fields: dict[str, str]) -> None:
         for cb in self.on_real:
@@ -29,6 +33,30 @@ class FakeSession:
     def drop(self) -> None:
         for cb in self.on_session:
             cb("disconnect", "", "")
+
+
+async def test_apply_plan_goes_through_xareal_advise_and_unadvise() -> None:
+    # DESIGN-ls-xing §9: xing은 계획 변경을 XAReal advise/unadvise로 바로 보낸다(로그인 뒤). 로그인
+    # 전엔 희망 목록만 바꾸고 _advise_all이 한꺼번에 등록한다.
+    fake = FakeSession()
+
+    async def ensure_login() -> None:
+        return None
+
+    client = XingRealClient(fake, ensure_login=ensure_login,  # type: ignore[arg-type]
+                            reconnect_backoff_s=0.0)
+    await client.apply_plan([("US3", "U005930   "), ("JH0", "A116B000")])
+    assert fake.advised == []  # 로그인 전
+    task = asyncio.ensure_future(client.run())
+    for _ in range(50):
+        if len(fake.advised) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    assert fake.advised == [("US3", "U005930   "), ("JH0", "A116B000")]
+    await client.apply_plan([("US3", "U005930   "), ("JH0", "A116C000")])  # 월물 근→차근
+    assert fake.advised[-1] == ("JH0", "A116C000") and fake.unadvised == [("JH0", "A116B000")]
+    client.stop()
+    await asyncio.wait_for(task, 1.0)
 
 
 def test_frame_from_real_picks_key_and_keeps_fields() -> None:

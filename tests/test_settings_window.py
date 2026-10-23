@@ -1,5 +1,10 @@
 """공통설정 창 — 금액 포맷(지수표현 방지 + 3자리 콤마)·원달러선물 콤보 표시 순수 로직."""
-from kp_arb.settings_window import _fmt_amount, fx_month_code, fx_month_label
+from kp_arb.settings_window import (
+    _fmt_amount,
+    fx_month_code,
+    fx_month_label,
+    quote_symbol_changes,
+)
 
 
 def test_fx_month_label_and_code_roundtrip() -> None:
@@ -19,3 +24,15 @@ def test_fmt_amount_thousands_comma() -> None:
 def test_fmt_amount_keeps_decimals() -> None:
     assert _fmt_amount(1234.5) == "1,234.50"
     assert _fmt_amount(999.99) == "999.99"
+
+
+def test_quote_symbol_checks_follow_core_changes_only() -> None:
+    # 공통설정 창이 열린 채 다른 화면이 종목을 다루면 코어가 체크를 켠다 — 그 변화만 창에 반영하고
+    # 사용자가 손댄 다른 종목은 덮지 않는다(사용자 2026-10-23). 처음엔 전부, 값이 이상하면 없음.
+    assert quote_symbol_changes(None, {"samsung": True, "sk_hynix": False}) == {
+        "samsung": True, "sk_hynix": False}
+    seen = {"samsung": True, "sk_hynix": False, "hyundai": False}
+    assert quote_symbol_changes(seen, {"samsung": True, "sk_hynix": True, "hyundai": False}) == {
+        "sk_hynix": True}
+    assert quote_symbol_changes(seen, dict(seen)) == {}
+    assert quote_symbol_changes(seen, None) == {} and quote_symbol_changes(seen, "x") == {}

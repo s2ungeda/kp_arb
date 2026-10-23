@@ -109,13 +109,19 @@ async def test_first_trade_opens_window_and_fires_once() -> None:
     assert o.price == 1303.5 and sys_.placed[0][2].price == 1298.4   # 0.5%: 1298.32 → 1298.4
     snap = eng.live_snapshot()[U.value]
     assert snap["fired"] and [r["order_id"] for r in snap["results"]] == ["O1", "O2", "O3"]
-    # 딱 한 번 — 창 안에서 더 와도, 창이 닫혀도 다시 안 낸다
+    # 나간 단(진입 1~3)은 다시 안 낸다 — 창 안에서 더 와도, 창이 닫혀도. 청산 단은 남아 있어 실행은
+    # 아직 켜져 있다(사용자 2026-10-23 "주문 나간 세트만 멈추고 설정한 시간까지는 계속")
     clk.advance(1.0)
     eng._on_trade(_nxt(1_700_000.0))
+    await _settle()
+    assert len(sys_.placed) == 1 and eng.settings(U).run_entry and eng.settings(U).run_exit
+    assert eng.live_snapshot()[U.value]["fired_tiers"] == [["entry", 0], ["entry", 1],
+                                                            ["entry", 2]]
     clk.advance(10.0)
     eng._on_fx()
     await _settle()
     assert len(sys_.placed) == 1 and eng.live_snapshot()[U.value]["window"] == "closed"
+    assert not eng.settings(U).run_entry  # 창이 끝나야 끈다
 
 
 async def test_no_orders_when_disabled_or_outside_window() -> None:
@@ -193,8 +199,12 @@ async def test_run_turns_off_by_itself_when_today_is_over() -> None:
     eng3._on_trade(_nxt(1_729_000.0))  # 창 안 — 진입 세 단 다 맞아 발주
     await _settle()
     assert sys3.placed and eng3.live_snapshot()[U.value]["fired"]
+    # 진입 세 단이 나갔어도 청산 단이 남아 있으면 창이 끝날 때까지 켜져 있다(2026-10-23)
+    assert screen3.of(U).run_entry and screen3.of(U).run_exit and eng3.chance_over(U) is None
+    clk3.advance(10.0)
+    eng3.live_snapshot()
     assert not screen3.of(U).run_entry and not screen3.of(U).run_exit
-    assert eng3.chance_over(U) == "오늘 발주 끝"
+    assert eng3.chance_over(U) == "오늘 창 끝"
     # 발주한 뒤라도 개장 시각을 바꾸면 되돌린다(사용자 2026-10-22 결정 1) — 다시 켤 수 있음
     screen3.of(U).open_hms = "08:30:00"
     eng3.reset_day(U)
@@ -247,3 +257,34 @@ def test_core_command_saves_settings_and_guards_run() -> None:
     assert _nxt_open_command(eng, state, {**run, "underlying": "sk_hynix"})["ok"]
     assert st.run_entry is True
     assert _nxt_open_command(None, state, {"cmd": "nxt_open_x"})["errors"] == ["underlying 필요"]
+
+
+async def test_each_tier_fires_once_and_rest_keep_running_until_window_end() -> None:
+    # 사용자 2026-10-23: 나간 단만 멈추고 나머지는 창 끝까지 — 10-23 08:00 청산1만 나가고 둘 다
+    # 꺼진 것 교정. NXT 1,729,000 / HL 매도1 1310.5: 청산괴리 +1.4% → 청산 단은 안 맞음.
+    # S를 올려 청산괴리를 −0.5%, −0.9%로 만든다(환 1338.4 × 1310.5 = 1,753,173).
+    eng, sys_, clk, screen = _engine(_wall(8, 0, 0.5))
+    st = screen.of(U)
+    st.entries = [Tier(0.05, 1, 0.009)]  # 안 맞는 진입 단 하나
+    st.exits = [Tier(-0.004, 1, -0.002), Tier(-0.008, 1, -0.006), Tier(-0.010, 1, -0.008)]
+    eng._on_trade(_nxt(1_762_000.0))  # T0 (청산괴리 −0.50%)
+    clk.advance(1.0)
+    eng._on_trade(_nxt(1_762_000.0))  # 창 안 — 청산1(−0.4%)만 충족
+    await _settle()
+    assert len(sys_.placed) == 1 and [o.tag for o in sys_.placed[0]] == ["청산1"]
+    assert st.run_entry and st.run_exit  # 나머지 단이 남아 계속 실행
+    clk.advance(1.0)
+    eng._on_trade(_nxt(1_769_000.0))  # 청산괴리 −0.90% → 청산2 추가, 청산1은 다시 안 냄
+    await _settle()
+    assert len(sys_.placed) == 2 and [o.tag for o in sys_.placed[1]] == ["청산2"]
+    snap = eng.live_snapshot()[U.value]
+    assert [r["order_id"] for r in snap["results"]] == ["O1", "O1"] and snap["fired"]
+    assert snap["fired_tiers"] == [["exit", 0], ["exit", 1]]
+    clk.advance(0.5)
+    eng._on_trade(_nxt(1_769_000.0))  # 같은 괴리 — 이미 나간 단은 다시 안 냄
+    await _settle()
+    assert len(sys_.placed) == 2 and st.run_exit
+    clk.advance(5.0)                   # 창 끝 → 남은 단(진입1·청산3)이 있어도 끔
+    eng.live_snapshot()
+    assert not st.run_entry and not st.run_exit and eng.chance_over(U) == "오늘 창 끝"
+

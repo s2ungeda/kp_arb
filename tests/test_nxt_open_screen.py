@@ -11,6 +11,7 @@ from kp_arb.nxt_open_screen import (
     qty_text,
     results_summary,
     row_complete,
+    row_locked,
     running_text,
     saved_under,
     settings_payload,
@@ -61,6 +62,9 @@ def test_result_and_status_text() -> None:
     assert status_text({"window": "closed", "t0": "08:00:00.5", "fired": True,
                         "fired_at": "08:00:01.2", "note": "", "results": res[:1]}) == (
         "발주 08:00:01.2 진입1 #123 100@1303.5")
+    # 여러 건이면 마지막 한 건만(사용자 2026-10-23 "하나씩만") — 앞 건은 상태줄 콤보 이력에
+    assert status_text({"fired": True, "fired_at": "08:00:03.0", "results": res}) == (
+        "발주 08:00:03.0 진입2 실패 주문가 계산 불가(S·환율 없음)")
     note = "오늘 판정 없음(개장 밖)"
     assert status_text({"window": "none", "note": note}) == note
 
@@ -79,6 +83,13 @@ def test_running_text_names_underlying_and_sets_for_close_dialog() -> None:
     assert running_text({"samsung": {"run_exit": True},
                          "sk_hynix": {"run_entry": True}}) == "하이닉스 진입, 삼성 청산"
     assert running_text({"samsung": {"run_entry": False}}) == "" and running_text({}) == ""
+
+
+def test_fired_tier_is_unlocked_while_running() -> None:
+    # 사용자 2026-10-23: 실행 중 완전한 단은 잠그되, 오늘 발주된 단은 풀어 준다(다시 안 나가니
+    # 고쳐도 됨)
+    assert row_locked(True, True, False) and not row_locked(True, True, True)
+    assert not row_locked(True, False, False) and not row_locked(False, True, False)
 
 
 def test_saved_underlying_restored_only_if_still_in_combo() -> None:

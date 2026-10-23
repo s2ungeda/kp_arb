@@ -170,12 +170,13 @@ def accept_t0(first_wall: float, open_hms: str, grace_s: float = OPEN_GRACE_S) -
     return t0_verdict(first_wall, open_hms, grace_s) == "ok"
 
 
-def day_over(now_wall: float, open_hms: str, window: str, t0_rejected: bool, fired: bool,
+def day_over(now_wall: float, open_hms: str, window: str, t0_rejected: bool, all_fired: bool,
              end_s: float, grace_s: float = OPEN_GRACE_S) -> bool:
-    """오늘 발주 기회가 끝났는가(사용자 2026-10-21 "시간이 지나면 자동으로 꺼졌으면") — 발주했거나,
-    창이 닫혔거나, 첫 체결이 개장 밖이었거나, 첫 체결 없이 개장+유예+창 끝 시각을 넘겼으면 True.
-    엔진은 이때 진입·청산 실행을 끈다. 순수."""
-    if fired or t0_rejected or window == "closed":
+    """오늘 발주 기회가 끝났는가(사용자 2026-10-21 "시간이 지나면 자동으로 꺼졌으면") — 유효한 단이
+    전부 발주됐거나(all_fired — 한 단이 나간 것만으로는 안 끝남, 사용자 2026-10-23), 창이 닫혔거나,
+    첫 체결이 개장 밖이었거나, 첫 체결 없이 개장+유효+창 끝 시각을 넘겼으면 True. 엔진은 이때
+    진입·청산 실행을 끈다. 순수."""
+    if all_fired or t0_rejected or window == "closed":
         return True
     if window == "none":
         return _sec_of_day(now_wall) > _hms_sec(open_hms) + grace_s + end_s
@@ -184,19 +185,37 @@ def day_over(now_wall: float, open_hms: str, window: str, t0_rejected: bool, fir
 
 # --- 판정 ---
 
-def judge(entry_disp: float | None, exit_disp: float | None,
-          settings: NxtOpenSettings) -> list[Plan]:
+TierKey = tuple[str, int]  # ("entry"|"exit", 단 번호 0~2)
+
+
+def remaining_tiers(settings: NxtOpenSettings, fired: frozenset[TierKey] | set[TierKey]) -> int:
+    """아직 발주되지 않은 유효한 단 수(실행 켜짐과 무관 — 켜기 전 판정에도 씀). 0이면 오늘 발주 끝.
+    순수."""
+    n = 0
+    for block, tiers in (("entry", settings.entries), ("exit", settings.exits)):
+        n += sum(1 for i, t in enumerate(tiers) if t.valid() and (block, i) not in fired)
+    return n
+
+
+def judge(entry_disp: float | None, exit_disp: float | None, settings: NxtOpenSettings,
+          fired: frozenset[TierKey] | set[TierKey] = frozenset()) -> list[Plan]:
     """조건이 맞는 단을 전부(동시주문). 진입이 하나라도 맞으면 진입만, 아니면 청산.
-    (둘 다 맞는 일은 식 구조상 없지만, 있어도 한 방향만 낸다.) 실행이 꺼진 쪽은 보지 않는다."""
+    (둘 다 맞는 일은 식 구조상 없지만, 있어도 한 방향만 낸다.) 실행이 꺼진 쪽은 보지 않는다.
+    **이미 발주된 단(fired)은 다시 보지 않는다** — 단마다 그날 한 번(사용자 2026-10-23 "주문 나간
+    세트만 멈추고 설정한 시간까지는 계속 실행 — 최대한 주문이 많이 나가게")."""
     plans: list[Plan] = []
     if entry_disp is not None and settings.run_entry:
         for i, t in enumerate(settings.entries):
+            if ("entry", i) in fired:
+                continue
             if t.valid() and t.spread is not None and entry_disp >= t.spread:
                 plans.append(Plan("entry", i, Side.SELL, t.qty, float(t.price_spread or 0.0)))
     if plans:
         return plans
     if exit_disp is not None and settings.run_exit:
         for i, t in enumerate(settings.exits):
+            if ("exit", i) in fired:
+                continue
             if t.valid() and t.spread is not None and exit_disp <= t.spread:
                 plans.append(Plan("exit", i, Side.BUY, t.qty, float(t.price_spread or 0.0)))
     return plans

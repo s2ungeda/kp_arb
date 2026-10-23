@@ -29,6 +29,7 @@ from .nxt_open import (
     judge,
     level_price,
     order_price,
+    remaining_tiers,
     t0_verdict,
     window_state,
 )
@@ -68,8 +69,9 @@ class DayState:
     t0: float | None = None          # monotonic
     t0_wall: float | None = None     # epoch(표시용)
     t0_rejected: bool = False        # 첫 체결이 개장 시각 밖 → 오늘 창 없음
-    fired: bool = False
-    fired_wall: float | None = None
+    fired: bool = False              # 오늘 한 단이라도 발주함(표시용)
+    fired_wall: float | None = None  # 마지막 발주 시각
+    fired_tiers: set[tuple[str, int]] = field(default_factory=set)  # 발주된 단 — 단마다 하루 한 번
     results: list[TierResult] = field(default_factory=list)
     s: float | None = None
     hl_bid_n: float | None = None
@@ -126,8 +128,8 @@ class NxtOpenEngine:
         d, st = self._day(u), self.settings(u)
         if not self._is_over(d, st):
             return None
-        if d.fired:
-            return "오늘 발주 끝"
+        if remaining_tiers(st, d.fired_tiers) == 0 and d.fired:
+            return "오늘 발주 끝(전 단)"
         if d.t0_rejected:
             return "오늘 판정 없음(개장 밖)"
         if d.t0 is not None:
@@ -149,7 +151,8 @@ class NxtOpenEngine:
 
     def _is_over(self, d: DayState, st: NxtOpenSettings) -> bool:
         window = window_state(self._clock(), d.t0, st.start_s, st.end_s)
-        return day_over(self._wall(), st.open_hms, window, d.t0_rejected, d.fired, st.end_s)
+        all_fired = d.fired and remaining_tiers(st, d.fired_tiers) == 0
+        return day_over(self._wall(), st.open_hms, window, d.t0_rejected, all_fired, st.end_s)
 
     def _auto_off(self, u: Underlying, d: DayState, st: NxtOpenSettings) -> None:
         """오늘 기회가 끝나면 진입·청산 실행을 자동으로 끈다(사용자 2026-10-21) — 발주 뒤·창 끝
@@ -161,12 +164,12 @@ class NxtOpenEngine:
         if not (st.run_entry or st.run_exit):
             return
         st.run_entry = st.run_exit = False
-        if d.fired:
-            why = "발주 끝"
+        if d.fired and remaining_tiers(st, d.fired_tiers) == 0:
+            why = "전 단 발주 끝"
         elif d.t0_rejected:
             why = "오늘 판정 없음(개장 밖)"
         elif d.t0 is not None:
-            why = "창 끝 미충족"
+            why = "창 끝" if d.fired else "창 끝 미충족"
         else:
             why = "첫 체결 없음"
         if not d.fired:  # 발주한 날은 상태줄이 발주 결과를 보여 주므로 비고를 안 바꾼다
@@ -242,14 +245,16 @@ class NxtOpenEngine:
         self._compute(u, d)
         st = self.settings(u)
         self._auto_off(u, d, st)
-        if d.fired or not (st.run_entry or st.run_exit):
+        if not (st.run_entry or st.run_exit):
             return
         if window_state(self._clock(), d.t0, st.start_s, st.end_s) != "open":
             return
-        plans = judge(d.entry_disp, d.exit_disp, st)
+        # 발주된 단은 빼고 판정 — 나머지 단은 창이 끝날 때까지 계속(사용자 2026-10-23)
+        plans = judge(d.entry_disp, d.exit_disp, st, d.fired_tiers)
         if not plans:
             return
-        d.fired, d.fired_wall = True, self._wall()  # 딱 한 번 — 발주 전에 잠근다
+        d.fired_tiers.update((p.block, p.index) for p in plans)  # 단마다 한 번 — 발주 전에 잠근다
+        d.fired, d.fired_wall = True, self._wall()
         task = asyncio.create_task(self._fire(u, d, plans))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -273,7 +278,7 @@ class NxtOpenEngine:
                 venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
                 side=p.side, qty=p.qty, order_type=OrderType.LIMIT, price=px,
                 source=SOURCE, tag=tag))
-        d.results = results
+        d.results.extend(results)  # 같은 창에서 여러 번 발주될 수 있어 누적
         self._log.info("[NXT개장] %s 발주 %s — 진입괴리 %s 청산괴리 %s S %s 환 %s: %s", u.value,
                        _hms(self._wall()), _pct(d.entry_disp), _pct(d.exit_disp),
                        f"{s:,.0f}" if s else "-", f"{fx:.2f}" if fx else "-",
@@ -313,6 +318,7 @@ class NxtOpenEngine:
                 "t0": _hms(d.t0_wall) if d.t0_wall else None,
                 "t0_rejected": d.t0_rejected,
                 "fired": d.fired,
+                "fired_tiers": [list(k) for k in sorted(d.fired_tiers)],  # JSON 모양(리스트)
                 "fired_at": _hms(d.fired_wall) if d.fired_wall else None,
                 "s": d.s, "hl_bid": d.hl_bid_n, "hl_ask": d.hl_ask_n,
                 # HL 호가단위 콤보용(체결쏴와 같은 모양) — 지금 가격대의 틱 목록·적용 중인 머지

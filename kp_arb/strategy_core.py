@@ -163,6 +163,10 @@ class SoundSetting:
     path: str = ""
 
 
+QUOTE_SYMBOL_KEYS: tuple[str, ...] = ("samsung", "sk_hynix", "hyundai")  # Underlying.value
+DEFAULT_QUOTE_SYMBOLS: dict[str, bool] = {"samsung": True, "sk_hynix": True, "hyundai": False}
+
+
 @dataclass
 class GlobalSettings:
     """전체 공통설정 — 일일 한도 + 알람 (DESIGN-settings). core_state.json에 저장."""
@@ -188,6 +192,11 @@ class GlobalSettings:
     fx_futures_code: str = ""
     # 시세 원문 기록(logs/probe, DESIGN-ls-xing §8 임시 진단) — 기본 끔(사용자 2026-10-02)
     quote_probe: bool = False
+    # LS 실시간 구독 종목(DESIGN-ls-xing §9, 사용자 2026-10-23 안 A) — 체크된 종목만 등록, 끄면
+    # 해제.
+    # 자동M·NXT 개장 화면에서 종목을 다루면(적·설정·실행) 그 종목은 자동으로 켜진다. 기본 삼성·
+    # 하이닉스 켬, 현대차 끔.
+    quote_symbols: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_QUOTE_SYMBOLS))
     sound_fill: SoundSetting = field(default_factory=SoundSetting)   # 주문 체결 시
     sound_error: SoundSetting = field(default_factory=SoundSetting)  # 에러(발주 거부·실패)
     sound_ws: SoundSetting = field(default_factory=SoundSetting)     # WS 끊김
@@ -377,6 +386,11 @@ def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
         s.fx_futures_code = code.strip()
     if isinstance(raw.get("quote_probe"), bool):
         s.quote_probe = raw["quote_probe"]
+    qs = raw.get("quote_symbols")
+    if isinstance(qs, dict):  # 모르는 키는 무시, 빠진 키는 기본값 유지
+        for key in QUOTE_SYMBOL_KEYS:
+            if isinstance(qs.get(key), bool):
+                s.quote_symbols[key] = qs[key]
     for name, snd in (("sound_fill", s.sound_fill), ("sound_error", s.sound_error),
                       ("sound_ws", s.sound_ws)):
         rs = raw.get(name)

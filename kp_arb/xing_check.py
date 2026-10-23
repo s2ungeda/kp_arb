@@ -177,19 +177,19 @@ async def _main(seconds: float) -> int:  # noqa: PLR0915 - 점검 순서를 한 
         return None
 
     real = XingRealClient(session, ensure_login=_noop, etf_symbols={})
-    for u in Underlying:
-        real.subscribe_quotes(u)
-        real.subscribe_trades(u)
-        real.subscribe_vi(u)
-    if futures_symbols:
-        real.subscribe_futures_quotes(futures_symbols)
-    if next_symbols:
-        real.subscribe_futures_quotes(next_symbols, instrument=Instrument.KR_STOCK_FUTURE_NEXT)
+    # 코어와 같은 계획(DESIGN-ls-xing §9) — 전 종목 켬·근월물·원달러 최근월물로 점검
+    from .quote_plan import QuotePlanInput, plan
+
+    real.register_futures_codes(futures_symbols)
+    real.register_futures_codes(next_symbols, instrument=Instrument.KR_STOCK_FUTURE_NEXT)
+    codes = {(u, "near"): c for u, c in futures_symbols.items()}
+    codes.update({(u, "next"): c for u, c in next_symbols.items()})
+    await real.apply_plan(plan(QuotePlanInput(
+        symbols_on=frozenset(Underlying), futures_codes=codes,
+        fx_code=fx_months[0][0] if fx_months else None)))
     real.subscribe_market_status()
     real.subscribe_stock_fills()
     real.subscribe_futures_fills()
-    for code, _ in fx_months:
-        real.subscribe_fx(code)
     real.subscribe_fx_spot()
     counts: dict[str, int] = {}
 

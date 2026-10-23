@@ -168,9 +168,12 @@ class XingRealClient(LSWebSocketClient):
                 log.warning("시세 원문 기록 쓰기 실패 — %s", exc)
 
     async def _health_loop(self, every_s: float = 1.0) -> None:
-        """COM 스레드 심장박동 감시 — 멈추면 이 채널을 '끊김'으로(주문 안전차단·자동M 대기가
-        걸리게), 다시 돌면 '연결'로. 운영 실측 2026-09-29 14:55: 스레드가 멈춰 LS 조회·주문·실시간이
-        전부 섰는데 세션은 '연결'로 보여 HL선이 헤지 없는 HL 주문을 계속 냈다."""
+        """COM 스레드 심장박동 감시 — 멈추면 이 채널을 '처리 멈춤'으로(주문 안전차단·자동M
+        대기가 걸리게), 다시 돌면 풀어 준다. 운영 실측 2026-09-29 14:55: 스레드가 멈춰 LS 조회·주문·
+        실시간이 전부 섰는데 세션은 '연결'로 보여 HL선이 헤지 없는 HL 주문을 계속 냈다.
+        **끊김으로 표시하지 않는다**(사용자 2026-10-23 "LS 끊김 팝업은 진짜 통신이 끊겼을 때만")
+        — 10-23 09:08 멈춤 때 접속은 살아 있었는데(체결 통보 수신 중) 'LS 끊김' 팝업·텔레그램이
+        나갔다. 접속 끊김은 세션 이벤트(OnDisconnect → _on_session)가 따로 알린다."""
         probe = getattr(self._session, "thread_stalled", None)
         if probe is None:  # 가짜 세션(테스트) — 감시 없음
             return
@@ -179,14 +182,12 @@ class XingRealClient(LSWebSocketClient):
             await asyncio.sleep(every_s)
             now_stalled = bool(probe())
             if now_stalled and not stalled:
-                log.error("%s xing COM 스레드 정지 감지(심장박동 끊김) — 채널 끊김 표시, "
-                          "자동M 주문 중단", self.status.name)
-                if self.status.connected:
-                    self.status.on_disconnect()
+                log.error("%s xing COM 스레드 정지 감지(심장박동 끊김) — 처리 멈춤 표시(접속은 "
+                          "유지), 자동M 주문 중단", self.status.name)
+                self.status.on_stall()
             elif stalled and not now_stalled:
-                log.warning("%s xing COM 스레드 회복 — 채널 연결 표시", self.status.name)
-                if not self.status.connected:
-                    self.status.on_connect()
+                log.warning("%s xing COM 스레드 회복 — 처리 멈춤 해제", self.status.name)
+                self.status.on_resume()
             stalled = now_stalled
 
     async def _stats_loop(self) -> None:
@@ -212,13 +213,32 @@ class XingRealClient(LSWebSocketClient):
         self._stop_event.set()
 
     async def _advise_all(self) -> None:
-        for tr_cd, tr_key, _tr_type in self._subs:
+        async with self._sub_lock:  # 계획 변경(apply_plan)과 겹치지 않게 — 부모와 같은 잠금
+            for tr_cd, tr_key, _tr_type in list(self._subs):
+                try:
+                    await self._session.advise(tr_cd, tr_key)
+                except Exception as exc:  # noqa: BLE001 - 한 TR 실패(Res 없음 등)로 나머지를 막지 않음
+                    log.warning("%s 실시간 등록 실패 %s/%r — %s", self.status.name, tr_cd, tr_key,
+                                exc)
+            log.info("%s 실시간 등록 %d건: %s", self.status.name, len(self._subs),
+                     ", ".join(f"{tr}/{key!r}" if key else tr for tr, key, _t in self._subs))
+
+    async def _send_plan_changes(self, add: list[tuple[str, str]],
+                                 remove: list[tuple[str, str]]) -> None:
+        """계획 변경분을 XAReal에 바로(advise/unadvise). 로그인 전이면 _advise_all이 나중에 한다.
+        한 건 실패는 로그만(나머지는 계속) — 부모 apply_plan이 잠금을 쥔 채 부른다."""
+        if not self.status.connected:
+            return
+        for tr_cd, tr_key in add:
             try:
                 await self._session.advise(tr_cd, tr_key)
-            except Exception as exc:  # noqa: BLE001 - 한 TR 실패(Res 없음 등)로 나머지를 막지 않음
+            except Exception as exc:  # noqa: BLE001 - 한 TR 실패로 나머지를 막지 않음
                 log.warning("%s 실시간 등록 실패 %s/%r — %s", self.status.name, tr_cd, tr_key, exc)
-        log.info("%s 실시간 등록 %d건: %s", self.status.name, len(self._subs),
-                 ", ".join(f"{tr}/{key!r}" if key else tr for tr, key, _t in self._subs))
+        for tr_cd, tr_key in remove:
+            try:
+                await self._session.unadvise(tr_cd, tr_key)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s 실시간 해제 실패 %s/%r — %s", self.status.name, tr_cd, tr_key, exc)
 
     # --- 이벤트 → 부모 디스패치 ---
 

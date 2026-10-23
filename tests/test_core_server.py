@@ -511,6 +511,62 @@ def test_manual_snapshot_carries_rejects() -> None:
     assert snap["rejects"] == [{"kind": "발주", "reason": "LS 02297"}]
 
 
+def test_quote_symbols_setting_and_plan_input() -> None:
+    # DESIGN-ls-xing §9 / DESIGN-settings §4: 시세 구독 종목 체크 저장·복원(모르는 키 무시),
+    # 계획 재료는 체크 종목 + 체결쏴 주식 거래소 + 주식선물·HL선 월물 합집합 + 원달러 코드.
+    # 실행 켜기는 자동 체크.
+    from kp_arb.core_server import auto_check_target, ensure_quote_symbol, quote_plan_input
+    from kp_arb.domain.enums import Underlying
+
+    state = CoreState()
+    assert state.settings.quote_symbols == {"samsung": True, "sk_hynix": True, "hyundai": False}
+    ok = apply_command(state, {"cmd": "settings_global",
+                               "quote_symbols": {"sk_hynix": False, "nope": True, "hyundai": 1}})
+    assert ok["ok"] and state.settings.quote_symbols == {"samsung": True, "sk_hynix": False,
+                                                         "hyundai": True}
+    restored = CoreState()
+    _global_settings_from_dict(restored.settings, {"quote_symbols": {"samsung": False, "x": 1}})
+    assert restored.settings.quote_symbols == {"samsung": False, "sk_hynix": True,
+                                               "hyundai": False}
+    state.autom.book(Underlying.SAMSUNG, "stock").market = "nxt"
+    state.autom.book(Underlying.SAMSUNG, "sf").future_month = "next"
+    state.autom.book(Underlying.SAMSUNG, "sf_hl_first").future_month = "near"
+
+    class _Sys:
+        futures_symbols = {Underlying.SAMSUNG: "A116B000"}
+        next_futures_symbols = {Underlying.SAMSUNG: "A116C000"}
+
+        @staticmethod
+        def fx_futures_code() -> str:
+            return "A756B000"
+
+    inp = quote_plan_input(state, _Sys())
+    assert inp.symbols_on == frozenset({Underlying.SAMSUNG, Underlying.HYUNDAI})
+    assert inp.stock_market[Underlying.SAMSUNG] == "nxt"
+    assert inp.futures_months[Underlying.SAMSUNG] == frozenset({"near", "next"})
+    assert inp.futures_codes[(Underlying.SAMSUNG, "next")] == "A116C000"
+    assert inp.fx_code == "A756B000"
+    assert quote_plan_input(state, None).fx_code is None and not quote_plan_input(
+        state, None).futures_codes
+    # 실행 켜기 → 체크 안 된 종목은 자동으로 켠다(거부 아님), 이미 켜져 있으면 변화 없음
+    assert ensure_quote_symbol(state, Underlying.SK_HYNIX, "자동M")
+    assert state.settings.quote_symbols["sk_hynix"]
+    assert not ensure_quote_symbol(state, Underlying.SK_HYNIX, "자동M")
+    # 자동 체크 대상 = 종목을 다루는 자동M·NXT 개장 명령 전부(사용자 2026-10-23 "적만 눌러도") —
+    # 실행 끔·종목 없음·다른 명령은 아님
+    assert auto_check_target({"cmd": "autom_ref_qty", "underlying": "sk_hynix"}) is (
+        Underlying.SK_HYNIX)
+    assert auto_check_target({"cmd": "autom_set", "underlying": "samsung"}) is Underlying.SAMSUNG
+    assert auto_check_target({"cmd": "nxt_open_settings", "underlying": "hyundai"}) is (
+        Underlying.HYUNDAI)
+    assert auto_check_target({"cmd": "autom_run", "underlying": "samsung", "value": True})
+    assert auto_check_target({"cmd": "autom_run", "underlying": "samsung", "value": False}) is None
+    assert auto_check_target({"cmd": "nxt_open_run", "underlying": "samsung"}) is None
+    assert auto_check_target({"cmd": "autom_stop_all"}) is None
+    assert auto_check_target({"cmd": "settings_global", "underlying": "samsung"}) is None
+    assert auto_check_target({"cmd": "autom_set", "underlying": "nope"}) is None
+
+
 def test_settings_global_risk_limits_roundtrip() -> None:
     # DESIGN-settings §1a — 리스크 한도 저장·복원, 음수는 거부, 키 없으면 기존 값
     state = CoreState()

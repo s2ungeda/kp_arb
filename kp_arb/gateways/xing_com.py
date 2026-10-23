@@ -36,6 +36,18 @@ QUERY_TIMEOUT_S = 10.0   # 조회(REST와 같은 값)
 ORDER_TIMEOUT_S = 30.0   # 주문(REST ORDER_REQUEST_TIMEOUT_S와 같은 값)
 STUCK_GRACE_S = 5.0      # COM 스레드가 멈춰 _expire가 안 돌 때 asyncio 쪽 2차 시간 초과 여유
 THREAD_STALL_S = 5.0     # COM 스레드 심장박동이 이만큼 끊기면 '정지'로 본다(실시간 상태 끊김 표시)
+# COM 스레드 한 바퀴(펌프+명령) 진단(사용자 2026-10-23 "스레드가 왜 멈춘 거지") — 운영 10-23
+# 09:08:52~09:09:02 심장박동이 10초 끊겼는데 그 사이 체결 통보는 처리됐다 = 죽은 게 아니라 한
+# 바퀴 안에서 밀린 메시지를 처리하던 것으로 보임. 바퀴가 이만큼 넘게 걸리면 무엇을 처리했는지
+# 한 줄 남긴다.
+# 실시간 TR 중 **읽는 칸을 제한**하는 것(DESIGN-ls-xing §9, 2026-10-23) — 전략은 1호가만 쓰므로
+# 호가 TR(주식 H1_/NH1 52~53칸, 주식선물 JH0 68칸)은 코드·시각·매도1·매수1·잔량 둘만 읽는다(COM 호출
+# 52~68 → 6~7). 없는 TR은 전부 읽는다.
+_LEVEL1 = frozenset({"shcode", "ex_shcode", "futcode", "hotime", "offerho1", "bidho1",
+                     "offerrem1", "bidrem1"})
+REAL_FIELD_LIMIT: dict[str, frozenset[str]] = {"H1_": _LEVEL1, "NH1": _LEVEL1, "JH0": _LEVEL1}
+SLOW_ITER_S = 1.0        # 한 바퀴가 이보다 길면 경고
+SLOW_ITER_LOG_GAP_S = 5.0  # 경고는 이 간격으로만(느린 바퀴가 이어질 때 로그 폭주 방지)
 LANE_QUERY = "query"
 LANE_ORDER = "order"
 
@@ -110,6 +122,16 @@ def is_ok_code(code: str) -> bool:
 
 # ------------------------------------------------------------------ 세션 ---
 
+def slow_iteration_text(total_s: float, pump_s: float, counts: dict[str, int],
+                        drain_s: float, drain_n: int, pending: int, top: int = 6) -> str:
+    """느린 바퀴 경고 글 — 전체·펌프·명령 처리 시간, 펌프에서 처리한 이벤트 수(종류별 많은 순
+    top개), 이번 바퀴 명령 수, 남은 명령 수. 순수."""
+    n = sum(counts.values())
+    kinds = ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])[:top])
+    return (f"xing COM 스레드 한 바퀴 {total_s:.2f}s — 펌프 {pump_s:.2f}s 이벤트 {n}건"
+            f"({kinds or '없음'}) 명령 {drain_s:.2f}s {drain_n}개, 남은 명령 {pending}개")
+
+
 class XingSession:
     """COM 스레드 소유자. 공개 메서드는 전부 asyncio 스레드에서 부른다."""
 
@@ -134,6 +156,8 @@ class XingSession:
         self._seq = itertools.count(1)              # 요청 순번(★7 (b))
         self._reals: dict[str, Any] = {}            # tr → XAReal
         self.last_beat = 0.0  # COM 스레드 루프가 마지막으로 돈 시각(_clock) — 정지 감시용
+        self._iter_counts: dict[str, int] = {}      # 이번 바퀴 펌프에서 처리한 이벤트 수(종류별)
+        self._last_slow_log = float("-inf")         # 느린 바퀴 경고를 마지막으로 남긴 시각
         self._real_keys: dict[str, set[str]] = {}   # tr → advise된 키
         self._specs: dict[str, ResSpec] = {}
         self._login_future: asyncio.Future[tuple[str, str]] | None = None
@@ -166,17 +190,30 @@ class XingSession:
             assert self._waker is not None
             while not self._stop:
                 self._waker.wait(50)
-                self.last_beat = self._clock()  # 심장박동 — 멈추면 xing_ws 감시가 '끊김'으로 표시
+                t0 = self.last_beat = self._clock()  # 심장박동 — 멈추면 xing_ws 감시가 '끊김'으로
+                self._iter_counts.clear()
                 try:
                     self._factory.pump()
                     self._expire()
                 except Exception:  # noqa: BLE001 - 펌프 한 번의 오류로 COM 스레드가 조용히 죽지 않게
                     log.exception("xing COM 펌프 오류 — 계속")
+                t1 = self._clock()
+                drain_n = self._cmds.qsize()
                 self._drain()
+                self._note_iteration(t0, t1, self._clock(), drain_n)
         finally:
             # 여기 오면 실시간·조회가 전부 멈춘다 — 조용히 끝나지 않게 반드시 남긴다
             log.warning("xing COM 스레드 종료(stop=%s)", self._stop)
             self._factory.uninit_thread()
+
+    def _note_iteration(self, t0: float, t1: float, t2: float, drain_n: int) -> None:
+        """한 바퀴 진단 — SLOW_ITER_S보다 오래 걸렸으면 무엇을 처리했는지 경고 한 줄(간격 제한)."""
+        total = t2 - t0
+        if total < SLOW_ITER_S or t2 - self._last_slow_log < SLOW_ITER_LOG_GAP_S:
+            return
+        self._last_slow_log = t2
+        log.warning(slow_iteration_text(total, t1 - t0, dict(self._iter_counts), t2 - t1,
+                                        drain_n, self._cmds.qsize()))
 
     def _drain(self) -> None:
         """이번 바퀴에 **지금 들어 있는 명령만** 처리한다(qsize 스냅샷).
@@ -368,6 +405,8 @@ class XingSession:
         """XAQuery 이벤트(COM 스레드): ('message', sys_err, code, msg) / ('data', tr).
         seq = 이벤트를 보낸 XAQuery의 요청 순번 — 지금 진행 중인 요청과 다르면(시간 초과로 정리한 앞
         요청의 늦은 응답) 버린다(★7 (b)). 'data'는 TR 이름까지 대조."""
+        key = f"{lane}응답"
+        self._iter_counts[key] = self._iter_counts.get(key, 0) + 1
         p = self._pending.get(lane)
         if p is None or p.seq != seq:
             log.warning("xing 늦은 응답 무시 — 차선 %s %s 순번 %s(진행 중 %s) %s", lane, kind, seq,
@@ -484,18 +523,53 @@ class XingSession:
         self._call(_do)
         await fut
 
+    async def unadvise(self, tr: str, key: str) -> None:
+        """실시간 해제(키 하나) — 종목·월물 구독 계획이 바뀔 때(DESIGN-ls-xing §9). 등록된 적 없는
+        키는 아무것도 안 한다. key=""(계좌 통보처럼 키 없는 TR)는 그 TR 전체 해제."""
+        assert self._loop is not None
+        fut: asyncio.Future[None] = self._loop.create_future()
+
+        def _do() -> None:
+            r = self._reals.get(tr)
+            keys = self._real_keys.get(tr)
+            if r is None or keys is None or key not in keys:
+                self._resolve(fut, None)
+                return
+            try:
+                if key:
+                    spec = self._specs.get(tr)
+                    width = (spec.in_blocks[0].length_of(spec.key_field() or "")
+                             if spec is not None and spec.in_blocks and spec.key_field() else 0)
+                    r.UnadviseRealDataWithKey(key[:width] if width else key)
+                else:
+                    r.UnadviseRealData()
+            except Exception as exc:  # noqa: BLE001 - COM 오류 → 호출자에 전달
+                self._resolve(fut, exc=XingError(f"{tr}/{key!r} 해제 실패: {exc}"))
+                return
+            keys.discard(key)
+            self._resolve(fut, None)
+
+        self._call(_do)
+        await fut
+
     def _on_real_event(self, tr: str, kind: str, *args: Any) -> None:
-        """XAReal 이벤트(COM 스레드): ('real', tr) → OutBlock 필드 dict를 asyncio로."""
+        """XAReal 이벤트(COM 스레드): ('real', tr) → OutBlock 필드 dict를 asyncio로.
+
+        REAL_FIELD_LIMIT에 있는 TR은 그 칸만 읽는다(GetFieldData가 COM 호출 하나씩이라 JH0 68칸을
+        다 읽으면 바퀴가 늦다 — §9 "호가는 1호가만")."""
         if kind != "real":
             return
+        self._iter_counts[tr] = self._iter_counts.get(tr, 0) + 1
         r = self._reals.get(tr)
         spec = self._specs.get(tr)
         if r is None or spec is None:
             return
+        keep = REAL_FIELD_LIMIT.get(tr)
         fields: dict[str, str] = {}
         for block in spec.out_blocks:
             for f in block.fields:
-                fields[f] = str(r.GetFieldData(block.name, f))
+                if keep is None or f in keep:
+                    fields[f] = str(r.GetFieldData(block.name, f))
         for cb in self.on_real:
             self._emit(cb, tr, "", fields)
 

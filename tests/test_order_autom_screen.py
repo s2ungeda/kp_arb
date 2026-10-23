@@ -1,10 +1,14 @@
 """자동M 화면(order_autom) 순수 부분 — 코어 명령 페이로드·누적 합산."""
 from kp_arb.order_autom import (
+    RESUME_TEXT,
+    STALL_TEXT,
+    ls_stalled,
     pct_to_frac,
     rt_manual_errors,
     set_inputs_sig,
     set_payload,
     settings_payload,
+    stall_notice,
     sum_acc,
 )
 
@@ -197,3 +201,21 @@ def test_run_gate_needs_apply_not_numbers() -> None:
 
     assert run_gate_error(True) is None
     assert "'적'" in str(run_gate_error(False))
+
+
+def test_stall_notice_on_status_bar_while_ls_thread_is_stalled() -> None:
+    # 사용자 2026-10-23 안 1: LS 처리 멈춤이면 체결쏴 상태줄에 빨간 글, 풀리면 초록 "재개" 5초,
+    # 그 뒤 보통
+    rows = [{"venue": "LS", "name": "LS xing", "connected": True, "stalled": True},
+            {"venue": "HL", "name": "HL", "connected": True}]
+    assert ls_stalled(rows)
+    assert not ls_stalled([{"venue": "LS", "connected": False, "stalled": True}])  # 끊김은 딴 길
+    assert not ls_stalled([{"venue": "HL", "connected": True, "stalled": True}])
+    box: dict[str, object] = {}
+    assert stall_notice(box, False, 100.0) is None
+    assert stall_notice(box, True, 101.0) == (STALL_TEXT, "red")
+    assert stall_notice(box, True, 103.0) == (STALL_TEXT, "red")
+    assert stall_notice(box, False, 110.0) == (RESUME_TEXT, "dark green")  # 풀린 직후
+    assert stall_notice(box, False, 114.9) == (RESUME_TEXT, "dark green")
+    assert stall_notice(box, False, 115.1) is None                        # 5초 지나면 보통
+
