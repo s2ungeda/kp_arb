@@ -108,6 +108,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     probe = tk.Button(left, text="진입", width=3, padx=0, pady=0, bd=1, highlightthickness=0)
     row_h = int((probe.winfo_reqheight() + 2) * 0.8)  # 체결쏴 세트 행보다 20% 낮게(사용자 10-23)
     probe.destroy()
+    # 실제 행 높이는 값 칸(큰 숫자 글꼴 라벨)의 자연 높이가 정해 왔다(≈26px) — 예상주문가에 테두리를
+    # 넣어도(10-23) 그 높이를 그대로 지킨다
+    probe_lbl = tk.Label(left, text="0", font=T.FONT_NUM_LG)
+    row_h = max(row_h, probe_lbl.winfo_reqheight())
+    probe_lbl.destroy()
 
     def paint_res(key: tuple[str, int]) -> None:
         on = bool(w["res_on"].get(key))
@@ -138,6 +143,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             sp, qty = samples[i] if preview else ("", "")
             cells["spread"] = entry(left, 6, vcmd_dec, sp)
             cells["qty"] = entry(left, 6, vcmd_qty, qty)
+            # 예상주문가는 테두리 없는 글자만 — 테두리를 넣어 봤더니 행 간격이 0이라 위아래 선이
+            # 겹쳐 두꺼워 보여 되돌림(사용자 2026-10-23)
             cells["px"] = tk.Label(left, text="-", width=10, anchor="e", fg="gray25",
                                    font=T.FONT_NUM_LG)
             for c, k in enumerate(("spread", "qty", "px")):
@@ -232,6 +239,23 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # uniform으로는 안 되니 자연 폭을 잰 뒤 좁은 쪽 마지막 칸을 minsize로 늘린다. 그러면 예약실행
     # 둘의 폭도 같아진다.
     right.update_idletasks()
+    # HL주문설정 묶음의 윗선(제목 글 가운데를 지나는 테두리)을 왼쪽 첫 역(HL매수) 버튼의 위에
+    # 맞춘다(사용자 2026-10-23 빨간 줄) — 위 묶음 간격(pady)을 그만큼 늘린다. 이미 더 아래면 그대로.
+    from tkinter import font as tkfont
+
+    def y_in_root(widget: tk.Misc) -> int:
+        """창 기준 y — 창이 아직 안 떠서(winfo_rooty 0) 부모 사슬의 winfo_y를 더한다."""
+        y = 0
+        cur: tk.Misc | None = widget
+        while cur is not None and cur is not root:
+            y += cur.winfo_y()
+            cur = cur.master
+        return y
+
+    title_half = tkfont.Font(font=T.FONT_LABEL).metrics("linespace") // 2
+    gap = y_in_root(w["res"][("sell", 0)]) - (y_in_root(p3) + title_half)
+    if gap > 0:
+        p3.grid_configure(pady=(6 + gap, 0))
 
     def part_w(box: tk.LabelFrame, cols: tuple[int, ...]) -> int:
         widths = []
