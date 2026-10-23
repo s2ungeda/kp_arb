@@ -34,6 +34,9 @@ _SCREEN_NAMES = {
     "kp_arb.order_autom": "체결쏴",
     "kp_arb.order_autom_stock": "체결쏴(주식)",  # 화면만 연결(코어 주식 종목 상태 전, 2026-09-16)
     "kp_arb.nxt_open_screen": "NXT 개장 매매",  # 오전 NXT 개장 HL 단독(DESIGN-nxt-open, 2026-10-20)
+    # 주식선물+원달러 동시호가 주문(DESIGN-auction-order) — 화면만 먼저 연결(2026-10-23, 코어
+    # 연결 전)
+    "kp_arb.auction_order_screen": "동시호가 주문",
     # 주식선물 HL선(exec §7D) — 시험 중지로 메뉴에서 뺌(2026-10-01, _RETIRED_SCREENS). 모듈은 남김
     "kp_arb.order_autom_hl_first": "체결쏴(HL선)",
     "kp_arb.monitor": "시세 모니터", "kp_arb.fx_monitor": "FX 노출 감시",
@@ -382,6 +385,8 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "meme.exe"), "autoMS"]
     if module == "kp_arb.nxt_open_screen":
         return [str(exe_dir / "meme.exe"), "nxtopen"]
+    if module == "kp_arb.auction_order_screen":
+        return [str(exe_dir / "meme.exe"), "auction"]
     if module == "kp_arb.order_autom_hl_first":
         return [str(exe_dir / "meme.exe"), "autoMH"]
     return [str(exe_dir / "meme.exe")]
@@ -833,6 +838,8 @@ def main() -> None:
                         command=lambda: open_screen("kp_arb.order_autom_stock"))
     m_order.add_command(label="NXT 개장 매매 (HL 단독)",
                         command=lambda: open_screen("kp_arb.nxt_open_screen"))
+    m_order.add_command(label="동시호가 주문 (주식선물+환)",
+                        command=lambda: open_screen("kp_arb.auction_order_screen"))
     m_order.add_separator()
     m_order.add_command(label="HL 일반주문 (수동)",
                         command=lambda: open_screen("kp_arb.order_hl"))

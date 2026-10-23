@@ -52,6 +52,9 @@ def main() -> None:
     elif arg == "nxtopen":  # 오전 NXT 개장 매매 화면(DESIGN-nxt-open, 2026-10-20)
         from kp_arb.nxt_open_screen import main as run
         run()
+    elif arg == "auction":  # 동시호가 주문 화면(DESIGN-auction-order, 2026-10-23 화면만 먼저)
+        from kp_arb.auction_order_screen import main as run
+        run()
     elif arg == "autoMH":  # 체결쏴 주식선물(HL선) 화면(exec §7D 시험, 2026-09-22)
         from kp_arb.order_autom_hl_first import main as run
         run()

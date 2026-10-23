@@ -44,6 +44,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     from . import win_state
     from .core_client import screen_log, watch_parent_exit
     from .ui_fields import is_decimal_text, is_int_text, is_time_text, is_unsigned_decimal_text
+    from .ui_status import StatusCombo
 
     preview = "--preview" in sys.argv
     if not preview:
@@ -121,8 +122,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def toggle_res(key: tuple[str, int]) -> None:
         w["res_on"][key] = not bool(w["res_on"].get(key))
         paint_res(key)
-        log.info("[동시호가 화면] %s %d행 예약 %s", "매수" if key[0] == "buy" else "매도",
-                 key[1] + 1, "켬" if w["res_on"][key] else "끔")
+        text = (f"{'매수' if key[0] == 'buy' else '매도'} {key[1] + 1}행 예약 "
+                f"{'켬' if w['res_on'][key] else '끔'}")
+        log.info("[동시호가 화면] %s", text)
+        w["status"].show(text)
 
     r = 1
     for side, samples in (("buy", SAMPLE_BUY), ("sell", SAMPLE_SELL)):
@@ -166,7 +169,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         return box
 
     def put(widget: tk.Widget, row: int, col: int, **kw: Any) -> None:
-        widget.grid(row=row, column=col, padx=GAP, pady=kw.pop("pady", 1), sticky="w", **kw)
+        widget.grid(row=row, column=col, padx=GAP, pady=kw.pop("pady", 1),
+                    sticky=kw.pop("sticky", "w"), **kw)
 
     # --- 주문시각 6칸 (ver2 G20~K22, 사용자 2026-10-22 답 4 "6개는 사용자 입력칸") ---
     tm = section("주문시각", 0)
@@ -180,24 +184,26 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         for c, k in enumerate(("hms", "ms", "itv"), start=1):
             put(w[f"{pre}_{k}"], rr, c)
 
-    # --- 원달러 대응(프로세스2) (ver2 F26~K27) — 대응개시 체크는 뺌(사용자 2026-10-23) ---
+    # --- 원달러 대응(프로세스2) (ver2 F26~K27) — 배치는 사용자 델파이 목업 Form2(2026-10-23 오후,
+    # "정렬과 배치만 참고"): 왼쪽 이름(오른쪽 맞춤)+입력칸 세 줄(틱·헤지비율·1회주문수량), 오른쪽은
+    # 첫 줄 [예약실행], 둘째·셋째 줄 환예상체결가·진입계약수 이름+값. 대응개시 체크는 뺌(10-23) ---
     p2 = section("원달러 대응", 1, name_col=False)
-    for c, h in enumerate(("환예상체결가", "진입계약수")):
-        put(head(p2, h), 0, c, pady=0)
-    w["fx_exp2"] = tk.Label(p2, text="-", width=9, anchor="e", font=T.FONT_NUM_LG)
-    put(w["fx_exp2"], 1, 0)
-    w["net_qty"] = tk.Label(p2, text="-", width=7, anchor="e", font=T.FONT_NUM_LG)
-    put(w["net_qty"], 1, 1)
+    w["tick"] = entry(p2, 7, vcmd_int, DEFAULTS["tick"])
+    w["hedge_pct"] = entry(p2, 7, vcmd_int, DEFAULTS["hedge_pct"])
+    w["fx_unit"] = entry(p2, 7, vcmd_int, DEFAULTS["fx_unit"])
+    for rr, (name, k) in enumerate((("틱", "tick"), ("헤지비율", "hedge_pct"),
+                                    ("1회주문수량", "fx_unit"))):
+        tk.Label(p2, text=name, anchor="e").grid(row=rr, column=0, sticky="e", padx=(0, 2))
+        put(w[k], rr, 1)
     w["fx_run"] = tk.Button(p2, text="예약실행", width=8, padx=0, pady=0, bd=1,
                             highlightthickness=0)
-    put(w["fx_run"], 1, 2)  # 오른쪽 빈자리(사용자 10-23)
-    for c, h in enumerate(("틱", "헤지비율", "1회주문수량")):
-        put(head(p2, h), 2, c, pady=(4, 0))
-    w["tick"] = entry(p2, 5, vcmd_int, DEFAULTS["tick"])
-    w["hedge_pct"] = entry(p2, 5, vcmd_int, DEFAULTS["hedge_pct"])
-    w["fx_unit"] = entry(p2, 5, vcmd_int, DEFAULTS["fx_unit"])
-    for c, k in enumerate(("tick", "hedge_pct", "fx_unit")):
-        put(w[k], 3, c)
+    w["fx_run"].grid(row=0, column=2, columnspan=2, padx=GAP, pady=1, sticky="ew")
+    w["fx_exp2"] = tk.Label(p2, text="-", width=9, anchor="e", font=T.FONT_NUM_LG)
+    w["net_qty"] = tk.Label(p2, text="-", width=9, anchor="e", font=T.FONT_NUM_LG)
+    for rr, (name, k) in enumerate((("환예상체결가", "fx_exp2"), ("진입계약수", "net_qty")),
+                                   start=1):
+        tk.Label(p2, text=name, anchor="w").grid(row=rr, column=2, sticky="w")
+        w[k].grid(row=rr, column=3, sticky="e", padx=GAP)
 
     # --- HL주문설정(프로세스3) a~d (ver2 F31~K35) — 버튼 글 "정정"·"취소"(사용자 2026-10-23) ---
     p3 = section("HL주문설정", 2, name_col=False)
@@ -205,7 +211,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         put(head(p3, h), 0, c, pady=0)
     w["hl_run"] = tk.Button(p3, text="예약실행", width=8, padx=0, pady=0, bd=1,
                             highlightthickness=0)
-    w["hl_run"].grid(row=0, column=3, columnspan=2, pady=(0, 2), sticky="w")  # 오른쪽 빈자리
+    # 머리글 줄의 정정·취소 자리를 가로로 꽉 채운다(목업 Form2)
+    w["hl_run"].grid(row=0, column=3, columnspan=2, padx=GAP, pady=(0, 2), sticky="ew")
     for rr, name in enumerate(HL_ROWS, start=1):
         tk.Label(p3, text=name, width=2, anchor="w").grid(row=rr, column=0, sticky="w")
         off = entry(p3, 6, vcmd_dec)
@@ -216,9 +223,34 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                           highlightthickness=0, state="disabled")
         cancel = tk.Button(p3, text="취소", width=5, padx=0, pady=0, bd=1,
                            highlightthickness=0, state="disabled")
-        put(amend, rr, 3)
-        put(cancel, rr, 4)
+        put(amend, rr, 3, sticky="ew")   # 정정·취소가 예약실행 폭을 반씩 채운다(목업 Form2)
+        put(cancel, rr, 4, sticky="ew")
         w["hl"][name] = {"off": off, "pt": pt, "amend": amend, "cancel": cancel}
+
+    # --- 두 묶음의 세로선 맞추기(사용자 2026-10-23 "정렬이 안 되어 있네", 목업 Form2): 왼쪽(이름+
+    # 입력칸) 끝과 오른쪽(예약실행·정정/취소) 시작을 같은 x에 — 칸 수가 달라(2 vs 3, 2 vs 2) grid의
+    # uniform으로는 안 되니 자연 폭을 잰 뒤 좁은 쪽 마지막 칸을 minsize로 늘린다. 그러면 예약실행
+    # 둘의 폭도 같아진다.
+    right.update_idletasks()
+
+    def part_w(box: tk.LabelFrame, cols: tuple[int, ...]) -> int:
+        widths = []
+        for c in cols:
+            bbox = box.grid_bbox(c, 0)
+            widths.append(int(bbox[2]) if bbox else 0)
+        return sum(widths)
+
+    # 주문시각 입력칸의 왼쪽도 원달러 대응 입력칸과 같은 선에(사용자 2026-10-23 빨간 줄)
+    name_w = max(NAME_W, part_w(tm, (0,)), part_w(p2, (0,)))
+    tm.grid_columnconfigure(0, minsize=name_w)
+    p2.grid_columnconfigure(0, minsize=name_w)
+    left_w = max(part_w(p2, (0, 1)), part_w(p3, (0, 1, 2)))
+    p2.grid_columnconfigure(1, minsize=left_w - part_w(p2, (0,)))
+    p3.grid_columnconfigure(2, minsize=left_w - part_w(p3, (0, 1)))
+    right_w = max(part_w(p2, (2, 3)), part_w(p3, (3, 4)))
+    p2.grid_columnconfigure(3, minsize=right_w - part_w(p2, (2,)))
+    p3.grid_columnconfigure(3, minsize=right_w // 2)      # 정정·취소 반반 → 예약실행과 같은 폭
+    p3.grid_columnconfigure(4, minsize=right_w - right_w // 2)
 
     def paint_run(key: str, on: bool) -> None:
         bg = T.C_BUY if on else "SystemButtonFace"
@@ -230,18 +262,23 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def toggle_run(key: str) -> None:
         run_on[key] = not run_on[key]
         paint_run(key, run_on[key])
-        log.info("[동시호가 화면] %s %s", "환 예약실행" if key == "fx_run" else "HL 예약실행",
-                 "켬" if run_on[key] else "끔")
+        text = (f"{'환 예약실행' if key == 'fx_run' else 'HL 예약실행'} "
+                f"{'켬' if run_on[key] else '끔'}")
+        log.info("[동시호가 화면] %s", text)
+        w["status"].show(text)
 
     w["fx_run"].config(command=partial(toggle_run, "fx_run"))
     w["hl_run"].config(command=partial(toggle_run, "hl_run"))
 
-    # ===== 상태줄 =====
-    status = tk.Label(root, text="-", anchor="w", relief="groove", fg=T.C_MUTED, width=1)
-    status.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(4, 6))
+    # ===== 상태줄 = 읽기 전용 콤보(체결쏴·NXT 개장과 같음, 사용자 2026-10-23) — 글 앞에 시각,
+    # 펼치면 지난 글 50건. 예약·예약실행 켬/끔도 여기에 남긴다.
+    status_box = StatusCombo(root, T.FONT_LABEL)
+    status_box.widget.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(4, 6))
     root.grid_columnconfigure(1, weight=1)
+    status_box.show("-")
+    w["status"] = status_box  # 예약 버튼 콜백이 쓴다(버튼은 상태줄보다 먼저 만들어짐)
     if preview:
-        status.config(text="UI 미리보기 — 코어 미연결")
+        status_box.show("UI 미리보기 — 코어 미연결")
         for i in (0, 2):  # 켜진 행 모양 확인용
             w["res_on"][("buy", i)] = True
             paint_res(("buy", i))
