@@ -8,6 +8,7 @@ a~d.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from .domain.enums import Underlying
@@ -34,6 +35,65 @@ def side_label(side: str) -> str:
     return "정(HL매도)" if side == "buy" else "역(HL매수)"
 
 
+def row_missing(spread_text: str, qty_text: str) -> str | None:
+    """예약주문을 켜기 전 행 검사(사용자 2026-10-26 "입력이 없을 때도 켜진다 — 알림 띄우고 못
+    켜게") — 빠진 것의 이름("주문Sprd"·"수량"), 다 있으면 None. 수량은 0보다 커야 한다. 순수."""
+    missing = []
+    try:
+        float(spread_text.strip())
+    except ValueError:
+        missing.append("주문Sprd")
+    try:
+        if float(qty_text.replace(",", "").strip()) <= 0:
+            missing.append("수량")
+    except ValueError:
+        missing.append("수량")
+    return "·".join(missing) if missing else None
+
+
+def fx_missing(tick_text: str, hedge_text: str, unit_text: str) -> str | None:
+    """환 예약실행을 켜기 전 검사(사용자 2026-10-26) — 빠진 것의 이름("틱"·"헤지비율"·
+    "1회주문수량"), 다 있으면 None. 틱은 0 이상, 헤지비율·1회주문수량은 0보다 커야 한다. 순수."""
+    missing = []
+    for name, text, min_ok in (("틱", tick_text, 0), ("헤지비율", hedge_text, 1),
+                               ("1회주문수량", unit_text, 1)):
+        try:
+            if int(text.replace(",", "").strip()) < min_ok:
+                missing.append(name)
+        except ValueError:
+            missing.append(name)
+    return "·".join(missing) if missing else None
+
+
+def hl_missing(offsets: Mapping[str, str]) -> str | None:
+    """HL 예약실행을 켜기 전 검사 — 주문설정(오프셋)이 **숫자가 아닌** 행 이름("a·c"), 없으면
+    None. 빈 칸은 0(스펙 §5 "비어 있으면 0 → 기준가" — 사용자 2026-10-26 "이것만 원복")이라 막지
+    않는다. 순수."""
+    bad = []
+    for name, text in offsets.items():
+        if not text.strip():
+            continue
+        try:
+            float(text.strip())
+        except ValueError:
+            bad.append(name)
+    return "·".join(bad) if bad else None
+
+
+def pt_missing(pt_text: str) -> bool:
+    """정정 버튼 전 검사(사용자 2026-10-26) — 정정PT가 비거나 0 이하면 True. 순수."""
+    try:
+        return float(pt_text.strip()) <= 0
+    except ValueError:
+        return True
+
+
+def any_reserved(res_on: Mapping[tuple[str, int], bool]) -> bool:
+    """예약주문 행이 하나라도 켜져 있나 — 켜져 있으면 윗줄(월물·호가단위·적)을 잠근다(사용자
+    2026-10-26). 순수."""
+    return any(bool(v) for v in res_on.values())
+
+
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
     import sys
     import tkinter as tk
@@ -43,8 +103,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     from . import ui_theme as T
     from . import win_state
     from .core_client import screen_log, watch_parent_exit
+    from .ui_dialog import show_message
     from .ui_fields import is_decimal_text, is_int_text, is_time_text, is_unsigned_decimal_text
-    from .ui_status import StatusCombo
+    from .ui_status import StallBanner, StatusCombo, log_tk_errors
 
     preview = "--preview" in sys.argv
     if not preview:
@@ -61,6 +122,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     vcmd_qty = (root.register(is_unsigned_decimal_text), "%P")
     vcmd_time = (root.register(is_time_text), "%P")
     log = screen_log()
+    log_tk_errors(root, log)  # 버튼 콜백 예외를 화면 로그에(콘솔이 없어 안 보임)
     w: dict[str, Any] = {"rows": {}, "res": {}, "res_on": {}, "hl": {}}
 
     def entry(parent: tk.Misc, width: int, vc: Any, text: str = "",
@@ -80,7 +142,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # ===== 윗줄: 종목 · 월물(최근/차근) · HL 호가단위 · 적 (ver2 A20, 기준수량 없음 — 답 5) =====
     top = tk.Frame(root)
-    top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 2))
+    top.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 2))  # 0행 = 지연 띠
     w["under"] = ttk.Combobox(top, values=[NAMES[u] for u in UNDERLYINGS], width=7,
                               state="readonly")
     w["under"].set(NAMES[UNDERLYINGS[0]])
@@ -100,7 +162,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # ===== 왼쪽: 예약주문 16행 (ver2 A22~D38) =====
     left = tk.Frame(root)
-    left.grid(row=1, column=0, sticky="nw", padx=(6, 4), pady=(2, 0))
+    left.grid(row=2, column=0, sticky="nw", padx=(6, 4), pady=(2, 0))
     heads = ("주문Sprd", "수량", "예상주문가", "예약주문")
     head_w = (8, 6, 10, 10)
     for c, (h, hw) in enumerate(zip(heads, head_w, strict=True)):
@@ -118,13 +180,35 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         on = bool(w["res_on"].get(key))
         # 색은 버튼 글의 HL 방향 기준(사용자 2026-10-23): 정(HL매도) 파랑, 역(HL매수) 빨강
         color = T.C_SELL if key[0] == "buy" else T.C_BUY
+        # 평소엔 글자만 그 색(파랑/빨강), 켜지면 바탕이 그 색·글자 흰색(사용자 2026-10-26)
         bg = color if on else "SystemButtonFace"
-        fg = "white" if on else "black"
+        fg = "white" if on else color
         w["res"][key].config(bg=bg, fg=fg, activebackground=bg, activeforeground=fg)
-        for k in ("spread", "qty"):  # 켜진 행은 입력 잠금
+        for k in ("spread", "qty"):  # 켜진 행은 입력 잠금, 끄면 풀림(사용자 2026-10-26)
             w["rows"][key][k].config(state="disabled" if on else "normal")
+        # 한 행이라도 켜져 있으면 월물·호가단위 콤보와 '적'을 잠근다(종목 콤보는 둔다 — 체결쏴와
+        # 같음)
+        locked = any_reserved(w["res_on"])
+        for k in ("month", "agg"):
+            w[k].config(state="disabled" if locked else "readonly")
+        w["apply"].config(state="disabled" if locked else "normal")
+        # LS주식선물 주문시각 줄(시각·ms·인터벌)도 같이 잠근다(사용자 2026-10-26)
+        for k in ("ls_hms", "ls_ms", "ls_itv"):
+            w[k].config(state="disabled" if locked else "normal")
 
     def toggle_res(key: tuple[str, int]) -> None:
+        name = f"{'매수' if key[0] == 'buy' else '매도'} {key[1] + 1}행"
+        log.info("[동시호가 화면] 예약 버튼 클릭 %s (지금 %s)", name,
+                 "켬" if w["res_on"].get(key) else "끔")  # 멈춤 조사용(2026-10-26)
+        if not w["res_on"].get(key):  # 켜려면 Sprd·수량이 있어야(사용자 2026-10-26)
+            cells = w["rows"][key]
+            missing = row_missing(cells["spread"].get(), cells["qty"].get())
+            if missing:
+                w["status"].show(f"{name} 예약 거부: {missing} 없음")
+                show_message(root, "동시호가 주문",
+                             f"{name}에 {missing}이(가) 없습니다.\n"
+                             "주문Sprd와 수량을 채워야 예약을 켤 수 있습니다.")
+                return
         w["res_on"][key] = not bool(w["res_on"].get(key))
         paint_res(key)
         text = (f"{'매수' if key[0] == 'buy' else '매도'} {key[1] + 1}행 예약 "
@@ -151,9 +235,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 cells[k].grid(row=r, column=c, padx=1, pady=0, sticky="nsew")
             # 행 높이는 버튼이 정한다(입력칸 24px보다 큼) — 버튼 글꼴을 한 단계 작게(10pt) 해서
             # 행을 낮춘다(사용자 2026-10-23 "높이 10% 더")
+            idle_fg = T.C_SELL if side == "buy" else T.C_BUY  # 평소 글자색(사용자 2026-10-26)
             btn = tk.Button(left, text=side_label(side), width=10, padx=0, pady=0, bd=1,
-                            highlightthickness=0, font=(T.FAMILY, 10),
-                            command=partial(toggle_res, key))
+                            highlightthickness=0, font=(T.FAMILY, 10), fg=idle_fg,
+                            activeforeground=idle_fg, command=partial(toggle_res, key))
             btn.grid(row=r, column=3, padx=(4, 1), pady=0, sticky="nsew")
             w["rows"][key] = cells
             w["res"][key] = btn
@@ -164,7 +249,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # (사용자 2026-10-23: 값 칸까지 폭을 맞추니 컨트롤이 너무 벌어짐 → 이름 칸만 맞추고 나머지는
     # 왼쪽에 붙여 촘촘하게)
     right = tk.Frame(root)
-    right.grid(row=1, column=1, sticky="nw", padx=(8, 6), pady=(2, 0))
+    right.grid(row=2, column=1, sticky="nw", padx=(8, 6), pady=(2, 0))
     NAME_W = 82   # 이름 칸(논리 픽셀) — "LS주식선물"이 들어가는 폭
     GAP = (0, 6)  # 값 칸 사이 간격
 
@@ -220,6 +305,17 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                             highlightthickness=0)
     # 머리글 줄의 정정·취소 자리를 가로로 꽉 채운다(목업 Form2)
     w["hl_run"].grid(row=0, column=3, columnspan=2, padx=GAP, pady=(0, 2), sticky="ew")
+
+    def amend_row(name: str) -> None:
+        """정정 버튼 — 정정PT가 없으면 알림으로 막는다(사용자 2026-10-26). 실제 정정은 코어 연결
+        뒤."""
+        if pt_missing(w["hl"][name]["pt"].get()):
+            w["status"].show(f"정정 {name} 거부: 정정PT 없음")
+            show_message(root, "동시호가 주문", f"{name} 행의 정정PT가 없습니다." + chr(10)
+                         + "정정PT(0보다 큰 USD)를 채워야 정정할 수 있습니다.")
+            return
+        w["status"].show(f"정정 {name} — 코어 연결 전(화면 초안)")
+
     for rr, name in enumerate(HL_ROWS, start=1):
         tk.Label(p3, text=name, width=2, anchor="w").grid(row=rr, column=0, sticky="w")
         off = entry(p3, 6, vcmd_dec)
@@ -227,7 +323,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         put(off, rr, 1)
         put(pt, rr, 2)
         amend = tk.Button(p3, text="정정", width=5, padx=0, pady=0, bd=1,
-                          highlightthickness=0, state="disabled")
+                          highlightthickness=0, state="disabled",
+                          command=partial(amend_row, name))
         cancel = tk.Button(p3, text="취소", width=5, padx=0, pady=0, bd=1,
                            highlightthickness=0, state="disabled")
         put(amend, rr, 3, sticky="ew")   # 정정·취소가 예약실행 폭을 반씩 채운다(목업 Form2)
@@ -284,8 +381,27 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     run_on: dict[str, bool] = {"fx_run": False, "hl_run": False}
 
     def toggle_run(key: str) -> None:
+        if key == "hl_run" and not run_on[key]:  # 주문설정은 비면 0(§5) — 숫자 아닌 글만 막는다
+            missing = hl_missing({n: w["hl"][n]["off"].get() for n in HL_ROWS})
+            if missing:
+                w["status"].show(f"HL 예약실행 거부: 주문설정 {missing} 숫자 아님")
+                show_message(root, "동시호가 주문",
+                             f"HL주문설정 {missing} 행의 주문설정이 숫자가 아닙니다." + chr(10)
+                             + "USD 오프셋(비우면 0)을 넣어야 예약실행을 켤 수 있습니다.")
+                return
+        if key == "fx_run" and not run_on[key]:  # 켜려면 틱·헤지비율·1회주문수량이 있어야(10-26)
+            missing = fx_missing(w["tick"].get(), w["hedge_pct"].get(), w["fx_unit"].get())
+            if missing:
+                w["status"].show(f"환 예약실행 거부: {missing} 없음")
+                show_message(root, "동시호가 주문",
+                             f"원달러 대응에 {missing}이(가) 없습니다." + chr(10)
+                             + "틱·헤지비율·1회주문수량을 채워야 예약실행을 켤 수 있습니다.")
+                return
         run_on[key] = not run_on[key]
         paint_run(key, run_on[key])
+        if key == "fx_run":  # 환 예약실행 켜면 틱·헤지비율·1회주문수량 + 원달러선물 주문시각 줄
+            for k in ("tick", "hedge_pct", "fx_unit", "fx_hms", "fx_ms", "fx_itv"):  # 잠금(10-26)
+                w[k].config(state="disabled" if run_on[key] else "normal")
         text = (f"{'환 예약실행' if key == 'fx_run' else 'HL 예약실행'} "
                 f"{'켬' if run_on[key] else '끔'}")
         log.info("[동시호가 화면] %s", text)
@@ -297,7 +413,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # ===== 상태줄 = 읽기 전용 콤보(체결쏴·NXT 개장과 같음, 사용자 2026-10-23) — 글 앞에 시각,
     # 펼치면 지난 글 50건. 예약·예약실행 켬/끔도 여기에 남긴다.
     status_box = StatusCombo(root, T.FONT_LABEL)
-    status_box.widget.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(4, 6))
+    status_box.widget.grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=(4, 6))
+    # LS 처리 지연 띠(사용자 2026-10-26) — 코어 연결(§9-3) 뒤 /state의 ws로 켜고 끈다. 지금은 숨김.
+    w["banner"] = StallBanner(root, (T.FAMILY, 10, "bold"),
+                              lambda wd: wd.grid(row=0, column=0, columnspan=2, sticky="ew"))
     root.grid_columnconfigure(1, weight=1)
     status_box.show("-")
     w["status"] = status_box  # 예약 버튼 콜백이 쓴다(버튼은 상태줄보다 먼저 만들어짐)

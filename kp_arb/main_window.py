@@ -718,6 +718,11 @@ def main() -> None:
     # width=1: 글 길이가 창 폭을 정하지 않게(크기 조절 허용 뒤, 2026-10-15) — 남는 폭은 fill로
     lbl_core = tk.Label(root, text="코어: 확인 중 ...", anchor="w", width=1)
     lbl_core.pack(fill="x", padx=8, pady=(8, 2))
+    # LS 처리 지연 띠 — 지연 동안만 맨 위(사용자 2026-10-26; 표의 "멈춤" 글만으론 못 보고 지나감)
+    from .ui_status import StallBanner, ls_stalled
+
+    banner = StallBanner(root, ("Malgun Gothic", 10, "bold"),
+                         lambda wd: wd.pack(fill="x", before=lbl_core))
     bottom = tk.Frame(root)
     bottom.pack(fill="x", padx=8, pady=(2, 8))
     status = tk.Label(bottom, text="-", anchor="w", relief="groove", width=1)
@@ -767,6 +772,7 @@ def main() -> None:
         if sig == ws_box["sig"]:  # 변화 없으면 다시 그리지 않음(깜빡임 방지)
             return
         ws_box["sig"] = sig
+        banner.set(ls_stalled(rows))
         ws_tree.delete(*ws_tree.get_children())
         for i, r in enumerate(rows, 1):
             up = bool(r.get("connected"))

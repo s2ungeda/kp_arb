@@ -45,6 +45,7 @@ from .ui_fields import (
     parse_qty,
     parse_threshold,
 )
+from .ui_status import ls_stalled  # noqa: F401 - 화면·테스트가 여기서도 가져다 쓴다
 
 # 방향별 컬럼 라벨 (목업 STG_2) — (태그, 이름, 진입SF, 진입S, 청산SF)
 # 정방향 진입 -HP/+SF·-HP/+S, 청산 +HP/-SF / 역방향은 부호 반대
@@ -402,14 +403,6 @@ RESUME_TEXT = "LS 처리 재개 — 자동M 주문 다시 냄"
 RESUME_SHOW_S = 5.0
 
 
-def ls_stalled(rows: Sequence[Mapping[str, Any]]) -> bool:
-    """/state 채널 현황에서 LS 채널이 '처리 멈춤'(접속은 살아 있는데 COM 스레드가 안 돎)인가.
-    체결쏴 상태줄 알림용(사용자 2026-10-23 "처리 지연이면 자동M 주문이 안 나간다는 걸 사용자가
-    알아야"). 끊김(connected False)은 다른 길(메인 끊김 알림)이 다룬다. 순수."""
-    return any(str(r.get("venue")) == "LS" and bool(r.get("connected")) and bool(r.get("stalled"))
-               for r in rows)
-
-
 def stall_notice(box: dict[str, Any], stalled: bool, now: float) -> tuple[str, str] | None:
     """상태줄에 띄울 (글, 글자색) — 멈춘 동안은 빨간 STALL_TEXT, 풀린 뒤 RESUME_SHOW_S초는 초록
     RESUME_TEXT, 그 밖엔 None(보통 상태줄). box에 멈춤 여부·재개 표시 시각을 든다. 순수."""
@@ -580,6 +573,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     # ===================== 상단 바 =====================
     top = tk.Frame(root)
     top.pack(fill="x", padx=4, pady=(2, 2))
+    # LS 처리 지연 띠 — 지연 동안만 상단 바 위에(사용자 2026-10-26, ui_status.StallBanner)
+    from .ui_status import StallBanner
+
+    banner = StallBanner(root, (T.FAMILY, 10, "bold"), lambda wd: wd.pack(fill="x", before=top))
     # 종목 콤보 — 현대차 제외(사용자 2026-09-04, 시세 화면과 동일). 코어 취급 종목은 그대로.
     # 앞의 '종목' 제목 라벨은 뺐다(사용자 2026-09-11, 상단 공간 확보).
     # 거래소 콤보(주식, 사용자 2026-09-17) — 종목 콤보 왼쪽. 실행 중에도 잠그지 않으며('적'은
@@ -2278,12 +2275,15 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 for lbl in mon.values():
                     lbl.config(text="-")
                 status_box.show("코어 미접속 — 메인에서 코어 시작")
+                banner.set(False)
             else:
                 apply_live()
-                # LS 처리 멈춤이면 상태줄을 덮어 알린다(사용자 2026-10-23 안 1) — 풀리면 재개 글
-                # 5초. 보통 때는 글자색을 되돌린다.
+                # LS 처리 지연이면 맨 위 빨간 띠(10-26) + 상태줄 덮어 알림(10-23 안 1) — 풀리면
+                # 띠는 사라지고 상태줄은 재개 글 5초. 보통 때는 글자색을 되돌린다.
                 data = state_box.get("data") or {}
-                notice = stall_notice(state_box, ls_stalled(data.get("ws") or []), time.time())
+                stalled = ls_stalled(data.get("ws") or [])
+                banner.set(stalled)
+                notice = stall_notice(state_box, stalled, time.time())
                 if notice is not None:
                     status_box.show(notice[0])
                     status_box.color(notice[1])

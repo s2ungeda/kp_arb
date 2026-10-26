@@ -22,3 +22,14 @@ def test_style_for_color_maps_known_colors_only() -> None:
     # 체결쏴 LS 처리 멈춤 알림(빨강)·재개(초록)는 콤보 스타일로, 모르는 색은 기본
     assert style_for("red") == "Stall.TCombobox" and style_for("dark green") == "Resume.TCombobox"
     assert style_for("black") == "TCombobox" == style_for("blue")
+
+
+def test_stall_banner_text_and_ls_stalled_judgement() -> None:
+    # 사용자 2026-10-26: 지연 띠 글은 "LS 처리 지연", 판정은 LS 채널이 연결된 채 stalled일 때만
+    from kp_arb.ui_status import STALL_BANNER_TEXT, ls_stalled
+
+    assert STALL_BANNER_TEXT.startswith("LS 처리 지연")
+    assert ls_stalled([{"venue": "LS", "connected": True, "stalled": True}])
+    assert not ls_stalled([{"venue": "LS", "connected": False, "stalled": True}])  # 끊김은 딴 길
+    assert not ls_stalled([{"venue": "HL", "connected": True, "stalled": True}])
+    assert not ls_stalled([])

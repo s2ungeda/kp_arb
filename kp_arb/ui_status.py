@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 HISTORY_MAX = 50  # 상태줄 콤보 이력(사용자 2026-10-23 "100건은 많고 50건까지만")
@@ -35,6 +36,55 @@ def push_history(history: list[str], text: str, limit: int = HISTORY_MAX,
     history.insert(0, f"{stamp} {text}" if stamp else text)
     del history[limit:]
     return True
+
+
+# LS 처리 지연 띠(사용자 2026-10-26 "상태바는 못 보고 지나간다 — 빨간 띠, 글은 'LS 처리 지연'"):
+# 창 맨 위에 지연 동안만 보이는 빨간 바탕 흰 글 한 줄. 체결쏴·NXT 개장·동시호가 주문·메인 창 공통.
+STALL_BANNER_TEXT = "LS 처리 지연 — 자동 주문 안 나감(풀리면 사라짐)"
+STALL_BANNER_BG = "#c00000"
+
+
+def ls_stalled(rows: Sequence[Mapping[str, Any]]) -> bool:
+    """/state 채널 현황에서 LS 채널이 '처리 지연'(접속은 살아 있는데 COM 스레드가 안 돎)인가.
+    끊김(connected False)은 다른 길(메인 끊김 알림)이 다룬다. 순수."""
+    return any(str(r.get("venue")) == "LS" and bool(r.get("connected")) and bool(r.get("stalled"))
+               for r in rows)
+
+
+class StallBanner:
+    """지연 띠 위젯 — ``set(True)``면 ``show(widget)``(화면이 정한 grid/pack)로 붙이고,
+    ``set(False)``면 뗀다. 같은 상태면 아무것도 안 해 깜빡이지 않는다."""
+
+    def __init__(self, parent: Any, font: Any, show: Callable[[Any], None]) -> None:
+        import tkinter as tk
+
+        self.widget = tk.Label(parent, text=STALL_BANNER_TEXT, bg=STALL_BANNER_BG, fg="white",
+                               font=font, anchor="w", padx=8, pady=3)
+        self._show = show
+        self.on = False
+
+    def set(self, stalled: bool) -> None:
+        if stalled == self.on:
+            return
+        self.on = stalled
+        if stalled:
+            self._show(self.widget)
+        elif self.widget.winfo_manager() == "grid":
+            self.widget.grid_remove()
+        else:
+            self.widget.pack_forget()
+
+
+def log_tk_errors(root: Any, log: Any) -> None:
+    """tk 콜백(버튼·after) 안의 예외를 화면 로그에 남긴다 — 메인이 띄운 화면은 콘솔이 없어 tk가
+    stderr로 내는 추적이 사라지고, 버튼이 '안 눌리는' 것처럼만 보인다(2026-10-26 동시호가 주문
+    "예약 버튼 상태가 안 변함" 조사). 원인 파악용 — 예외를 삼키지 않고 기록만 한다."""
+    import traceback
+
+    def report(exc_type: Any, exc: Any, tb: Any) -> None:
+        log.error("[화면 오류] %s", "".join(traceback.format_exception(exc_type, exc, tb)))
+
+    root.report_callback_exception = report
 
 
 def style_for(color: str) -> str:

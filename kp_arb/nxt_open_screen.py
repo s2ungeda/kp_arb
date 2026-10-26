@@ -181,14 +181,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     import time
     import tkinter as tk
     from functools import partial
-    from tkinter import messagebox, ttk
+    from tkinter import ttk
 
     from . import ui_theme as T
     from . import win_state
     from .core_client import core_request, run_state_feed, screen_log, watch_parent_exit
     from .ui_close import attach_auto_close, main_closing
+    from .ui_dialog import show_message
     from .ui_fields import is_decimal_text, is_int_text, is_time_text, is_unsigned_decimal_text
-    from .ui_status import StatusCombo
+    from .ui_status import StallBanner, StatusCombo, log_tk_errors, ls_stalled
 
     preview = "--preview" in sys.argv
     if not preview:
@@ -205,6 +206,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     vcmd_qty = (root.register(is_unsigned_decimal_text), "%P")  # 단 수량: 소수 가능(HL 주문)
     vcmd_time = (root.register(is_time_text), "%P")
     log = screen_log()
+    log_tk_errors(root, log)  # 버튼 콜백 예외를 화면 로그에(콘솔이 없어 안 보임, 2026-10-26)
 
     jobs: queue.Queue[tuple[dict[str, Any], str]] = queue.Queue()
     results: queue.Queue[tuple[str, dict[str, Any] | None]] = queue.Queue()
@@ -236,7 +238,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # ===== 1줄: 종목·HL 호가단위·적·기준수량·시간 (체결쏴 주식 윗줄 순서, 사용자 2026-10-20) =====
     top = tk.Frame(root)
-    top.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+    top.grid(row=1, column=0, sticky="ew", padx=6, pady=(6, 2))  # 0행 = LS 처리 지연 띠
     w["under"] = ttk.Combobox(top, values=[NAMES[u] for u in UNDERLYINGS], width=7,
                               state="readonly")
     w["under"].set(NAMES[UNDERLYINGS[0]])
@@ -275,7 +277,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 2~4행 = 3단. 실행은 3행 병합 버튼(HL매도/HL매수). 역산가는 주문가 옆 표시 열(사용자
     # 2026-10-22 — 숨은 패널 대신), 결과 열은 없다.
     tbl = tk.Frame(root)
-    tbl.grid(row=1, column=0, sticky="ew", padx=6, pady=(4, 0))
+    tbl.grid(row=2, column=0, sticky="ew", padx=6, pady=(4, 0))
     heads = ("Sprd", "수량", "주문가", "역산가", "실행")  # Sprd = 체결쏴 표기
     widths = (5, 6, 5, 8, 7)   # 입력칸 폭은 체결쏴 세트 행과 같게(5·6·5), 역산가 8(1,303.50)
     head_w = (7, 7, 7, 8, 7)   # 헤더 폭이 곧 칸 폭(입력칸은 nsew로 채움 — 체결쏴 세트 행과 같음)
@@ -340,7 +342,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 상태줄 = 읽기 전용 콤보(사용자 2026-10-23): 최신 글을 보여 주고 펼치면 지난 글 50건. width=1 +
     # 가로 채움 — 긴 글이 창을 넓히지 않게. 펼친 목록은 넓혀서 긴 글도 보이게(postcommand).
     status_box = StatusCombo(root, T.FONT_LABEL)  # 체결쏴와 공용(ui_status)
-    status_box.widget.grid(row=2, column=0, sticky="ew", padx=6, pady=(4, 6))
+    status_box.widget.grid(row=3, column=0, sticky="ew", padx=6, pady=(4, 6))
+    # LS 처리 지연 띠 — 지연 동안만 맨 위(사용자 2026-10-26)
+    banner = StallBanner(root, (T.FAMILY, 10, "bold"),
+                         lambda wd: wd.grid(row=0, column=0, sticky="ew"))
     show_status = status_box.show
     root.grid_columnconfigure(0, weight=1)
     note: dict[str, Any] = {"text": "", "until": 0.0}  # 명령 결과는 5초만 보여 주고 창 상태로
@@ -433,9 +438,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             # 완전한 단이 하나도 없으면 켜지 않고 알림(사용자 2026-10-21 "청산처럼 모든 세트가
             # 조건에 안 맞으면 알림") — 상태줄 한 줄로는 지나치기 쉬움
             set_status(f"{label} 켬 거부: 완전한 단 없음", err=True)
-            messagebox.showwarning("NXT 개장 매매", f"{label} 세트에 완전한 단이 없습니다.\n"
-                                   "Sprd·수량·주문가를 다 채운 단이 하나는 있어야 켤 수 있습니다.",
-                                   parent=root)
+            # 알림창은 부모 창 가운데(ui_dialog, 사용자 2026-10-26) — tk messagebox는 모니터 가운데
+            show_message(root, "NXT 개장 매매", f"{label} 세트에 완전한 단이 없습니다.\n"
+                         "Sprd·수량·주문가를 다 채운 단이 하나는 있어야 켤 수 있습니다.")
             return
         if value:
             save_current()  # 켤 때 입력값부터 코어에
@@ -508,6 +513,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     def refresh() -> None:
         data = state_box.get("data") or {}
+        banner.set(ls_stalled(data.get("ws") or []))
         u = cur["u"]
         settings = (data.get("nxt_open") or {}).get("books") or {}
         if not cur["loaded"] and isinstance(settings.get(u.value), dict):
