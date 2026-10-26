@@ -54,6 +54,7 @@ from .strategy_core import (
 from .ticks import tick_for
 
 if TYPE_CHECKING:
+    from .auction_order_engine import AuctionOrderEngine
     from .auto_m_engine import AutoMEngine
     from .bootstrap import LiveSystem
     from .core_engine import RehearsalEngine
@@ -140,7 +141,8 @@ def auto_check_target(payload: dict[str, Any]) -> Underlying | None:
     종목 없는 명령·종목 오류는 None. 화면이 그 종목을 보여 주려면 시세가 있어야 하므로 실행 전이라도
     켠다."""
     cmd = str(payload.get("cmd", ""))
-    if not (cmd.startswith("autom_") or cmd.startswith("nxt_open_")):
+    if not (cmd.startswith("autom_") or cmd.startswith("nxt_open_")
+            or cmd.startswith("auction_")):
         return None
     if cmd.endswith("_run") and not payload.get("value"):
         return None
@@ -662,6 +664,57 @@ def _autom_set_from_body(target: Any, body: dict[str, Any]) -> None:
         target.sf_net, target.hl_net = 0, 0.0
 
 
+async def _auction_command(engine: AuctionOrderEngine | None, state: CoreState,
+                           body: dict[str, Any]) -> dict[str, Any]:
+    """동시호가 주문 명령(DESIGN-auction-order §6) — auction_rows(16행 설정) · auction_settings
+    (설정·월물) · auction_run(예약실행 proc fx|hl) · auction_amend/auction_cancel(HL 행 a~d).
+    행·설정은 엔진 없이도 저장되고, 실행·정정·취소는 엔진이 있어야 한다."""
+    from .auction_order import HL_ROWS, apply_rows, settings_from_dict
+
+    cmd = body.get("cmd")
+    try:
+        u = Underlying(str(body["underlying"]))
+    except (KeyError, ValueError):
+        return _fail(["underlying 필요"])
+    book = state.auction.book(u.value)
+    alog = logging.getLogger("kp_arb.auction")
+    if cmd == "auction_rows":
+        errors = apply_rows(book, body)
+        if errors:
+            return _fail(errors)
+        alog.info("[동시호가] %s 행 저장: 매수 %s 매도 %s", u.value,
+                  [(r.spread, r.qty, r.on) for r in book.buy],
+                  [(r.spread, r.qty, r.on) for r in book.sell])
+        return _ok()
+    if cmd == "auction_settings":
+        merged = {**dataclasses.asdict(book.settings),
+                  **{k: v for k, v in body.items() if k not in ("cmd", "underlying", "month")}}
+        book.settings = settings_from_dict(merged)
+        if "month" in body:
+            month = str(body["month"]).strip()
+            if month not in ("near", "next"):
+                return _fail([f"월물 값 오류: {month!r} (near|next)"])
+            book.month = month
+        alog.info("[동시호가] %s 설정 저장: 월물 %s %s", u.value, book.month,
+                  dataclasses.asdict(book.settings))
+        return _ok()
+    if engine is None:
+        return _fail(["코어 시세 미접속 — 실행 불가"])
+    if cmd == "auction_run":
+        proc = str(body.get("proc", ""))
+        if proc not in ("fx", "hl", "test"):
+            return _fail([f"proc은 fx|hl|test: {proc!r}"])
+        engine.set_run(u, proc, bool(body.get("value", False)))
+        return _ok()
+    if cmd in ("auction_amend", "auction_cancel"):
+        name = str(body.get("row", ""))
+        if name not in HL_ROWS:
+            return _fail([f"row는 a~d: {name!r}"])
+        why = await (engine.amend(u, name) if cmd == "auction_amend" else engine.cancel(u, name))
+        return _fail([why]) if why else _ok()
+    return _fail([f"알 수 없는 명령: {cmd}"])
+
+
 def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
                       body: dict[str, Any]) -> dict[str, Any]:
     """오전 NXT 개장 매매 명령(DESIGN-nxt-open.md §6) — nxt_open_settings(종목 설정 저장) ·
@@ -906,6 +959,27 @@ async def _manual_command(
             else:
                 state.hl_merge[underlying.value] = [n_sig_figs, mantissa]
         return _ok()
+    if cmd == "manual_fx_futures":  # 원달러선물 1건 직접 발주(KR_FX, 진단용 — 사용자 2026-10-26
+        # "원달러선물 주문 직접 내 봐, 어떤 거부가 나는지"). 월물·가격을 안 주면 공통설정 월물·
+        # 현재가.
+        try:
+            fx_side = Side(str(body.get("side", "buy")))
+            fx_qty = int(body.get("qty", 1))
+            fx_code = str(body.get("code") or (system.fx_futures_code() or ""))
+            price_raw = body.get("price")
+            fx_px = (float(price_raw) if price_raw is not None
+                     else float(system.fx_futures_price.get(fx_code) or 0.0))
+        except (TypeError, ValueError) as exc:
+            return _fail([f"잘못된 인자: {exc}"])
+        if not fx_code or fx_px <= 0 or fx_qty <= 0:
+            return _fail([f"월물·가격·수량 확인: code={fx_code!r} price={fx_px} qty={fx_qty}"])
+        try:
+            oid = await system.place_fx_futures(fx_code, fx_side, fx_qty, fx_px, src="수동(진단)")
+        except Exception as exc:  # noqa: BLE001 - 거부 사유를 그대로 화면·호출자에게
+            logging.getLogger("kp_arb.core").error("수동 원달러선물 발주 거부 %s %s %d @ %s — %s",
+                                                   fx_code, fx_side.value, fx_qty, fx_px, exc)
+            return _fail([f"{type(exc).__name__}: {exc}"[:300]])
+        return _ok(order_id=oid, code=fx_code, price=fx_px)
     if cmd == "manual_refresh":  # 잔고/포지션 재조회 → OrderBook 재동기 ('적' 버튼)
         # refresh_snapshot은 LS/HL REST라 느려, 응답을 막으면 화면 core_request가
         # 타임아웃나 '코어 미접속'으로 뜬다. 백그라운드로 돌리고 즉시 OK — 결과는 폴링 반영.
@@ -1355,6 +1429,7 @@ def make_app(
     autom_stock: AutoMEngine | None = None,  # 주식 체결쏴 엔진(exec §7C, 2026-09-17)
     autom_hl_first: AutoMEngine | None = None,  # 주식선물 HL선 엔진(exec §7D 시험, 2026-09-22)
     nxt_open: NxtOpenEngine | None = None,  # 오전 NXT 개장 매매 엔진(DESIGN-nxt-open, 2026-10-20)
+    auction: AuctionOrderEngine | None = None,  # 동시호가 주문 엔진(DESIGN-auction-order, 10-26)
 ) -> web.Application:
     """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅.
 
@@ -1406,6 +1481,8 @@ def make_app(
             **(autom_hl_first.live_snapshot() if autom_hl_first is not None else {})}
         # 오전 NXT 개장 매매 실시간(괴리·창·판정 결과) — 설정은 payload["nxt_open"](CoreState)
         payload["nxt_open_live"] = nxt_open.live_snapshot() if nxt_open is not None else {}
+        # 동시호가 주문 실시간(예상주문가·발주 결과·환·HL 행) — 설정은 payload["auction"]
+        payload["auction_live"] = auction.live_snapshot() if auction is not None else {}
         return payload
 
     if hub is not None and hub.state_provider is None:
@@ -1440,6 +1517,12 @@ def make_app(
             return web.json_response(result, dumps=_dumps)
         if isinstance(cmd, str) and cmd.startswith("fx_"):
             result = _fx_command(fx_service, payload)
+            return web.json_response(result, dumps=_dumps)
+        if isinstance(cmd, str) and cmd.startswith("auction_"):
+            await _auto_check_symbol(payload, "동시호가")
+            result = await _auction_command(auction, state, payload)
+            if result.get("ok") and save:
+                save()  # 행·설정·HL 행↔주문번호 저장(예약실행은 저장 안 함)
             return web.json_response(result, dumps=_dumps)
         if isinstance(cmd, str) and cmd.startswith("nxt_open_"):
             await _auto_check_symbol(payload, "NXT 개장")
@@ -1639,6 +1722,7 @@ async def _serve() -> None:
         autom_engine_stock = None
         autom_engine_hl_first = None
         nxt_open_engine = None
+        auction_engine = None
         tasks: list[asyncio.Task[None]] = []
         boot_errors: list[str] = []  # 코어 조립 실패 사유 → /state load_errors → 메인창 팝업
         try:
@@ -1683,6 +1767,12 @@ async def _serve() -> None:
 
             nxt_open_engine = _NxtOpenEngine(
                 state.nxt_open, system, save=lambda: save_state(STATE_PATH, state))
+            # 동시호가 주문(DESIGN-auction-order.md) — 20ms 틱 타이머 태스크
+            from .auction_order_engine import AuctionOrderEngine as _AuctionEngine
+
+            auction_engine = _AuctionEngine(
+                state.auction, system, save=lambda: save_state(STATE_PATH, state))
+            tasks.append(asyncio.create_task(auction_engine.run()))
             tasks.append(asyncio.create_task(engine.run()))
             tasks.append(asyncio.create_task(fx_service.run()))
             tasks.append(asyncio.create_task(autom_engine.run()))
@@ -1714,7 +1804,7 @@ async def _serve() -> None:
             system=system, engine=engine, fx_service=fx_service,
             boot_errors=boot_errors, hub=hub, autom=autom_engine,
             autom_stock=autom_engine_stock, autom_hl_first=autom_engine_hl_first,
-            nxt_open=nxt_open_engine),
+            nxt_open=nxt_open_engine, auction=auction_engine),
             access_log=None)
         await runner.setup()
         if system is not None:  # LS 구독 계획(§9) — 저장된 설정(종목 체크·월물)대로 등록
@@ -1742,6 +1832,8 @@ async def _serve() -> None:
             await autom_engine_stock.shutdown()
         if autom_engine_hl_first is not None:
             await autom_engine_hl_first.shutdown()
+        if auction_engine is not None:  # 동시호가 예약·예약실행 끔(메인 종료 = 모든 자동주문 끔)
+            await auction_engine.shutdown()
         if system is not None:
             await system.stop()  # WS(_guarded_ws)·시동 태스크 명시 취소 — 종료 중 재접속 방지
         for task in tasks:

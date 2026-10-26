@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import time as dtime
 from enum import StrEnum
 
+from .auction_order import AuctionScreen
+from .auction_order import screen_from_dict as auction_from_dict
 from .auto_m import AutoMScreen, autom_from_dict
 from .domain.enums import Block, Instrument, Side, Underlying, Venue
 from .nxt_open import NxtOpenScreen
@@ -221,6 +223,9 @@ class CoreState:
     hl_merge: dict[str, list[int | None]] = field(default_factory=dict)
     # 오전 NXT 개장 매매(DESIGN-nxt-open.md) — 종목별 설정. 실행 상태는 복원 안 함.
     nxt_open: NxtOpenScreen = field(default_factory=NxtOpenScreen)
+    # 동시호가 주문(DESIGN-auction-order.md §6) — 종목별 16행·월물·설정·HL 행↔주문번호. 예약실행은
+    # 복원 안 함.
+    auction: AuctionScreen = field(default_factory=AuctionScreen)
 
 
 # --- 검증 ---
@@ -424,6 +429,7 @@ def state_from_dict(data: dict[str, object]) -> CoreState:
         legacy_u = str(raw_screens["autoM"].get("underlying", legacy_u))
     autom_from_dict(state.autom, data.get("autom"), legacy_underlying=legacy_u)
     nxt_open_from_dict(state.nxt_open, data.get("nxt_open"))
+    auction_from_dict(state.auction, data.get("auction"))
     merges = data.get("hl_merge")
     if isinstance(merges, dict):  # 종목별 [nSigFigs, mantissa] — 형식 틀린 항목만 버림
         valid = {u.value for u in Underlying}

@@ -4,7 +4,10 @@
 배치는 엑셀 ver2 셀 자리를 따른다: 윗줄(종목·월물·호가단위·적) / 왼쪽 예약주문 16행(매수 8·매도 8:
 주문Sprd·수량·예상주문가·예약주문 버튼) / 오른쪽 주문시각 6칸 → 원달러 대응 설정 행 → HL주문설정
 a~d.
-`--preview`로 코어 없이 뜬다. 코어 명령·상태 연결은 화면 모양이 확정된 뒤(§9-2·3).
+`--preview`로 코어 없이 뜬다. 코어 연결(§9-3, 2026-10-26): 행·설정은 예약 버튼·예약실행·정정·'적'을
+누를 때와 종목 바꿀 때·닫을 때 코어로(auction_rows / auction_settings — 체결쏴 결정 74 방식),
+예약실행은 auction_run, 정정·취소는 auction_amend/auction_cancel.
+표시(예상체결가·예상주문가·발주 결과·환 분할·HL 행·진입계약수)는 /state의 auction_live.
 """
 from __future__ import annotations
 
@@ -17,6 +20,7 @@ UNDERLYINGS = (Underlying.SK_HYNIX, Underlying.SAMSUNG)
 NAMES = {Underlying.SK_HYNIX: "하이닉스", Underlying.SAMSUNG: "삼성"}
 BY_NAME = {v: k for k, v in NAMES.items()}
 ROWS_PER_SIDE = 8                      # 매수 8행 + 매도 8행 고정(ver2 P24)
+HOLD_S = 2.0   # 버튼을 누른 뒤 이 동안은 화면 값을 지키고 코어 상태로 덮지 않는다(깜박임 방지)
 HL_ROWS = ("a", "b", "c", "d")         # 프로세스3 4건
 # 기본값(ver2 G21~K22·F26~K27) — 전부 사용자 입력칸(사용자 2026-10-22 답 4)
 DEFAULTS = {"ls_hms": "15:44:55", "ls_ms": "100", "ls_itv": "200",
@@ -88,6 +92,117 @@ def pt_missing(pt_text: str) -> bool:
         return True
 
 
+def rows_payload(u: str, buy: list[tuple[str, str, bool]],
+                 sell: list[tuple[str, str, bool]]) -> dict[str, Any]:
+    """행 설정 명령(auction_rows) 본문 — (스프레드 글, 수량 글, 켬) 목록 → 숫자. 스프레드 칸은
+    **%**(체결쏴·NXT 개장과 같음: 0.3 = 0.3%) → 코어엔 소수(0.003). 빈 글은 None/0. 순수.
+    (2026-10-26 시험: 0.1을 그대로 보내 10%로 역산돼 한 건도 안 나감 → %로 고침)"""
+    def conv(rows: list[tuple[str, str, bool]]) -> list[dict[str, Any]]:
+        out = []
+        for sp, qty, on in rows:
+            sp_t, q_t = sp.strip(), qty.replace(",", "").strip()
+            out.append({"spread": float(sp_t) / 100.0 if sp_t else None,
+                        "qty": int(float(q_t)) if q_t else 0, "on": bool(on)})
+        return out
+    return {"cmd": "auction_rows", "underlying": u, "buy": conv(buy), "sell": conv(sell)}
+
+
+def settings_payload(u: str, texts: Mapping[str, str], month: str,
+                     hl_off: Mapping[str, str], hl_pt: Mapping[str, str]) -> dict[str, Any]:
+    """설정 명령(auction_settings) 본문 — 시각 칸은 글 그대로, 숫자 칸은 int, HL 오프셋·정정PT는
+    float(비면 0). 순수."""
+    def num(text: str, default: int) -> int:
+        t = text.replace(",", "").strip()
+        return int(float(t)) if t else default
+
+    def fnum(text: str) -> float:
+        t = text.strip()
+        return float(t) if t else 0.0
+    return {"cmd": "auction_settings", "underlying": u, "month": month,
+            "ls_hms": texts["ls_hms"].strip(), "ls_ms": num(texts["ls_ms"], 0),
+            "ls_itv_ms": num(texts["ls_itv"], 0),
+            "fx_hms": texts["fx_hms"].strip(), "fx_ms": num(texts["fx_ms"], 0),
+            "fx_itv_ms": num(texts["fx_itv"], 0),
+            "tick": num(texts["tick"], 0), "hedge_pct": num(texts["hedge_pct"], 0),
+            "fx_unit": num(texts["fx_unit"], 0),
+            "hl_off": {k: fnum(v) for k, v in hl_off.items()},
+            "hl_pt": {k: fnum(v) for k, v in hl_pt.items()}}
+
+
+def book_texts(book: Mapping[str, Any]) -> dict[str, str]:
+    """코어 종목 상태(auction.books[u]) → 설정 칸 글. 순수."""
+    st = dict(book.get("settings") or {})
+
+    def g(key: str, default: str) -> str:
+        v = st.get(key)
+        return default if v in (None, "") else str(v)
+    return {"ls_hms": g("ls_hms", DEFAULTS["ls_hms"]), "ls_ms": g("ls_ms", DEFAULTS["ls_ms"]),
+            "ls_itv": g("ls_itv_ms", DEFAULTS["ls_itv"]),
+            "fx_hms": g("fx_hms", DEFAULTS["fx_hms"]), "fx_ms": g("fx_ms", DEFAULTS["fx_ms"]),
+            "fx_itv": g("fx_itv_ms", DEFAULTS["fx_itv"]),
+            "tick": g("tick", DEFAULTS["tick"]), "hedge_pct": g("hedge_pct", DEFAULTS["hedge_pct"]),
+            "fx_unit": g("fx_unit", DEFAULTS["fx_unit"])}
+
+
+def row_texts(row: Mapping[str, Any]) -> tuple[str, str, bool]:
+    """코어 행(스프레드 소수) → (스프레드 % 글, 수량 글, 켬). 순수."""
+    sp, qty = row.get("spread"), row.get("qty")
+    return (("" if sp is None else f"{round(float(sp) * 100.0, 6):g}"),
+            ("" if not qty else f"{int(float(qty))}"), bool(row.get("on")))
+
+
+def num_text(v: float | None) -> str:
+    """오프셋·정정PT 글 — 0은 빈칸. 순수."""
+    return "" if not v else f"{float(v):g}"
+
+
+def px_text(v: float | None) -> str:
+    return "-" if v is None else f"{v:,.0f}"
+
+
+def pct2(frac: float | None) -> str:
+    """모니터 스프레드 — 소수 → % 두 자리(체결쏴 모니터와 같은 모양). 없으면 "-"."""
+    return "-" if frac is None else f"{frac * 100:.2f}"
+
+
+def result_line(side: str, i: int, r: Mapping[str, Any]) -> str:
+    """행 발주 결과 한 줄(상태줄) — "매수1 발주 #123 20@1,767,000" / "매수3 실패 …". 순수."""
+    name = f"{'매수' if side == 'buy' else '매도'}{i + 1}"
+    if r.get("error"):
+        return f"{name} 실패 {r['error']}"
+    if r.get("skipped"):
+        return f"{name} 안 냄 — {r['skipped']}"
+    return f"{name} 발주 #{r.get('order_id')} {r.get('qty')}@{px_text(r.get('price'))}"
+
+
+def hl_line(name: str, row: Mapping[str, Any]) -> str:
+    """HL 행 상태 한 줄 — "HL a 접수 #9 7.5@1333.0 잔량 7.5". 순수."""
+    st = str(row.get("status") or "")
+    if st == "실패":
+        return f"HL {name} 실패 {row.get('error')}"
+    rem = row.get("remaining")
+    tail = f" 잔량 {rem:g}" if isinstance(rem, int | float) else ""
+    return (f"HL {name} {st} #{row.get('order_id')} {row.get('qty')}"
+            f"@{row.get('price')}{tail}").replace("  ", " ")
+
+
+def px_style(row: Mapping[str, Any] | None, fires: bool) -> tuple[str, str]:
+    """예상주문가 칸 (글자색, 바탕색) — 발주 초록·실패 빨강·안 냄 주황, 아직 안 본 행 중 지금 값으로
+    나갈 행은 연두 바탕(사용자 2026-10-26 "나갈 거로 예상되는 행에 색"), 그 밖엔 회색. 순수."""
+    if row:
+        if row.get("error"):
+            return "red", "SystemButtonFace"
+        if row.get("skipped"):
+            return "dark orange", "SystemButtonFace"
+        return "dark green", "SystemButtonFace"
+    return ("black", "#d8f5d0") if fires else ("gray25", "SystemButtonFace")
+
+
+def hl_buttons_enabled(row: Mapping[str, Any]) -> bool:
+    """정정·취소 버튼 — 그 행의 HL 주문이 열려 있을 때만(§5 접수 확인 뒤 활성). 순수."""
+    return bool(row.get("open"))
+
+
 def any_reserved(res_on: Mapping[tuple[str, int], bool]) -> bool:
     """예약주문 행이 하나라도 켜져 있나 — 켜져 있으면 윗줄(월물·호가단위·적)을 잠근다(사용자
     2026-10-26). 순수."""
@@ -95,17 +210,22 @@ def any_reserved(res_on: Mapping[tuple[str, int], bool]) -> bool:
 
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
+    import queue
     import sys
+    import threading
+    import time
     import tkinter as tk
     from functools import partial
     from tkinter import ttk
 
     from . import ui_theme as T
     from . import win_state
-    from .core_client import screen_log, watch_parent_exit
+    from .core_client import core_request, run_state_feed, screen_log, watch_parent_exit
+    from .nxt_open_screen import active_label, merge_choices
+    from .ui_close import attach_auto_close, main_closing
     from .ui_dialog import show_message
     from .ui_fields import is_decimal_text, is_int_text, is_time_text, is_unsigned_decimal_text
-    from .ui_status import StallBanner, StatusCombo, log_tk_errors
+    from .ui_status import StallBanner, StatusCombo, log_tk_errors, ls_stalled
 
     preview = "--preview" in sys.argv
     if not preview:
@@ -123,7 +243,36 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     vcmd_time = (root.register(is_time_text), "%P")
     log = screen_log()
     log_tk_errors(root, log)  # 버튼 콜백 예외를 화면 로그에(콘솔이 없어 안 보임)
-    w: dict[str, Any] = {"rows": {}, "res": {}, "res_on": {}, "hl": {}}
+
+    # --- 코어 연결: 전송은 뒷단 스레드(jobs → results), 상태는 run_state_feed(공유메모리/폴링) ---
+    jobs: queue.Queue[tuple[dict[str, Any], str]] = queue.Queue()
+    results: queue.Queue[tuple[str, dict[str, Any] | None]] = queue.Queue()
+    state_box: dict[str, Any] = {"data": None}
+
+    def sender() -> None:
+        while True:
+            payload, label = jobs.get()
+            results.put((label, core_request("/command", payload, timeout=10.0)))
+            jobs.task_done()
+
+    def poller() -> None:
+        run_state_feed(state_box, log_tag="동시호가", channel="state",
+                       fallback_path="/state", poll_s=1.0)
+
+    if not preview:
+        threading.Thread(target=sender, daemon=True).start()
+        threading.Thread(target=poller, daemon=True).start()
+
+    def send(payload: dict[str, Any], label: str) -> None:
+        if preview:
+            return
+        jobs.put(({**payload, "sent_at": time.time()}, label))
+
+    cur: dict[str, Any] = {"u": UNDERLYINGS[0], "loaded": False, "agg_under": None,
+                           "sent_rows": None, "sent_settings": None, "seen_rows": set(),
+                           "seen_hl": {}, "fx_note": "", "note": ""}
+    agg_map: dict[str, tuple[Any, Any]] = {}
+    w: dict[str, Any] = {"rows": {}, "res": {}, "res_on": {}, "hl": {}, "hold": {}}
 
     def entry(parent: tk.Misc, width: int, vc: Any, text: str = "",
               justify: Literal["left", "center", "right"] = "right") -> tk.Entry:
@@ -155,18 +304,57 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     w["agg"].pack(side="left", padx=(0, 4))
     w["apply"] = ttk.Button(top, text="적", width=3)
     w["apply"].pack(side="left", padx=(0, 8))
-    w["sf_exp"] = tk.Label(top, text="주식선물 예상체결가 -", font=T.FONT_LABEL, fg="gray25")
-    w["sf_exp"].pack(side="left", padx=(0, 8))
-    w["fx_exp"] = tk.Label(top, text="환 예상체결가 -", font=T.FONT_LABEL, fg="gray25")
-    w["fx_exp"].pack(side="left")
+    # 시험 모드(§7a, 사용자 2026-10-26): 장중엔 예상체결가가 없어 주식선물 1호가 중간값·원달러선물
+    # 현재가로 대신 — 동시호가 단계에 들어가면 코어가 무시한다. 저장 안 함(매번 켠다).
+    w["test_var"] = tk.BooleanVar(value=False)
+    w["test"] = tk.Checkbutton(top, text="시험(현재가)", variable=w["test_var"],
+                               fg="dark red", font=T.FONT_LABEL)
+    # 윗줄 오른쪽 끝 = 현재 시각(PC 시계, 주문시각과 같은 기준 — 사용자 2026-10-26), 그 왼쪽에 시험
+    # 체크. 시험 체크는 배포판(exe)에서는 뺀다(사용자 "배포 때 제외") — 개발 실행에서만 보인다.
+    w["clock"] = tk.Label(top, text="--:--:--", font=T.FONT_NUM_LG, fg="gray25")
+    w["clock"].pack(side="right")
+    if not getattr(sys, "frozen", False):
+        w["test"].pack(side="right", padx=(0, 10))
+
+    def tick_clock() -> None:
+        try:
+            w["clock"].config(text=time.strftime("%H:%M:%S"))
+            root.after(200, tick_clock)
+        except tk.TclError:
+            pass  # 창 닫힘
+
+    tick_clock()
+    # 모니터 수치(사용자 2026-10-26): 역방향매수(빨강)·정방향매도(파랑) — 주식선물 예상체결가로 센
+    # 스프레드(%). 환 예상체결가는 원달러 대응에서 보여 주니 윗줄에서 뺌, 주식선물 예상체결가는
+    # 주문시각 묶음 안으로.
+    # 체결쏴 모니터와 같은 모양 — 제목 없이 색 상자(역방향매수 빨강, 정방향매도 파랑)에 흰 글씨
+    w["mon_rev"] = tk.Label(top, text="-", width=6, anchor="center", font=T.FONT_NUM_LG,
+                            bg=T.C_BUY, fg="white")
+    w["mon_rev"].pack(side="left", padx=(0, 6))
+    w["mon_fwd"] = tk.Label(top, text="-", width=6, anchor="center", font=T.FONT_NUM_LG,
+                            bg=T.C_SELL, fg="white")
+    w["mon_fwd"].pack(side="left")
 
     # ===== 왼쪽: 예약주문 16행 (ver2 A22~D38) =====
     left = tk.Frame(root)
     left.grid(row=2, column=0, sticky="nw", padx=(6, 4), pady=(2, 0))
-    heads = ("주문Sprd", "수량", "예상주문가", "예약주문")
-    head_w = (8, 6, 10, 10)
+    heads = ("주문Sprd%", "수량", "예상주문가")
+    head_w = (8, 6, 10)
     for c, (h, hw) in enumerate(zip(heads, head_w, strict=True)):
         head(left, h, hw).grid(row=0, column=c, padx=1, sticky="nsew")
+    # '예약주문' 제목 자리에 일괄 [실행][중지] — 예약 버튼과 같은 높이, 폭은 반씩(사용자 2026-10-26
+    # "예약주문 개수가 많다 보니 일괄 실행·중지")
+    bulk = tk.Frame(left)
+    bulk.grid(row=0, column=3, padx=(4, 1), pady=0, sticky="nsew")
+    bulk.grid_columnconfigure(0, weight=1, uniform="bulk")
+    bulk.grid_columnconfigure(1, weight=1, uniform="bulk")
+    bulk.grid_rowconfigure(0, weight=1)  # 버튼 높이를 틀(= 행 높이)에 맞춤
+    w["bulk_on"] = tk.Button(bulk, text="실행", width=1, padx=0, pady=0, bd=1,
+                             highlightthickness=0, font=(T.FAMILY, 10))
+    w["bulk_off"] = tk.Button(bulk, text="중지", width=1, padx=0, pady=0, bd=1,
+                              highlightthickness=0, font=(T.FAMILY, 10))
+    w["bulk_on"].grid(row=0, column=0, sticky="nsew")
+    w["bulk_off"].grid(row=0, column=1, sticky="nsew", padx=(1, 0))
     probe = tk.Button(left, text="진입", width=3, padx=0, pady=0, bd=1, highlightthickness=0)
     row_h = int((probe.winfo_reqheight() + 2) * 0.8)  # 체결쏴 세트 행보다 20% 낮게(사용자 10-23)
     probe.destroy()
@@ -175,6 +363,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     probe_lbl = tk.Label(left, text="0", font=T.FONT_NUM_LG)
     row_h = max(row_h, probe_lbl.winfo_reqheight())
     probe_lbl.destroy()
+    left.grid_rowconfigure(0, minsize=row_h)  # 머리글 줄도 행 높이로(일괄 버튼 = 예약 버튼 높이)
 
     def paint_res(key: tuple[str, int]) -> None:
         on = bool(w["res_on"].get(key))
@@ -210,11 +399,38 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              "주문Sprd와 수량을 채워야 예약을 켤 수 있습니다.")
                 return
         w["res_on"][key] = not bool(w["res_on"].get(key))
+        w["hold"][key] = time.time() + HOLD_S  # 코어 상태가 올 때까지 화면 값을 지킨다(깜박임 방지)
         paint_res(key)
         text = (f"{'매수' if key[0] == 'buy' else '매도'} {key[1] + 1}행 예약 "
                 f"{'켬' if w['res_on'][key] else '끔'}")
         log.info("[동시호가 화면] %s", text)
         w["status"].show(text)
+        send_settings()      # 버튼을 누르는 순간의 칸 값이 함께 코어로(결정 74 방식)
+        send_rows(force=True)
+
+    def bulk_res(on: bool) -> None:
+        """일괄 실행/중지 — 켤 땐 Sprd·수량이 있는 행만(없는 행은 건너뜀, 상태줄에 개수), 끌 땐
+        전부. 한 번에 코어로 보낸다(행마다 보내지 않음)."""
+        changed, skipped = 0, 0
+        for key, cells in w["rows"].items():
+            if on and row_missing(cells["spread"].get(), cells["qty"].get()):
+                skipped += 1
+                continue
+            if bool(w["res_on"].get(key)) is not on:
+                w["res_on"][key] = on
+                w["hold"][key] = time.time() + HOLD_S
+                paint_res(key)
+                changed += 1
+        text = (f"일괄 {'실행' if on else '중지'} — {changed}행 {'켬' if on else '끔'}"
+                + (f", {skipped}행 건너뜀(Sprd·수량 없음)" if skipped else ""))
+        log.info("[동시호가 화면] %s", text)
+        w["status"].show(text)
+        if changed:
+            send_settings()
+            send_rows(force=True)
+
+    w["bulk_on"].config(command=lambda: bulk_res(True))
+    w["bulk_off"].config(command=lambda: bulk_res(False))
 
     r = 1
     for side, samples in (("buy", SAMPLE_BUY), ("sell", SAMPLE_SELL)):
@@ -275,6 +491,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         w[f"{pre}_itv"] = entry(tm, 5, vcmd_int, DEFAULTS[f"{pre}_itv"])
         for c, k in enumerate(("hms", "ms", "itv"), start=1):
             put(w[f"{pre}_{k}"], rr, c)
+    # 주식선물 예상체결가 — 주문시각 묶음 안(사용자 2026-10-26)
+    tk.Label(tm, text="예상체결가", anchor="w").grid(row=3, column=0, sticky="w")
+    w["sf_exp"] = tk.Label(tm, text="-", anchor="w", font=T.FONT_NUM_LG)
+    w["sf_exp"].grid(row=3, column=1, columnspan=3, sticky="w", padx=GAP)
 
     # --- 원달러 대응(프로세스2) (ver2 F26~K27) — 배치는 사용자 델파이 목업 Form2(2026-10-23 오후,
     # "정렬과 배치만 참고"): 왼쪽 이름(오른쪽 맞춤)+입력칸 세 줄(틱·헤지비율·1회주문수량), 오른쪽은
@@ -314,7 +534,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             show_message(root, "동시호가 주문", f"{name} 행의 정정PT가 없습니다." + chr(10)
                          + "정정PT(0보다 큰 USD)를 채워야 정정할 수 있습니다.")
             return
-        w["status"].show(f"정정 {name} — 코어 연결 전(화면 초안)")
+        send_settings(force=True)  # 정정PT 최신 값을 코어에 먼저
+        send({"cmd": "auction_amend", "underlying": cur["u"].value, "row": name}, f"정정 {name}")
+
+    def cancel_row(name: str) -> None:
+        send({"cmd": "auction_cancel", "underlying": cur["u"].value, "row": name}, f"취소 {name}")
 
     for rr, name in enumerate(HL_ROWS, start=1):
         tk.Label(p3, text=name, width=2, anchor="w").grid(row=rr, column=0, sticky="w")
@@ -326,7 +550,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                           highlightthickness=0, state="disabled",
                           command=partial(amend_row, name))
         cancel = tk.Button(p3, text="취소", width=5, padx=0, pady=0, bd=1,
-                           highlightthickness=0, state="disabled")
+                           highlightthickness=0, state="disabled",
+                           command=partial(cancel_row, name))
         put(amend, rr, 3, sticky="ew")   # 정정·취소가 예약실행 폭을 반씩 채운다(목업 Form2)
         put(cancel, rr, 4, sticky="ew")
         w["hl"][name] = {"off": off, "pt": pt, "amend": amend, "cancel": cancel}
@@ -397,15 +622,26 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              f"원달러 대응에 {missing}이(가) 없습니다." + chr(10)
                              + "틱·헤지비율·1회주문수량을 채워야 예약실행을 켤 수 있습니다.")
                 return
-        run_on[key] = not run_on[key]
-        paint_run(key, run_on[key])
-        if key == "fx_run":  # 환 예약실행 켜면 틱·헤지비율·1회주문수량 + 원달러선물 주문시각 줄
-            for k in ("tick", "hedge_pct", "fx_unit", "fx_hms", "fx_ms", "fx_itv"):  # 잠금(10-26)
-                w[k].config(state="disabled" if run_on[key] else "normal")
+        set_run_state(key, not run_on[key])
+        w["hold"][key] = time.time() + HOLD_S
         text = (f"{'환 예약실행' if key == 'fx_run' else 'HL 예약실행'} "
                 f"{'켬' if run_on[key] else '끔'}")
         log.info("[동시호가 화면] %s", text)
         w["status"].show(text)
+        send_settings(force=True)  # 켜기 직전 값으로 코어 설정을 맞춘 뒤
+        send({"cmd": "auction_run", "underlying": cur["u"].value,
+              "proc": "fx" if key == "fx_run" else "hl", "value": run_on[key]}, text)
+
+    def set_run_state(key: str, on: bool) -> None:
+        """예약실행 표시·잠금 — 코어 상태(auction_live)가 진실, 누른 직후엔 먼저 칠한다."""
+        if run_on[key] is on and w.get("_run_painted", {}).get(key) is on:
+            return
+        run_on[key] = on
+        w.setdefault("_run_painted", {})[key] = on
+        paint_run(key, on)
+        if key == "fx_run":  # 환 예약실행 켜면 틱·헤지비율·1회주문수량 + 원달러선물 주문시각 줄
+            for k in ("tick", "hedge_pct", "fx_unit", "fx_hms", "fx_ms", "fx_itv"):  # 잠금(10-26)
+                w[k].config(state="disabled" if on else "normal")
 
     w["fx_run"].config(command=partial(toggle_run, "fx_run"))
     w["hl_run"].config(command=partial(toggle_run, "hl_run"))
@@ -420,6 +656,278 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     root.grid_columnconfigure(1, weight=1)
     status_box.show("-")
     w["status"] = status_box  # 예약 버튼 콜백이 쓴다(버튼은 상태줄보다 먼저 만들어짐)
+
+    # ===== 코어 연결 — 입력 → 명령, 상태 → 표시 =====
+    def set_entry(e: tk.Entry, val: str) -> None:
+        """입력칸 글 바꾸기 — 잠긴(disabled) 칸은 프로그램 쓰기도 막히므로 잠깐 풀고 쓴다."""
+        locked = str(e.cget("state")) == "disabled"
+        if locked:
+            e.config(state="normal")
+        e.delete(0, "end")
+        e.insert(0, val)
+        if locked:
+            e.config(state="disabled")
+
+    def rows_now() -> tuple[list[tuple[str, str, bool]], list[tuple[str, str, bool]]]:
+        def side_rows(side: str) -> list[tuple[str, str, bool]]:
+            return [(w["rows"][(side, i)]["spread"].get(), w["rows"][(side, i)]["qty"].get(),
+                     bool(w["res_on"].get((side, i)))) for i in range(ROWS_PER_SIDE)]
+        return side_rows("buy"), side_rows("sell")
+
+    def send_rows(force: bool = False) -> None:
+        """16행을 코어에(Enter·칸 이동·켬/끔 때) — 같은 내용이면 안 보낸다."""
+        if not cur["loaded"]:
+            return
+        try:
+            payload = rows_payload(cur["u"].value, *rows_now())
+        except ValueError:
+            w["status"].show("행 저장 안 함 — 숫자가 아닌 칸이 있습니다")
+            return
+        key = (payload["buy"], payload["sell"])
+        if not force and key == cur["sent_rows"]:
+            return
+        cur["sent_rows"] = key
+        send(payload, "행 저장")
+
+    def settings_now() -> dict[str, Any]:
+        texts = {k: w[k].get() for k in ("ls_hms", "ls_ms", "ls_itv", "fx_hms", "fx_ms", "fx_itv",
+                                          "tick", "hedge_pct", "fx_unit")}
+        month = "next" if w["month"].get() == "차근" else "near"
+        return settings_payload(cur["u"].value, texts, month,
+                                {n: w["hl"][n]["off"].get() for n in HL_ROWS},
+                                {n: w["hl"][n]["pt"].get() for n in HL_ROWS})
+
+    def send_settings(force: bool = False) -> None:
+        if not cur["loaded"]:
+            return
+        try:
+            payload = settings_now()
+        except ValueError:
+            w["status"].show("설정 저장 안 함 — 숫자가 아닌 칸이 있습니다")
+            return
+        key = {k: v for k, v in payload.items() if k != "cmd"}
+        if not force and key == cur["sent_settings"]:
+            return
+        cur["sent_settings"] = key
+        send(payload, "설정 저장")
+
+    # 저장 시점(사용자 2026-10-26 "바꿔" — 체결쏴 결정 74와 같은 방식): Enter·칸 이동은 아무 일도 안
+    # 하고, **예약 버튼·예약실행·정정을 누를 때와 종목을 바꿀 때·창을 닫을 때** 그 순간 값이 코어로
+    # 간다('적'은 윗줄만). "저장 안 된 값" 알림은 두지 않는다(사용자 2026-10-26 "안 남겨도 됨").
+    def apply_top() -> None:
+        """'적' — 윗줄만: 호가단위(manual_hl_merge, 코어 공용) + 월물(체결쏴와 같은 역할). 설정 칸·
+        행은 예약 버튼·예약실행을 누를 때 간다(사용자 2026-10-26 "'적' 눌러서 저장은 안 하기로")."""
+        label = w["agg"].get()
+        if label in agg_map:
+            nsf, mant = agg_map[label]
+            send({"cmd": "manual_hl_merge", "underlying": cur["u"].value,
+                  "n_sig_figs": nsf, "mantissa": mant}, "호가단위")
+        send({"cmd": "auction_settings", "underlying": cur["u"].value,
+              "month": "next" if w["month"].get() == "차근" else "near"}, "월물")
+
+    w["apply"].config(command=apply_top)
+
+    def toggle_test() -> None:
+        on = bool(w["test_var"].get())
+        w["hold"]["test"] = time.time() + HOLD_S
+        w["status"].show(f"시험 모드(현재가 대용) {'켬' if on else '끔'}")
+        send({"cmd": "auction_run", "underlying": cur["u"].value, "proc": "test",
+              "value": on}, "시험 모드")
+
+    w["test"].config(command=toggle_test)
+
+    def load_book(book: dict[str, Any]) -> None:
+        """코어 종목 상태 → 입력칸·켬 상태(종목을 바꾸거나 처음 받을 때 한 번)."""
+        for side_k in ("buy", "sell"):
+            rows = list(book.get(side_k) or [])
+            for i in range(ROWS_PER_SIDE):
+                sp, qty, on = row_texts(rows[i] if i < len(rows) and isinstance(rows[i], dict)
+                                        else {})
+                cells = w["rows"][(side_k, i)]
+                set_entry(cells["spread"], sp)
+                set_entry(cells["qty"], qty)
+                w["res_on"][(side_k, i)] = on
+        for key in w["rows"]:
+            paint_res(key)
+        texts = book_texts(book)
+        for k, v in texts.items():
+            set_entry(w[k], v)
+        st = dict(book.get("settings") or {})
+        for n in HL_ROWS:
+            set_entry(w["hl"][n]["off"], num_text((st.get("hl_off") or {}).get(n)))
+            set_entry(w["hl"][n]["pt"], num_text((st.get("hl_pt") or {}).get(n)))
+        w["month"].set("차근" if book.get("month") == "next" else "최근")
+        # 방금 받은 값 = 저장된 값(이것과 다르면 "저장 안 된 값 있음")
+        try:
+            sent = rows_payload(cur["u"].value, *rows_now())
+            cur["sent_rows"] = (sent["buy"], sent["sell"])
+            cur["sent_settings"] = {k: v for k, v in settings_now().items() if k != "cmd"}
+        except ValueError:
+            cur["sent_rows"] = cur["sent_settings"] = None
+
+    def sync_rows_on(book: dict[str, Any]) -> None:
+        """켬 상태는 코어가 진실 — 거부돼 되돌아온 행을 화면에 맞춘다(매 갱신, 다를 때만 칠함)."""
+        for side_k in ("buy", "sell"):
+            rows = list(book.get(side_k) or [])
+            for i in range(ROWS_PER_SIDE):
+                on = bool(rows[i].get("on")) if i < len(rows) and isinstance(rows[i], dict) \
+                    else False
+                if (bool(w["res_on"].get((side_k, i))) is not on
+                        and time.time() > w["hold"].get((side_k, i), 0.0)):
+                    w["res_on"][(side_k, i)] = on
+                    paint_res((side_k, i))
+
+    def refresh_agg(live: dict[str, Any]) -> None:
+        ticks = live.get("hl_merge_ticks") or []
+        if not ticks or (cur["agg_under"] == cur["u"] and agg_map):
+            return
+        labels, table = merge_choices(ticks)
+        agg_map.clear()
+        agg_map.update(table)
+        w["agg"].config(values=labels)
+        w["agg"].set(active_label(agg_map, live.get("hl_merge_active")) or labels[0])
+        cur["agg_under"] = cur["u"]
+
+    def on_under_change(_e: object = None) -> None:
+        if cur["loaded"]:
+            send_rows()
+            send_settings()
+        cur["u"], cur["loaded"], cur["agg_under"] = BY_NAME.get(w["under"].get(),
+                                                                UNDERLYINGS[0]), False, None
+        cur["seen_rows"], cur["seen_hl"], cur["fx_note"], cur["note"] = set(), {}, "", ""
+        agg_map.clear()
+        w["agg"].config(values=["-"])
+        w["agg"].set("-")
+        for key in ("fx_run", "hl_run"):
+            set_run_state(key, False)
+        w["test_var"].set(False)
+
+    w["under"].bind("<<ComboboxSelected>>", on_under_change)
+
+    def drain() -> None:
+        try:
+            while True:
+                label, result = results.get_nowait()
+                if result is None:
+                    w["status"].show(f"{label} 실패 — 코어 미접속")
+                elif not result.get("ok"):
+                    w["status"].show(f"{label} 거부 — {'; '.join(result.get('errors', []))}")
+                elif label not in ("행 저장", "설정 저장"):
+                    w["status"].show(f"{label}됨")
+        except queue.Empty:
+            pass
+
+    def refresh() -> None:
+        try:
+            data = state_box.get("data") or {}
+            w["banner"].set(ls_stalled(data.get("ws") or []))
+            u = cur["u"]
+            book = ((data.get("auction") or {}).get("books") or {}).get(u.value)
+            if not cur["loaded"] and isinstance(book, dict):
+                load_book(book)
+                cur["loaded"] = True
+            elif isinstance(book, dict):
+                sync_rows_on(book)
+            live = (data.get("auction_live") or {}).get(u.value) or {}
+            refresh_agg(live)
+            sf, fx = live.get("sf_expected"), live.get("fx_expected")
+            tag = " (현재가 대용)" if live.get("testing") else ""
+            w["sf_exp"].config(text=f"{px_text(sf)}{tag}")
+            if "test" in live and time.time() > w["hold"].get("test", 0.0):
+                w["test_var"].set(bool(live.get("test")))  # 코어 상태가 진실(누른 뒤 2초는 화면 값)
+            w["fx_exp2"].config(text=(f"{fx:,.2f}" if fx else "-") + tag)
+            w["mon_rev"].config(text=pct2(live.get("mon_rev")))
+            w["mon_fwd"].config(text=pct2(live.get("mon_fwd")))
+            net = live.get("net")
+            w["net_qty"].config(text=(f"{'+' if net['side'] == 'buy' else '-'}{net['qty']}"
+                                      if net else "-"))
+            prices = live.get("prices") or {}
+            rows_live = live.get("rows") or {}
+            fires = live.get("fires") or {}
+            for (side_k, i), cells in w["rows"].items():
+                key = f"{side_k}:{i}"
+                r = rows_live.get(key)
+                # 프로세스1이 본 행(발주·실패·안 냄)은 그때 가격을 그대로 둔다 — 그 뒤 계산은 안 함
+                # (사용자 2026-10-26). 아직 안 본 행만 지금 값으로 갱신
+                shown = r.get("price") if r and r.get("price") else prices.get(key)
+                cells["px"].config(text=px_text(shown))
+                fg, bg = px_style(r, bool(fires.get(key)))
+                cells["px"].config(fg=fg, bg=bg)
+                if r and key not in cur["seen_rows"]:
+                    cur["seen_rows"].add(key)
+                    w["status"].show(result_line(side_k, i, r))
+            for key in ("fx_run", "hl_run"):
+                if key in live and time.time() > w["hold"].get(key, 0.0):
+                    core_on = bool(live.get(key))
+                    if core_on is not run_on[key]:  # 진단(2026-10-26 "끔인데 버튼은 켜져 있음")
+                        log.info("[동시호가 화면] %s 표시 %s → 코어 %s로 맞춤", key,
+                                 "켬" if run_on[key] else "끔", "켬" if core_on else "끔")
+                    set_run_state(key, core_on)
+            if live.get("fx_note") and live["fx_note"] != cur["fx_note"]:
+                cur["fx_note"] = live["fx_note"]
+                w["status"].show(live["fx_note"])
+            for n in HL_ROWS:
+                row = (live.get("hl") or {}).get(n) or {}
+                enabled = hl_buttons_enabled(row)
+                for k in ("amend", "cancel"):
+                    w["hl"][n][k].config(state="normal" if enabled else "disabled")
+                sig = (row.get("order_id"), row.get("status"), row.get("remaining"))
+                if row.get("status") and cur["seen_hl"].get(n) != sig:
+                    cur["seen_hl"][n] = sig
+                    w["status"].show(hl_line(n, row))
+            if live.get("note") and live["note"] != cur["note"]:
+                cur["note"] = live["note"]
+                w["status"].show(live["note"])
+            drain()
+            if main_closing():
+                root.after(50, on_close)
+                return
+        except tk.TclError:
+            return
+        except Exception:  # noqa: BLE001 - 갱신 한 번의 오류로 화면이 멈춘 것처럼 보이지 않게
+            log.exception("[동시호가 화면] 갱신 오류")
+        root.after(150, refresh)
+
+    def is_running() -> bool:
+        return any_reserved(w["res_on"]) or run_on["fx_run"] or run_on["hl_run"]
+
+    def describe_running() -> str:
+        parts = []
+        n_on = sum(1 for v in w["res_on"].values() if v)
+        if n_on:
+            parts.append(f"예약 {n_on}행")
+        if run_on["fx_run"]:
+            parts.append("환 예약실행")
+        if run_on["hl_run"]:
+            parts.append("HL 예약실행")
+        return f"{NAMES[cur['u']]} " + "·".join(parts)
+
+    def send_stop() -> None:
+        """닫기 확인 뒤 정지 — 예약 전부 끔 + 예약실행 둘 끔(코어에)."""
+        for key in list(w["res_on"]):
+            w["res_on"][key] = False
+        send_rows(force=True)
+        for proc in ("fx", "hl"):
+            send({"cmd": "auction_run", "underlying": cur["u"].value, "proc": proc,
+                  "value": False}, "예약실행 끔")
+        run_on["fx_run"] = run_on["hl_run"] = False
+
+    def before_close() -> None:
+        if preview:
+            return
+        if cur["loaded"]:
+            send_rows()
+            send_settings()
+        deadline = time.time() + 3.0
+        while jobs.unfinished_tasks and time.time() < deadline:
+            time.sleep(0.05)
+
+    on_close = attach_auto_close(root, title="동시호가 주문", is_running=is_running,
+                                 send_stop=send_stop, set_status=w["status"].show,
+                                 before_close=before_close, skip_confirm=main_closing,
+                                 describe_running=describe_running)
+    if not preview:
+        root.after(150, refresh)
     if preview:
         status_box.show("UI 미리보기 — 코어 미연결")
         for i in (0, 2):  # 켜진 행 모양 확인용
@@ -427,9 +935,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             paint_res(("buy", i))
         w["res_on"][("sell", 1)] = True
         paint_res(("sell", 1))
-        w["sf_exp"].config(text="주식선물 예상체결가 1,766,000")
-        w["fx_exp"].config(text="환 예상체결가 1,327.30")
+        w["sf_exp"].config(text="1,766,000")
         w["fx_exp2"].config(text="1,327.30")
+        w["mon_rev"].config(text="-0.12")
+        w["mon_fwd"].config(text="0.21")
         w["net_qty"].config(text="+35")
         for (side, i), cells in w["rows"].items():
             sign = 1 if side == "buy" else -1

@@ -913,6 +913,21 @@ class LiveSystem:
         """대응주문 감시 정지(화면 중지)."""
         self.fx_auction.stop()
 
+    async def place_fx_futures(self, code: str, side: Side, qty: int, price: float,
+                               src: str = "") -> str:
+        """원달러선물 발주(KR_FX 전용 경로, OrderBook 밖) + 주문 리스트용 기록(fx_hedges). 동시호가
+        주문 엔진(DESIGN-auction-order §4)이 부른다. 실패는 기록을 남기고 예외로 올린다."""
+        rec = {"time": self._now_hms(), "code": code, "side": side.value, "qty": qty,
+               "price": price, "src": src}
+        try:
+            oid = await self._gw.place_fx_futures(code, side, qty, price)
+        except Exception as exc:
+            self.fx_hedges.appendleft(
+                {**rec, "order_id": "", "status": "실패", "err": str(exc)[:120]})
+            raise
+        self.fx_hedges.appendleft({**rec, "order_id": oid, "status": "접수"})
+        return oid
+
     async def _place_fx_hedge(self, action: HedgeAction) -> None:
         """대응주문 실제 발주(KR_FX) + 화면용 로그. 발주 실패해도 감시는 계속."""
         import logging

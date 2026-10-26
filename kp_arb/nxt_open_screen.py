@@ -253,9 +253,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     w["ref"] = tk.Entry(top, width=6, justify="right", validate="key",
                         validatecommand=vcmd_int, font=T.FONT_NUM_LG)  # 기준수량(모니터 est용)
     w["ref"].insert(0, "1")
-    w["ref"].pack(side="left", padx=(0, 8))
-    w["ref"].bind("<Return>", lambda _e: send_ref_qty())
-    w["ref"].bind("<FocusOut>", lambda _e: send_ref_qty())
+    w["ref"].pack(side="left", padx=(0, 8))  # 기준수량은 '적'을 누를 때 코어로(결정 74 방식)
     # 개장 시각 · 창(첫 체결 + 시작초 ~ + 끝초) — 제목 글자 없이 칸만(사용자 2026-10-20)
     w["open"] = tk.Entry(top, width=9, justify="center", validate="key",
                          validatecommand=vcmd_time, font=T.FONT_NUM_LG)
@@ -317,9 +315,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                              validatecommand=vc, font=T.FONT_NUM_LG,
                              disabledforeground="black", disabledbackground="#f0f0f0")
                 e.grid(row=r, column=base + c, padx=1, pady=1, sticky="nsew")
-                # Enter·칸 이동 때 바로 코어에(기준수량 칸과 같음) — 역산가가 입력을 따라가게
-                e.bind("<Return>", lambda _e: save_if_changed())
-                e.bind("<FocusOut>", lambda _e: save_if_changed())
+                # 저장은 실행 켤 때·'적'·종목 바꿀 때·창 닫을 때(체결쏴 결정 74 방식, 사용자
+                # 2026-10-26 "바꿔") — Enter·칸 이동은 아무 일도 안 한다
                 cells[key] = e
             # 역산가 — 주문가 옆 표시 칸(입력 아님, 테두리 없는 회색 글). 그 세트의 실행이 켜진
             # 동안만 갱신하고 꺼지면 마지막 값을 둔다(사용자 2026-10-21·22).
@@ -385,6 +382,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             send({"cmd": "manual_hl_merge", "underlying": cur["u"].value,
                   "n_sig_figs": nsf, "mantissa": mant}, "호가단위")
         send_ref_qty(force=True)
+        save_if_changed()  # 단 값도 '적'을 누르면 함께(결정 74 방식)
 
     def set_entry(e: tk.Entry, val: str) -> None:
         """입력칸 글 바꾸기 — 잠긴(disabled) 칸은 프로그램 쓰기도 막히므로 잠깐 풀고 쓴다."""
@@ -462,7 +460,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 lock_rows(block, True)
 
     def save_if_changed() -> None:
-        """입력칸 Enter·이동 — 보낸 값과 다를 때만 저장(같은 값으로 매번 보내지 않게)."""
+        """보낸 값과 다를 때만 저장(같은 값으로 매번 보내지 않게) — '적'·종목 바꿀 때 쓴다."""
         u = cur["u"]
         if local.get(u) != payload_of(u):
             save_current()

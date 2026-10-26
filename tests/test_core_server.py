@@ -587,3 +587,52 @@ def test_settings_global_risk_limits_roundtrip() -> None:
                                                    "hl_max_qty_per_order": -5})
     assert restored.settings.hl_price_limit_pct == 0.01
     assert restored.settings.hl_max_qty_per_order == 0.0
+
+
+def test_auction_screen_state_persists_per_underlying(tmp_path: Path) -> None:
+    # DESIGN-auction-order §6: 동시호가 종목별 상태(행·월물·설정·HL 행↔주문번호)가 core_state.json에
+    # 저장·복원된다(예약실행은 상태에 없음)
+    from kp_arb.auction_order import Row
+
+    state = CoreState()
+    b = state.auction.book("sk_hynix")
+    b.buy[0] = Row(0.3, 20, True)
+    b.month = "next"
+    b.settings.fx_hms = "15:44:57"
+    b.hl_orders["a"] = "777"
+    path = tmp_path / "core_state.json"
+    save_state(path, state)
+    back = load_state(path)
+    assert back.auction.book("sk_hynix") == b and "samsung" not in back.auction.books
+
+
+async def test_manual_fx_futures_command_places_one_order_or_reports_rejection() -> None:
+    # 진단용(사용자 2026-10-26): 원달러선물 1건을 KR_FX로 직접 — 월물·가격을 안 주면 공통설정
+    # 월물·현재가, 거부는 사유 그대로 돌려준다
+    from kp_arb.core_server import _manual_command
+    from kp_arb.domain.enums import Side
+
+    class _Sys:
+        fx_futures_price = {"A756B000": 1321.5}
+        placed: list[tuple[str, Side, int, float, str]] = []
+        fail = False
+
+        def fx_futures_code(self) -> str:
+            return "A756B000"
+
+        async def place_fx_futures(self, code: str, side: Side, qty: int, price: float,
+                                   src: str = "") -> str:
+            if self.fail:
+                raise RuntimeError("CFOAT00100 요청 실패 -9: 해당 계좌가 없습니다.")
+            self.placed.append((code, side, qty, price, src))
+            return "F77"
+
+    sys_ = _Sys()
+    ok = await _manual_command(sys_, {"cmd": "manual_fx_futures"})  # type: ignore[arg-type]
+    assert ok["ok"] and ok["order_id"] == "F77" and ok["code"] == "A756B000"
+    assert sys_.placed == [("A756B000", Side.BUY, 1, 1321.5, "수동(진단)")]
+    sys_.fail = True
+    bad = await _manual_command(sys_, {"cmd": "manual_fx_futures", "side": "sell",  # type: ignore[arg-type]
+                                      "qty": 2, "price": 1320.0})
+    assert not bad["ok"] and "해당 계좌가 없습니다" in bad["errors"][0]
+    assert not (await _manual_command(sys_, {"cmd": "manual_fx_futures", "qty": 0}))["ok"]  # type: ignore[arg-type]
