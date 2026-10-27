@@ -310,11 +310,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     w["test"] = tk.Checkbutton(top, text="시험(현재가)", variable=w["test_var"],
                                fg="dark red", font=T.FONT_LABEL)
     # 윗줄 오른쪽 끝 = 현재 시각(PC 시계, 주문시각과 같은 기준 — 사용자 2026-10-26), 그 왼쪽에 시험
-    # 체크. 시험 체크는 배포판(exe)에서는 뺀다(사용자 "배포 때 제외") — 개발 실행에서만 보인다.
+    # 체크. 배포판(exe)에도 당분간 둔다(사용자 2026-10-27 "당분간 포함" — 10-26 "배포 때 제외"를
+    # 되돌림). 다시 빼려면 아래 pack을 `if not getattr(sys, "frozen", False):`로 감싼다.
     w["clock"] = tk.Label(top, text="--:--:--", font=T.FONT_NUM_LG, fg="gray25")
     w["clock"].pack(side="right")
-    if not getattr(sys, "frozen", False):
-        w["test"].pack(side="right", padx=(0, 10))
+    w["test"].pack(side="right", padx=(0, 10))
 
     def tick_clock() -> None:
         try:
