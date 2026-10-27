@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 
 from kp_arb.gateways.xing_com import (
+    BACKLOG_N,
+    ITER_EVENTS_N,
     LANE_ORDER,
     LANE_QUERY,
     REAL_FIELD_LIMIT,
@@ -17,6 +19,8 @@ from kp_arb.gateways.xing_com import (
     XingSession,
     XingTimeout,
     is_ok_code,
+    iteration_needs_log,
+    read_unified_quote,
     slow_iteration_text,
 )
 
@@ -347,6 +351,42 @@ async def test_realtime_advise_and_event_to_asyncio(res_dir: Path) -> None:
         s.close()
 
 
+def test_read_unified_quote_stops_when_both_exchanges_found() -> None:
+    # DESIGN-ls-xing §9(2026-10-27 오후): UH1은 단계별 8칸을 KRX·NXT 매도·매수 1호가가 다 나올
+    # 때까지만 읽는다(COM 호출 절감). 1단계에 KRX 매수·NXT 매도만 있으면 2단계까지, 둘 다 있으면
+    # 1단계에서 끝. 빈 단계(가격 0)면 끝. Res에 없는 칸은 안 읽는다.
+    data = {"ex_shcode": "U005930   ", "shcode": "005930", "hotime": "100000",
+            "offerho1": "70200", "bidho1": "70100", "krx_offerrem1": "0", "nxt_offerrem1": "30",
+            "unt_offerrem1": "30", "krx_bidrem1": "50", "nxt_bidrem1": "0", "unt_bidrem1": "50",
+            "offerho2": "70300", "bidho2": "70000", "krx_offerrem2": "80", "nxt_offerrem2": "10",
+            "unt_offerrem2": "90", "krx_bidrem2": "20", "nxt_bidrem2": "40", "unt_bidrem2": "60",
+            "offerho3": "70400", "bidho3": "69900", "krx_offerrem3": "1", "nxt_offerrem3": "1",
+            "unt_offerrem3": "2", "krx_bidrem3": "1", "nxt_bidrem3": "1", "unt_bidrem3": "2",
+            "volume": "123"}
+    calls: list[str] = []
+
+    def get(f: str) -> str:
+        calls.append(f)
+        return data[f]
+
+    got = read_unified_quote(get, data.keys())
+    assert got["offerho2"] == "70300" and "offerho3" not in got and "volume" not in got
+    assert len(calls) == 3 + 8 * 2                      # 머리 셋 + 두 단계
+    # 1단계에 넷 다 있으면 한 단계만
+    calls.clear()
+    one = dict(data, krx_offerrem1="5", nxt_bidrem1="7")
+    got1 = read_unified_quote(lambda f: one[f], one.keys())
+    assert "offerho2" not in got1 and set(got1) >= {"hotime", "offerho1", "unt_bidrem1"}
+    # 빈 단계(가격 둘 다 0)면 거기서 끝 — 마감 뒤 KRX처럼 한쪽이 끝까지 없어도 멈춘다
+    empty = dict(data, offerho2="0", bidho2="0")
+    got2 = read_unified_quote(lambda f: empty[f], empty.keys())
+    assert "offerho3" not in got2 and got2["offerho2"] == "0"
+    # Res에 없는 칸(모의 등)은 건너뛴다
+    few = {k: v for k, v in data.items() if not k.startswith(("krx_", "nxt_"))}
+    got3 = read_unified_quote(lambda f: few[f], few.keys(), levels=2)
+    assert "krx_offerrem1" not in got3 and got3["unt_offerrem2"] == "90"
+
+
 async def test_unadvise_one_key_and_jh0_reads_only_first_level(res_dir: Path) -> None:
     # DESIGN-ls-xing §9(2026-10-23): 구독 계획이 바뀌면 키 하나만 해제(UnadviseRealDataWithKey),
     # 안 등록한 키는 무시. JH0는 68칸 중 1호가 여섯 칸만 GetFieldData(COM 호출 절감).
@@ -409,10 +449,46 @@ async def test_disconnect_clears_realtime_keys_so_relogin_readvises(res_dir: Pat
 
 def test_slow_iteration_text_lists_top_kinds() -> None:
     # COM 스레드 한 바퀴 진단 글(사용자 2026-10-23 "스레드가 왜 멈춘 거지") — 종류별 많은 순
-    text = slow_iteration_text(10.2, 9.9, {"JH0": 480, "US3": 700, "order응답": 6}, 0.3, 4, 2)
+    text = slow_iteration_text(10.2, 9.9, {"JH0": 480, "US3": 700, "order응답": 6}, 0.3, 4, 2, 57)
     assert text == ("xing COM 스레드 한 바퀴 10.20s — 펌프 9.90s 이벤트 1186건"
-                    "(US3 700, JH0 480, order응답 6) 명령 0.30s 4개, 남은 명령 2개")
+                    "(US3 700, JH0 480, order응답 6) 명령 0.30s 4개, 남은 명령 2개, 인계 대기 57건")
     assert "이벤트 0건(없음)" in slow_iteration_text(1.5, 1.5, {}, 0.0, 0, 0)
+    assert slow_iteration_text(1.5, 1.5, {}, 0.0, 0, 0).endswith("인계 대기 0건")
+
+
+def test_iteration_needs_log_on_time_or_events_or_backlog() -> None:
+    # 시세 큐 카운트 진단(사용자 2026-10-27): 시간·바퀴당 이벤트·인계 대기 중 하나라도 문턱 이상
+    assert not iteration_needs_log(0.3, 50, 10)
+    assert iteration_needs_log(1.0, 0, 0)                 # 느린 바퀴
+    assert iteration_needs_log(0.1, ITER_EVENTS_N, 0)     # 바퀴당 이벤트(윈도 큐 밀림)
+    assert iteration_needs_log(0.1, 0, BACKLOG_N)         # 인계 대기(루프 밀림)
+    assert iteration_needs_log(0.1, 5, 5, events_n=5)     # 문턱은 조정 가능(환경변수)
+    assert not iteration_needs_log(0.1, 150, 0, events_n=1000)
+
+
+def test_note_iteration_logs_backlog_and_event_count(
+    res_dir: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    s = XingSession(FakeFactory(), res_dir)
+    with caplog.at_level("WARNING", logger="kp_arb.xing"):
+        s._iter_counts.update({"US3": s._iter_events_n})      # 빠른 바퀴인데 이벤트가 문턱만큼
+        s._note_iteration(0.0, 0.1, 0.2, 0)
+        assert len(caplog.records) == 1 and "인계 대기 0건" in caplog.records[0].message
+        s._iter_counts.clear()
+        s._real_sent, s._real_done = 1000, 1000 - s._backlog_n  # 루프가 못 따라옴
+        s._note_iteration(10.0, 10.1, 10.2, 0)
+        assert len(caplog.records) == 2
+        assert f"인계 대기 {s._backlog_n}건" in caplog.records[1].message
+        s._real_done = 1000
+        s._note_iteration(20.0, 20.1, 20.2, 0)                # 다 따라잡음 — 조용
+        assert len(caplog.records) == 2
+
+
+def test_backlog_env_override(res_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KP_XING_ITER_EVENTS_N", "7")
+    monkeypatch.setenv("KP_XING_BACKLOG_N", "abc")           # 못 읽으면 기본값
+    s = XingSession(FakeFactory(), res_dir)
+    assert s._iter_events_n == 7 and s._backlog_n == BACKLOG_N
 
 
 def test_note_iteration_warns_only_when_slow_and_rate_limited(

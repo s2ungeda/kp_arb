@@ -22,7 +22,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -46,8 +46,55 @@ THREAD_STALL_S = 5.0     # COM 스레드 심장박동이 이만큼 끊기면 '�
 _LEVEL1 = frozenset({"shcode", "ex_shcode", "futcode", "hotime", "offerho1", "bidho1",
                      "offerrem1", "bidrem1"})
 REAL_FIELD_LIMIT: dict[str, frozenset[str]] = {"H1_": _LEVEL1, "NH1": _LEVEL1, "JH0": _LEVEL1}
+# 통합 호가 UH1(2026-10-27 오후, §9 "주식 호가는 UH1 하나"): 단계마다 가격 둘 + 잔량 여섯
+# (KRX·NXT·통합 × 매도·매수)을 KRX·NXT 매도·매수 1호가가 다 나올 때까지만 읽는다(최대 10단계,
+# 가격 0이면 끝).
+UNIFIED_QUOTE_TR = "UH1"
+UNIFIED_HEAD_FIELDS = ("ex_shcode", "shcode", "hotime")
+UNIFIED_LEVEL_FIELDS = ("offerho{i}", "bidho{i}", "krx_offerrem{i}", "nxt_offerrem{i}",
+                        "unt_offerrem{i}", "krx_bidrem{i}", "nxt_bidrem{i}", "unt_bidrem{i}")
+UNIFIED_MAX_LEVELS = 10
+
+
+def _positive(raw: str | None) -> bool:
+    try:
+        return float(raw or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def read_unified_quote(get: Callable[[str], str], have: Collection[str],
+                       *, levels: int = UNIFIED_MAX_LEVELS) -> dict[str, str]:
+    """UH1 칸을 필요한 만큼만 읽는다(순수 — get은 칸 하나 읽기, have는 Res의 칸 이름들).
+
+    머리 칸(코드·시각) 뒤 단계별 8칸을 읽다가 KRX·NXT의 매도·매수 1호가(그 거래소 잔량 > 0인 첫
+    단계)가 넷 다 나오면 멈춘다. 가격이 둘 다 0인 단계(빈 단계)면 끝. 보통 1~2단계 = 11~19칸."""
+    out: dict[str, str] = {}
+    for f in UNIFIED_HEAD_FIELDS:
+        if f in have:
+            out[f] = get(f)
+    need = {"krx_offerrem", "nxt_offerrem", "krx_bidrem", "nxt_bidrem"}
+    for i in range(1, levels + 1):
+        names = [n.format(i=i) for n in UNIFIED_LEVEL_FIELDS]
+        vals = {n: get(n) for n in names if n in have}
+        out.update(vals)
+        if not _positive(vals.get(f"offerho{i}")) and not _positive(vals.get(f"bidho{i}")):
+            break
+        for key in list(need):
+            if _positive(vals.get(f"{key}{i}")):
+                need.discard(key)
+        if not need:
+            break
+    return out
 SLOW_ITER_S = 1.0        # 한 바퀴가 이보다 길면 경고
 SLOW_ITER_LOG_GAP_S = 5.0  # 경고는 이 간격으로만(느린 바퀴가 이어질 때 로그 폭주 방지)
+# 시세 큐 카운트 진단(사용자 2026-10-27, DESIGN-ls-xing §9) — 바퀴당 처리 이벤트 수(윈도 메시지
+# 큐에 밀린 양의 간접 지표)와 COM→asyncio 인계 대기 건수(넘김 − 처리)가 이만큼이면 같은 경고 줄.
+# 운영 실측 10-27 장 시작 분당 7,500건 = 바퀴당 6건이라 넉넉히 둔 값 — 환경변수로 조정.
+ITER_EVENTS_N = 100
+BACKLOG_N = 200
+ITER_EVENTS_ENV = "KP_XING_ITER_EVENTS_N"
+BACKLOG_ENV = "KP_XING_BACKLOG_N"
 LANE_QUERY = "query"
 LANE_ORDER = "order"
 
@@ -123,13 +170,33 @@ def is_ok_code(code: str) -> bool:
 # ------------------------------------------------------------------ 세션 ---
 
 def slow_iteration_text(total_s: float, pump_s: float, counts: dict[str, int],
-                        drain_s: float, drain_n: int, pending: int, top: int = 6) -> str:
+                        drain_s: float, drain_n: int, pending: int, backlog: int = 0,
+                        top: int = 6) -> str:
     """느린 바퀴 경고 글 — 전체·펌프·명령 처리 시간, 펌프에서 처리한 이벤트 수(종류별 많은 순
-    top개), 이번 바퀴 명령 수, 남은 명령 수. 순수."""
+    top개), 이번 바퀴 명령 수, 남은 명령 수, COM→asyncio 인계 대기 시세 건수. 순수."""
     n = sum(counts.values())
     kinds = ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])[:top])
     return (f"xing COM 스레드 한 바퀴 {total_s:.2f}s — 펌프 {pump_s:.2f}s 이벤트 {n}건"
-            f"({kinds or '없음'}) 명령 {drain_s:.2f}s {drain_n}개, 남은 명령 {pending}개")
+            f"({kinds or '없음'}) 명령 {drain_s:.2f}s {drain_n}개, 남은 명령 {pending}개, "
+            f"인계 대기 {backlog}건")
+
+
+def iteration_needs_log(total_s: float, n_events: int, backlog: int, *,
+                        slow_s: float = SLOW_ITER_S, events_n: int = ITER_EVENTS_N,
+                        backlog_n: int = BACKLOG_N) -> bool:
+    """한 바퀴를 로그에 남길 조건(DESIGN-ls-xing §9 시세 지연 진단) — 시간·바퀴당 이벤트·인계
+    대기 중 하나라도 문턱 이상. 순수."""
+    return total_s >= slow_s or n_events >= events_n or backlog >= backlog_n
+
+
+def _env_int(name: str, default: int) -> int:
+    """환경변수 정수(없거나 못 읽으면 기본값)."""
+    import os
+
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
 
 
 class XingSession:
@@ -158,6 +225,12 @@ class XingSession:
         self.last_beat = 0.0  # COM 스레드 루프가 마지막으로 돈 시각(_clock) — 정지 감시용
         self._iter_counts: dict[str, int] = {}      # 이번 바퀴 펌프에서 처리한 이벤트 수(종류별)
         self._last_slow_log = float("-inf")         # 느린 바퀴 경고를 마지막으로 남긴 시각
+        # 시세 인계 카운터(§9 진단) — _real_sent는 COM 스레드만, _real_done은 asyncio 루프만 올린다
+        # (각자 한 쪽만 쓰니 잠금 없이 안전). 차 = 루프가 아직 못 본 시세 건수.
+        self._real_sent = 0
+        self._real_done = 0
+        self._iter_events_n = _env_int(ITER_EVENTS_ENV, ITER_EVENTS_N)
+        self._backlog_n = _env_int(BACKLOG_ENV, BACKLOG_N)
         self._real_keys: dict[str, set[str]] = {}   # tr → advise된 키
         self._specs: dict[str, ResSpec] = {}
         self._login_future: asyncio.Future[tuple[str, str]] | None = None
@@ -206,14 +279,24 @@ class XingSession:
             log.warning("xing COM 스레드 종료(stop=%s)", self._stop)
             self._factory.uninit_thread()
 
+    @property
+    def real_backlog(self) -> int:
+        """COM 스레드가 넘겼지만 asyncio 루프가 아직 처리하지 않은 시세 건수."""
+        return self._real_sent - self._real_done
+
     def _note_iteration(self, t0: float, t1: float, t2: float, drain_n: int) -> None:
-        """한 바퀴 진단 — SLOW_ITER_S보다 오래 걸렸으면 무엇을 처리했는지 경고 한 줄(간격 제한)."""
+        """한 바퀴 진단 — 오래 걸렸거나(SLOW_ITER_S) 바퀴당 이벤트·인계 대기가 문턱 이상이면
+        무엇을 처리했는지 경고 한 줄(간격 제한). DESIGN-ls-xing §9 시세 지연 진단."""
         total = t2 - t0
-        if total < SLOW_ITER_S or t2 - self._last_slow_log < SLOW_ITER_LOG_GAP_S:
+        backlog = self.real_backlog
+        if not iteration_needs_log(total, sum(self._iter_counts.values()), backlog,
+                                   events_n=self._iter_events_n, backlog_n=self._backlog_n):
+            return
+        if t2 - self._last_slow_log < SLOW_ITER_LOG_GAP_S:
             return
         self._last_slow_log = t2
         log.warning(slow_iteration_text(total, t1 - t0, dict(self._iter_counts), t2 - t1,
-                                        drain_n, self._cmds.qsize()))
+                                        drain_n, self._cmds.qsize(), backlog))
 
     def _drain(self) -> None:
         """이번 바퀴에 **지금 들어 있는 명령만** 처리한다(qsize 스냅샷).
@@ -567,11 +650,23 @@ class XingSession:
         keep = REAL_FIELD_LIMIT.get(tr)
         fields: dict[str, str] = {}
         for block in spec.out_blocks:
+            if tr == UNIFIED_QUOTE_TR:
+                def get(f: str, _name: str = block.name) -> str:
+                    return str(r.GetFieldData(_name, f))
+
+                fields.update(read_unified_quote(get, block.fields))
+                continue
             for f in block.fields:
                 if keep is None or f in keep:
                     fields[f] = str(r.GetFieldData(block.name, f))
+        self._real_sent += 1  # COM 스레드만 올린다
+        self._emit(self._deliver_real, tr, fields)
+
+    def _deliver_real(self, tr: str, fields: dict[str, str]) -> None:
+        """asyncio 루프에서 시세 1건을 콜백들에 전달 — 처리 카운터는 루프만 올린다."""
+        self._real_done += 1
         for cb in self.on_real:
-            self._emit(cb, tr, "", fields)
+            cb(tr, "", fields)
 
 
 # ------------------------------------------------------- pywin32 구현 ---

@@ -218,9 +218,14 @@ class CoreState:
     settings: GlobalSettings = field(default_factory=GlobalSettings)  # 공통설정(한도·알람)
     # 자동M(정방향 3세트 + 체결쏴 공통설정) — DESIGN-auto-m(-exec). 실행 상태는 복원 안 함.
     autom: AutoMScreen = field(default_factory=AutoMScreen)
-    # HL 호가단위 머지(종목별 [nSigFigs, mantissa]) — 단일 진실=코어. 코어 재시동 때 다시
-    # 적용해 시세·일반주문·자동M 콤보가 마지막 선택을 유지한다(사용자 2026-09-07). 원시는 항목 없음.
-    hl_merge: dict[str, list[int | None]] = field(default_factory=dict)
+    # HL 호가단위 — 종목별 **고른 틱(USD 숫자)**. 단일 진실=코어, 재시동 때 다시 적용해 시세·
+    # 일반주문·자동M 콤보가 마지막 선택을 유지한다(사용자 2026-09-07). 2026-10-27부터 틱으로 저장:
+    # 전엔 [nSigFigs, mantissa]였는데 유효숫자 기준이라 가격이 자릿수를 넘으면(하이닉스 1,000달러)
+    # 같은 값이 10배 틱이 됐다(사용자 "원래 가격대별로 호가단위가 있어야 함"). 가격대에 맞는
+    # 인자는 코어 2초 루프(core_server.sync_hl_merge)가 고른다.
+    hl_merge: dict[str, float] = field(default_factory=dict)
+    # 옛 형식([nSigFigs, mantissa])으로 남아 있던 항목 — 첫 HL 가격이 오면 틱으로 바꿔 hl_merge로
+    hl_merge_legacy: dict[str, list[int | None]] = field(default_factory=dict)
     # 오전 NXT 개장 매매(DESIGN-nxt-open.md) — 종목별 설정. 실행 상태는 복원 안 함.
     nxt_open: NxtOpenScreen = field(default_factory=NxtOpenScreen)
     # 동시호가 주문(DESIGN-auction-order.md §6) — 종목별 16행·월물·설정·HL 행↔주문번호. 예약실행은
@@ -430,14 +435,29 @@ def state_from_dict(data: dict[str, object]) -> CoreState:
     autom_from_dict(state.autom, data.get("autom"), legacy_underlying=legacy_u)
     nxt_open_from_dict(state.nxt_open, data.get("nxt_open"))
     auction_from_dict(state.auction, data.get("auction"))
+    valid = {u.value for u in Underlying}
+
+    def _legacy_pair(val: object) -> list[int | None] | None:
+        if (isinstance(val, list) and len(val) == 2 and isinstance(val[0], int)
+                and not isinstance(val[0], bool)
+                and (val[1] is None or (isinstance(val[1], int) and not isinstance(val[1], bool)))):
+            return [val[0], val[1]]
+        return None
+
     merges = data.get("hl_merge")
-    if isinstance(merges, dict):  # 종목별 [nSigFigs, mantissa] — 형식 틀린 항목만 버림
-        valid = {u.value for u in Underlying}
-        for key, pair in merges.items():
-            if (key in valid and isinstance(pair, list) and len(pair) == 2
-                    and isinstance(pair[0], int)
-                    and (pair[1] is None or isinstance(pair[1], int))):
-                state.hl_merge[str(key)] = [pair[0], pair[1]]
+    if isinstance(merges, dict):  # 종목별 틱(숫자). 옛 형식 [nSigFigs, mantissa]는 legacy로
+        for key, val in merges.items():
+            if key not in valid:
+                continue
+            if isinstance(val, int | float) and not isinstance(val, bool) and val > 0:
+                state.hl_merge[str(key)] = float(val)
+            elif (pair := _legacy_pair(val)) is not None:
+                state.hl_merge_legacy[str(key)] = pair
+    legacy = data.get("hl_merge_legacy")
+    if isinstance(legacy, dict):
+        for key, val in legacy.items():
+            if key in valid and (pair := _legacy_pair(val)) is not None:
+                state.hl_merge_legacy[str(key)] = pair
     screens = data.get("screens")
     if not isinstance(screens, dict):
         return state

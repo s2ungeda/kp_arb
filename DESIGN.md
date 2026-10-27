@@ -185,7 +185,7 @@
 - **취급 종목이 적으므로**(3 underlying × 주식/주식선물/HL perp), **시동 시 종목정보를 한 번 조회해 코어가 보관**한다. 화면은 `적` 없이도 이 정보를 읽어 즉시 표시(호가단위 콤보 등). 규칙/상수/하드코딩으로 흩어져 있던 것을 한 구조로 모은다.
 - **`InstrumentInfo`**(underlying, instrument별): `code`(거래소 심볼), `multiplier`(승수 — 주식 1 / 주식선물 10 / HL 1), `sz_decimals`(HL 수량 소수·틱 파생), `max_leverage`(HL), `expiry`(주식선물 YYYYMM). 순수 도메인 모델.
 - **조회 출처(시동 1회):** HL = `metaAndAssetCtxs` universe → 코인별 `szDecimals`·`maxLeverage`(펀딩 조회와 같은 응답 재사용). 주식선물 = `t8401`(코드·만기, 이미) + 승수 10. 주식 = 승수 1·틱규칙.
-- **보관·노출:** `LiveSystem.instruments[(underlying, instrument)] = InstrumentInfo`. `manual_snapshot`에 필요한 값 노출 — 특히 **HL 호가단위(merge) 단계**(일반주문·자동M·시세 화면 콤보 모두 같은 **숫자 틱** 표 — 시세 화면은 `/monitor`의 `hl_merge_ticks`, 옛 '원시/2배/5배' 표기 폐기 2026-09-07)는 순수 함수 `hl_merge.merge_tick_options(price)`(가격 자릿수 기반, `szDecimals`와 무관)로 스냅샷에 실어 화면 콤보가 즉시 채워지게. `max_leverage`는 포지션 없어도 레버리지 팝업 상한·표시에 사용(clearinghouse는 포지션 있을 때만 주는 한계 보완).
+- **보관·노출:** `LiveSystem.instruments[(underlying, instrument)] = InstrumentInfo`. `manual_snapshot`에 필요한 값 노출 — 특히 **HL 호가단위(merge) 단계**(일반주문·자동M·시세 화면 콤보 모두 같은 **숫자 틱** 표 — 시세 화면은 `/monitor`의 `hl_merge_ticks`, 옛 '원시/2배/5배' 표기 폐기 2026-09-07)는 순수 함수 `hl_merge.merge_tick_options(price)`(가격 자릿수 기반, `szDecimals`와 무관)로 스냅샷에 실어 화면 콤보가 즉시 채워지게. **고른 값의 단일 진실은 틱(USD)**(2026-10-27, 사용자 "원래 가격대별로 호가단위가 있어야 함" — 하이닉스가 1,000달러를 넘자 저장된 nSigFigs 4가 0.1→1달러 격자): 코어 상태 `hl_merge`는 종목별 틱을 저장하고 2초 루프 `sync_hl_merge`가 지금 가격대의 인자로 재구독한다(DESIGN-manual-order `manual_hl_merge`). `max_leverage`는 포지션 없어도 레버리지 팝업 상한·표시에 사용(clearinghouse는 포지션 있을 때만 주는 한계 보완).
 - **불변식:** 틱단위·승수는 종목정보에서 읽어 **주문 수량·가격 계산의 단일 출처**로 삼는다(하드코딩 상수 산재 금지 지향). 만기 롤오버 시 재조회(기존 t8401 흐름 유지).
 
 ### 5.12 LS 접근을 xingAPI로 교체 (사용자 결정 2026-09-23) → 계약 = [DESIGN-ls-xing.md](DESIGN-ls-xing.md)
@@ -230,7 +230,7 @@
 | 상품 | 환산가 | 기준가 |
 |---|---|---|
 | HL perp | HL 호가 × **환율이론가** | 국내 **주식 현재가** (KRX) |
-| 주식선물 | 그대로 | **선물이론가** = 기초 주식 현재가 × (1 + 연 3.0% × 잔존일/365) — 배당 무시, 최근월물. 이자율은 공통설정 사용자 입력(기본 3.0%) |
+| 주식선물 | 그대로 | **선물이론가** = 기초 주식 현재가 × (1 + 연 3.0% × 잔존일/365) — 배당 무시, 최근월물. 이자율은 공통설정 사용자 입력(기본 3.0%). **"현재가" = 1호가 가중값** `매수1 + (매도1 − 매수1) × 매수1잔량/(매도1잔량 + 매수1잔량)`(사용자 2026-10-27 — 주식 체결 구독을 끊어 시세 지연을 막음; 호가는 통합 UH1의 통합 잔량 — 10-27 오후, DESIGN-ls-xing §9) |
 | ETF | 그대로 | **ETF 이론가**(iNAV, `ETF 이론가.md` / `etf_theory.py`) |
 
 - **HL 환산 환율 = 판정용 환율** (사용자 확정 2026-09-28, `DESIGN-auto-m-exec.md` 결정 47이 계약): 두 원천은

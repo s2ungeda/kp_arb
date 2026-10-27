@@ -111,9 +111,13 @@ def merge_choices(ticks: list[dict[str, Any]]) -> tuple[list[str], dict[str, tup
 
 
 def active_label(table: dict[str, tuple[Any, Any]], active: Any) -> str | None:
-    """코어가 지금 적용 중인 머지(n_sig_figs, mantissa)에 해당하는 콤보 글."""
+    """코어가 지금 적용 중인 머지에 해당하는 콤보 글 — 틱 글(tick)이 있으면 그것, 없으면
+    (n_sig_figs, mantissa)로 찾는다."""
     if not isinstance(active, dict):
         return None
+    tick = active.get("tick")
+    if tick is not None and str(tick) in table:
+        return str(tick)
     key = (active.get("n_sig_figs"), active.get("mantissa"))
     return next((s for s, v in table.items() if v == key), None)
 
@@ -362,15 +366,19 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     ref_sent = {"qty": -1}
 
-    def send_ref_qty(force: bool = False) -> None:
-        """기준수량만 코어로 — Enter·포커스 이동 때 바로(체결쏴와 같음)."""
+    def send_ref_qty(force: bool = False, applied: bool = False) -> None:
+        """기준수량만 코어로 — Enter·포커스 이동 때 바로(체결쏴와 같음). applied='적'을 누른 것:
+        코어가 오늘 날짜를 적고 NXT 체결(NS3)을 구독한다(사용자 2026-10-27)."""
         qty = int_of(w["ref"].get())
         if not force and qty == ref_sent["qty"]:
             return
         ref_sent["qty"] = qty
         if not preview:
-            send({"cmd": "nxt_open_settings", "underlying": cur["u"].value, "ref_qty": qty},
-                 "기준수량")
+            body: dict[str, Any] = {"cmd": "nxt_open_settings", "underlying": cur["u"].value,
+                                    "ref_qty": qty}
+            if applied:
+                body["applied"] = True
+            send(body, "기준수량")
 
     def apply_top() -> None:
         """'적' — 호가단위(manual_hl_merge) + 기준수량을 코어에(체결쏴 apply_market과 같은 역할).
@@ -380,8 +388,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if label in agg_map and not preview:
             nsf, mant = agg_map[label]
             send({"cmd": "manual_hl_merge", "underlying": cur["u"].value,
-                  "n_sig_figs": nsf, "mantissa": mant}, "호가단위")
-        send_ref_qty(force=True)
+                  "tick": label.replace(",", ""), "n_sig_figs": nsf, "mantissa": mant},
+                 "호가단위")
+        send_ref_qty(force=True, applied=True)
         save_if_changed()  # 단 값도 '적'을 누르면 함께(결정 74 방식)
 
     def set_entry(e: tk.Entry, val: str) -> None:
@@ -466,11 +475,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             save_current()
 
     def refresh_agg(live: dict[str, Any]) -> None:
-        """코어 hl_merge_ticks로 호가단위 콤보 채우기 — 종목이 바뀌거나 처음일 때만 set."""
+        """코어 hl_merge_ticks로 호가단위 콤보 채우기 — 종목이 바뀌거나 처음, 또는 틱 표가 바뀌었을
+        때(가격이 자릿수를 넘음 — 하이닉스 1,000달러, 2026-10-27) set."""
         ticks = live.get("hl_merge_ticks") or []
-        if not ticks or (cur["agg_under"] == cur["u"] and agg_map):
+        if not ticks:
             return
         labels, table = merge_choices(ticks)
+        if cur["agg_under"] == cur["u"] and agg_map and list(w["agg"]["values"]) == labels:
+            return
         agg_map.clear()
         agg_map.update(table)
         w["agg"].config(values=labels)
@@ -613,6 +625,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         win_state.save_fields("nxt_open", collect_fields())
         if cur["loaded"]:  # 닫을 때 보던 종목의 입력값 저장(체결쏴 결정 82와 같은 요령)
             send(payload_of(cur["u"]), "저장")
+        # 화면 닫힘 = 실행 종료 → '적'으로 붙인 NXT 체결 구독 근거를 지운다(보던 종목만, 사용자
+        # 2026-10-27 "실행이 종료됐을 때 구독 취소")
+        send({"cmd": "nxt_open_settings", "underlying": cur["u"].value, "applied": False},
+             "구독 해제")
         deadline = time.time() + 3.0
         while jobs.unfinished_tasks and time.time() < deadline:
             time.sleep(0.05)

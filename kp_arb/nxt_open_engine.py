@@ -161,6 +161,7 @@ class NxtOpenEngine:
         if d.over_seen or not self._is_over(d, st):
             return
         d.over_seen = True
+        st.applied_day = None  # 오늘 기회 끝 → '적'으로 붙인 NXT 체결 구독도 해제(2초 루프)
         if not (st.run_entry or st.run_exit):
             return
         st.run_entry = st.run_exit = False

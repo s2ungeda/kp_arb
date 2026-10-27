@@ -41,9 +41,12 @@ class FakeSystem:
         self.on_fill: list[Any] = []
         self.quotes: dict[tuple[Underlying, Instrument, str], Quote] = {
             (U, Instrument.HL_PERP, "hl"): Quote(underlying=U, instrument=Instrument.HL_PERP,
-                                                 bid=1332.4, ask=1332.6, ts=0, market="hl")}
-        self.trades: dict[tuple[Underlying, Instrument, str], float] = {
-            (U, Instrument.KR_STOCK, "nxt"): 1_766_000.0}
+                                                 bid=1332.4, ask=1332.6, ts=0, market="hl"),
+            # S = NXT 1호가 가중값(2026-10-27) — 매수1=매도1=1,766,000이면 그 값
+            (U, Instrument.KR_STOCK, "nxt"): Quote(underlying=U, instrument=Instrument.KR_STOCK,
+                                                   bid=1_766_000.0, ask=1_766_000.0, ts=0,
+                                                   bid_qty=1.0, ask_qty=1.0, market="nxt")}
+        self.trades: dict[tuple[Underlying, Instrument, str], float] = {}
         self.instruments = {(U, Instrument.HL_PERP): InstrumentInfo(
             underlying=U, instrument=Instrument.HL_PERP, code="xyz:SKHX", sz_decimals=2)}
         self.expected_prices: dict[tuple[Underlying, Instrument], float] = {(U, SF): 1_766_000.0}

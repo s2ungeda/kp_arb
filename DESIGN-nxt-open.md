@@ -67,7 +67,12 @@
 4. 같은 종목의 자동M 세트가 08:00 창과 겹치지 않을 것(자동M 주문가능시간은 보통 08:00:05부터 — 겹치면 포지션이 섞인다).
 
 ## 6. 코어·데이터 (구현 2026-10-20 — `nxt_open.py` 순수 로직 · `nxt_open_engine.py` 엔진 · `nxt_open_screen.py` 화면)
-- 실시간: NXT 체결 `NS3`(S·T0), HL `l2Book`(N호가)·`activeAssetCtx`(오라클), 현물환(CUR/하나고시). 전부 코어가 이미 받는다.
+- 실시간: NXT 체결 `NS3`(S·T0), HL `l2Book`(N호가)·`activeAssetCtx`(오라클), 현물환(CUR/하나고시). **NS3는 그 종목의
+  화면에서 '적'을 누른 날(설정 `applied_day` = 오늘) 또는 진입·청산 실행이 켜진 동안 구독**하고, **실행이 종료되면 해제** —
+  설정 시간이 지나 자동 끔이 될 때, 또는 화면을 닫을 때(보던 종목, `nxt_open_settings {applied: false}`로 `applied_day` 지움;
+  사용자 2026-10-27 "결국 실행이 종료됐을 때 구독 취소"). 실행 버튼만 끄고 화면을 둔 동안은 유지(사용자 2026-10-27 "실행할 때만 NXT 체결 구독하고 매매 종료 시 구독 취소" → 같은 날 오후 "'적'
+  누르는 순간 체결 데이터를 구독" — '적'만 누른 화면의 모니터 S·괴리가 "-"였음; DESIGN-ls-xing §9 구독 계획). `applied_day`는
+  저장·복원(같은 날 재시동이면 구독 유지). 나머지는 코어가 이미 받는다.
   엔진은 이벤트 주도(별도 루프 없음): on_trade(NXT)·on_quote(HL)·on_fx마다 괴리를 다시 구하고 창 안이면 판정.
 - 상태(코어 저장 `core_state.json`의 `nxt_open.books[종목]`): 창 `start_s`/`end_s`·**개장 시각
   `open_hms`**(기본 08:00:00)·진입 3단 `entries`·청산 3단 `exits`(각 spread·qty·price_spread, 소수)·실행 `enabled`(**복원

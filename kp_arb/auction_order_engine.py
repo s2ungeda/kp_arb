@@ -44,6 +44,7 @@ from .auction_order import (
 from .domain.enums import Account, Instrument, OrderType, SessionPhase, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .hl_merge import merge_tick_options
+from .theory import weighted_quote_price
 
 FUTURES_MARKET = "5"           # JIF 선물 시장(session_service.FUTURES_MARKET)
 START_GRACE_S = 60.0           # 주문시각이 이보다 더 지난 뒤 켠 코어는 그날 그 프로세스를 안 돌림
@@ -225,11 +226,15 @@ class AuctionOrderEngine:
             sq = self._system.quotes.get((u, inst, "krx"))
             sf_exp = hl_mid(sq.bid, sq.ask) if sq is not None else None
             fx_exp = self._system.fx_futures_price.get(code) if code else None
+        # S = NXT 1호가 가중값(사용자 2026-10-27 — 체결 구독 없음, DESIGN-auction-order §1).
+        # 통합 호가(UH1)에서 NXT 잔량이 있는 첫 단계로 만든 Quote(market "nxt") — 늘 들어온다.
+        nq = self._system.quotes.get((u, Instrument.KR_STOCK, "nxt"))
         return {
             "sf_expected": sf_exp,
             "fx_expected": fx_exp,
             "hl_mid": hl_mid(hq.bid, hq.ask) if hq is not None else None,
-            "s": self._system.trades.get((u, Instrument.KR_STOCK, "nxt")),
+            "s": (weighted_quote_price(nq.bid, nq.ask, nq.bid_qty, nq.ask_qty)
+                  if nq is not None else None),
             "theory": self._system.stock_futures_theory(u, inst),
         }
 

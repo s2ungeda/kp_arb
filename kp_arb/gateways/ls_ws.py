@@ -39,10 +39,13 @@ QUOTE_TRS: frozenset[str] = frozenset({"H1_", "NH1", "UH1"})  # KRX/NXT/통합 �
 FUTURES_QUOTE_TR = "JH0"   # 주식선물 호가 (body 필드는 H1_와 동일 가정 — 장중 실확인 예정)
 STOCK_TRADE_TRS: tuple[str, ...] = ("S3_", "NS3", "US3")  # 체결: KRX/NXT/통합
 # 종목·월물에 따라 바뀌는 시세 TR — apply_plan(§9)이 다루는 범위. 종목과 무관한 CUR·JIF·통보는 밖.
-# 주식 호가는 체결쏴 주식이 고른 거래소 하나(H1_ | NH1)만 — 읽는 칸은 xing_com.REAL_FIELD_LIMIT가
-# 1호가로 제한.
-PLAN_TRS: frozenset[str] = frozenset({"US3", "UYS", "H1_", "NH1", "VI_", "JH0", "YJC", "FC9",
-                                      "YF9"})
+# 주식 호가는 통합(UH1) 하나(2026-10-27 오후) — 단계별 KRX·NXT·통합 잔량이 따로 와 한 건에서
+# Quote 셋(uni/krx/nxt)을 만든다. H1_/NH1은 더 안 쓰지만 남은 등록을 지우도록 계획 범위엔 둔다.
+PLAN_TRS: frozenset[str] = frozenset({"NS3", "UYS", "UH1", "H1_", "NH1", "VI_", "JH0", "YJC",
+                                      "FC9", "YF9"})
+UNIFIED_QUOTE_TR = "UH1"
+# UH1 Quote 셋 — (market, 잔량 칸 접두). krx/nxt는 그 거래소 잔량이 0보다 큰 첫 단계가 1호가.
+UNIFIED_MARKETS: tuple[tuple[str, str], ...] = (("uni", "unt_"), ("krx", "krx_"), ("nxt", "nxt_"))
 FUTURES_TRADE_TR = "JC0"   # 주식선물 체결 (동일 가정)
 # 통화(원달러)선물 체결 — 명목상 "KOSPI200선물" TR이지만 tr_key에 USD선물 단축코드를 넣어 공용.
 # 구 FC0/FH0는 **2026-06-23 폐지**(LS 공식 답변) → 등록하면 rsp_cd 10002 거부.
@@ -571,7 +574,11 @@ class LSWebSocketClient:
                     log.info("%s 구독 응답 정상 %d건 (요청 %d건 전부)",
                              self.status.name, self._ack_ok, len(self._subs))
             return
-        if tr_cd in QUOTE_TRS:
+        if tr_cd == UNIFIED_QUOTE_TR:
+            for uq in self._parse_unified_quotes(msg):
+                for handler in self.on_quote:
+                    handler(uq)
+        elif tr_cd in QUOTE_TRS:
             quote = self._parse_quote(msg)
             if quote is not None:
                 for handler in self.on_quote:
@@ -726,18 +733,54 @@ class LSWebSocketClient:
                          self.status.name, raw)
         return "uni"
 
-    def _parse_quote(self, msg: dict[str, Any]) -> Quote | None:
+    def _stock_instrument(self, msg: dict[str, Any]) -> tuple[Instrument, Underlying] | None:
+        """호가 프레임의 종목코드(shcode, 없으면 tr_key) → (주식|ETF, 종목). 둘 다 아니면 None."""
         body = msg["body"]
         code = _norm_code(str(body.get("shcode") or msg.get("header", {}).get("tr_key", "")))
-        # 종목코드로 주식 vs ETF 판별(둘 다 아니면 무시).
         etf_underlying = self._etf_underlying.get(code)
         if etf_underlying is not None:
-            instrument, underlying = Instrument.KR_ETF, etf_underlying
-        else:
-            stock_underlying = Underlying.from_krx_code(code)
-            if stock_underlying is None:
-                return None
-            instrument, underlying = Instrument.KR_STOCK, stock_underlying
+            return Instrument.KR_ETF, etf_underlying
+        stock_underlying = Underlying.from_krx_code(code)
+        if stock_underlying is None:
+            return None
+        return Instrument.KR_STOCK, stock_underlying
+
+    def _parse_unified_quotes(self, msg: dict[str, Any]) -> list[Quote]:
+        """UH1(통합 호가) 한 건 → Quote 셋(DESIGN-ls-xing §9, 2026-10-27 오후). 단계마다 가격은
+        통합 하나, 잔량은 KRX·NXT·통합 셋이라 **거래소별 1호가 = 그 거래소 잔량이 0보다 큰 첫
+        단계**. 어느 거래소가 양쪽(매도·매수) 다 없으면(마감 뒤 KRX 등) 그 Quote는 안 만든다. 통합
+        (uni)은 1단계 그대로."""
+        resolved = self._stock_instrument(msg)
+        if resolved is None:
+            return []
+        instrument, underlying = resolved
+        body = msg["body"]
+        try:
+            ts = float(body["hotime"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        out: list[Quote] = []
+        for market, pre in UNIFIED_MARKETS:
+            asks = _depth(body, "offerho", f"{pre}offerrem")
+            bids = _depth(body, "bidho", f"{pre}bidrem")
+            if market != "uni":
+                asks = [lv for lv in asks if lv[1] > 0]
+                bids = [lv for lv in bids if lv[1] > 0]
+            if not asks or not bids:
+                continue
+            out.append(Quote(
+                underlying=underlying, instrument=instrument,
+                bid=bids[0][0], ask=asks[0][0], ts=ts,
+                bid_qty=bids[0][1], ask_qty=asks[0][1], market=market,
+                bids=bids, asks=asks))
+        return out
+
+    def _parse_quote(self, msg: dict[str, Any]) -> Quote | None:
+        body = msg["body"]
+        resolved = self._stock_instrument(msg)
+        if resolved is None:
+            return None
+        instrument, underlying = resolved
         # 실측 필드: bidho1~10/offerho1~10(호가), bidrem/offerrem(잔량), hotime(HHMMSS).
         # 통합(UH1)의 잔량은 unt_bidrem/unt_offerrem (RTD 실측 이관).
         tr_cd = msg.get("header", {}).get("tr_cd", "")

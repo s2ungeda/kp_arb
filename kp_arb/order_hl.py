@@ -383,16 +383,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         under = UNDER_MAP.get(cb_under.get())
         if under is None:
             return
-        if _merge_shown["under"] == under and cb_merge["values"]:
-            return  # 이미 이 종목으로 채워짐 — 유지
         ticks = _selected_symbol().get("merge_ticks") or []
         if not ticks:
             return  # 아직 가격 미수신 — 다음 폴링에 재시도
+        vals = [str(t.get("tick")) for t in ticks]
+        if _merge_shown["under"] == under and list(cb_merge["values"]) == vals:
+            return  # 이미 이 종목·이 틱 표로 채워짐 — 유지(표가 바뀌면 다시: 가격이 자릿수를 넘음)
         merge_map.clear()
-        vals: list[str] = []
-        for t in ticks:
-            s = str(t.get("tick"))
-            vals.append(s)
+        for t, s in zip(ticks, vals, strict=True):
             merge_map[s] = (t.get("n_sig_figs"), t.get("mantissa"))
         cb_merge["values"] = vals
         # 우선순위: 코어 현재 적용값(merge_active) > 창 저장값(win_state) > 최소 틱.
@@ -544,7 +542,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         _merge_pending["under"] = under
         nsf, mant = merge_map.get(cb_merge.get(), (None, None))
         send({"cmd": "manual_hl_merge", "underlying": under,
-              "n_sig_figs": nsf, "mantissa": mant}, "머지")
+              "tick": cb_merge.get().replace(",", ""), "n_sig_figs": nsf, "mantissa": mant},
+             "머지")
 
     def open_leverage_popup() -> None:
         # 레버리지·마진모드 설정 팝업(§1-3) — 주문과 별개 액션. 성공 시 닫고, 실패 시 유지+사유.

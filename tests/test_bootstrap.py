@@ -15,7 +15,7 @@ from kp_arb.bootstrap import (
     startup_symbol_error,
 )
 from kp_arb.domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
-from kp_arb.domain.models import OrderIntent, Position
+from kp_arb.domain.models import OrderIntent, Position, Quote
 from kp_arb.gateways.ls_ws import Fill, LSWebSocketClient, WSClosed
 from kp_arb.gateways.mock_ls import MockLSGateway
 from kp_arb.order_book import OrderBook, OrderStatus
@@ -1485,6 +1485,11 @@ def test_disparity_board_computes_pairs() -> None:
         underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
         bid=299_500.0, ask=300_500.0, ts=0.0,
     )
+    # 기초가(stock_last)는 통합(uni) 1호가 가중값(10-27) — 잔량 없음 → 중간값 300,000
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK, "uni")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
+        bid=299_500.0, ask=300_500.0, ts=0.0, market="uni",
+    )
 
     board = system.disparity_board(1)  # 1호가만 있어 est=1호가로 축약(수치 동일)
 
@@ -1520,7 +1525,10 @@ def test_disparity_board_est_is_quantity_dependent() -> None:
     system.futures_symbols[SAMSUNG] = "A1167000"
     system.futures_expiry[(SAMSUNG, Instrument.KR_STOCK_FUTURE)] = 202612
     system.usdkrw_theory = 1_500.0
-    system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] = 300_000.0
+    # 현재가 = 통합 1호가 가중값(2026-10-27) — 매수1=매도1=300,000으로 시드하면 그 값
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK, "uni")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=300_000.0, ask=300_000.0,
+        ts=0.0, bid_qty=1.0, ask_qty=1.0, market="uni")
     system.stock_change_pct[(SAMSUNG, "krx")] = 0.0
     system.session.seed_phase(SessionPhase.REGULAR)
     # 1호가는 얕고(잔량 1), 2호가는 깊다(잔량 100) — 큰 수량이면 2호가까지 먹는다.
@@ -1551,9 +1559,10 @@ def test_pair_signal_est_based() -> None:
     system, _, _ = _system([])
     system.usdkrw_theory = 1_500.0
     system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] = 300_000.0
-    system.quotes[(SAMSUNG, Instrument.KR_STOCK, "krx")] = Quote(
+    # 기준가 = 통합(uni) 1호가 가중값(10-27) — 잔량 없음 → 중간값 300,000
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK, "uni")] = Quote(
         underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
-        bid=299_500.0, ask=300_500.0, ts=0.0)
+        bid=299_500.0, ask=300_500.0, ts=0.0, market="uni")
     system.quotes[(SAMSUNG, Instrument.HL_PERP, "hl")] = Quote(
         underlying=SAMSUNG, instrument=Instrument.HL_PERP,
         bid=201.0, ask=202.0, ts=0.0, market="hl",
@@ -1664,7 +1673,7 @@ async def test_refresh_quote_plan_registers_only_plan_and_fx_on_deriv_channel() 
     system, stock_conn, deriv_conn = _system([], deriv_frames=[])
     system.futures_symbols[SAMSUNG] = "A116B000"
     system.next_futures_symbols[SAMSUNG] = "A116C000"
-    inp = QuotePlanInput(symbols_on=frozenset({SAMSUNG}), stock_market={SAMSUNG: "nxt"},
+    inp = QuotePlanInput(symbols_on=frozenset({SAMSUNG}),
                          futures_codes={(SAMSUNG, "near"): "A116B000",
                                         (SAMSUNG, "next"): "A116C000"},
                          fx_code="A756B000")
@@ -1675,8 +1684,10 @@ async def test_refresh_quote_plan_registers_only_plan_and_fx_on_deriv_channel() 
     assert deriv_conn is not None
     stock_trs = {json.loads(m)["body"]["tr_cd"] for m in stock_conn.conn.sent}
     deriv_trs = {json.loads(m)["body"]["tr_cd"] for m in deriv_conn.conn.sent}
-    assert {"US3", "UYS", "NH1", "VI_", "JH0", "YJC", "JIF", "SC1", "CUR"} <= stock_trs
-    assert not stock_trs & {"H1_", "UH1", "S3_", "NS3", "YS3", "JC0", "FC9", "DC0", "S2_", "NS2"}
+    assert {"UYS", "UH1", "VI_", "JH0", "YJC", "JIF", "SC1", "CUR"} <= stock_trs
+    assert "US3" not in stock_trs  # 주식 체결은 안 받는다(2026-10-27)
+    # 주식 호가는 통합 UH1 하나(10-27 오후) — 거래소별 H1_/NH1 없음
+    assert not stock_trs & {"H1_", "NH1", "S3_", "NS3", "YS3", "JC0", "FC9", "DC0", "S2_", "NS2"}
     assert {"FC9", "YF9", "C01"} <= deriv_trs and "US3" not in deriv_trs
     keys = {json.loads(m)["body"]["tr_key"] for m in stock_conn.conn.sent
             if json.loads(m)["body"]["tr_cd"] == "JH0"}
@@ -1687,8 +1698,9 @@ async def test_refresh_quote_plan_registers_only_plan_and_fx_on_deriv_channel() 
 
 
 async def test_stock_trade_mirrors_to_uni_from_exchange_split_stream() -> None:
-    # §9: 주식 체결은 US3 하나 — 거래소명으로 krx/nxt로 갈려 오고, "통틀어 마지막"(uni)은 어느
-    # 거래소든 가장 최근 체결. stock_last·이론가 기초가는 그대로 uni를 읽는다.
+    # §9: 주식 체결(NS3, NXT 개장·동시호가가 켜진 동안만)은 trades에 남고 "통틀어 마지막"(uni)도
+    # 거울로 만든다. stock_last는 체결이 아니라 1호가 가중값(사용자 2026-10-27)이라
+    # 체결만으로는 None.
     from kp_arb.gateways.ls_ws import TradeTick
 
     system, _, _ = _system([])
@@ -1701,7 +1713,7 @@ async def test_stock_trade_mirrors_to_uni_from_exchange_split_stream() -> None:
     assert system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] == 70_000.0
     assert system.trades[(SAMSUNG, Instrument.KR_STOCK, "nxt")] == 70_100.0
     assert system.trades[(SAMSUNG, Instrument.KR_STOCK, "uni")] == 70_100.0
-    assert system.stock_last(SAMSUNG) == 70_100.0
+    assert system.stock_last(SAMSUNG) is None
     assert system.stock_change_pct[(SAMSUNG, "krx")] == 0.5
     fan(TradeTick(underlying=SAMSUNG, instrument=Instrument.HL_PERP, price=50.0, ts=0.0,
                   market="hl"))
@@ -1897,3 +1909,63 @@ async def test_ls_place_replays_pending_with_account() -> None:
         venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
         side=Side.SELL, qty=1, order_type=OrderType.LIMIT, price=1_212_000.0))
     assert calls == [(oid, Account.KR_DERIV)]  # 계좌 없이 보낸 intent도 라우팅 계좌로 채워 넘김
+
+
+def test_ls_quote_lag_ms_from_hotime() -> None:
+    # LS 호가 수신 지연(사용자 2026-10-27): 거래소 호가시각 HHMMSS 대비 자정 기준 초
+    from kp_arb.bootstrap import ls_quote_lag_ms, tod_seconds
+
+    tod = 9 * 3600 + 0 * 60 + 5.25           # 09:00:05.25
+    assert ls_quote_lag_ms(90004.0, tod) == 1250.0
+    assert ls_quote_lag_ms(90006.0, tod) == -750.0   # 거래소 시계가 앞서면 음수(시계 오차)
+    assert ls_quote_lag_ms(0.0, tod) is None         # hotime 없음
+    assert ls_quote_lag_ms(250000.0, tod) is None    # HHMMSS 범위 밖(epoch ms 등)
+    import time as _t
+
+    now = _t.mktime((2026, 10, 27, 9, 0, 5, 0, 0, -1)) + 0.5
+    assert abs(tod_seconds(now) - (9 * 3600 + 5.5)) < 1e-6
+
+
+def test_fan_quote_logs_ls_lag_per_window(caplog: pytest.LogCaptureFixture) -> None:
+    # 10분 창이 차면 한 줄(최대 3초 이상이면 WARNING), HL 호가는 세지 않는다
+    import time as _t
+
+    from kp_arb.bootstrap import LagMeter
+
+    system, _, _ = _system([])
+    system._ls_lag = LagMeter(window_s=0.4)   # 창을 0.4초로 — 두 번째 건(0.5초 뒤)에서 집계
+    base = _t.mktime((2026, 10, 27, 9, 0, 10, 0, 0, -1))
+    with caplog.at_level("INFO", logger="kp_arb.bootstrap"):
+        system._note_ls_quote_lag(90009.0, base)          # 1초 늦음
+        system._note_ls_quote_lag(90006.0, base + 0.5)    # 4.5초 늦음 → 창 마감
+    recs = [r for r in caplog.records if "LS 호가 수신 지연" in r.message]
+    assert len(recs) == 1 and recs[0].levelname == "WARNING"
+    assert "10분 2건 평균 2.8s 최대 4.5s" in recs[0].message
+
+
+def test_weighted_quote_price_formula() -> None:
+    # 사용자 2026-10-27 식: 매수1 + (매도1 − 매수1) × 매수1잔량/(매도1잔량 + 매수1잔량)
+    from kp_arb.bootstrap import weighted_quote_price
+
+    # 매수 잔량이 많으면 매도1 쪽으로
+    assert weighted_quote_price(70_000.0, 70_100.0, 300.0, 100.0) == 70_075.0
+    assert weighted_quote_price(70_000.0, 70_100.0, 100.0, 300.0) == 70_025.0
+    assert weighted_quote_price(70_000.0, 70_100.0, 0.0, 0.0) == 70_050.0      # 잔량 없음 → 중간값
+    assert weighted_quote_price(70_000.0, 70_100.0, None, None) == 70_050.0
+    assert weighted_quote_price(0.0, 70_100.0, 1.0, 1.0) is None
+
+
+async def test_stock_last_is_weighted_unified_quote() -> None:
+    # stock_last = 통합(uni) 1호가 가중값(통합 호가 UH1, 10-27 오후) — 이론가·자동M·메인이 전부
+    # 이걸 읽는다. 거래소별(krx/nxt) Quote는 체결쏴·동시호가 몫이라 현재가엔 안 쓴다.
+    system, _, _ = _system([])
+    system._wire()
+    fan = system._stock_ws.on_quote[-1]
+    assert system.stock_last(SAMSUNG) is None
+    fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=70_200.0, ask=70_300.0,
+              ts=0.0, bid_qty=100.0, ask_qty=100.0, market="nxt"))
+    assert system.stock_last(SAMSUNG) is None
+    fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=70_000.0, ask=70_100.0,
+              ts=0.0, bid_qty=300.0, ask_qty=100.0, market="uni"))
+    assert system.stock_last(SAMSUNG) == 70_075.0
+    assert system.stock_futures_theory(SAMSUNG) is None or system.stock_futures_theory(SAMSUNG) > 0

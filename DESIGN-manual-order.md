@@ -269,7 +269,14 @@ HL 웹이나 다른 데서 거래하면 이 화면에 안 잡힌다.
 - `manual_cancel` {order_id} → `cancel`.
 - `manual_cancel_all` {underlying, instrument, side?} (2026-09-28; side 2026-09-29) → 그 종목·상품의 미체결 취소(`LiveSystem.cancel_many`). **side("buy"|"sell")를 주면 그쪽만** — 일반주문창은 매수/매도 라디오 값을 보내고 버튼 글자도 "매수 일괄 취소"/"매도 일괄 취소"로 바뀐다(사용자 2026-09-29). side 없으면 양쪽 전부. **HL은 `cancel` 액션의 cancels 배열로 한 요청**(SDK `bulk_cancel`, 응답 statuses가 건별 "success"/{error}; 요청 한도 절약 — 사용자 2026-09-28), LS는 한 건씩. 실패는 건너뛰고 세어서 보고 `{cancelled, failed}`. 화면: 일반주문창 **주문 버튼 아래 [일괄 취소]**(주문 버튼 높이를 1/3 줄여 그 자리에). **안전 잠금 '일취' 체크박스**(왼쪽 체크 열 맨 아래): 체크돼 있을 때만 발송, 보내면 다시 꺼짐, 화면 저장에서 제외(열 때마다 꺼진 상태). 원클릭 '주문' 체크와는 별개.
 - **스냅샷 = 한 화면 분량 + '이전' 버튼(사용자 2026-09-29):** `/manual_state`·메인 채널 manual 스냅샷의 체결·취소·거부는 각 **최신 200건**(`SNAPSHOT_PAGE`)만 싣고, 그 이전은 `GET /history?kind=fills|cancels|rejects&before=<seq>&limit=200`(코어는 당일 전부 보관, 행마다 일련번호 `seq`). 주문리스트 필터 줄의 **[이전 200건]**(뒷단 스레드가 세 종류 각각 지금 보이는 가장 오래된 seq 이전을 가져와 이어 붙임)·**[최신]**(되돌림). 근거: HL선이 역산가 변경으로 하루 7,000건+ 취소 → 통째 스냅샷이 MB급 → 메인 채널 1MiB 상한에 끊김·코어 부하(운영 2026-09-29). 09-16 "당일치 전부"(50건 상한으로 아침 체결이 안 보임)는 이 방식으로 충족 — 버튼으로 다 볼 수 있다.
-- `manual_hl_merge` {underlying, n_sig_figs, mantissa} → `set_hl_aggregation`(HL 호가단위 머지, WS 재구독). 같은 단위면 재구독 생략(호가창이 잠깐 비는 것 방지). 종목별 선택은 코어 상태(`hl_merge`)에 저장돼 **코어 재시동 때 다시 적용**되고, 시세·일반주문·자동M 콤보는 모두 코어 적용값을 따른다(단일 진실=코어, 2026-09-07).
+- `manual_hl_merge` {underlying, **tick**(USD 숫자 — 2026-10-27부터 단일 진실), n_sig_figs, mantissa(틱 없을 때만 지금 가격대로 틱 환산)} →
+  코어 상태 `hl_merge[종목] = 틱`, 지금 HL 가격대 옵션 중 그 틱의 (nSigFigs, mantissa)로 `set_hl_aggregation`(WS 재구독). **가격이
+  자릿수를 넘으면 2초 루프 `sync_hl_merge`가 같은 틱의 새 인자로 재구독**(운영 실측 10-27: 하이닉스가 1,000달러를 넘자 저장된
+  nSigFigs 4가 0.1→1달러 격자가 됐는데 화면은 옛 라벨 "0.1" — 사용자 "원래 가격대별로 호가단위가 있어야 함"). 고른 틱이 새
+  가격대 옵션에 없으면(0.01은 1,000달러 위에 없음) 로그 거리가 가장 가까운 것(같으면 작은 쪽)을 걸고 가격대마다 한 번 WARNING;
+  가격대가 돌아오면 고른 틱으로 복귀. 옛 저장 형식 [nSigFigs, mantissa]는 첫 가격에 틱으로 바꾸고 WARNING(확인 요망). 화면 콤보는
+  코어가 준 틱 표가 바뀌면 다시 채운다(전엔 종목이 바뀔 때만 → 옛 라벨이 남던 원인). 스냅샷 `hl_merge`/`merge_active`에 `tick`
+  (표시 글) 동반. 같은 단위면 재구독 생략(호가창이 잠깐 비는 것 방지). 종목별 선택은 코어 상태(`hl_merge`)에 저장돼 **코어 재시동 때 다시 적용**되고, 시세·일반주문·자동M 콤보는 모두 코어 적용값을 따른다(단일 진실=코어, 2026-09-07).
 - `manual_refresh` {} → `refresh_snapshot`(잔고/포지션 재조회 → OrderBook 재동기, '적' 버튼·HTS 외부거래 반영).
 - **[신규]** `manual_leverage` {underlying, is_cross, leverage} → `updateLeverage`. **주문과 별개** (§1-3).
 - **[신규·나중]** `hl_dex_abstraction` {enabled} → `userDexAbstraction`. **계정 단위라 주문창이 아니라 설정 화면에 둔다.** 이 창의 개발 범위 밖.

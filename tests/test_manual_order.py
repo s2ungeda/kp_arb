@@ -405,32 +405,55 @@ async def test_manual_amend_ls_still_allowed() -> None:
     assert r["ok"] and sys.amended == [("L1", 80500.0, False, False)]
 
 
+def _hl_quote(px: float) -> dict[Any, Quote]:
+    return {(Underlying.SAMSUNG, Instrument.HL_PERP, "hl"): Quote(
+        underlying=Underlying.SAMSUNG, instrument=Instrument.HL_PERP, bid=px, ask=px, ts=0.0,
+        market="hl")}
+
+
 async def test_manual_hl_merge_calls_system() -> None:
-    sys = _fake_system(OrderBook())
+    # 화면은 틱(USD 글)을 보낸다(2026-10-27) — 코어가 지금 가격대의 인자로 바꿔 건다(163달러대 0.02
+    # = nSigFigs 5 mantissa 2)
+    sys = _fake_system(OrderBook(), quotes=_hl_quote(163.0))
     r = await _manual_command(sys, {"cmd": "manual_hl_merge",
-        "underlying": "samsung", "n_sig_figs": 5, "mantissa": 2})
+        "underlying": "samsung", "tick": "0.02", "n_sig_figs": 5, "mantissa": 2})
     assert r["ok"] and sys.merges == [(Underlying.SAMSUNG, 5, 2)]
 
 
 async def test_manual_hl_merge_raw_is_none() -> None:
-    sys = _fake_system(OrderBook())
+    # 기준틱(0.01)은 원시(None, None). 틱 없이 인자만 온 옛 화면은 지금 가격대로 틱을 센다.
+    sys = _fake_system(OrderBook(), quotes=_hl_quote(163.0))
     r = await _manual_command(sys, {"cmd": "manual_hl_merge",
-        "underlying": "samsung", "n_sig_figs": None, "mantissa": None})
+        "underlying": "samsung", "tick": "0.01"})
     assert r["ok"] and sys.merges == [(Underlying.SAMSUNG, None, None)]
+    r = await _manual_command(sys, {"cmd": "manual_hl_merge",
+        "underlying": "samsung", "n_sig_figs": 4, "mantissa": None})
+    assert r["ok"] and sys.merges[-1] == (Underlying.SAMSUNG, 4, None)
+    none = _fake_system(OrderBook())  # HL 시세 없음 + 틱 없음 → 거부
+    r = await _manual_command(none, {"cmd": "manual_hl_merge",
+        "underlying": "samsung", "n_sig_figs": 4, "mantissa": None})
+    assert not r["ok"] and none.merges == []
 
 
 async def test_manual_hl_merge_remembered_in_state() -> None:
-    # 코어 상태에 종목별로 남겨 재시동 때 복원(단일 진실=코어, 2026-09-07). 원시면 항목 제거.
+    # 코어 상태에 종목별 **틱**으로 남겨 재시동 때 복원(단일 진실=코어). 원시도 틱(기준틱)으로
+    # 남는다 — 가격대가 바뀌어도 "가장 작은 틱"이 아니라 그 틱을 따라간다.
     from kp_arb.strategy_core import CoreState
 
-    sys = _fake_system(OrderBook())
+    sys = _fake_system(OrderBook(), quotes=_hl_quote(163.0))
     state = CoreState()
+    state.hl_merge_legacy["samsung"] = [4, None]
     await _manual_command(sys, {"cmd": "manual_hl_merge", "underlying": "samsung",
-                                "n_sig_figs": 5, "mantissa": 2}, state)
-    assert state.hl_merge == {"samsung": [5, 2]}
+                                "tick": "0.02"}, state)
+    assert state.hl_merge == {"samsung": 0.02} and state.hl_merge_legacy == {}
     await _manual_command(sys, {"cmd": "manual_hl_merge", "underlying": "samsung",
-                                "n_sig_figs": None, "mantissa": None}, state)
-    assert state.hl_merge == {}
+                                "tick": "0.01"}, state)
+    assert state.hl_merge == {"samsung": 0.01}
+    # 가격 전에 틱이 오면 저장만(인자가 같이 왔으면 우선 그대로 걸어 둔다)
+    cold = _fake_system(OrderBook())
+    await _manual_command(cold, {"cmd": "manual_hl_merge", "underlying": "samsung",
+                                 "tick": "0.1", "n_sig_figs": 4, "mantissa": None}, state)
+    assert state.hl_merge == {"samsung": 0.1} and cold.merges == [(Underlying.SAMSUNG, 4, None)]
 
 
 async def test_manual_refresh_resyncs() -> None:

@@ -118,4 +118,6 @@ def test_merge_combo_helpers_follow_core_ticks() -> None:
     labels, table = merge_choices(ticks)
     assert labels == ["0.1", "0.2", "0.5"] and table["0.5"] == (5, 5)
     assert active_label(table, {"n_sig_figs": 5, "mantissa": 2}) == "0.2"
+    # 틱 글이 오면 그것으로(2026-10-27 — 가격대가 바뀌어 인자가 달라도 라벨은 틱)
+    assert active_label(table, {"n_sig_figs": 9, "mantissa": None, "tick": "0.5"}) == "0.5"
     assert active_label(table, None) is None and active_label(table, {"n_sig_figs": 9}) is None

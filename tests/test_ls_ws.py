@@ -681,6 +681,46 @@ async def test_unified_quote_and_trade_parse() -> None:
     assert any(f"U{SAMSUNG_CODE}   " in m and '"US3"' in m for m in session.sent)
 
 
+async def test_unified_quote_splits_into_krx_and_nxt_best_levels() -> None:
+    # DESIGN-ls-xing §9(2026-10-27 오후): UH1 한 건 → Quote 셋. 단계마다 가격은 통합 하나, 잔량은
+    # KRX·NXT·통합 셋 → 거래소별 1호가 = 그 거래소 잔량이 0보다 큰 첫 단계. 여기선 매도 1단계는
+    # NXT만, KRX 매도는 2단계부터; 매수 1단계는 KRX만, NXT 매수는 2단계부터.
+    body = {"shcode": SAMSUNG_CODE, "hotime": "100000",
+            "offerho1": "70200", "bidho1": "70100",
+            "krx_offerrem1": "0", "nxt_offerrem1": "30", "unt_offerrem1": "30",
+            "krx_bidrem1": "50", "nxt_bidrem1": "0", "unt_bidrem1": "50",
+            "offerho2": "70300", "bidho2": "70000",
+            "krx_offerrem2": "80", "nxt_offerrem2": "10", "unt_offerrem2": "90",
+            "krx_bidrem2": "20", "nxt_bidrem2": "40", "unt_bidrem2": "60"}
+    uh1 = json.dumps({"header": {"tr_cd": "UH1", "tr_key": f"U{SAMSUNG_CODE}   "}, "body": body})
+    session = FakeConnection([uh1])
+    client = LSWebSocketClient(FakeConnector([session]))
+    quotes: list[Quote] = []
+    client.on_quote.append(quotes.append)
+
+    await client.run()
+
+    by = {q.market: q for q in quotes}
+    assert set(by) == {"uni", "krx", "nxt"} and all(q.ts == 100000.0 for q in quotes)
+    assert (by["uni"].ask, by["uni"].bid, by["uni"].ask_qty, by["uni"].bid_qty) == (
+        70_200, 70_100, 30, 50)
+    assert (by["krx"].ask, by["krx"].bid, by["krx"].ask_qty, by["krx"].bid_qty) == (
+        70_300, 70_100, 80, 50)                                   # KRX 매도는 2단계가 1호가
+    assert (by["nxt"].ask, by["nxt"].bid, by["nxt"].ask_qty, by["nxt"].bid_qty) == (
+        70_200, 70_000, 30, 40)                                   # NXT 매수는 2단계가 1호가
+    assert by["krx"].asks == [(70_300.0, 80.0)] and by["nxt"].bids == [(70_000.0, 40.0)]
+    # KRX 마감 뒤(KRX 잔량 전부 0)엔 krx Quote가 없고 uni·nxt만
+    closed = {k: ("0" if k.startswith("krx_") else v) for k, v in body.items()}
+    session2 = FakeConnection([json.dumps({"header": {"tr_cd": "UH1",
+                                                      "tr_key": f"U{SAMSUNG_CODE}   "},
+                                           "body": closed})])
+    client2 = LSWebSocketClient(FakeConnector([session2]))
+    quotes2: list[Quote] = []
+    client2.on_quote.append(quotes2.append)
+    await client2.run()
+    assert [q.market for q in quotes2] == ["uni", "nxt"]
+
+
 async def test_nxt_quote_and_vi_event() -> None:
     # 2026-09-17: 체결쏴 주식 — NXT 전용 호가(NH1, tr_key "N"+코드+공백3)는 market="nxt"로
     # 오고, 종목 VI(VI_)는 ViEvent(발동/해제)로 온다. 구독 목록에 NH1·NS3·VI_ 키가 있어야 한다.
@@ -776,18 +816,18 @@ async def test_apply_plan_sends_only_changes_and_keeps_fixed_subs() -> None:
     client = LSWebSocketClient(FakeConnector([session]))
     client.subscribe_market_status()
     client.subscribe_fills()
-    add, remove = await client.apply_plan([("US3", f"U{SAMSUNG_CODE}   "), ("H1_", SAMSUNG_CODE),
+    add, remove = await client.apply_plan([("NS3", f"N{SAMSUNG_CODE}   "), ("H1_", SAMSUNG_CODE),
                                            ("FC9", "A756B000")])
     assert len(add) == 3 and remove == [] and session.sent == []  # 접속 전 — 전송 없음
     assert client._fx_codes == {"A756B000"}
     await client.run()  # 접속 → 전부 등록 뒤 스트림 종료
     trs = [json.loads(m)["body"]["tr_cd"] for m in session.sent]
-    assert trs.count("JIF") == 1 and "US3" in trs and "H1_" in trs and "FC9" in trs
+    assert trs.count("JIF") == 1 and "NS3" in trs and "H1_" in trs and "FC9" in trs
     # 접속 중 계획 변경 — 거래소 KRX→NXT, 원달러 월물 교체
     session.sent.clear()
     client._conn = session
     client.status.on_connect()
-    add, remove = await client.apply_plan([("US3", f"U{SAMSUNG_CODE}   "),
+    add, remove = await client.apply_plan([("NS3", f"N{SAMSUNG_CODE}   "),
                                            ("NH1", f"N{SAMSUNG_CODE}   "), ("FC9", "A756C000")])
     sent = [json.loads(m) for m in session.sent]
     assert [(m["body"]["tr_cd"], m["header"]["tr_type"]) for m in sent] == [

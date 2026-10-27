@@ -228,6 +228,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             if pair is None:
                 return  # 틱 목록이 아직 없음(가격 미수신)
             jobs.put({"cmd": "manual_hl_merge", "underlying": u.value,
+                      "tick": combo.get().replace(",", ""),
                       "n_sig_figs": pair[0], "mantissa": pair[1]})
         return _apply
 

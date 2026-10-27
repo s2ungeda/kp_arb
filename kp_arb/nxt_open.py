@@ -73,6 +73,10 @@ class NxtOpenSettings:
     exits: list[Tier] = field(default_factory=_tiers)
     run_entry: bool = False   # 진입(HL매도) 실행 — 화면 표의 병합 버튼(사용자 2026-10-20 목업)
     run_exit: bool = False    # 청산(HL매수) 실행
+    # '적'을 누른 날(YYYY-MM-DD) — 그날은 실행 전에도 NXT 체결(NS3)을 구독해 모니터 S·괴리가 보인다
+    # (사용자 2026-10-27 "'적' 누르는 순간 체결 데이터를 구독"). 오늘 기회가 끝나면(자동 끔 시점)
+    # 지운다. 저장·복원(같은 날 재시동이면 구독 유지).
+    applied_day: str | None = None
 
 
 @dataclass
@@ -261,6 +265,9 @@ def settings_from_dict(raw: object) -> NxtOpenSettings:
     hms = raw.get("open_hms")
     if isinstance(hms, str) and len(hms) == 8 and hms[2] == ":" and hms[5] == ":":
         st.open_hms = hms
+    day = raw.get("applied_day")
+    if isinstance(day, str) and len(day) == 10 and day[4] == "-" and day[7] == "-":
+        st.applied_day = day
     for key in ("entries", "exits"):
         rows = raw.get(key)
         if isinstance(rows, list):

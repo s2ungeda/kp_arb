@@ -91,6 +91,20 @@ def in_time_window(now: time, start: time, end: time) -> bool:
     return now >= start or now < end
 
 
+def weighted_quote_price(bid: float, ask: float, bid_qty: float | None,
+                         ask_qty: float | None) -> float | None:
+    """1호가 가중값(사용자 2026-10-27 식, 주식 "현재가" 대용 — DESIGN-ls-xing §9) =
+    매수1 + (매도1 − 매수1) × 매수1잔량/(매도1잔량 + 매수1잔량).
+    매수 잔량이 많을수록 매도1 쪽으로 붙는다. 잔량 합이 0(또는 없음)이면 중간값. 호가가 0 이하면
+    None. 순수."""
+    if bid <= 0 or ask <= 0:
+        return None
+    bq, aq = float(bid_qty or 0.0), float(ask_qty or 0.0)
+    if bq + aq <= 0:
+        return (bid + ask) / 2.0
+    return bid + (ask - bid) * bq / (aq + bq)
+
+
 def carry_theory(base_price: float, days: int, annual_rate: float) -> float:
     """비용캐리 이론가 = 가격 × (1 + 연이자율 × 잔존일/365)."""
     return base_price * (1.0 + annual_rate * days / 365.0)

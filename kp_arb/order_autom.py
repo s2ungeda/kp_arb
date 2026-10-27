@@ -629,7 +629,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         if cb_agg.get() in agg_map:  # 틱 목록이 아직 없으면(가격 미수신) 머지는 건너뜀
             nsf, mant = agg_map[cb_agg.get()]
             send({"cmd": "manual_hl_merge", "underlying": u,
-                  "n_sig_figs": nsf, "mantissa": mant}, "호가단위")
+                  "tick": cb_agg.get().replace(",", ""), "n_sig_figs": nsf, "mantissa": mant},
+                 "호가단위")
         if spec.has_month:
             send({"cmd": "autom_month", "underlying": u, "month": MONTH_MAP[cb_month.get()]},
                  "선물 월물")
@@ -2106,13 +2107,14 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         live = _live_book()
         ticks = live.get("hl_merge_ticks") or []
         under = cb_under.get()
-        if not ticks or (agg_shown["under"] == under and agg_map):
+        if not ticks:
+            return
+        vals = [str(t.get("tick")) for t in ticks]
+        # 틱 표가 바뀌면(가격이 자릿수를 넘음 — 하이닉스 1,000달러, 2026-10-27) 다시 채운다
+        if agg_shown["under"] == under and agg_map and list(cb_agg["values"]) == vals:
             return
         agg_map.clear()
-        vals: list[str] = []
-        for t in ticks:
-            label = str(t.get("tick"))
-            vals.append(label)
+        for t, label in zip(ticks, vals, strict=True):
             agg_map[label] = (t.get("n_sig_figs"), t.get("mantissa"))
         cb_agg.config(values=vals)
         active = live.get("hl_merge_active")

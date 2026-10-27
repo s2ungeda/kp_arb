@@ -77,6 +77,7 @@ from .theory import (
     parse_hhmm,
     pick_fx_futures,
     select_usd_futures_months,
+    weighted_quote_price,
 )
 from .ticks import ceil_to_tick, floor_to_tick, maker_cap, tick_for
 from .ws_status import WsStatus
@@ -236,6 +237,27 @@ class LagMeter:
         return out
 
 
+def tod_seconds(now: float) -> float:
+    """epoch 초 → 그 PC 지역시각의 자정 기준 초(소수 포함)."""
+    import time as _t
+
+    lt = _t.localtime(now)
+    return lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec + (now - int(now))
+
+
+def ls_quote_lag_ms(hotime: float, now_tod_s: float) -> float | None:
+    """LS 호가 수신 지연(ms) — 거래소 호가시각 hotime(HHMMSS, 초 단위) 대비 수신 시각(자정 기준
+    초). hotime이 없거나(0) HHMMSS 범위 밖이면 None. 초 단위라 ±1초는 시계 오차 범위.
+    DESIGN-ls-xing §9 시세 지연 진단(사용자 2026-10-27). 순수."""
+    if hotime <= 0 or hotime >= 240000:
+        return None
+    h = int(hotime)
+    sec = (h // 10000) * 3600 + (h // 100 % 100) * 60 + h % 100
+    if sec >= 86400:
+        return None
+    return (now_tod_s - sec) * 1000.0
+
+
 def _bump_row_seq(obj: Any) -> int:
     """체결·취소·거부 행 일련번호(전체 공용, 최신일수록 큼) — obj의 `_row_seq`를 1 올려 돌려준다.
     테스트가 SimpleNamespace를 self로 쓰는 경로도 있어 속성이 없으면 0에서 시작."""
@@ -384,6 +406,8 @@ class LiveSystem:
         self.hl_trades: dict[Underlying, deque[dict[str, Any]]] = {}
         # HL 체결 수신 지연 집계 — 10분 창(사용자 2026-09-29: 10초마다 찍히면 로그가 넘침)
         self._hl_lag = LagMeter(window_s=600.0)
+        # LS 호가 수신 지연 집계(거래소 호가시각 hotime 대비) — 같은 10분 창(사용자 2026-10-27)
+        self._ls_lag = LagMeter(window_s=600.0)
         # 배경 상시 태스크(괴리 CSV 등) — wait()가 기다리는 스트리밍 태스크와 분리, stop()이 취소.
         self._aux_tasks: list[asyncio.Task[None]] = []
         # 안전종료 때 같이 닫을 것(xing COM 세션 등, DESIGN-ls-xing.md) — bootstrap_live가 넣는다
@@ -680,6 +704,26 @@ class LiveSystem:
     def hl_daily_filled_today(self) -> float:
         """HL 당일 체결액(USDC) — 스냅샷·표시용."""
         return self._hl_filled.total(self._today())
+
+    def _note_ls_quote_lag(self, hotime: float, now: float | None = None) -> None:
+        """LS 호가 1건의 수신 지연을 10분 창에 넣고, 창이 차면 한 줄 남긴다(최대 3초 이상이면
+        WARNING). DESIGN-ls-xing §9 시세 지연 진단 — 큐 카운트가 못 잡는 '서버·망에서 늦게 옴'."""
+        import logging as _lg
+        import time as _t
+
+        now = _t.time() if now is None else now
+        lag = ls_quote_lag_ms(hotime, tod_seconds(now))
+        if lag is None:
+            return
+        summary = self._ls_lag.add(lag, now)
+        if summary is None:
+            return
+        n, avg, mx = summary
+        _lg.getLogger("kp_arb.bootstrap").log(
+            _lg.WARNING if mx >= 3000 else _lg.INFO,
+            "LS 호가 수신 지연 — 10분 %d건 평균 %.1fs 최대 %.1fs "
+            "(거래소 호가시각 HHMMSS 대비, 초 단위·PC 시계 오차 포함)",
+            n, avg / 1000.0, mx / 1000.0)
 
     def quote_age(self, key: tuple[Underlying, Instrument, str]) -> float | None:
         """그 호가를 마지막으로 받은 지 몇 초인가(결정 86). 한 번도 없으면 None."""
@@ -1425,6 +1469,11 @@ class LiveSystem:
             # 최신 호가판 보관(다단계 포함) 후 콜백 전달.
             self.quotes[(quote.underlying, quote.instrument, quote.market)] = quote
             self.quote_rx[(quote.underlying, quote.instrument, quote.market)] = _monotonic()
+            # LS 호가 지연 계측 — UH1 한 건이 Quote 셋(uni/krx/nxt)으로 갈라져 오므로 주식은 uni만
+            if quote.market != "hl" and not (
+                    quote.instrument in (Instrument.KR_STOCK, Instrument.KR_ETF)
+                    and quote.market != "uni"):
+                self._note_ls_quote_lag(quote.ts)
             for handler in self.on_quote:
                 handler(quote)
 
@@ -1934,9 +1983,14 @@ class LiveSystem:
         return (min(q.ask for q in candidates), max(q.bid for q in candidates))
 
     def stock_last(self, underlying: Underlying) -> float | None:
-        """기초 주식 현재가 — 통합(uni, NXT 포함) 우선, 없으면 KRX. 엑셀(RTD 현재가)과 동일."""
-        return (self.trades.get((underlying, Instrument.KR_STOCK, "uni"))
-                or self.trades.get((underlying, Instrument.KR_STOCK, "krx")))
+        """기초 주식 "현재가" = **통합 1호가 가중값**(사용자 2026-10-27 — 주식 체결 구독을 끊어
+        시세 지연을 막음; 오후 "통합호가 하나로", DESIGN-ls-xing §9). 통합 호가(UH1, market "uni"
+        — KRX+NXT 합친 1호가와 통합 잔량)에서 `매수1 + (매도1 − 매수1) × 매수1잔량/(매도1잔량 +
+        매수1잔량)`. 호가가 없으면 None(체결 때 남던 마지막 값은 더 없다 — 이론가·판정 보류)."""
+        q = self.quotes.get((underlying, Instrument.KR_STOCK, "uni"))
+        if q is None:
+            return None
+        return weighted_quote_price(q.bid, q.ask, q.bid_qty, q.ask_qty)
 
     @staticmethod
     def _levels(

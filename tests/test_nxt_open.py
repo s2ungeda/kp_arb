@@ -137,10 +137,13 @@ def test_judge_sends_every_matching_tier_at_once_entry_first() -> None:
 def test_settings_roundtrip_and_validation() -> None:
     st = _settings()
     st.start_s, st.end_s, st.run_entry, st.ref_qty = 1.0, 4.0, True, 100
+    st.applied_day = "2026-10-27"  # '적' 누른 날은 저장·복원(같은 날 재시동이면 구독 유지)
     from dataclasses import asdict
 
     back = settings_from_dict(asdict(st))
     assert back.start_s == 1.0 and back.end_s == 4.0 and back.ref_qty == 100
+    assert back.applied_day == "2026-10-27"
+    assert settings_from_dict({"applied_day": "x"}).applied_day is None
     assert back.entries[0] == Tier(0.012, 100, 0.009) and back.exits[2] == Tier(-0.010, 100, -0.008)
     assert back.run_entry is False and back.run_exit is False  # 실행은 복원 안 함
     # 틀린 값은 그 항목만 기본값

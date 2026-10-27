@@ -35,7 +35,13 @@ from pydantic import ValidationError
 from .domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .fx_auction import FxAuctionSettings
-from .hl_merge import merge_tick_options
+from .hl_merge import (
+    fmt_tick,
+    merge_band,
+    merge_choice_for_tick,
+    merge_tick_options,
+    merge_tick_size,
+)
 from .logs import DailyFileHandler
 from .manual_order import is_spot_stock, sellable_qty, short_sale_error
 from .quote_plan import QuotePlanInput
@@ -89,18 +95,15 @@ HISTORY_LIMIT_MAX = 1000
 # --- LS 실시간 구독 계획(DESIGN-ls-xing §9, 2026-10-23 "전략이 쓰는 시세만") ---
 
 def quote_plan_input(state: CoreState, system: Any) -> QuotePlanInput:
-    """설정·종목 상태 → 구독 계획 재료(순수). 종목 = 공통설정 체크, 주식 거래소 = 체결쏴 주식 종목
-    상태, 주식선물 월물 = 주식선물·HL선 종목 상태의 월물 합집합(없으면 근월물), 원달러 = 공통설정이
-    고른 월물. system에서는 선물 코드·원달러 코드만 읽는다(없으면 빈 값)."""
+    """설정·종목 상태 → 구독 계획 재료(순수). 종목 = 공통설정 체크, 주식선물 월물 = 주식선물·HL선
+    종목 상태의 월물 합집합(없으면 근월물), 원달러 = 공통설정이 고른 월물. 주식 호가는 통합(UH1)
+    하나라 체결쏴 주식의 거래소는 계획과 무관(2026-10-27 오후). system에서는 선물 코드·원달러
+    코드만 읽는다(없으면 빈 값)."""
     from .auto_m import book_key
 
     on = frozenset(u for u in Underlying if state.settings.quote_symbols.get(u.value, False))
-    stock_market: dict[Underlying, str] = {}
     months: dict[Underlying, frozenset[str]] = {}
     for u in Underlying:
-        stock = state.autom.books.get(book_key(u, "stock"))
-        if stock is not None:
-            stock_market[u] = stock.market
         used = {bk.future_month for product in ("sf", "sf_hl_first")
                 if (bk := state.autom.books.get(book_key(u, product))) is not None}
         if used:
@@ -112,9 +115,21 @@ def quote_plan_input(state: CoreState, system: Any) -> QuotePlanInput:
         codes[(u, "next")] = code
     fx_fn = getattr(system, "fx_futures_code", None)
     fx_code = fx_fn() if callable(fx_fn) else None
-    return QuotePlanInput(symbols_on=on, stock_market=stock_market, futures_codes=codes,
-                          futures_months=months, fx_code=fx_code if isinstance(fx_code, str)
-                          else None)
+    return QuotePlanInput(symbols_on=on, futures_codes=codes, futures_months=months,
+                          fx_code=fx_code if isinstance(fx_code, str) else None,
+                          nxt_trade_symbols=nxt_trade_symbols(state))
+
+
+def nxt_trade_symbols(state: CoreState, today: str | None = None) -> frozenset[Underlying]:
+    """NXT 체결(NS3)을 구독할 종목 — NXT 개장 화면에서 **오늘 '적'을 누른 종목**(applied_day = 오늘,
+    사용자 2026-10-27 "'적' 누르는 순간 체결 데이터를 구독") 또는 진입·청산 실행 중인 종목. 오늘
+    기회가 끝나면 엔진이 applied_day를 지워 해제된다("매매 종료 시 구독 취소"). 순수(today는
+    시험용)."""
+    day = today or time.strftime("%Y-%m-%d")
+    return frozenset(
+        u for u in Underlying
+        if (nx := state.nxt_open.books.get(u.value)) is not None
+        and (nx.run_entry or nx.run_exit or nx.applied_day == day))
 
 
 async def sync_quote_plan(state: CoreState, system: Any) -> None:
@@ -129,10 +144,93 @@ async def sync_quote_plan(state: CoreState, system: Any) -> None:
 
 async def quote_plan_loop(state: CoreState, system: Any, every_s: float = 2.0) -> None:
     """설정·거래소·월물이 어디서 바뀌든(주문가능시간 구간의 거래소 전환은 엔진 안에서 바뀐다)
-    계획을 따라잡는 상시 루프 — 차이가 없으면 아무것도 안 한다."""
+    계획을 따라잡는 상시 루프 — 차이가 없으면 아무것도 안 한다. HL 호가단위(틱)도 같은 박자로
+    가격대에 맞춘다(sync_hl_merge)."""
     while True:
         await asyncio.sleep(every_s)
         await sync_quote_plan(state, system)
+        try:
+            sync_hl_merge(state, system)
+        except Exception:  # noqa: BLE001 - 머지 재적용 실패로 루프를 멈추지 않는다
+            logging.getLogger("kp_arb.core").exception("HL 호가단위 재적용 실패")
+
+
+def hl_ref_price(system: Any, u: Underlying) -> float | None:
+    """HL 기준 가격(매도1, 없으면 매수1) — 호가단위 옵션·틱 환산의 가격대 기준. 시세 없으면 None."""
+    hq = (getattr(system, "quotes", None) or {}).get((u, Instrument.HL_PERP, "hl"))
+    if hq is None:
+        return None
+    ref = hq.ask or hq.bid
+    return float(ref) if ref else None
+
+
+def apply_hl_merge(system: Any, u: Underlying, tick: float,
+                   price: float | None) -> tuple[float, int | None, int | None] | None:
+    """고른 틱을 지금 가격대의 머지 인자(nSigFigs, mantissa)로 HL WS에 적용. 가격이 없으면 아직
+    못 정하므로 None(2초 루프가 첫 가격에 적용). 돌려주는 값 = (적용 틱, nSigFigs, mantissa)."""
+    if not price:
+        return None
+    choice = merge_choice_for_tick(price, tick)
+    if choice is None:
+        return None
+    system.set_hl_aggregation(u, choice[1], choice[2])
+    return choice
+
+
+_merge_warned_band: dict[str, int] = {}  # 종목 → 경고한 가격대(없는 틱 대체는 가격대마다 한 번)
+
+
+def sync_hl_merge(state: CoreState, system: Any) -> list[str]:
+    """고른 틱(state.hl_merge)을 지금 HL 가격대의 머지 인자로 유지(사용자 2026-10-27 "원래 가격대
+    별로 호가단위가 있어야 함" — 운영 실측: 하이닉스가 1,000달러를 넘자 저장된 nSigFigs 4가
+    0.1→1달러 격자가 됐는데 화면은 옛 라벨 "0.1"). 가격이 자릿수를 넘어 인자가 달라지면 재구독하고
+    INFO. 고른 틱이 이 가격대 옵션에 없으면 가장 가까운 것을 걸고 가격대마다 한 번 WARNING. 옛 형식
+    ([nSigFigs, mantissa])은 첫 가격에 틱으로 바꾸고 WARNING(고른 틱이 맞는지 확인). HL WS·시세
+    없음은 건너뜀. 돌려주는 값 = 남긴 로그 글(테스트·진단용)."""
+    out: list[str] = []
+    if system is None or not hasattr(system, "hl_merge_active"):
+        return out
+    log = logging.getLogger("kp_arb.core")
+    for key, pair in list(state.hl_merge_legacy.items()):
+        price = hl_ref_price(system, Underlying(key))
+        if not price:
+            continue
+        tick = merge_tick_size(price, pair[0], pair[1])
+        state.hl_merge[key] = tick
+        del state.hl_merge_legacy[key]
+        msg = (f"HL 호가단위 옛 형식 변환 — {key} nSigFigs {pair[0]} mantissa {pair[1]} → 틱 "
+               f"{fmt_tick(tick)}(지금 가격 {price:,.6g} 기준) — 고른 틱이 맞는지 확인")
+        log.warning(msg)
+        out.append(msg)
+    for key, tick in state.hl_merge.items():
+        u = Underlying(key)
+        price = hl_ref_price(system, u)
+        if not price:
+            continue
+        choice = merge_choice_for_tick(price, tick)
+        if choice is None:
+            continue
+        applied, nsf, mant = choice
+        active = system.hl_merge_active(u)
+        if active is None:  # HL WS 없음
+            continue
+        if abs(applied - tick) > tick * 1e-9:
+            band = merge_band(price)
+            if band is not None and _merge_warned_band.get(key) != band:
+                _merge_warned_band[key] = band
+                msg = (f"HL 호가단위 — {key} 고른 틱 {fmt_tick(tick)}은 지금 가격대"
+                       f"({price:,.6g})에 없음 → {fmt_tick(applied)} 적용(가격대가 돌아오면 "
+                       f"{fmt_tick(tick)}로)")
+                log.warning(msg)
+                out.append(msg)
+        if tuple(active) == (nsf, mant):
+            continue
+        system.set_hl_aggregation(u, nsf, mant)
+        msg = (f"HL 호가단위 재적용 — {key} 가격 {price:,.6g}: 틱 {fmt_tick(applied)} 유지 → "
+               f"nSigFigs {nsf} mantissa {mant} (전 nSigFigs {active[0]} mantissa {active[1]})")
+        log.info(msg)
+        out.append(msg)
+    return out
 
 
 def auto_check_target(payload: dict[str, Any]) -> Underlying | None:
@@ -572,7 +670,9 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
                 _ma = (system.hl_merge_active(u)
                        if hasattr(system, "hl_merge_active") else None)
                 entry["merge_active"] = (
-                    {"n_sig_figs": _ma[0], "mantissa": _ma[1]} if _ma is not None else None)
+                    {"n_sig_figs": _ma[0], "mantissa": _ma[1],
+                     "tick": (fmt_tick(merge_tick_size(float(_ref), _ma[0], _ma[1]))
+                              if _ref else None)} if _ma is not None else None)
             if is_spot_stock(inst):
                 entry["sellable"] = sellable_qty(
                     held, pending_sell.get((u, inst), 0.0))
@@ -736,6 +836,9 @@ def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
                                 sz_decimals=engine.sz_decimals(u) if engine else None)
         if errors:
             return _fail(errors)
+        if "applied" in body:  # '적'(True) — 오늘은 실행 전에도 NXT 체결을 구독(모니터 S·괴리);
+            # 화면 닫힘(False) — 실행 종료이므로 구독 근거를 지운다(사용자 2026-10-27)
+            st.applied_day = time.strftime("%Y-%m-%d") if body["applied"] else None
         if engine is not None and st.open_hms != open_before:
             engine.reset_day(u)  # 개장 시각이 바뀌면 오늘 상태 다시(사용자 2026-10-21)
         logging.getLogger("kp_arb.nxt_open").info(
@@ -943,21 +1046,32 @@ async def _manual_command(
     if system is None:
         return _fail(["코어 시세 미접속 — 수동 주문 불가"])
     cmd = body.get("cmd")
-    if cmd == "manual_hl_merge":  # HL 호가단위 머지(종목별) — WS 재구독
+    if cmd == "manual_hl_merge":  # HL 호가단위(종목별) — 고른 틱 저장 + 지금 가격대 인자로 재구독
         try:
             underlying = Underlying(str(body["underlying"]))
             nsf = body.get("n_sig_figs")
             mant = body.get("mantissa")
             n_sig_figs = int(nsf) if nsf is not None else None
             mantissa = int(mant) if mant is not None else None
+            tick_raw = body.get("tick")
+            tick = (float(str(tick_raw).replace(",", "")) if tick_raw is not None
+                    and str(tick_raw).strip() else None)
         except (KeyError, ValueError) as exc:
             return _fail([f"잘못된 머지 인자: {exc}"])
-        system.set_hl_aggregation(underlying, n_sig_figs, mantissa)
-        if state is not None:  # 코어 재시동 때 복원(단일 진실=코어). 원시면 항목 제거.
-            if n_sig_figs is None:
-                state.hl_merge.pop(underlying.value, None)
-            else:
-                state.hl_merge[underlying.value] = [n_sig_figs, mantissa]
+        price = hl_ref_price(system, underlying)
+        if tick is None:  # 틱 없이 인자만 온 옛 화면 — 지금 가격대로 틱을 센다
+            if not price:
+                return _fail(["HL 시세 없음 — 호가단위를 틱으로 못 바꿈"])
+            tick = merge_tick_size(price, n_sig_figs, mantissa)
+        if tick <= 0:
+            return _fail(["호가단위 틱은 0보다 커야 함"])
+        if state is not None:  # 코어 재시동 때 복원(단일 진실=코어) — 틱(USD)으로
+            state.hl_merge[underlying.value] = tick
+            state.hl_merge_legacy.pop(underlying.value, None)
+        choice = apply_hl_merge(system, underlying, tick, price)
+        if choice is None and price is None:  # 가격 전 — 인자가 왔으면 우선 그대로 걸고 루프가
+            # 가격대에 맞춘다
+            system.set_hl_aggregation(underlying, n_sig_figs, mantissa)
         return _ok()
     if cmd == "manual_fx_futures":  # 원달러선물 1건 직접 발주(KR_FX, 진단용 — 사용자 2026-10-26
         # "원달러선물 주문 직접 내 봐, 어떤 거부가 나는지"). 월물·가격을 안 주면 공통설정 월물·
@@ -1171,10 +1285,12 @@ def monitor_snapshot(
     if hasattr(system, "hl_merge_active"):
         for u in Underlying:
             active = system.hl_merge_active(u)
-            merges[u.value] = ({"n_sig_figs": active[0], "mantissa": active[1]}
-                               if active is not None else None)
             hq = system.quotes.get((u, Instrument.HL_PERP, "hl"))
             ref = (hq.ask or hq.bid) if hq is not None else None
+            merges[u.value] = ({"n_sig_figs": active[0], "mantissa": active[1],
+                                "tick": (fmt_tick(merge_tick_size(float(ref), active[0],
+                                                                  active[1])) if ref else None)}
+                               if active is not None else None)
             merge_ticks[u.value] = ([{"tick": s, "n_sig_figs": nsf, "mantissa": mant}
                                      for s, nsf, mant in merge_tick_options(float(ref))]
                                     if ref else [])
@@ -1732,11 +1848,15 @@ async def _serve() -> None:
 
             system = await bootstrap_live(http)
             await system.start()
-            # 저장된 HL 호가단위 복원 — WS 접속 전이라 희망 구독 상태만 바뀌고 접속 시 그대로 구독.
-            for key, pair in state.hl_merge.items():
+            # 저장된 HL 호가단위 복원 — 틱은 첫 HL 가격이 온 뒤 2초 루프(sync_hl_merge)가 가격대에
+            # 맞는 인자로 구독을 맞춘다. 옛 형식([nSigFigs, mantissa])은 우선 그대로 걸고(WS 접속 전
+            # 이라 희망 구독 상태만) 가격이 오면 틱으로 바꾼다.
+            for key, pair in state.hl_merge_legacy.items():
                 system.set_hl_aggregation(Underlying(key), pair[0], pair[1])
-            if state.hl_merge:
-                log.info("HL 호가단위 복원: %s", state.hl_merge)
+            if state.hl_merge or state.hl_merge_legacy:
+                log.info("HL 호가단위 복원: 틱 %s, 옛 형식 %s",
+                         {k: fmt_tick(v) for k, v in state.hl_merge.items()},
+                         state.hl_merge_legacy)
             engine = RehearsalEngine(state, system)
             # FX 노출 보고 자동 송신 — .env KP_FX_AUTO_SEND=0이면 일시정지로 시작(테스트 기간)
             fx_auto = os.environ.get("KP_FX_AUTO_SEND", "1").strip().lower()

@@ -721,7 +721,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if label in agg_map:
             nsf, mant = agg_map[label]
             send({"cmd": "manual_hl_merge", "underlying": cur["u"].value,
-                  "n_sig_figs": nsf, "mantissa": mant}, "호가단위")
+                  "tick": label.replace(",", ""), "n_sig_figs": nsf, "mantissa": mant},
+                 "호가단위")
         send({"cmd": "auction_settings", "underlying": cur["u"].value,
               "month": "next" if w["month"].get() == "차근" else "near"}, "월물")
 
@@ -778,10 +779,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     paint_res((side_k, i))
 
     def refresh_agg(live: dict[str, Any]) -> None:
+        # 종목이 바뀌거나 처음, 또는 틱 표가 바뀌었을 때(가격이 자릿수를 넘음, 2026-10-27) 다시 채움
         ticks = live.get("hl_merge_ticks") or []
-        if not ticks or (cur["agg_under"] == cur["u"] and agg_map):
+        if not ticks:
             return
         labels, table = merge_choices(ticks)
+        if cur["agg_under"] == cur["u"] and agg_map and list(w["agg"]["values"]) == labels:
+            return
         agg_map.clear()
         agg_map.update(table)
         w["agg"].config(values=labels)

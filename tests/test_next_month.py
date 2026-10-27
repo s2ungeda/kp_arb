@@ -92,7 +92,12 @@ def _live_system() -> LiveSystem:
 def test_core_theory_and_board_per_month() -> None:
     # 이론가는 월물별 만기(잔존일)로 — 차근이 근보다 길어 이론가가 더 높다. 괴리보드에 차근 행.
     system = _live_system()
-    system.trades[(Underlying.SAMSUNG, Instrument.KR_STOCK, "krx")] = 100_000.0
+    from kp_arb.domain.models import Quote
+
+    # 현재가 = 통합 1호가 가중값(2026-10-27) — 매수1=매도1=100,000
+    system.quotes[(Underlying.SAMSUNG, Instrument.KR_STOCK, "uni")] = Quote(
+        underlying=Underlying.SAMSUNG, instrument=Instrument.KR_STOCK, bid=100_000.0,
+        ask=100_000.0, ts=0.0, bid_qty=1.0, ask_qty=1.0, market="uni")
     near_t = system.stock_futures_theory(Underlying.SAMSUNG)
     next_t = system.stock_futures_theory(Underlying.SAMSUNG, NEXT)
     assert near_t is not None and next_t is not None and next_t > near_t > 100_000

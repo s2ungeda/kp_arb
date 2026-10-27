@@ -1,5 +1,6 @@
 """코어 API 테스트 — 명령 적용(순수) + HTTP 왕복 + 저장/복원 (DESIGN §12, §6.2)."""
 from pathlib import Path
+from typing import Any
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -8,9 +9,11 @@ from kp_arb.core_server import (
     apply_command,
     load_state,
     make_app,
+    nxt_trade_symbols,
     save_state,
     snapshot,
 )
+from kp_arb.domain.enums import Instrument, Underlying
 from kp_arb.strategy_core import CoreState, ScreenKind, _global_settings_from_dict
 
 
@@ -108,19 +111,75 @@ def test_state_persistence_roundtrip(tmp_path: Path) -> None:
 
 
 def test_state_persists_hl_merge(tmp_path: Path) -> None:
-    # HL 호가단위(종목별)는 코어 재시동 때 복원 — 형식 틀린 항목·모르는 종목은 버린다.
+    # HL 호가단위(종목별 틱 USD, 2026-10-27)는 코어 재시동 때 복원 — 형식 틀린 항목·모르는 종목은
+    # 버린다. 옛 형식 [nSigFigs, mantissa]는 legacy로 따로 들고 간다(첫 가격에 틱으로 변환).
     state = CoreState()
-    state.hl_merge["samsung"] = [5, 2]
-    state.hl_merge["sk_hynix"] = [4, None]
+    state.hl_merge["samsung"] = 0.02
+    state.hl_merge["sk_hynix"] = 0.1
+    state.hl_merge_legacy["hyundai"] = [4, None]
     path = tmp_path / "core_state.json"
     save_state(path, state)
     restored = load_state(path)
-    assert restored.hl_merge == {"samsung": [5, 2], "sk_hynix": [4, None]}
+    assert restored.hl_merge == {"samsung": 0.02, "sk_hynix": 0.1}
+    assert restored.hl_merge_legacy == {"hyundai": [4, None]}
 
     from kp_arb.strategy_core import state_from_dict
-    bad = state_from_dict({"hl_merge": {"samsung": [5, 2], "nope": [5, 2],
-                                        "hyundai": "x", "sk_hynix": [None, 2]}})
-    assert bad.hl_merge == {"samsung": [5, 2]}
+    bad = state_from_dict({"hl_merge": {"samsung": [5, 2], "nope": [5, 2], "hyundai": "x",
+                                        "sk_hynix": [None, 2], "samsung_x": 0.1}})
+    assert bad.hl_merge == {} and bad.hl_merge_legacy == {"samsung": [5, 2]}
+    old = state_from_dict({"hl_merge": {"sk_hynix": [4, None], "samsung": 0.5}})
+    assert old.hl_merge == {"samsung": 0.5} and old.hl_merge_legacy == {"sk_hynix": [4, None]}
+
+
+def test_sync_hl_merge_keeps_tick_across_price_band() -> None:
+    # 사용자 2026-10-27 "하이닉스 가격 상승으로 호가단위가 변하는데 우리 시스템은 예전 상태" — 고른
+    # 틱 0.1은 999달러대에선 nSigFigs 4, 1,000달러를 넘으면 원시(None)여야 한다. 2초 루프가 가격대
+    # 변화를 보고 재구독. 없는 틱(0.01 → 1,000달러 위)은 가장 가까운 0.1로 대체하고 가격대마다 한 번
+    # 경고. 옛 형식은 첫 가격에 틱으로 변환.
+    from kp_arb.core_server import sync_hl_merge
+    from kp_arb.domain.models import Quote
+
+    class _HL:
+        def __init__(self) -> None:
+            self.quotes: dict[Any, Quote] = {}
+            self.active: dict[Underlying, tuple[int | None, int | None]] = {}
+            self.calls: list[tuple[Underlying, int | None, int | None]] = []
+
+        def hl_merge_active(self, u: Underlying) -> tuple[int | None, int | None]:
+            return self.active.get(u, (None, None))
+
+        def set_hl_aggregation(self, u: Underlying, nsf: int | None, mant: int | None) -> None:
+            self.active[u] = (nsf, mant)
+            self.calls.append((u, nsf, mant))
+
+    def quote(px: float) -> Quote:
+        return Quote(underlying=Underlying.SK_HYNIX, instrument=Instrument.HL_PERP, bid=px,
+                     ask=px, ts=0.0, market="hl")
+
+    sys_ = _HL()
+    state = CoreState()
+    state.hl_merge["sk_hynix"] = 0.1
+    assert sync_hl_merge(state, sys_) == [] and sys_.calls == []  # 가격 전 — 아무것도 안 함
+    sys_.quotes[(Underlying.SK_HYNIX, Instrument.HL_PERP, "hl")] = quote(999.0)
+    msgs = sync_hl_merge(state, sys_)
+    assert sys_.calls == [(Underlying.SK_HYNIX, 4, None)] and "재적용" in msgs[0]
+    assert sync_hl_merge(state, sys_) == []                       # 같은 가격대 — 조용
+    sys_.quotes[(Underlying.SK_HYNIX, Instrument.HL_PERP, "hl")] = quote(1009.0)
+    msgs = sync_hl_merge(state, sys_)
+    assert sys_.calls[-1] == (Underlying.SK_HYNIX, None, None)   # 1,000달러 위 0.1 = 원시
+    assert len(msgs) == 1 and "0.1" in msgs[0]
+    assert state.hl_merge["sk_hynix"] == 0.1                      # 고른 틱은 그대로
+    # 없는 틱: 0.01을 골랐는데 1,000달러 위 → 0.1 적용 + 경고 한 번(같은 가격대 반복 없음)
+    state.hl_merge["sk_hynix"] = 0.01
+    msgs = sync_hl_merge(state, sys_)
+    assert any("없음" in m for m in msgs) and sys_.active[Underlying.SK_HYNIX] == (None, None)
+    assert not any("없음" in m for m in sync_hl_merge(state, sys_))
+    # 옛 형식 변환: [5, 2]를 1,009달러에서 보면 틱 0.2
+    state.hl_merge.clear()
+    state.hl_merge_legacy["sk_hynix"] = [5, 2]
+    msgs = sync_hl_merge(state, sys_)
+    assert state.hl_merge == {"sk_hynix": 0.2} and state.hl_merge_legacy == {}
+    assert any("옛 형식" in m for m in msgs) and sys_.active[Underlying.SK_HYNIX] == (5, 2)
 
 
 def test_settings_global_fx_fut_window_user_input() -> None:
@@ -542,12 +601,27 @@ def test_quote_symbols_setting_and_plan_input() -> None:
 
     inp = quote_plan_input(state, _Sys())
     assert inp.symbols_on == frozenset({Underlying.SAMSUNG, Underlying.HYUNDAI})
-    assert inp.stock_market[Underlying.SAMSUNG] == "nxt"
     assert inp.futures_months[Underlying.SAMSUNG] == frozenset({"near", "next"})
     assert inp.futures_codes[(Underlying.SAMSUNG, "next")] == "A116C000"
     assert inp.fx_code == "A756B000"
     assert quote_plan_input(state, None).fx_code is None and not quote_plan_input(
         state, None).futures_codes
+    # NXT 체결(NS3)은 NXT 개장 화면에서 오늘 '적'을 눌렀거나 실행 중인 종목만(사용자 2026-10-27).
+    # 동시호가 예약 행·체결쏴 주식의 거래소는 계획과 무관(주식 호가는 통합 UH1 하나 — 10-27 오후).
+    assert inp.nxt_trade_symbols == frozenset()
+    state.nxt_open.of(Underlying.SK_HYNIX).applied_day = "2026-10-27"
+    assert nxt_trade_symbols(state, "2026-10-27") == frozenset({Underlying.SK_HYNIX})
+    assert nxt_trade_symbols(state, "2026-10-28") == frozenset()   # 다른 날 — 안 붙는다
+    state.nxt_open.of(Underlying.SK_HYNIX).applied_day = None
+    state.nxt_open.of(Underlying.SAMSUNG).run_exit = True
+    state.auction.book("sk_hynix").buy[0].on = True
+    inp2 = quote_plan_input(state, _Sys())
+    assert inp2.nxt_trade_symbols == frozenset({Underlying.SAMSUNG})
+    assert inp2 == quote_plan_input(state, _Sys())
+    state.nxt_open.of(Underlying.SAMSUNG).run_exit = False
+    state.auction.book("sk_hynix").buy[0].on = False
+    inp3 = quote_plan_input(state, _Sys())
+    assert inp3.nxt_trade_symbols == frozenset()
     # 실행 켜기 → 체크 안 된 종목은 자동으로 켠다(거부 아님), 이미 켜져 있으면 변화 없음
     assert ensure_quote_symbol(state, Underlying.SK_HYNIX, "자동M")
     assert state.settings.quote_symbols["sk_hynix"]

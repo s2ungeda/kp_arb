@@ -162,6 +162,7 @@ async def test_run_turns_off_by_itself_when_today_is_over() -> None:
     st = screen.of(U)
     st.entries = [Tier(0.05, 100, 0.009)]  # 괴리 1.4%로는 안 맞는 단
     st.exits = []
+    st.applied_day = "2026-10-27"  # '적'을 누른 날 — NXT 체결 구독 근거(사용자 2026-10-27)
     eng._on_trade(_nxt(1_729_000.0))  # T0
     clk.advance(3.0)
     eng._on_trade(_nxt(1_729_000.0))
@@ -170,6 +171,7 @@ async def test_run_turns_off_by_itself_when_today_is_over() -> None:
     snap = eng.live_snapshot()[U.value]
     assert snap["window"] == "closed" and not sys_.placed
     assert not st.run_entry and not st.run_exit and snap["note"] == "창 끝 미충족 · 자동 끔"
+    assert st.applied_day is None  # 오늘 기회 끝 → '적'으로 붙인 NXT 체결 구독도 풀린다
     # 기회가 지난 뒤엔 켜기 거부 사유가 나온다(코어가 이걸로 거부) — 켜 둔 채 남지 않게
     assert eng.chance_over(U) == "오늘 창 끝"
     # 개장 시각을 바꾸면 오늘 상태를 새로 시작 — 다시 켤 수 있고 개장 전 체결은 무시, 개장 뒤 첫
@@ -231,6 +233,11 @@ def test_core_command_saves_settings_and_guards_run() -> None:
     assert _nxt_open_command(None, state, body)["ok"]
     st = state.nxt_open.of(U)
     assert st.entries[0] == Tier(0.012, 100, 0.009)
+    assert st.applied_day is None  # 보통 저장은 '적' 표시와 무관
+    assert _nxt_open_command(None, state, {**body, "applied": True})["ok"]
+    assert st.applied_day is not None and len(st.applied_day) == 10  # '적' → 오늘 날짜
+    assert _nxt_open_command(None, state, {**body, "applied": False})["ok"]  # 화면 닫힘 → 지움
+    assert st.applied_day is None
     assert not _nxt_open_command(None, state, {**body, "start_s": 9.0, "end_s": 1.0})["ok"]
     # 실행: 엔진 없으면 거부, 단이 비어 있으면 거부
     run = {"cmd": "nxt_open_run", "underlying": "samsung", "block": "entry", "value": True}
