@@ -141,10 +141,12 @@ def test_halt_does_not_clobber_phase_and_resumes() -> None:
 
 
 def test_futures_phase_falls_back_to_stock() -> None:
-    # 선물 phase 미수신 시 주식 phase 공용(기존 규칙).
+    # 선물 phase 미수신 시 주식 phase 공용(기존 규칙). received_phase는 대신하지 않고 None
+    # (동시호가 주문의 선물 동시호가 판정용 — 2026-10-27 모의 실측).
     svc = SessionService()
     svc.on_market_status(jif("21"))       # 주식만 수신
     assert svc.phase_for_market("5") is SessionPhase.REGULAR
+    assert svc.received_phase("5") is None and svc.received_phase("1") is SessionPhase.REGULAR
 
 
 # --- SessionService: JIF → 세션 맵 ---

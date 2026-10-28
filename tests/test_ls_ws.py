@@ -719,6 +719,19 @@ async def test_unified_quote_splits_into_krx_and_nxt_best_levels() -> None:
     client2.on_quote.append(quotes2.append)
     await client2.run()
     assert [q.market for q in quotes2] == ["uni", "nxt"]
+    # 통합(uni)은 한쪽만 있어도 Quote(없는 쪽 0) — 현재가 규칙 ②(사용자 2026-10-28). 거래소별은
+    # 양쪽 필요.
+    one_side = {k: v for k, v in body.items() if not k.startswith("bidho")}
+    one_side.update({"bidho1": "0", "bidho2": "0"})
+    session3 = FakeConnection([json.dumps({"header": {"tr_cd": "UH1",
+                                                      "tr_key": f"U{SAMSUNG_CODE}   "},
+                                           "body": one_side})])
+    client3 = LSWebSocketClient(FakeConnector([session3]))
+    quotes3: list[Quote] = []
+    client3.on_quote.append(quotes3.append)
+    await client3.run()
+    assert [q.market for q in quotes3] == ["uni"]
+    assert quotes3[0].bid == 0.0 and quotes3[0].ask == 70_200 and quotes3[0].bids == []
 
 
 async def test_nxt_quote_and_vi_event() -> None:

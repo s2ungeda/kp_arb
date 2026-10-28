@@ -1945,7 +1945,7 @@ def test_fan_quote_logs_ls_lag_per_window(caplog: pytest.LogCaptureFixture) -> N
 
 def test_weighted_quote_price_formula() -> None:
     # 사용자 2026-10-27 식: 매수1 + (매도1 − 매수1) × 매수1잔량/(매도1잔량 + 매수1잔량)
-    from kp_arb.bootstrap import weighted_quote_price
+    from kp_arb.theory import weighted_quote_price
 
     # 매수 잔량이 많으면 매도1 쪽으로
     assert weighted_quote_price(70_000.0, 70_100.0, 300.0, 100.0) == 70_075.0
@@ -1953,6 +1953,15 @@ def test_weighted_quote_price_formula() -> None:
     assert weighted_quote_price(70_000.0, 70_100.0, 0.0, 0.0) == 70_050.0      # 잔량 없음 → 중간값
     assert weighted_quote_price(70_000.0, 70_100.0, None, None) == 70_050.0
     assert weighted_quote_price(0.0, 70_100.0, 1.0, 1.0) is None
+    # 현재가 규칙(사용자 2026-10-28): ① 둘 다 없음 → None ② 한쪽만 → 그쪽 ③ 둘 다 → 가중값
+    # 1원 반올림
+    from kp_arb.theory import quote_price
+
+    assert quote_price(0.0, 0.0, None, None) is None
+    assert quote_price(70_000.0, 0.0, 10.0, 0.0) == 70_000.0
+    assert quote_price(0.0, 70_100.0, 0.0, 10.0) == 70_100.0
+    assert quote_price(70_000.0, 70_100.0, 200.0, 100.0) == 70_067.0   # 70,066.67 → 70,067
+    assert quote_price(70_000.0, 70_100.0, 100.0, 200.0) == 70_033.0   # 70,033.33 → 70,033
 
 
 async def test_stock_last_is_weighted_unified_quote() -> None:
@@ -1968,4 +1977,24 @@ async def test_stock_last_is_weighted_unified_quote() -> None:
     fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=70_000.0, ask=70_100.0,
               ts=0.0, bid_qty=300.0, ask_qty=100.0, market="uni"))
     assert system.stock_last(SAMSUNG) == 70_075.0
+    # 한쪽만 있으면 그쪽(규칙 ②), 둘 다 없으면 None(①)
+    fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=0.0, ask=70_100.0,
+              ts=0.0, bid_qty=0.0, ask_qty=5.0, market="uni"))
+    assert system.stock_last(SAMSUNG) == 70_100.0
+    fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=0.0, ask=0.0,
+              ts=0.0, bid_qty=0.0, ask_qty=0.0, market="uni"))
+    assert system.stock_last(SAMSUNG) is None
+    # 동시호가(장전·장마감)·VI 중엔 예상체결가(UYS) — 없으면 None(사용자 2026-10-28)
+    fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=70_000.0, ask=70_100.0,
+              ts=0.0, bid_qty=1.0, ask_qty=1.0, market="uni"))
+    system.vi_state[SAMSUNG] = "1"
+    assert system.stock_last(SAMSUNG) is None
+    system.expected_prices[(SAMSUNG, Instrument.KR_STOCK)] = 70_300.0
+    assert system.stock_last(SAMSUNG) == 70_300.0
+    system.vi_state[SAMSUNG] = "0"
+    assert system.stock_last(SAMSUNG) == 70_050.0
+    from kp_arb.gateways.ls_ws import MarketStatus
+    system.session.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "1",
+                                                                     "jstatus": "31"}))
+    assert system.session.stock_auction() and system.stock_last(SAMSUNG) == 70_300.0
     assert system.stock_futures_theory(SAMSUNG) is None or system.stock_futures_theory(SAMSUNG) > 0

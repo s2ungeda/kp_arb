@@ -198,6 +198,12 @@ class SessionService:
             return self._market_phase[market]
         return self._market_phase.get(STOCK_MARKET, self.DEFAULT_PHASE)
 
+    def received_phase(self, market: str) -> SessionPhase | None:
+        """그 시장의 장운영을 **실제로 받았을 때만** phase, 아니면 None(주식 phase로 대신하지 않음).
+        동시호가 주문의 "선물 동시호가 단계" 판정용 — 모의 서버는 선물(5) 장운영을 안 보내 주식
+        장마감 동시호가(15:20~15:30)가 선물 동시호가로 보였다(개발 PC 실측 2026-10-27)."""
+        return self._market_phase.get(market)
+
     def is_tradeable(self, market: str) -> bool:
         """해당 시장에 지금 발주 가능한가 — phase가 데드 아님 AND 정지 없음 (§8).
 

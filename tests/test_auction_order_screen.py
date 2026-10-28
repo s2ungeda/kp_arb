@@ -24,6 +24,8 @@ def test_fx_missing_requires_tick_hedge_and_unit() -> None:
     from kp_arb.auction_order_screen import fx_missing
 
     assert fx_missing("20", "100", "10") is None and fx_missing("0", "50", "1") is None
+    assert fx_missing("-5", "100", "10") is None   # 틱 음수 허용(사용자 2026-10-27)
+    assert fx_missing("-", "100", "10") == "틱"    # '-'만 친 상태는 아직 값 아님
     assert fx_missing("", "100", "10") == "틱" and fx_missing("20", "0", "10") == "헤지비율"
     assert fx_missing("20", "100", "") == "1회주문수량"
     assert fx_missing("", "", "x") == "틱·헤지비율·1회주문수량"

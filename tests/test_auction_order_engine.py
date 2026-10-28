@@ -29,9 +29,13 @@ SF = Instrument.KR_STOCK_FUTURE
 class _Session:
     def __init__(self) -> None:
         self.phase = SessionPhase.PRE_OPEN
+        self.received: SessionPhase | None | str = "same"  # "same" = phase 그대로 받은 셈
 
     def phase_for_market(self, market: str) -> SessionPhase:
         return self.phase
+
+    def received_phase(self, market: str) -> SessionPhase | None:
+        return self.phase if self.received == "same" else self.received  # type: ignore[return-value]
 
 
 class FakeSystem:
@@ -299,6 +303,10 @@ async def test_test_mode_uses_futures_mid_and_fx_last_outside_auction() -> None:
     assert [i.tag for i in sys_.placed] == ["매수1"]   # 1,767,000 > 1,765,500 → 나감
     sys_.session.phase = SessionPhase.PRE_OPEN   # 동시호가에 들어가면 시험 모드 무시
     assert not eng._testing(eng._day(U)) and eng.live_snapshot()[U.value]["sf_expected"] is None
+    # 선물 장운영을 받은 적이 없으면(모의 — 주식 phase가 PRE_OPEN이어도) 동시호가로 보지 않는다
+    # (2026-10-27 개발 PC 15:20~15:30 주식 장마감 동시호가 때 시험 수치 전부 "-")
+    sys_.session.received = None
+    assert eng._testing(eng._day(U)) and eng.live_snapshot()[U.value]["sf_expected"] == 1_765_500.0
 
 
 async def test_armed_rows_cleared_on_startup_and_shutdown() -> None:
@@ -330,17 +338,24 @@ async def test_moving_order_time_later_reruns_process1_same_day() -> None:
     d = eng._day(U)
     assert d.ls_done and [i.tag for i in sys_.placed] == ["매수1"]
     assert not any(r.on for r in b.buy)     # 끝나면 자동 끔
-    # 시각을 14:32:00으로 바꾸고(14:31에) 예약을 다시 켠다
+    # 시각을 14:32:00으로 바꾸고(14:31에) 예약을 다시 켠다 — 낸 행(매수1)도 다시 켜면 다시 나간다
+    # (사용자 2026-10-27 "2번째 재실행부터 주문이 안 들어감" — 전엔 낸 행을 건너뛰었다)
+    first_oid = d.rows[("buy", 0)].order_id
     clk.wall = _wall(14, 31, 0.0)
     b.settings.ls_hms = "14:32:00"
-    b.buy[1].on = True
+    b.buy[0].on = b.buy[1].on = True
     sys_.expected_prices[(U, SF)] = 1_764_000.0   # 이제 매수2(1,765,000)도 맞는다
     eng._tick(U)
-    assert not d.ls_done and not d.ls_started and ("buy", 0) in d.rows and ("buy", 1) not in d.rows
+    assert not d.ls_done and not d.ls_started and d.rows == {}
+    assert [r.order_id for r in d.past_rows] == [first_oid]   # 전 바퀴 주문은 체결 추적용으로
     clk.wall = _wall(14, 32, 0.15)
     eng._tick(U)
     await _settle(8)
-    assert [i.tag for i in sys_.placed] == ["매수1", "매수2"] and d.ls_done
+    assert [i.tag for i in sys_.placed] == ["매수1", "매수1", "매수2"] and d.ls_done
+    # 전 바퀴 주문의 체결 통보도 여전히 우리 것으로 잡힌다
+    sys_.on_fill[0](Fill(fill_id="xr", order_id=first_oid, qty=1.0, price=1_767_000.0, ts=0,
+                         account=Account.KR_DERIV))
+    assert d.fills[first_oid] == ("buy", 1.0)
     # 지난 시각으로 바꾸는 건 되돌리지 않는다
     b.settings.ls_hms = "14:00:00"
     eng._tick(U)

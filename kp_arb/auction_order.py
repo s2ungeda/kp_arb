@@ -61,7 +61,7 @@ class AuctionSettings:
     fx_hms: str = DEFAULT_FX_HMS
     fx_ms: int = DEFAULT_FX_MS
     fx_itv_ms: int = DEFAULT_FX_ITV
-    tick: int = DEFAULT_TICK            # 환 주문가 ±x틱(0.1원 틱)
+    tick: int = DEFAULT_TICK            # 환 주문가 ±x틱(0.1원 틱) — 음수면 반대쪽(2026-10-27)
     hedge_pct: int = DEFAULT_HEDGE_PCT  # 헤지비율(%)
     fx_unit: int = DEFAULT_FX_UNIT      # 환 1회주문수량(계약)
     hl_off: dict[str, float] = field(default_factory=lambda: dict.fromkeys(HL_ROWS, 0.0))

@@ -105,6 +105,20 @@ def weighted_quote_price(bid: float, ask: float, bid_qty: float | None,
     return bid + (ask - bid) * bq / (aq + bq)
 
 
+def quote_price(bid: float, ask: float, bid_qty: float | None,
+                ask_qty: float | None) -> float | None:
+    """호가로 정하는 주식 "현재가"(사용자 2026-10-28 유의사항 — DESIGN-ls-xing §9):
+    ① 매도·매수 1호가가 둘 다 없으면 현재가 없음(None) ② 한쪽만 있으면 있는 쪽 1호가
+    ③ 둘 다 있으면 가중값(weighted_quote_price)을 **1원 반올림**. 순수."""
+    has_bid, has_ask = bid > 0, ask > 0
+    if not has_bid and not has_ask:
+        return None
+    if has_bid != has_ask:
+        return bid if has_bid else ask
+    w = weighted_quote_price(bid, ask, bid_qty, ask_qty)
+    return None if w is None else float(round(w))
+
+
 def carry_theory(base_price: float, days: int, annual_rate: float) -> float:
     """비용캐리 이론가 = 가격 × (1 + 연이자율 × 잔존일/365)."""
     return base_price * (1.0 + annual_rate * days / 365.0)

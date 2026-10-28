@@ -27,6 +27,9 @@ def test_rows_and_settings_payload_from_entry_texts() -> None:
     assert st["cmd"] == "auction_settings" and st["month"] == "next"
     assert (st["ls_ms"], st["ls_itv_ms"], st["fx_itv_ms"]) == (100, 200, 0)
     assert st["hl_off"] == {"a": 0.5, "b": 0.0} and st["hl_pt"]["a"] == 0.7
+    # 틱 음수 허용(사용자 2026-10-27) — '-'만 친 상태는 기본값 0
+    assert settings_payload("samsung", {**texts, "tick": "-15"}, "near", {}, {})["tick"] == -15
+    assert settings_payload("samsung", {**texts, "tick": "-"}, "near", {}, {})["tick"] == 0
 
 
 def test_book_to_entry_texts_and_status_lines() -> None:
@@ -54,7 +57,7 @@ def test_book_to_entry_texts_and_status_lines() -> None:
 def test_px_style_marks_rows_expected_to_fire() -> None:
     # 사용자 2026-10-26: 예약 걸어 둔 상태에서 지금 값으로 나갈 행은 연두 바탕, 발주/실패/안 냄은
     # 글자색
-    assert px_style(None, True) == ("black", "#d8f5d0")
+    assert px_style(None, True) == ("black", "white")   # 나갈 행 = 흰 바탕(2026-10-27, 연두에서)
     assert px_style(None, False) == ("gray25", "SystemButtonFace")
     assert px_style({"order_id": "1"}, True)[0] == "dark green"
     assert px_style({"error": "x"}, False)[0] == "red"

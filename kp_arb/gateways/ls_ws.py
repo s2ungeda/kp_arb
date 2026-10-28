@@ -766,13 +766,17 @@ class LSWebSocketClient:
             if market != "uni":
                 asks = [lv for lv in asks if lv[1] > 0]
                 bids = [lv for lv in bids if lv[1] > 0]
-            if not asks or not bids:
+                if not asks or not bids:
+                    continue  # 거래소별 1호가는 양쪽 다 있어야(체결쏴 상대호가용)
+            elif not asks and not bids:
                 continue
+            # 통합(uni)은 한쪽만 있어도 만든다(없는 쪽 0) — 현재가 규칙 ②(한쪽만 있으면 그쪽,
+            # 사용자 2026-10-28)를 코어가 적용할 수 있게
             out.append(Quote(
                 underlying=underlying, instrument=instrument,
-                bid=bids[0][0], ask=asks[0][0], ts=ts,
-                bid_qty=bids[0][1], ask_qty=asks[0][1], market=market,
-                bids=bids, asks=asks))
+                bid=bids[0][0] if bids else 0.0, ask=asks[0][0] if asks else 0.0, ts=ts,
+                bid_qty=bids[0][1] if bids else 0.0, ask_qty=asks[0][1] if asks else 0.0,
+                market=market, bids=bids, asks=asks))
         return out
 
     def _parse_quote(self, msg: dict[str, Any]) -> Quote | None:

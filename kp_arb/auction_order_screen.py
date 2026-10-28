@@ -57,13 +57,16 @@ def row_missing(spread_text: str, qty_text: str) -> str | None:
 
 def fx_missing(tick_text: str, hedge_text: str, unit_text: str) -> str | None:
     """환 예약실행을 켜기 전 검사(사용자 2026-10-26) — 빠진 것의 이름("틱"·"헤지비율"·
-    "1회주문수량"), 다 있으면 None. 틱은 0 이상, 헤지비율·1회주문수량은 0보다 커야 한다. 순수."""
+    "1회주문수량"), 다 있으면 None. 틱은 정수면 됨(음수도 — 사용자 2026-10-27 "틱 마이너스도 입력
+    가능하게": 매수는 예상체결가 아래·매도는 위), 헤지비율·1회주문수량은 0보다 커야 한다. 순수."""
     missing = []
-    for name, text, min_ok in (("틱", tick_text, 0), ("헤지비율", hedge_text, 1),
+    for name, text, min_ok in (("틱", tick_text, None), ("헤지비율", hedge_text, 1),
                                ("1회주문수량", unit_text, 1)):
         try:
-            if int(text.replace(",", "").strip()) < min_ok:
+            if min_ok is not None and int(text.replace(",", "").strip()) < min_ok:
                 missing.append(name)
+            elif min_ok is None:
+                int(text.replace(",", "").strip())
         except ValueError:
             missing.append(name)
     return "·".join(missing) if missing else None
@@ -113,7 +116,10 @@ def settings_payload(u: str, texts: Mapping[str, str], month: str,
     float(비면 0). 순수."""
     def num(text: str, default: int) -> int:
         t = text.replace(",", "").strip()
-        return int(float(t)) if t else default
+        try:
+            return int(float(t)) if t else default
+        except ValueError:  # '-'만 쳐 둔 틱 칸 등
+            return default
 
     def fnum(text: str) -> float:
         t = text.strip()
@@ -188,14 +194,15 @@ def hl_line(name: str, row: Mapping[str, Any]) -> str:
 
 def px_style(row: Mapping[str, Any] | None, fires: bool) -> tuple[str, str]:
     """예상주문가 칸 (글자색, 바탕색) — 발주 초록·실패 빨강·안 냄 주황, 아직 안 본 행 중 지금 값으로
-    나갈 행은 연두 바탕(사용자 2026-10-26 "나갈 거로 예상되는 행에 색"), 그 밖엔 회색. 순수."""
+    나갈 행은 **흰 바탕**(사용자 2026-10-26 "나갈 거로 예상되는 행에 색" → 2026-10-27 "바탕색을
+    흰색으로" — 연두에서 바꿈), 그 밖엔 회색. 순수."""
     if row:
         if row.get("error"):
             return "red", "SystemButtonFace"
         if row.get("skipped"):
             return "dark orange", "SystemButtonFace"
         return "dark green", "SystemButtonFace"
-    return ("black", "#d8f5d0") if fires else ("gray25", "SystemButtonFace")
+    return ("black", "white") if fires else ("gray25", "SystemButtonFace")
 
 
 def hl_buttons_enabled(row: Mapping[str, Any]) -> bool:
@@ -224,7 +231,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     from .nxt_open_screen import active_label, merge_choices
     from .ui_close import attach_auto_close, main_closing
     from .ui_dialog import show_message
-    from .ui_fields import is_decimal_text, is_int_text, is_time_text, is_unsigned_decimal_text
+    from .ui_fields import (
+        is_decimal_text,
+        is_int_text,
+        is_signed_int_text,
+        is_time_text,
+        is_unsigned_decimal_text,
+    )
     from .ui_status import StallBanner, StatusCombo, log_tk_errors, ls_stalled
 
     preview = "--preview" in sys.argv
@@ -238,6 +251,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     T.apply_base(root)
     root.option_add("*Font", T.FONT_BASE_LG)  # 체결쏴·NXT 개장과 같은 11pt
     vcmd_int = (root.register(is_int_text), "%P")
+    vcmd_sint = (root.register(is_signed_int_text), "%P")  # 틱 — 음수 허용(사용자 2026-10-27)
     vcmd_dec = (root.register(is_decimal_text), "%P")
     vcmd_qty = (root.register(is_unsigned_decimal_text), "%P")
     vcmd_time = (root.register(is_time_text), "%P")
@@ -338,23 +352,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # ===== 왼쪽: 예약주문 16행 (ver2 A22~D38) =====
     left = tk.Frame(root)
     left.grid(row=2, column=0, sticky="nw", padx=(6, 4), pady=(2, 0))
-    heads = ("주문Sprd%", "수량", "예상주문가")
-    head_w = (8, 6, 10)
+    # '예약주문' 제목 복귀(사용자 2026-10-27 "일괄 버튼 제거하고 예전 제목") — 10-26의 일괄
+    # [실행][중지] 버튼은 뺐다.
+    heads = ("주문Sprd%", "수량", "예상주문가", "예약주문")
+    head_w = (8, 6, 10, 10)
     for c, (h, hw) in enumerate(zip(heads, head_w, strict=True)):
         head(left, h, hw).grid(row=0, column=c, padx=1, sticky="nsew")
-    # '예약주문' 제목 자리에 일괄 [실행][중지] — 예약 버튼과 같은 높이, 폭은 반씩(사용자 2026-10-26
-    # "예약주문 개수가 많다 보니 일괄 실행·중지")
-    bulk = tk.Frame(left)
-    bulk.grid(row=0, column=3, padx=(4, 1), pady=0, sticky="nsew")
-    bulk.grid_columnconfigure(0, weight=1, uniform="bulk")
-    bulk.grid_columnconfigure(1, weight=1, uniform="bulk")
-    bulk.grid_rowconfigure(0, weight=1)  # 버튼 높이를 틀(= 행 높이)에 맞춤
-    w["bulk_on"] = tk.Button(bulk, text="실행", width=1, padx=0, pady=0, bd=1,
-                             highlightthickness=0, font=(T.FAMILY, 10))
-    w["bulk_off"] = tk.Button(bulk, text="중지", width=1, padx=0, pady=0, bd=1,
-                              highlightthickness=0, font=(T.FAMILY, 10))
-    w["bulk_on"].grid(row=0, column=0, sticky="nsew")
-    w["bulk_off"].grid(row=0, column=1, sticky="nsew", padx=(1, 0))
     probe = tk.Button(left, text="진입", width=3, padx=0, pady=0, bd=1, highlightthickness=0)
     row_h = int((probe.winfo_reqheight() + 2) * 0.8)  # 체결쏴 세트 행보다 20% 낮게(사용자 10-23)
     probe.destroy()
@@ -363,7 +366,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     probe_lbl = tk.Label(left, text="0", font=T.FONT_NUM_LG)
     row_h = max(row_h, probe_lbl.winfo_reqheight())
     probe_lbl.destroy()
-    left.grid_rowconfigure(0, minsize=row_h)  # 머리글 줄도 행 높이로(일괄 버튼 = 예약 버튼 높이)
+    left.grid_rowconfigure(0, minsize=row_h)  # 머리글 줄도 행 높이로
 
     def paint_res(key: tuple[str, int]) -> None:
         on = bool(w["res_on"].get(key))
@@ -407,30 +410,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         w["status"].show(text)
         send_settings()      # 버튼을 누르는 순간의 칸 값이 함께 코어로(결정 74 방식)
         send_rows(force=True)
-
-    def bulk_res(on: bool) -> None:
-        """일괄 실행/중지 — 켤 땐 Sprd·수량이 있는 행만(없는 행은 건너뜀, 상태줄에 개수), 끌 땐
-        전부. 한 번에 코어로 보낸다(행마다 보내지 않음)."""
-        changed, skipped = 0, 0
-        for key, cells in w["rows"].items():
-            if on and row_missing(cells["spread"].get(), cells["qty"].get()):
-                skipped += 1
-                continue
-            if bool(w["res_on"].get(key)) is not on:
-                w["res_on"][key] = on
-                w["hold"][key] = time.time() + HOLD_S
-                paint_res(key)
-                changed += 1
-        text = (f"일괄 {'실행' if on else '중지'} — {changed}행 {'켬' if on else '끔'}"
-                + (f", {skipped}행 건너뜀(Sprd·수량 없음)" if skipped else ""))
-        log.info("[동시호가 화면] %s", text)
-        w["status"].show(text)
-        if changed:
-            send_settings()
-            send_rows(force=True)
-
-    w["bulk_on"].config(command=lambda: bulk_res(True))
-    w["bulk_off"].config(command=lambda: bulk_res(False))
 
     r = 1
     for side, samples in (("buy", SAMPLE_BUY), ("sell", SAMPLE_SELL)):
@@ -500,7 +479,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # "정렬과 배치만 참고"): 왼쪽 이름(오른쪽 맞춤)+입력칸 세 줄(틱·헤지비율·1회주문수량), 오른쪽은
     # 첫 줄 [예약실행], 둘째·셋째 줄 환예상체결가·진입계약수 이름+값. 대응개시 체크는 뺌(10-23) ---
     p2 = section("원달러 대응", 1, name_col=False)
-    w["tick"] = entry(p2, 7, vcmd_int, DEFAULTS["tick"])
+    w["tick"] = entry(p2, 7, vcmd_sint, DEFAULTS["tick"])
     w["hedge_pct"] = entry(p2, 7, vcmd_int, DEFAULTS["hedge_pct"])
     w["fx_unit"] = entry(p2, 7, vcmd_int, DEFAULTS["fx_unit"])
     for rr, (name, k) in enumerate((("틱", "tick"), ("헤지비율", "hedge_pct"),
@@ -510,7 +489,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     w["fx_run"] = tk.Button(p2, text="예약실행", width=8, padx=0, pady=0, bd=1,
                             highlightthickness=0)
     w["fx_run"].grid(row=0, column=2, columnspan=2, padx=GAP, pady=1, sticky="ew")
-    w["fx_exp2"] = tk.Label(p2, text="-", width=9, anchor="e", font=T.FONT_NUM_LG)
+    # 너비 고정 없음 — 시험 모드의 "(현재가 대용)" 꼬리까지 들어가야 한다(2026-10-27: width=9에
+    # 오른쪽 정렬이라 숫자가 왼쪽으로 잘려 "현재가 대용)"만 보였음)
+    w["fx_exp2"] = tk.Label(p2, text="-", anchor="e", font=T.FONT_NUM_LG)
     w["net_qty"] = tk.Label(p2, text="-", width=9, anchor="e", font=T.FONT_NUM_LG)
     for rr, (name, k) in enumerate((("환예상체결가", "fx_exp2"), ("진입계약수", "net_qty")),
                                    start=1):
@@ -947,6 +928,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         for (side, i), cells in w["rows"].items():
             sign = 1 if side == "buy" else -1
             cells["px"].config(text=f"{1_766_000 + (3 - i) * 1000 * sign:,}")
+            # 켜진 행 중 "나갈 행"(흰 바탕)·발주 끝(초록 글자) 모양도 미리보기에 — 매수1 나갈 행,
+            # 매수3 발주됨, 매도2 안 냄(주황)
+            sample = {("buy", 0): px_style(None, True),
+                      ("buy", 2): px_style({"order_id": "O1"}, False),
+                      ("sell", 1): px_style({"skipped": "안 맞음"}, False)}.get((side, i))
+            if sample is not None:
+                cells["px"].config(fg=sample[0], bg=sample[1])
     root.mainloop()
 
 

@@ -76,8 +76,8 @@ from .theory import (
     is_rolled,
     parse_hhmm,
     pick_fx_futures,
+    quote_price,
     select_usd_futures_months,
-    weighted_quote_price,
 )
 from .ticks import ceil_to_tick, floor_to_tick, maker_cap, tick_for
 from .ws_status import WsStatus
@@ -1986,11 +1986,16 @@ class LiveSystem:
         """기초 주식 "현재가" = **통합 1호가 가중값**(사용자 2026-10-27 — 주식 체결 구독을 끊어
         시세 지연을 막음; 오후 "통합호가 하나로", DESIGN-ls-xing §9). 통합 호가(UH1, market "uni"
         — KRX+NXT 합친 1호가와 통합 잔량)에서 `매수1 + (매도1 − 매수1) × 매수1잔량/(매도1잔량 +
-        매수1잔량)`. 호가가 없으면 None(체결 때 남던 마지막 값은 더 없다 — 이론가·판정 보류)."""
+        매수1잔량)`을 1원 반올림(theory.quote_price — 한쪽 호가만 있으면 그쪽, 둘 다 없으면 None).
+        **주식 동시호가(장전·장마감)나 그 종목 VI 중엔 예상체결가(UYS)**(사용자 2026-10-28 "동시호가
+        (장중 서킷브레이크·VI 등 포함) 때는 예상체결가 데이터 사용") — 없으면 None. 호가가 없으면
+        None(체결 때 남던 마지막 값은 더 없다 — 이론가·판정 보류)."""
+        if self.session.stock_auction() or self.stock_vi(underlying):
+            return self.expected_prices.get((underlying, Instrument.KR_STOCK))
         q = self.quotes.get((underlying, Instrument.KR_STOCK, "uni"))
         if q is None:
             return None
-        return weighted_quote_price(q.bid, q.ask, q.bid_qty, q.ask_qty)
+        return quote_price(q.bid, q.ask, q.bid_qty, q.ask_qty)
 
     @staticmethod
     def _levels(

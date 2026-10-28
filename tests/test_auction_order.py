@@ -70,6 +70,9 @@ def test_fx_hedge_net_quantity_price_and_split() -> None:
     assert net_exposure(7, 7) is None
     side, px, parts = fx_hedge_plan(Side.BUY, 85, 1_766_000, 1327.30, 20, 100, 20)
     assert side is Side.SELL and px == 1325.3                      # 매도 = 예상체결가 − 2.0원
+    # 틱 음수(사용자 2026-10-27) — 매도인데 예상체결가 **위**에 건다(유리한 가격, 포함 보장 없음)
+    assert fx_hedge_plan(Side.BUY, 85, 1_766_000, 1327.30, -20, 100, 20)[1] == 1329.3
+    assert fx_hedge_plan(Side.SELL, 1, 1_766_000, 1327.30, -5, 100, 10)[1] == 1326.8
     # 85 × 10 × 1,766,000 / 1,327.30 / 10,000 = 113.1 → 113계약 → 20×5 + 13
     assert parts == [20] * 5 + [13] and sum(parts) == 113
     side2, px2, parts2 = fx_hedge_plan(Side.SELL, 1, 1_766_000, 1327.30, 20, 100, 10)

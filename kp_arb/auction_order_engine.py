@@ -44,7 +44,7 @@ from .auction_order import (
 from .domain.enums import Account, Instrument, OrderType, SessionPhase, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .hl_merge import merge_tick_options
-from .theory import weighted_quote_price
+from .theory import quote_price
 
 FUTURES_MARKET = "5"           # JIF 선물 시장(session_service.FUTURES_MARKET)
 START_GRACE_S = 60.0           # 주문시각이 이보다 더 지난 뒤 켠 코어는 그날 그 프로세스를 안 돌림
@@ -82,6 +82,7 @@ class RowState:
     """행 하나의 오늘 결과 — 발주했으면 주문번호·가격·수량, 실패면 사유."""
 
     fired: bool = False
+    side: str = ""       # "buy"|"sell" — 재실행 뒤 past_rows에서 체결 방향을 알기 위해
     order_id: str | None = None
     price: float | None = None
     qty: int = 0
@@ -106,6 +107,10 @@ class HlRow:
 class DayState:
     day: str = ""
     rows: dict[tuple[str, int], RowState] = field(default_factory=dict)
+    # 재실행 전 바퀴에서 낸 행(체결 추적용 — 주문번호로 찾는다). 같은 날 다시 돌 때 rows는 비우고
+    # 여기로 옮겨 모든 행이 다시 판정·발주된다(사용자 2026-10-27 "2번째 재실행부터 주문이 안 들어감"
+    # — 전엔 낸 행을 rows에 남겨 두 번째부터 건너뛰었다)
+    past_rows: list[RowState] = field(default_factory=list)
     px: dict[tuple[str, int], float | None] = field(default_factory=dict)  # 표시용 예상주문가
     ls_started: bool = False
     ls_done: bool = False
@@ -233,7 +238,7 @@ class AuctionOrderEngine:
             "sf_expected": sf_exp,
             "fx_expected": fx_exp,
             "hl_mid": hl_mid(hq.bid, hq.ask) if hq is not None else None,
-            "s": (weighted_quote_price(nq.bid, nq.ask, nq.bid_qty, nq.ask_qty)
+            "s": (quote_price(nq.bid, nq.ask, nq.bid_qty, nq.ask_qty)
                   if nq is not None else None),
             "theory": self._system.stock_futures_theory(u, inst),
         }
@@ -255,7 +260,14 @@ class AuctionOrderEngine:
         return inp
 
     def _in_auction(self) -> bool:
-        return self._system.session.phase_for_market(FUTURES_MARKET) is SessionPhase.PRE_OPEN
+        """선물 시장(5)이 동시호가 단계인가 — **선물 장운영을 실제로 받았을 때만** 판정
+        (received_phase). 주식 phase로 대신하면 15:20~15:30 주식 장마감 동시호가가 선물 동시호가로
+        보여 시험 모드가 꺼진다(개발 PC·모의 실측 2026-10-27 — 모의는 선물 장운영을 안 보냄).
+        옛 세션(메서드 없음)은 phase_for_market 그대로."""
+        session = self._system.session
+        fn = getattr(session, "received_phase", None)
+        phase = fn(FUTURES_MARKET) if callable(fn) else session.phase_for_market(FUTURES_MARKET)
+        return phase is SessionPhase.PRE_OPEN
 
     # --- 타이머 ---
 
@@ -279,10 +291,12 @@ class AuctionOrderEngine:
             self._refresh_prices(u, d)
         ls_at = order_moment(st.ls_hms, st.ls_ms)
         # 주문시각을 **미래로 바꾸면** 그날 다시 돈다(사용자 2026-10-26 "시간 변경해서 다시 시도") —
-        # 끝난 프로세스의 상태를 되돌린다. 이미 낸 주문(order_id 있는 행)은 체결 추적을 위해 남긴다.
+        # 끝난 프로세스의 상태를 되돌린다. 이미 낸 주문(order_id 있는 행)은 체결 추적을 위해
+        # past_rows로 옮기고, 행 자체는 전부 다시 판정·발주 대상(사용자 2026-10-27).
         if (d.ls_done and ls_at is not None and ls_at != d.ls_at and now < ls_at):
             d.ls_started = d.ls_done = False
-            d.rows = {k: r for k, r in d.rows.items() if r.order_id}
+            d.past_rows.extend(r for r in d.rows.values() if r.order_id)
+            d.rows = {}
             d.note = f"LS주문시각 {st.ls_hms}.{st.ls_ms:03d}으로 바뀜 — 다시 대기"
             self._log.info("[동시호가] %s %s", u.value, d.note)
         if (armed and not d.ls_started and ls_at is not None
@@ -356,7 +370,7 @@ class AuctionOrderEngine:
     async def _place_row(self, u: Underlying, d: DayState, inst: Instrument, side: Side,
                          i: int, px: float, qty: int) -> None:
         name = f"{'매수' if side is Side.BUY else '매도'}{i + 1}"
-        rs = RowState(fired=True, price=px, qty=qty, at=_hms(self._wall()))
+        rs = RowState(fired=True, side=side.value, price=px, qty=qty, at=_hms(self._wall()))
         d.rows[(side.value, i)] = rs  # 응답 전에 적어 두어 같은 행이 다시 나가지 않게
         intent = OrderIntent(venue=Venue.LS, underlying=u, instrument=inst, side=side, qty=qty,
                              order_type=OrderType.LIMIT, price=px, source=SOURCE, tag=name)
@@ -428,7 +442,8 @@ class AuctionOrderEngine:
         if account not in (None, Account.KR_DERIV):
             return
         for u, d in self._days.items():
-            for (s, _i), r in d.rows.items():
+            for s, r in [*((s, r) for (s, _i), r in d.rows.items()),
+                         *((r.side, r) for r in d.past_rows)]:
                 if r.order_id == oid:
                     prev = d.fills.get(oid, (s, 0.0))
                     d.fills[oid] = (s, prev[1] + float(getattr(fill, "qty", 0.0)))
