@@ -9,7 +9,6 @@ from kp_arb.core_server import (
     apply_command,
     load_state,
     make_app,
-    nxt_trade_symbols,
     save_state,
     snapshot,
 )
@@ -606,22 +605,13 @@ def test_quote_symbols_setting_and_plan_input() -> None:
     assert inp.fx_code == "A756B000"
     assert quote_plan_input(state, None).fx_code is None and not quote_plan_input(
         state, None).futures_codes
-    # NXT 체결(NS3)은 NXT 개장 화면에서 오늘 '적'을 눌렀거나 실행 중인 종목만(사용자 2026-10-27).
-    # 동시호가 예약 행·체결쏴 주식의 거래소는 계획과 무관(주식 호가는 통합 UH1 하나 — 10-27 오후).
-    assert inp.nxt_trade_symbols == frozenset()
-    state.nxt_open.of(Underlying.SK_HYNIX).applied_day = "2026-10-27"
-    assert nxt_trade_symbols(state, "2026-10-27") == frozenset({Underlying.SK_HYNIX})
-    assert nxt_trade_symbols(state, "2026-10-28") == frozenset()   # 다른 날 — 안 붙는다
-    state.nxt_open.of(Underlying.SK_HYNIX).applied_day = None
+    # NXT 개장·동시호가 화면의 실행·예약 상태, 체결쏴 주식의 거래소는 계획과 무관(주식 호가는 통합
+    # UH1 하나, 주식 체결은 안 받음 — 2026-10-28)
     state.nxt_open.of(Underlying.SAMSUNG).run_exit = True
     state.auction.book("sk_hynix").buy[0].on = True
-    inp2 = quote_plan_input(state, _Sys())
-    assert inp2.nxt_trade_symbols == frozenset({Underlying.SAMSUNG})
-    assert inp2 == quote_plan_input(state, _Sys())
+    assert quote_plan_input(state, _Sys()) == inp
     state.nxt_open.of(Underlying.SAMSUNG).run_exit = False
     state.auction.book("sk_hynix").buy[0].on = False
-    inp3 = quote_plan_input(state, _Sys())
-    assert inp3.nxt_trade_symbols == frozenset()
     # 실행 켜기 → 체크 안 된 종목은 자동으로 켠다(거부 아님), 이미 켜져 있으면 변화 없음
     assert ensure_quote_symbol(state, Underlying.SK_HYNIX, "자동M")
     assert state.settings.quote_symbols["sk_hynix"]

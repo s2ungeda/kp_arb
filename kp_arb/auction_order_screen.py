@@ -55,6 +55,13 @@ def row_missing(spread_text: str, qty_text: str) -> str | None:
     return "·".join(missing) if missing else None
 
 
+def saved_under(saved: Mapping[str, Any]) -> str | None:
+    """창 저장(win_state fields)의 보던 종목 이름 — 콤보에 있는 이름일 때만(제외된 종목 무시).
+    NXT 개장·체결쏴와 같은 요령(사용자 2026-10-28 "종목 콤보가 저장이 안 되네")."""
+    name = saved.get("under")
+    return name if isinstance(name, str) and name in BY_NAME else None
+
+
 def fx_missing(tick_text: str, hedge_text: str, unit_text: str) -> str | None:
     """환 예약실행을 켜기 전 검사(사용자 2026-10-26) — 빠진 것의 이름("틱"·"헤지비율"·
     "1회주문수량"), 다 있으면 None. 틱은 정수면 됨(음수도 — 사용자 2026-10-27 "틱 마이너스도 입력
@@ -88,9 +95,11 @@ def hl_missing(offsets: Mapping[str, str]) -> str | None:
 
 
 def pt_missing(pt_text: str) -> bool:
-    """정정 버튼 전 검사(사용자 2026-10-26) — 정정PT가 비거나 0 이하면 True. 순수."""
+    """정정 버튼 전 검사(사용자 2026-10-26) — 정정PT가 비거나 0이면 True. 음수는 허용(사용자
+    2026-10-28 "테스트라 체결 안 되게 정정하려고 — '-'도 입력 가능하게": 상대호가 반대쪽으로).
+    순수."""
     try:
-        return float(pt_text.strip()) <= 0
+        return float(pt_text.strip()) == 0
     except ValueError:
         return True
 
@@ -230,7 +239,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     from .core_client import core_request, run_state_feed, screen_log, watch_parent_exit
     from .nxt_open_screen import active_label, merge_choices
     from .ui_close import attach_auto_close, main_closing
-    from .ui_dialog import show_message
+    from .ui_dialog import ask_yes_no, show_message
     from .ui_fields import (
         is_decimal_text,
         is_int_text,
@@ -511,10 +520,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         """정정 버튼 — 정정PT가 없으면 알림으로 막는다(사용자 2026-10-26). 실제 정정은 코어 연결
         뒤."""
         if pt_missing(w["hl"][name]["pt"].get()):
+            log.info("[동시호가 화면] 정정 %s 거부 — 정정PT 없음(%r)", name,
+                     w["hl"][name]["pt"].get())
             w["status"].show(f"정정 {name} 거부: 정정PT 없음")
             show_message(root, "동시호가 주문", f"{name} 행의 정정PT가 없습니다." + chr(10)
-                         + "정정PT(0보다 큰 USD)를 채워야 정정할 수 있습니다.")
+                         + "정정PT(USD, 0이 아닌 값 — 음수는 상대호가 반대쪽)를 채워야 "
+                         + "정정할 수 있습니다.")
             return
+        log.info("[동시호가 화면] 정정 %s 클릭 — 정정PT %s", name, w["hl"][name]["pt"].get())
         send_settings(force=True)  # 정정PT 최신 값을 코어에 먼저
         send({"cmd": "auction_amend", "underlying": cur["u"].value, "row": name}, f"정정 {name}")
 
@@ -626,6 +639,59 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     w["fx_run"].config(command=partial(toggle_run, "fx_run"))
     w["hl_run"].config(command=partial(toggle_run, "hl_run"))
+
+    # --- 3단계 시험용 가상 체결(§7a, 사용자 2026-10-28): HL주문설정 아래 오른쪽 — 매수·매도
+    # 계약수를 체결된 셈 치고(주식선물 실주문 없음) 확인창을 거쳐 코어 auction_test_order.
+    # HL 예약실행이 켜져 있어야 하고, 바로 3단계가 나간다(HL은 실거래).
+    tb = tk.Frame(right)
+    tb.grid(row=3, column=0, sticky="e", pady=(4, 0))
+    # '시험 허용' 체크 — 켜져 있을 때만 버튼이 살고, 버튼을 누르는 순간 풀린다(사용자 2026-10-28
+    # "체크 되어 있을 때만 시험매수/매도, 클릭 시 체크 해제"). 창을 열면 꺼짐, 저장 안 함.
+    w["test_allow_var"] = tk.BooleanVar(value=False)
+    w["test_btns"] = []
+
+    def sync_test_buttons() -> None:
+        st = "normal" if w["test_allow_var"].get() else "disabled"
+        for btn in w["test_btns"]:
+            btn.config(state=st)
+
+    w["test_allow"] = tk.Checkbutton(tb, text="시험 허용", variable=w["test_allow_var"],
+                                     fg="dark red", font=T.FONT_LABEL, command=sync_test_buttons)
+    w["test_allow"].grid(row=0, column=0, padx=(0, 4))
+    tk.Label(tb, text="시험 수량", font=T.FONT_LABEL, fg="dark red").grid(row=0, column=1)
+    w["test_qty"] = entry(tb, 4, vcmd_int, "1")  # 주식선물 계약수(사용자 2026-10-28 "수량 입력")
+    w["test_qty"].grid(row=0, column=2, padx=(2, 6))
+
+    def test_order(side: str) -> None:
+        if preview or not w["test_allow_var"].get():
+            return
+        w["test_allow_var"].set(False)  # 한 번 누르면 풀림 — 다음 시험은 다시 체크
+        sync_test_buttons()
+        word = "매수" if side == "buy" else "매도"
+        try:
+            qty = int(w["test_qty"].get().strip())
+        except ValueError:
+            qty = 0
+        if qty <= 0:
+            show_message(root, "동시호가 주문", "시험 수량(주식선물 계약수)을 1 이상으로 넣으세요.")
+            return
+        if not ask_yes_no(root, "동시호가 주문",
+                          f"{w['under'].get()} 주식선물 {word} {qty}계약이 체결된 셈 칩니다"
+                          + "(시험용, 주식선물 실주문 없음).\n"
+                          + f"바로 HL {qty * 10}단위의 3단계 헤지가 나갑니다(HL은 실거래).\n"
+                          + "HL 예약실행이 켜져 있어야 합니다. 계속할까요?"):
+            return
+        w["status"].show(f"시험 가상 체결 {word} {qty}계약 보냄")
+        send({"cmd": "auction_test_order", "underlying": cur["u"].value, "side": side,
+              "qty": qty}, "시험 주문")
+
+    for col, (side_k, text) in enumerate((("buy", "시험 매수"), ("sell", "시험 매도")),
+                                         start=3):
+        btn = tk.Button(tb, text=text, width=9, padx=0, pady=0, bd=1, highlightthickness=0,
+                        fg="dark red", font=T.FONT_LABEL, command=partial(test_order, side_k))
+        btn.grid(row=0, column=col, padx=(4, 0))
+        w["test_btns"].append(btn)
+    sync_test_buttons()
 
     # ===== 상태줄 = 읽기 전용 콤보(체결쏴·NXT 개장과 같음, 사용자 2026-10-23) — 글 앞에 시각,
     # 펼치면 지난 글 50건. 예약·예약실행 켬/끔도 여기에 남긴다.
@@ -897,9 +963,33 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                   "value": False}, "예약실행 끔")
         run_on["fx_run"] = run_on["hl_run"] = False
 
+    # --- 창 저장/복원(win_state, NXT 개장·체결쏴와 같은 요령) — 보던 종목(사용자 2026-10-28 "종목
+    # 콤보가 저장이 안 되네"). 위치는 attach가 2초마다. 행·설정은 코어가 종목별로 들고 있어 제외.
+    def collect_fields() -> dict[str, Any]:
+        return {"under": w["under"].get()}
+
+    def restore_saved() -> None:
+        name = saved_under(win_state.saved_fields("auction_order"))
+        if name is None or name == w["under"].get():
+            return
+        w["under"].set(name)  # on_under_change를 부르지 않는다 — 아직 받은 값이 없어 저장할 게 없음
+        cur["u"], cur["loaded"], cur["agg_under"] = BY_NAME[name], False, None
+
+    def persist_fields() -> None:
+        try:
+            win_state.save_fields("auction_order", collect_fields())
+            root.after(2000, persist_fields)
+        except tk.TclError:
+            pass  # 창 닫힘
+
+    if not preview:
+        restore_saved()
+        root.after(2000, persist_fields)
+
     def before_close() -> None:
         if preview:
             return
+        win_state.save_fields("auction_order", collect_fields())
         if cur["loaded"]:
             send_rows()
             send_settings()

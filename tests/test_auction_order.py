@@ -89,10 +89,16 @@ def test_hl_base_price_nearest_grid_tie_higher_and_offsets() -> None:
     assert hl_base_price(1332.0, 1333.0, 5, 5, 1) == 1332.5                  # 머지 0.5틱
     assert hl_base_price(1332.0, 1332.6, 4, None, 1) == 1332.0  # 머지 1틱: 1332.3 → 1332
     assert hl_base_price(None, 1332.0, None, None, 1) is None
-    assert hl_order_price(1332.5, 0.3, 1) == 1332.8 and hl_order_price(1332.5, -1.0, 1) == 1331.5
-    assert hl_order_price(1332.5, 0.0, 1) == 1332.5
+    assert hl_order_price(1332.5, 0.3, Side.BUY, 1) == 1332.8
+    assert hl_order_price(1332.5, -1.0, Side.BUY, 1) == 1331.5
+    assert hl_order_price(1332.5, 0.0, Side.BUY, 1) == 1332.5
+    # 매도는 입력값에 −1(사용자 2026-10-28): 양수 = 상대호가 쪽(아래), 음수 = 반대쪽(위, 메이커)
+    assert hl_order_price(1332.5, 0.3, Side.SELL, 1) == 1332.2
+    assert hl_order_price(1332.5, -1.0, Side.SELL, 1) == 1333.5
+    assert hl_order_price(1332.5, 0.0, Side.SELL, 1) == 1332.5
     assert hl_amend_price(1332.5, 0.5, Side.BUY, 1) == 1333.0                # 매수 정정은 위로
     assert hl_amend_price(1332.5, 0.5, Side.SELL, 1) == 1332.0               # 매도는 아래로
+    assert hl_amend_price(1332.5, -0.5, Side.BUY, 1) == 1332.0               # 음수 = 반대쪽(시험용)
 
 
 def test_hl_split_four_ways_two_decimals_remainder_to_a() -> None:

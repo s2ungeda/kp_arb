@@ -116,20 +116,7 @@ def quote_plan_input(state: CoreState, system: Any) -> QuotePlanInput:
     fx_fn = getattr(system, "fx_futures_code", None)
     fx_code = fx_fn() if callable(fx_fn) else None
     return QuotePlanInput(symbols_on=on, futures_codes=codes, futures_months=months,
-                          fx_code=fx_code if isinstance(fx_code, str) else None,
-                          nxt_trade_symbols=nxt_trade_symbols(state))
-
-
-def nxt_trade_symbols(state: CoreState, today: str | None = None) -> frozenset[Underlying]:
-    """NXT 체결(NS3)을 구독할 종목 — NXT 개장 화면에서 **오늘 '적'을 누른 종목**(applied_day = 오늘,
-    사용자 2026-10-27 "'적' 누르는 순간 체결 데이터를 구독") 또는 진입·청산 실행 중인 종목. 오늘
-    기회가 끝나면 엔진이 applied_day를 지워 해제된다("매매 종료 시 구독 취소"). 순수(today는
-    시험용)."""
-    day = today or time.strftime("%Y-%m-%d")
-    return frozenset(
-        u for u in Underlying
-        if (nx := state.nxt_open.books.get(u.value)) is not None
-        and (nx.run_entry or nx.run_exit or nx.applied_day == day))
+                          fx_code=fx_code if isinstance(fx_code, str) else None)
 
 
 async def sync_quote_plan(state: CoreState, system: Any) -> None:
@@ -806,12 +793,30 @@ async def _auction_command(engine: AuctionOrderEngine | None, state: CoreState,
             return _fail([f"proc은 fx|hl|test: {proc!r}"])
         engine.set_run(u, proc, bool(body.get("value", False)))
         return _ok()
+    if cmd == "auction_test_order":  # §7a 시험용 가상 체결(실주문 없음) → 3단계 HL, 2026-10-28
+        try:
+            side = Side(str(body.get("side", "buy")))
+            qty = int(body.get("qty", 10))
+        except ValueError as exc:
+            return _fail([f"잘못된 시험 주문 인자: {exc}"])
+        if qty <= 0:
+            return _fail(["수량은 1 이상"])
+        try:
+            oid = await engine.test_order(u, side, qty)
+        except Exception as exc:  # noqa: BLE001 - 호가 없음·거부 사유를 화면에
+            return _fail([f"시험 주문 실패: {exc}"])
+        return _ok(order_id=oid)
     if cmd in ("auction_amend", "auction_cancel"):
         name = str(body.get("row", ""))
         if name not in HL_ROWS:
             return _fail([f"row는 a~d: {name!r}"])
         why = await (engine.amend(u, name) if cmd == "auction_amend" else engine.cancel(u, name))
-        return _fail([why]) if why else _ok()
+        if why:  # 거부 사유는 상태줄뿐 아니라 로그에도(10-28 "정정이 안 되네" 조사 때 흔적 없음)
+            logging.getLogger("kp_arb.auction").warning(
+                "[동시호가] %s HL %s %s 거부 — %s", u.value, name,
+                "정정" if cmd == "auction_amend" else "취소", why)
+            return _fail([why])
+        return _ok()
     return _fail([f"알 수 없는 명령: {cmd}"])
 
 
@@ -836,9 +841,6 @@ def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
                                 sz_decimals=engine.sz_decimals(u) if engine else None)
         if errors:
             return _fail(errors)
-        if "applied" in body:  # '적'(True) — 오늘은 실행 전에도 NXT 체결을 구독(모니터 S·괴리);
-            # 화면 닫힘(False) — 실행 종료이므로 구독 근거를 지운다(사용자 2026-10-27)
-            st.applied_day = time.strftime("%Y-%m-%d") if body["applied"] else None
         if engine is not None and st.open_hms != open_before:
             engine.reset_day(u)  # 개장 시각이 바뀌면 오늘 상태 다시(사용자 2026-10-21)
         logging.getLogger("kp_arb.nxt_open").info(

@@ -244,19 +244,23 @@ async def test_process3_fills_to_four_hl_orders_then_amend_and_cancel() -> None:
     await asyncio.sleep(FILL_DEBOUNCE_S + 0.05)
     d = eng._day(U)
     hl = [i for i in sys_.placed if i.venue is Venue.HYPERLIQUID]
-    # 선물 매수 3계약 → HL 매도 30 → 7.5씩, 기준가 1332.5 + 오프셋
+    # 선물 매수 3계약 → HL 매도 30 → 7.5씩, 매도는 기준가 1332.5 − 오프셋(사용자 2026-10-28 — 매도면
+    # 입력값에 −1: 양수 = 상대호가 쪽 아래, 음수 = 위 메이커)
     assert [(i.tag, i.side, i.qty, i.price) for i in hl] == [
-        ("HLa", Side.SELL, 7.5, 1333.0), ("HLb", Side.SELL, 7.5, 1332.5),
-        ("HLc", Side.SELL, 7.5, 1332.0), ("HLd", Side.SELL, 7.5, 1331.5)]
+        ("HLa", Side.SELL, 7.5, 1332.0), ("HLb", Side.SELL, 7.5, 1332.5),
+        ("HLc", Side.SELL, 7.5, 1333.0), ("HLd", Side.SELL, 7.5, 1333.5)]
     assert all(i.order_type is OrderType.LIMIT and not i.reduce_only for i in hl)
     assert b.hl_orders == {"a": "O2", "b": "O3", "c": "O4", "d": "O5"} and d.hl_base == 1332.5
     assert not d.hl_run                        # 4건 나갔으니 HL 예약실행 자동 끔(10-26)
-    # 정정 a: 잔량 7.5를 1333.0 − 0.7 = 1332.3으로(매도는 아래로), 취소 확인 뒤 신규
+    # 정정 a: 잔량 7.5를 1332.0 − 0.7 = 1331.3으로(매도는 아래로), 취소 확인 뒤 신규
     assert await eng.amend(U, "a") is None
     assert sys_.cancelled == ["O2"] and b.hl_orders["a"] == "O6"
     new = sys_.placed[-1]
-    assert (new.tag, new.side, new.qty, new.price) == ("HLa정정", Side.SELL, 7.5, 1332.3)
+    assert (new.tag, new.side, new.qty, new.price) == ("HLa정정", Side.SELL, 7.5, 1331.3)
     assert await eng.amend(U, "b") == "b 행 정정PT가 없습니다"
+    # 음수 정정PT(2026-10-28 시험용): 매도 d를 1333.5 + 0.5 = 1334.0으로(반대쪽 — 체결 안 되게)
+    b.settings.hl_pt["d"] = -0.5
+    assert await eng.amend(U, "d") is None and sys_.placed[-1].price == 1334.0
     # 취소 c
     assert await eng.cancel(U, "c") is None and "O4" in sys_.cancelled and "c" not in b.hl_orders
     assert await eng.cancel(U, "c") == "c 행에 HL 주문이 없습니다"
@@ -267,7 +271,15 @@ async def test_process3_fills_to_four_hl_orders_then_amend_and_cancel() -> None:
     sys_.on_fill[0](Fill(fill_id="x3", order_id="O1", qty=1.0, price=1_767_000.0, ts=0,
                          account=Account.KR_DERIV))
     await asyncio.sleep(FILL_DEBOUNCE_S + 0.05)
-    assert len([i for i in sys_.placed if i.venue is Venue.HYPERLIQUID]) == 5
+    assert len([i for i in sys_.placed if i.venue is Venue.HYPERLIQUID]) == 6  # 4건 + 정정 a·d
+    # HL 예약실행을 다시 켜면 새 바퀴(사용자 2026-10-28) — 전 체결 집계는 버리고 그 뒤 체결(2계약)만
+    eng.set_run(U, "hl", True)
+    assert not d.hl_done and d.fills == {}
+    sys_.on_fill[0](Fill(fill_id="x4", order_id="O1", qty=2.0, price=1_767_000.0, ts=0,
+                         account=Account.KR_DERIV))
+    await asyncio.sleep(FILL_DEBOUNCE_S + 0.05)
+    again = [i for i in sys_.placed if i.venue is Venue.HYPERLIQUID][6:]
+    assert len(again) == 4 and sum(i.qty for i in again) == 20.0 and d.hl_done and not d.hl_run
 
 
 async def test_hl_not_fired_when_run_off_and_net_zero() -> None:
@@ -307,6 +319,39 @@ async def test_test_mode_uses_futures_mid_and_fx_last_outside_auction() -> None:
     # (2026-10-27 개발 PC 15:20~15:30 주식 장마감 동시호가 때 시험 수치 전부 "-")
     sys_.session.received = None
     assert eng._testing(eng._day(U)) and eng.live_snapshot()[U.value]["sf_expected"] == 1_765_500.0
+
+
+async def test_test_order_is_virtual_fill_feeding_process3() -> None:
+    # 사용자 2026-10-28 "운영 PC에서는 실제 주문 체결을 시킬 수 없으니 체결됐다 치고 HL 주문이
+    # 나가게": 주식선물 실주문 없이 그 계약수를 체결된 셈 쳐 3단계(HL 4건)로. HL 예약실행이 꺼져
+    # 있으면 거절.
+    eng, sys_, _clk, _screen = _engine(_wall(14, 30, 0.0))
+    sys_.quotes[(U, SF, "krx")] = Quote(underlying=U, instrument=SF, bid=1_765_000.0,
+                                        ask=1_766_000.0, ts=0, market="krx")
+    try:
+        await eng.test_order(U, Side.SELL, qty=3)
+    except RuntimeError as exc:
+        assert "예약실행" in str(exc)
+    else:
+        raise AssertionError("HL 예약실행이 꺼져 있으면 거절해야 한다")
+    assert sys_.placed == [] and eng._day(U).past_rows == []
+    eng.set_run(U, "hl", True)
+    oid = await eng.test_order(U, Side.SELL, qty=3)
+    assert sys_.placed == []                                   # 주식선물 실주문 없음
+    row = eng._day(U).past_rows[-1]
+    assert row.order_id == oid and row.side == "sell" and row.qty == 3 and row.price == 1_765_000.0
+    assert eng._day(U).fills[oid] == ("sell", 3.0)
+    await asyncio.sleep(FILL_DEBOUNCE_S + 0.05)
+    hl = [i for i in sys_.placed if i.venue is Venue.HYPERLIQUID]
+    assert eng._day(U).hl_done and [i.side for i in hl] == [Side.BUY] * 4
+    assert sum(i.qty for i in hl) == 30.0
+    # 주식선물 호가가 없어도 된다(기록용 가격 0) — 새 바퀴에서 매수 가상 체결
+    sys_.quotes.pop((U, SF, "krx"))
+    eng.set_run(U, "hl", True)
+    oid2 = await eng.test_order(U, Side.BUY, qty=1)
+    assert oid2 != oid and eng._day(U).past_rows[-1].price == 0.0
+    await asyncio.sleep(FILL_DEBOUNCE_S + 0.05)
+    assert [i.side for i in sys_.placed if i.venue is Venue.HYPERLIQUID][4:] == [Side.SELL] * 4
 
 
 async def test_armed_rows_cleared_on_startup_and_shutdown() -> None:

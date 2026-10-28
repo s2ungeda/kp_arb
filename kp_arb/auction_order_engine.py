@@ -43,6 +43,7 @@ from .auction_order import (
 )
 from .domain.enums import Account, Instrument, OrderType, SessionPhase, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
+from .gateways.ls_ws import Fill
 from .hl_merge import merge_tick_options
 from .theory import quote_price
 
@@ -148,6 +149,7 @@ class AuctionOrderEngine:
         self._days: dict[Underlying, DayState] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._hl_timers: dict[Underlying, asyncio.Task[None]] = {}
+        self._test_seq = 0  # 시험용 가상 체결 번호(§7a `시험-n`)
         hooks = getattr(system, "on_fill", None)
         if hooks is not None:
             hooks.append(self._on_fill)
@@ -210,6 +212,14 @@ class AuctionOrderEngine:
         if proc == "fx":
             d.fx_run = value
         else:
+            if value and d.hl_done:
+                # 다시 켜면 새 바퀴(사용자 2026-10-28 "두 번째부터 안 되네" — 2단계 재실행과 같은
+                # 요령): 전 바퀴의 체결 집계를 버리고, 그 뒤 체결부터 다시 하루 한 번. 전 바퀴 HL
+                # 주문 a~d의 정정·취소 손잡이는 다음 발주 때 덮인다(남은 미체결은 주문리스트에서).
+                dropped = len(d.fills)
+                d.hl_done, d.fills = False, {}
+                self._log.info("[동시호가] %s HL 예약실행 다시 켬 — 3단계 새 바퀴(전 체결 %d건 "
+                               "집계 버림)", u.value, dropped)
             d.hl_run = value
         self._log.info("[동시호가] %s %s 예약실행 %s", u.value, "환" if proc == "fx" else "HL",
                        "켬" if value else "끔")
@@ -367,6 +377,31 @@ class AuctionOrderEngine:
         self._log.info("[동시호가] %s %s", u.value, d.note)
         d.ls_done = True
 
+    async def test_order(self, u: Underlying, side: Side, qty: int = 10) -> str:
+        """시험용 가상 체결(§7a, 사용자 2026-10-28 "운영 PC에서는 실제 주문 체결을 시킬 수 없으니
+        체결됐다 치고 HL 주문이 나가게"): 주식선물 주문은 내지 않고 그 계약수가 체결된 셈 쳐
+        past_rows(주문번호 `시험-n`)에 넣고 보통 체결 통보와 같은 길(_on_fill)로 3단계(HL 헤지,
+        실거래)를 태운다. 장부·포지션은 안 바뀐다. HL 예약실행이 꺼져 있으면 거절(켜는 순간 집계를
+        버리므로 먼저 켜야 함). 호가는 기록용 가격에만(없으면 0). 돌려주는 값 = 가상 주문번호."""
+        inst = self._instrument(u)
+        d = self._day(u)
+        if not d.hl_run:
+            raise RuntimeError("HL 예약실행을 먼저 켜세요")
+        sq = self._system.quotes.get((u, inst, "krx"))
+        px = 0.0
+        if sq is not None:
+            px = float(sq.ask if side is Side.BUY else sq.bid)
+        self._test_seq += 1
+        oid = f"시험-{self._test_seq}"
+        name = f"시험{'매수' if side is Side.BUY else '매도'}"
+        d.past_rows.append(RowState(fired=True, side=side.value, price=px, qty=qty,
+                                    at=_hms(self._wall()), order_id=oid))
+        self._log.warning("[동시호가] %s %s %d계약 가상 체결 #%s(실주문 없음) → 3단계 HL 헤지",
+                          u.value, name, qty, oid)
+        self._on_fill(Fill(fill_id=oid, order_id=oid, qty=float(qty), price=px,
+                           ts=self._wall(), account=Account.KR_DERIV))
+        return oid
+
     async def _place_row(self, u: Underlying, d: DayState, inst: Instrument, side: Side,
                          i: int, px: float, qty: int) -> None:
         name = f"{'매수' if side is Side.BUY else '매도'}{i + 1}"
@@ -488,7 +523,7 @@ class AuctionOrderEngine:
         intents: list[OrderIntent] = []
         names: list[str] = []
         for name, qty in zip(HL_ROWS, parts, strict=False):
-            px = hl_order_price(base, book.settings.hl_off.get(name, 0.0), sz)
+            px = hl_order_price(base, book.settings.hl_off.get(name, 0.0), side, sz)
             d.hl[name] = HlRow(side=side.value, price=px, qty=qty)
             names.append(name)
             intents.append(OrderIntent(venue=Venue.HYPERLIQUID, underlying=u,
@@ -535,7 +570,7 @@ class AuctionOrderEngine:
         if tracked is None or not tracked.is_open:
             return f"{name} 행 주문 #{oid}이(가) 열려 있지 않습니다"
         pt = book.settings.hl_pt.get(name, 0.0)
-        if pt <= 0:
+        if pt == 0:  # 음수 허용(2026-10-28, 시험용 — 상대호가 반대쪽으로 옮겨 체결 안 되게)
             return f"{name} 행 정정PT가 없습니다"
         side = tracked.intent.side
         remaining = float(tracked.remaining_qty)

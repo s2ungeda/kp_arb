@@ -1,7 +1,9 @@
 """오전 NXT 개장 매매 실행 엔진 — DESIGN-nxt-open.md §3·§6.
 
 CoreState.nxt_open(종목별 설정)과 LiveSystem을 묶는다. 이벤트 주도(별도 루프 없음):
-- NXT 주식 체결(on_trade, market "nxt") → 그날 첫 체결이면 T0(개장 시각 + 유예 안일 때만) + S 갱신
+- NXT 주식 1호가(on_quote, market "nxt" — 통합호가 UH1의 NXT 쪽) → 그날 첫 호가면 T0(개장 시각 +
+  유예 안일 때만) + S(1호가 가중값, theory.quote_price) 갱신. 주식 체결은 안 받는다(사용자
+  2026-10-28 "NXT 개장 매매에도 현재가 대신 호가 가중치, 주식 체결 시세 구독 안 해도 될 것 같음")
 - HL 호가(on_quote, 선택한 호가단위 적용 1호가)·환율(on_fx) → 괴리 재계산
 - 창 안(T0 + start ~ + end)이고 실행이 켜져 있으면 판정 → 맞는 단을 한꺼번에 HL 묶음 발주, 딱 한 번
 발주 뒤 미체결·포지션은 건드리지 않는다(정리는 사용자). 날짜가 바뀌면 그날 상태를 비운다.
@@ -33,6 +35,7 @@ from .nxt_open import (
     t0_verdict,
     window_state,
 )
+from .theory import quote_price
 
 
 class _System(Protocol):
@@ -95,8 +98,7 @@ class NxtOpenEngine:
         self._log = logging.getLogger("kp_arb.nxt_open")
         self._days: dict[Underlying, DayState] = {u: DayState() for u in Underlying}
         self._tasks: set[asyncio.Task[None]] = set()
-        for name, handler in (("on_trade", self._on_trade), ("on_quote", self._on_quote),
-                              ("on_fx", self._on_fx)):
+        for name, handler in (("on_quote", self._on_quote), ("on_fx", self._on_fx)):
             hooks = getattr(system, name, None)
             if hooks is not None:
                 hooks.append(handler)
@@ -161,7 +163,6 @@ class NxtOpenEngine:
         if d.over_seen or not self._is_over(d, st):
             return
         d.over_seen = True
-        st.applied_day = None  # 오늘 기회 끝 → '적'으로 붙인 NXT 체결 구독도 해제(2초 루프)
         if not (st.run_entry or st.run_exit):
             return
         st.run_entry = st.run_exit = False
@@ -186,34 +187,39 @@ class NxtOpenEngine:
             d = self._days[u] = DayState(day=today)
         return d
 
-    def _on_trade(self, tick: Any) -> None:
-        if getattr(tick, "instrument", None) is not Instrument.KR_STOCK:
-            return
-        if getattr(tick, "market", "") != "nxt":
-            return
-        u: Underlying = tick.underlying
+    def _on_nxt_quote(self, quote: Quote) -> None:
+        """NXT 주식 1호가(UH1의 NXT 쪽) — S = 1호가 가중값(현재가 규칙 ①~③), 그날 첫 호가가 T0
+        (사용자 2026-10-28 답 1: 개장 시각 뒤 첫 NXT 호가 — 운영 실측 개장 전 NXT 호가 0건, 08:00
+        첫 분에 체결과 같이 옴). 호가가 비어 S가 없으면(규칙 ①) T0 후보로 안 본다."""
+        u = quote.underlying
         d = self._day(u)
-        d.s = float(tick.price)
+        s = quote_price(quote.bid, quote.ask, quote.bid_qty, quote.ask_qty)
+        if s is None:
+            self._evaluate(u)
+            return
+        d.s = s
         if d.t0 is None and not d.t0_rejected:
             now_wall = self._wall()
             st = self.settings(u)
             verdict = t0_verdict(now_wall, st.open_hms)
             if verdict == "early":
-                pass  # 개장 전 체결 — T0 후보 아님(무시), 개장 뒤 첫 체결을 기다린다
+                pass  # 개장 전 호가 — T0 후보 아님(무시), 개장 뒤 첫 호가를 기다린다
             elif verdict == "ok":
                 d.t0, d.t0_wall = self._clock(), now_wall
-                self._log.info("[NXT개장] %s 첫 체결 %s @ %s — 창 +%.1f~+%.1f초", u.value,
+                self._log.info("[NXT개장] %s 첫 NXT 호가 %s S %s — 창 +%.1f~+%.1f초", u.value,
                                _hms(now_wall), f"{d.s:,.0f}", st.start_s, st.end_s)
             else:
                 d.t0_rejected = True
                 d.note = "오늘 판정 없음(개장 밖)"
-                self._log.warning("[NXT개장] %s 첫 NXT 체결이 %s(개장 %s 기준 유예 밖) — 오늘 창 "
+                self._log.warning("[NXT개장] %s 첫 NXT 호가가 %s(개장 %s 기준 유예 밖) — 오늘 창 "
                                   "없음", u.value, _hms(now_wall), st.open_hms)
         self._evaluate(u)
 
     def _on_quote(self, quote: Quote) -> None:
         if quote.instrument is Instrument.HL_PERP:
             self._evaluate(quote.underlying)
+        elif quote.instrument is Instrument.KR_STOCK and quote.market == "nxt":
+            self._on_nxt_quote(quote)
 
     def _on_fx(self) -> None:
         for u in Underlying:
@@ -235,8 +241,10 @@ class NxtOpenEngine:
         else:
             d.hl_bid_n = level_price(bids, 1)
             d.hl_ask_n = level_price(asks, 1)
-        if d.s is None:
-            d.s = self._system.trades.get((u, Instrument.KR_STOCK, "nxt"))
+        nq = self._system.quotes.get((u, Instrument.KR_STOCK, "nxt"))
+        s = quote_price(nq.bid, nq.ask, nq.bid_qty, nq.ask_qty) if nq is not None else None
+        if s is not None:  # 호가가 비면(규칙 ①) 마지막 S 유지
+            d.s = s
         fx = self._system.usdkrw_spot
         d.entry_disp = disparity(fx, d.hl_bid_n, d.s)
         d.exit_disp = disparity(fx, d.hl_ask_n, d.s)

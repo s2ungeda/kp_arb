@@ -19,6 +19,15 @@ def test_row_missing_names_empty_spread_or_qty() -> None:
     assert row_missing("x", "-1") == "주문Sprd·수량"
 
 
+def test_saved_under_only_known_names() -> None:
+    # 창 저장의 보던 종목 복원(사용자 2026-10-28) — 콤보에 있는 이름만, 없는 이름·형식은 무시
+    from kp_arb.auction_order_screen import saved_under
+
+    assert saved_under({"under": "하이닉스"}) == "하이닉스"
+    assert saved_under({"under": "현대차"}) is None and saved_under({}) is None
+    assert saved_under({"under": 3}) is None
+
+
 def test_fx_missing_requires_tick_hedge_and_unit() -> None:
     # 사용자 2026-10-26: 틱·헤지비율·1회주문수량이 없으면 환 예약실행을 못 켠다(틱은 0 허용)
     from kp_arb.auction_order_screen import fx_missing
@@ -39,4 +48,5 @@ def test_hl_missing_and_pt_missing() -> None:
 
     assert hl_missing({"a": "0.5", "b": "", "c": "-0.5", "d": "0"}) is None
     assert hl_missing({"a": "", "b": "0", "c": "x", "d": "1"}) == "c"
-    assert not pt_missing("0.5") and pt_missing("") and pt_missing("0") and pt_missing("-1")
+    assert not pt_missing("0.5") and pt_missing("") and pt_missing("0")
+    assert not pt_missing("-1")  # 음수 허용(2026-10-28, 시험용 — 반대쪽으로)

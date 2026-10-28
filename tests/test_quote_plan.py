@@ -26,19 +26,6 @@ def test_plan_subscribes_only_checked_symbols_with_three_stock_trs() -> None:
     assert len(got) == 2 * 3 + 2 * 2 + 2                             # 12건(통보·CUR·JIF는 밖)
 
 
-def test_plan_adds_nxt_trade_only_for_running_screens() -> None:
-    # NXT 체결(NS3)은 NXT 개장이 실행 중인 종목만(사용자 2026-10-27 "실행할 때만 구독, 매매 종료 시
-    # 취소") — 체크 안 된 종목은 실행 중이라도 계획 밖(자동 체크가 먼저 켠다)
-    inp = QuotePlanInput(symbols_on=frozenset({S, H}), futures_codes=CODES, fx_code="A756B000",
-                         nxt_trade_symbols=frozenset({H, M}))
-    got = plan(inp)
-    assert ("NS3", "N000660   ") in got and ("NS3", "N005930   ") not in got
-    assert not any("005380" in k for _t, k in got)
-    off = plan(QuotePlanInput(symbols_on=frozenset({S, H}), futures_codes=CODES,
-                              fx_code="A756B000"))
-    assert not any(t == "NS3" for t, _k in off)
-
-
 def test_plan_follows_futures_month_choice_and_symbol_toggle() -> None:
     # 차근을 고른 종목은 차근 JH0·YJC도(근월물과 같이 쓰는 세트가 있을 수 있어 합집합), 체크 끄면
     # 전부 빠짐

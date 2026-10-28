@@ -258,9 +258,11 @@ def hl_base_price(bid: float | None, ask: float | None, n_sig_figs: int | None,
     return snap_nearest(mid, hl_grid_step(mid, n_sig_figs, mantissa, sz_decimals))
 
 
-def hl_order_price(base: float, offset: float, sz_decimals: int | None) -> float:
-    """HL 건 가격 = 기준가 + 오프셋(USD, 양·음, 비면 0) — HL 격자 한 칸에 가장 가까운 값으로."""
-    px = base + offset
+def hl_order_price(base: float, offset: float, side: Side, sz_decimals: int | None) -> float:
+    """HL 건 가격(§5) = 매수 `기준가 + 오프셋` / 매도 `기준가 − 오프셋`(USD, 양·음, 비면 0) — HL
+    격자 한 칸에 가장 가까운 값으로. 매도는 입력값에 −1(사용자 2026-10-28 — 양수 = 상대호가 쪽,
+    음수 = 반대쪽, 정정PT와 같은 규칙)."""
+    px = base + offset if side is Side.BUY else base - offset
     if px <= 0:
         return px
     return snap_nearest(px, hl_price_step(px, sz_decimals))
@@ -286,7 +288,8 @@ def hl_split(total: float, sz_decimals: int | None, n: int = len(HL_ROWS),
 
 
 def hl_amend_price(price: float, pt: float, side: Side, sz_decimals: int | None) -> float:
-    """정정가(§5 정정PT) — 잔량을 **상대호가 방향으로만**: 매수면 가격 ↑, 매도면 ↓, 격자에 맞춤."""
+    """정정가(§5 정정PT) — 잔량을 상대호가 방향으로: 매수면 가격 ↑, 매도면 ↓, 격자에 맞춤. PT가
+    음수면 반대쪽(사용자 2026-10-28, 시험용 — 체결 안 되게)."""
     px = price + pt if side is Side.BUY else price - pt
     return snap_nearest(px, hl_price_step(px, sz_decimals)) if px > 0 else px
 

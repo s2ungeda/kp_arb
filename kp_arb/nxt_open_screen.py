@@ -366,19 +366,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     ref_sent = {"qty": -1}
 
-    def send_ref_qty(force: bool = False, applied: bool = False) -> None:
-        """기준수량만 코어로 — Enter·포커스 이동 때 바로(체결쏴와 같음). applied='적'을 누른 것:
-        코어가 오늘 날짜를 적고 NXT 체결(NS3)을 구독한다(사용자 2026-10-27)."""
+    def send_ref_qty(force: bool = False) -> None:
+        """기준수량만 코어로 — Enter·포커스 이동 때 바로(체결쏴와 같음)."""
         qty = int_of(w["ref"].get())
         if not force and qty == ref_sent["qty"]:
             return
         ref_sent["qty"] = qty
         if not preview:
-            body: dict[str, Any] = {"cmd": "nxt_open_settings", "underlying": cur["u"].value,
-                                    "ref_qty": qty}
-            if applied:
-                body["applied"] = True
-            send(body, "기준수량")
+            send({"cmd": "nxt_open_settings", "underlying": cur["u"].value, "ref_qty": qty},
+                 "기준수량")
 
     def apply_top() -> None:
         """'적' — 호가단위(manual_hl_merge) + 기준수량을 코어에(체결쏴 apply_market과 같은 역할).
@@ -390,7 +386,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             send({"cmd": "manual_hl_merge", "underlying": cur["u"].value,
                   "tick": label.replace(",", ""), "n_sig_figs": nsf, "mantissa": mant},
                  "호가단위")
-        send_ref_qty(force=True, applied=True)
+        send_ref_qty(force=True)
         save_if_changed()  # 단 값도 '적'을 누르면 함께(결정 74 방식)
 
     def set_entry(e: tk.Entry, val: str) -> None:
@@ -625,10 +621,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         win_state.save_fields("nxt_open", collect_fields())
         if cur["loaded"]:  # 닫을 때 보던 종목의 입력값 저장(체결쏴 결정 82와 같은 요령)
             send(payload_of(cur["u"]), "저장")
-        # 화면 닫힘 = 실행 종료 → '적'으로 붙인 NXT 체결 구독 근거를 지운다(보던 종목만, 사용자
-        # 2026-10-27 "실행이 종료됐을 때 구독 취소")
-        send({"cmd": "nxt_open_settings", "underlying": cur["u"].value, "applied": False},
-             "구독 해제")
         deadline = time.time() + 3.0
         while jobs.unfinished_tasks and time.time() < deadline:
             time.sleep(0.05)

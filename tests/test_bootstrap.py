@@ -1984,17 +1984,68 @@ async def test_stock_last_is_weighted_unified_quote() -> None:
     fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=0.0, ask=0.0,
               ts=0.0, bid_qty=0.0, ask_qty=0.0, market="uni"))
     assert system.stock_last(SAMSUNG) is None
-    # 동시호가(장전·장마감)·VI 중엔 예상체결가(UYS) — 없으면 None(사용자 2026-10-28)
+    # 동시호가(장전·장마감)·VI 중엔 그 직전의 가중값 유지(사용자 2026-10-28 "직전 가중값으로") —
+    # 멈춘 동안 온 호가로는 갱신 안 함, 풀리면 다시 호가
     fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=70_000.0, ask=70_100.0,
               ts=0.0, bid_qty=1.0, ask_qty=1.0, market="uni"))
     system.vi_state[SAMSUNG] = "1"
-    assert system.stock_last(SAMSUNG) is None
-    system.expected_prices[(SAMSUNG, Instrument.KR_STOCK)] = 70_300.0
-    assert system.stock_last(SAMSUNG) == 70_300.0
-    system.vi_state[SAMSUNG] = "0"
     assert system.stock_last(SAMSUNG) == 70_050.0
+    fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=70_400.0, ask=70_500.0,
+              ts=0.0, bid_qty=1.0, ask_qty=1.0, market="uni"))   # VI 중 호가 — 무시
+    assert system.stock_last(SAMSUNG) == 70_050.0
+    system.vi_state[SAMSUNG] = "0"
+    assert system.stock_last(SAMSUNG) == 70_450.0
     from kp_arb.gateways.ls_ws import MarketStatus
     system.session.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "1",
                                                                      "jstatus": "31"}))
-    assert system.session.stock_auction() and system.stock_last(SAMSUNG) == 70_300.0
+    assert system.session.stock_auction() and system.stock_last(SAMSUNG) == 70_450.0
     assert system.stock_futures_theory(SAMSUNG) is None or system.stock_futures_theory(SAMSUNG) > 0
+    # 서킷브레이커(발동 61 ~ 회복 동시호가 종료 63)도 단일가라 멈춤(사용자 2026-10-28 "단일가 시
+    # 호가로 가중값 계산하면 안 되지") — 62(호가접수개시)는 회복 동시호가라 아직 유지
+    system.session.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "1",
+                                                                     "jstatus": "41"}))
+    assert not system.session.stock_auction() and system.stock_last(SAMSUNG) == 70_450.0
+    system.session.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "1",
+                                                                     "jstatus": "61"}))
+    fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=60_000.0, ask=60_100.0,
+              ts=0.0, bid_qty=1.0, ask_qty=1.0, market="uni"))   # 서킷 중 호가 — 무시
+    assert system.stock_halted() and system.stock_last(SAMSUNG) == 70_450.0
+    system.session.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "1",
+                                                                     "jstatus": "62"}))
+    assert system.stock_halted() and system.stock_last(SAMSUNG) == 70_450.0
+    system.session.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "1",
+                                                                     "jstatus": "63"}))
+    assert not system.stock_halted() and system.stock_last(SAMSUNG) == 60_050.0
+
+
+async def test_stock_last_seeded_from_snapshot_when_started_in_auction() -> None:
+    # 코어를 동시호가·VI 중에 켜면 직전 가중값이 없다 → 시동 초기값의 현재가 조회(t1102 현재가 =
+    # 마지막 체결가)를 직전 값으로(사용자 2026-10-28 "2번이 더 좋다"). 접속매매 호가가 오면 그쪽이
+    # 덮고, 호가가 먼저 와 있었으면 조회값으로 덮지 않는다.
+    from kp_arb.gateways.ls_ws import MarketStatus
+
+    system, _, _ = _system([])
+    system._wire()
+    system._gw.seed_last_price(SAMSUNG, Instrument.KR_STOCK, 70_300.0)  # type: ignore[attr-defined]
+    system.session.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "1",
+                                                                     "jstatus": "31"}))
+    assert system.session.stock_auction() and system.stock_last(SAMSUNG) is None
+    await system._seed_prices()
+    assert system.stock_last(SAMSUNG) == 70_300.0
+    fan = system._stock_ws.on_quote[-1]
+    fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=70_000.0, ask=70_100.0,
+              ts=0.0, bid_qty=1.0, ask_qty=1.0, market="uni"))   # 동시호가 중 호가 — 무시
+    assert system.stock_last(SAMSUNG) == 70_300.0
+    system.session.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "1",
+                                                                     "jstatus": "41"}))
+    assert not system.session.stock_auction() and system.stock_last(SAMSUNG) == 70_050.0
+    # 호가가 먼저 와 있었으면(직전 값 있음) 조회값은 안 덮는다
+    system2, _, _ = _system([])
+    system2._wire()
+    system2._stock_ws.on_quote[-1](Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
+                                         bid=70_000.0, ask=70_100.0, ts=0.0, bid_qty=1.0,
+                                         ask_qty=1.0, market="uni"))
+    system2._gw.seed_last_price(SAMSUNG, Instrument.KR_STOCK, 70_300.0)  # type: ignore[attr-defined]
+    await system2._seed_prices()
+    system2.vi_state[SAMSUNG] = "1"
+    assert system2.stock_last(SAMSUNG) == 70_050.0

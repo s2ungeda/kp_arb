@@ -447,6 +447,9 @@ class LiveSystem:
         self._row_seq = 0
         # 종목 VI 상태(vi_gubun, "0" = 해제) — LS 실시간 VI_(exec §8, 체결쏴 주식 정지)
         self.vi_state: dict[Underlying, str] = {}
+        # 주식 동시호가·VI 직전의 현재가(통합 1호가 가중값) — 호가가 멈춘 동안 이 값을 쓴다(사용자
+        # 2026-10-28 "직전 가중값으로"). 동시호가·VI가 아닐 때 통합 호가가 올 때마다 갱신.
+        self._stock_last_before_pause: dict[Underlying, float] = {}
         self._daylog_state: dict[str, str] = {}  # roll_daily_logs — 보관분의 날짜
         # 원달러선물 동시호가 대응주문(§9.1, DESIGN-fx-auction) — 감시 컨트롤러 + 발주 로그.
         self.fx_hedges: deque[dict[str, Any]] = deque(maxlen=200)
@@ -1469,6 +1472,8 @@ class LiveSystem:
             # 최신 호가판 보관(다단계 포함) 후 콜백 전달.
             self.quotes[(quote.underlying, quote.instrument, quote.market)] = quote
             self.quote_rx[(quote.underlying, quote.instrument, quote.market)] = _monotonic()
+            if quote.instrument is Instrument.KR_STOCK and quote.market == "uni":
+                self._note_stock_last(quote)
             # LS 호가 지연 계측 — UH1 한 건이 Quote 셋(uni/krx/nxt)으로 갈라져 오므로 주식은 uni만
             if quote.market != "hl" and not (
                     quote.instrument in (Instrument.KR_STOCK, Instrument.KR_ETF)
@@ -1987,15 +1992,34 @@ class LiveSystem:
         시세 지연을 막음; 오후 "통합호가 하나로", DESIGN-ls-xing §9). 통합 호가(UH1, market "uni"
         — KRX+NXT 합친 1호가와 통합 잔량)에서 `매수1 + (매도1 − 매수1) × 매수1잔량/(매도1잔량 +
         매수1잔량)`을 1원 반올림(theory.quote_price — 한쪽 호가만 있으면 그쪽, 둘 다 없으면 None).
-        **주식 동시호가(장전·장마감)나 그 종목 VI 중엔 예상체결가(UYS)**(사용자 2026-10-28 "동시호가
-        (장중 서킷브레이크·VI 등 포함) 때는 예상체결가 데이터 사용") — 없으면 None. 호가가 없으면
-        None(체결 때 남던 마지막 값은 더 없다 — 이론가·판정 보류)."""
-        if self.session.stock_auction() or self.stock_vi(underlying):
-            return self.expected_prices.get((underlying, Instrument.KR_STOCK))
+        **주식 동시호가(장전·장마감, CB 포함)나 그 종목 VI 중엔 그 직전의 가중값**(사용자 2026-10-28
+        "직전 가중값으로 수정" — 처음 표의 "예상체결가 사용"을 바꿈) — 직전 값이 없으면(시동 직후)
+        None. 호가가 없으면 None(체결 때 남던 마지막 값은 더 없다 — 이론가·판정 보류)."""
+        if self._stock_paused(underlying):
+            return self._stock_last_before_pause.get(underlying)
         q = self.quotes.get((underlying, Instrument.KR_STOCK, "uni"))
         if q is None:
             return None
-        return quote_price(q.bid, q.ask, q.bid_qty, q.ask_qty)
+        v = quote_price(q.bid, q.ask, q.bid_qty, q.ask_qty)
+        if v is not None:  # 멈추기 직전 값 — 수신 때뿐 아니라 읽을 때도 최신으로
+            self._stock_last_before_pause[underlying] = v
+        return v
+
+    def _stock_paused(self, underlying: Underlying) -> bool:
+        """주식 호가가 멈춘(단일가) 구간 — 주식 시장 동시호가(장전·장마감), 서킷브레이커(발동~회복
+        동시호가 종료 = 주식 시장 정지 표시, §8) 또는 그 종목 VI. 단일가 호가로 가중값을 내면 안
+        된다(사용자 2026-10-28 — 전엔 서킷이 빠져 있었음)."""
+        return (self.session.stock_auction() or self.stock_halted()
+                or self.stock_vi(underlying))
+
+    def _note_stock_last(self, quote: Quote) -> None:
+        """통합 호가 수신 때 "직전 가중값" 갱신 — 동시호가·VI 중에 온 호가는 안 쓴다(그 직전 값
+        유지)."""
+        if self._stock_paused(quote.underlying):
+            return
+        v = quote_price(quote.bid, quote.ask, quote.bid_qty, quote.ask_qty)
+        if v is not None:
+            self._stock_last_before_pause[quote.underlying] = v
 
     @staticmethod
     def _levels(
@@ -2252,6 +2276,10 @@ class LiveSystem:
             )
             return
         for (u, inst), price in snapshot.items():
+            if inst is Instrument.KR_STOCK:
+                # 동시호가·VI 중에 켜면 "직전 가중값"이 없다 — 조회한 현재가(마지막 체결가)를
+                # 직전 값으로(사용자 2026-10-28 "2번이 더 좋다"). 접속매매 호가가 이미 왔으면 그쪽.
+                self._stock_last_before_pause.setdefault(u, price)
             key = (u, inst, "krx")
             if key in self.trades:
                 continue  # 실시간이 먼저 왔으면 그쪽 우선
