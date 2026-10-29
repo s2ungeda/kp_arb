@@ -13,6 +13,7 @@ from kp_arb.auction_order import (
     fx_hedge_plan,
     hl_amend_price,
     hl_base_price,
+    hl_fill_summary,
     hl_mid,
     hl_order_price,
     hl_split,
@@ -43,9 +44,18 @@ def test_expected_order_price_reverses_spread_and_snaps_to_futures_tick() -> Non
     assert hl_mid(1332.0, 1333.0) == 1332.5 and hl_mid(None, 1.0) is None
 
 
-def test_row_fires_and_fire_order_top_down_buy_then_sell() -> None:
+def test_hl_fill_summary_weighted_average() -> None:
+    # §5 체결 표시(2026-10-29): 주문별 (체결수량, 평균체결가) → (합, 수량 가중 평균). 0 수량은 뺀다.
+    assert hl_fill_summary([]) == (0.0, None)
+    assert hl_fill_summary([(0.0, 1332.0), (7.5, 0.0)][:1]) == (0.0, None)
+    qty, avg = hl_fill_summary([(7.5, 1332.5), (2.5, 1331.3), (0.0, 1333.0)])
+    assert qty == 10.0 and abs(avg - 1332.2) < 1e-9  # type: ignore[operator]
+
+
+def test_row_fires_and_fire_order_top_down_sell_then_buy() -> None:
     # §3: 매수 = 예상주문가 > 예상체결가, 매도 = 예상주문가 < 예상체결가(같으면 안 냄). 순서는 화면
-    # 위→아래(매수 1~8, 매도 1~8), 켜진 행 중 수량·스프레드가 있는 행만.
+    # 위→아래(매도 1~8, 매수 1~8 — 호가창처럼 매도 위, 사용자 2026-10-29), 켜진 행 중
+    # 수량·스프레드가 있는 행만.
     assert row_fires(Side.BUY, 1_767_000, 1_766_000)
     assert not row_fires(Side.BUY, 1_766_000, 1_766_000)
     assert row_fires(Side.SELL, 1_765_000, 1_766_000)
@@ -56,7 +66,7 @@ def test_row_fires_and_fire_order_top_down_buy_then_sell() -> None:
     b.buy[5] = Row(None, 10, True)       # 스프레드 없음 — 뺀다
     b.sell[1] = Row(-0.1, 20, True)
     b.sell[0] = Row(-0.1, 20, False)     # 꺼짐
-    assert fire_order(b) == [(Side.BUY, 0), (Side.BUY, 2), (Side.SELL, 1)]
+    assert fire_order(b) == [(Side.SELL, 1), (Side.BUY, 0), (Side.BUY, 2)]
 
 
 def test_fx_hedge_net_quantity_price_and_split() -> None:

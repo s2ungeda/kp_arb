@@ -2,6 +2,7 @@
 from kp_arb.auction_order_screen import (
     book_texts,
     hl_buttons_enabled,
+    hl_fill_text,
     hl_line,
     num_text,
     pct2,
@@ -52,6 +53,13 @@ def test_book_to_entry_texts_and_status_lines() -> None:
                          "remaining": 7.5}) == "HL a 접수 #9 7.5@1333.0 잔량 7.5"
     assert hl_line("b", {"status": "실패", "error": "x"}) == "HL b 실패 x"
     assert hl_buttons_enabled({"open": True}) and not hl_buttons_enabled({"open": False})
+    # HL체결 한 줄(§5 체결 표시, 2026-10-29): 낸 주문 없음 "-", 체결 전 "매도 0/30", 전량이면 '완료'
+    assert hl_fill_text(None) == "-" and hl_fill_text({"total": 0.0}) == "-"
+    assert hl_fill_text({"side": "sell", "qty": 0.0, "total": 30.0, "avg": None}) == "매도 0/30"
+    assert hl_fill_text({"side": "sell", "qty": 10.0, "total": 30.0, "avg": 1332.2}) == (
+        "매도 10/30 평균 1332.2")
+    assert hl_fill_text({"side": "buy", "qty": 30.0, "total": 30.0, "avg": 1332.25}) == (
+        "매수 30/30 평균 1332.25 완료")
 
 
 def test_px_style_marks_rows_expected_to_fire() -> None:

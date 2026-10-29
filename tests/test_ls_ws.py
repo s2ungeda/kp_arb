@@ -744,7 +744,8 @@ async def test_nxt_quote_and_vi_event() -> None:
     vi_on = json.dumps({"header": {"tr_cd": "VI_", "tr_key": SAMSUNG_CODE},
                         "body": {"vi_gubun": "1", "shcode": SAMSUNG_CODE, "time": "092415",
                                  "svi_recprice": "70000", "dvi_recprice": "0",
-                                 "vi_trgprice": "70500", "ref_shcode": SAMSUNG_CODE}})
+                                 "vi_trgprice": "70500", "ref_shcode": SAMSUNG_CODE,
+                                 "exchname": "KRX"}})
     vi_off = json.dumps({"header": {"tr_cd": "VI_", "tr_key": SAMSUNG_CODE},
                          "body": {"vi_gubun": "0", "shcode": SAMSUNG_CODE, "time": "092700"}})
     session = FakeConnection([nh1, vi_on, vi_off])
@@ -762,6 +763,10 @@ async def test_nxt_quote_and_vi_event() -> None:
     assert quotes[0].market == "nxt" and quotes[0].bid == 70_000 and quotes[0].bid_qty == 10
     assert [(v.gubun, v.active) for v in vis] == [("1", True), ("0", False)]
     assert vis[0].underlying is Underlying.SAMSUNG and vis[0].time == "092415"
+    # 2026-10-29: 거래소명·발동가·기준가는 로그 확인용으로 실어 보낸다(없으면 빈 문자열).
+    assert (vis[0].exchange, vis[0].trigger_price) == ("KRX", "70500")
+    assert (vis[0].static_base, vis[0].dynamic_base) == ("70000", "0")
+    assert (vis[1].exchange, vis[1].trigger_price) == ("", "")
     assert any(f"N{SAMSUNG_CODE}   " in m and '"NH1"' in m for m in session.sent)
     assert any(f"N{SAMSUNG_CODE}   " in m and '"NS3"' in m for m in session.sent)
     assert any(f'"{SAMSUNG_CODE}"' in m and '"VI_"' in m for m in session.sent)

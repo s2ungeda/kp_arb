@@ -31,6 +31,7 @@ from .auction_order import (
     fx_hedge_plan,
     hl_amend_price,
     hl_base_price,
+    hl_fill_summary,
     hl_mid,
     hl_order_price,
     hl_side,
@@ -102,6 +103,8 @@ class HlRow:
     qty: float = 0.0
     status: str = ""     # "접수" | "실패" | "정정중" | "취소" | "끝"
     error: str | None = None
+    # 정정으로 바뀌기 전 주문번호들 — 체결 표시(§5, 2026-10-29)는 원주문 체결 + 신규 체결을 합친다
+    past_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -125,6 +128,7 @@ class DayState:
     hl_done: bool = False
     hl: dict[str, HlRow] = field(default_factory=dict)
     hl_base: float | None = None
+    hl_total: float = 0.0  # 이 바퀴 4건의 낸 수량 합(체결 표시 분모, §5 2026-10-29)
     note: str = ""
     fx_run: bool = False   # 예약실행(2) — 저장하지 않는다(매일 켠다)
     hl_run: bool = False   # 예약실행(3)
@@ -520,6 +524,8 @@ class AuctionOrderEngine:
         d.hl_base = base
         book = self.book(u)
         parts = hl_split(contracts * HL_PER_CONTRACT, sz)
+        d.hl_total = float(sum(parts))
+        d.hl = {}  # 새 바퀴의 4건만 — 체결 표시·손잡이 모두 이번 발주 기준
         intents: list[OrderIntent] = []
         names: list[str] = []
         for name, qty in zip(HL_ROWS, parts, strict=False):
@@ -607,6 +613,8 @@ class AuctionOrderEngine:
             if self._save:
                 self._save()
             return f"신규주문 실패 — {row.error}"
+        if row.order_id and row.order_id != str(new_oid):
+            row.past_ids.append(row.order_id)  # 원주문 체결분은 체결 표시에 계속 합친다
         row.order_id, row.price, row.qty, row.status = str(new_oid), new_px, remaining, "접수"
         book.hl_orders[name] = str(new_oid)
         if self._save:
@@ -654,6 +662,16 @@ class AuctionOrderEngine:
                     "remaining": float(tracked.remaining_qty) if tracked is not None else None,
                     "open": bool(tracked.is_open) if tracked is not None else False,
                     "status": row.status if row else "", "error": row.error if row else None}
+            # 체결 표시(§5, 사용자 2026-10-29): 4건(정정 전 원주문 포함)의 체결수량 합·평균체결가
+            per_order: list[tuple[float, float]] = []
+            for row in d.hl.values():
+                for oid2 in [*row.past_ids, row.order_id]:
+                    t = self._system.order_book.order(oid2) if oid2 else None
+                    if t is not None:
+                        per_order.append((float(t.filled_qty), float(t.avg_fill_price)))
+            filled_qty, avg_px = hl_fill_summary(per_order)
+            hl_fill = {"side": next((r.side for r in d.hl.values() if r.side), ""),
+                       "qty": filled_qty, "total": d.hl_total, "avg": avg_px}
             placed = [PlacedOrder(Side(s), r.price, r.qty) for (s, _i), r in d.rows.items()
                       if r.order_id and r.price is not None]
             net = (net_exposure(*fillable_qty(placed, inp["sf_expected"]))
@@ -691,6 +709,7 @@ class AuctionOrderEngine:
                 "fx_sent": list(d.fx_sent), "fx_note": d.fx_note,
                 "fills": {oid: {"side": s, "qty": q} for oid, (s, q) in d.fills.items()},
                 "hl_run": d.hl_run, "hl_done": d.hl_done, "hl_base": d.hl_base, "hl": hl_rows,
+                "hl_fill": hl_fill,
                 "note": d.note, "auction": self._in_auction(), "test": d.test,
                 "testing": self._testing(d),
             }

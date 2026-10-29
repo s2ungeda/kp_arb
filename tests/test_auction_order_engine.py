@@ -144,40 +144,46 @@ async def test_process1_goes_top_down_once_skipping_rows_that_do_not_qualify() -
     b = screen.book(U.value)
     # 환 1327.30·HL 중간 1332.5·S 1,766,000·이론가 1,770,000 → s 0.003 → 매수 1,767,000
     # (> 예상 1,766,000 ✓)
-    b.buy[0] = Row(0.003, 20, True)        # 나감
+    # 순서는 화면대로 매도 1~8 → 매수 1~8(호가창처럼 매도 위, 사용자 2026-10-29)
+    b.sell[0] = Row(-0.001, 5, True)       # 매도 1,775,000 ≥ 예상 → 건너뜀
+    b.sell[1] = Row(0.002, 5, True)        # 매도 1,770,000(올림) ≥ 1,766,000 → 건너뜀
+    b.sell[2] = Row(0.005, 5, True)        # 매도 1,764,000(올림) < 1,766,000 → 나감
+    b.buy[0] = Row(0.003, 20, True)        # 1,767,000 — 차례엔 예상체결가가 올라 건너뜀
     b.buy[1] = Row(0.004, 10, True)        # 1,765,000 ≤ 1,766,000 → 건너뜀
     b.buy[2] = Row(0.003, 7, True)         # 1,767,000 — 차례엔 예상체결가가 올라 건너뜀
-    b.sell[0] = Row(-0.001, 5, True)       # 매도 1,775,000 ≥ 예상 → 건너뜀
-    b.sell[1] = Row(0.002, 5, True)        # 매도 1,770,000(올림) — 차례 전 예상체결가가 오르면 나감
     b.settings.ls_itv_ms = 50              # 낸 주문 뒤 인터벌 — 그 사이에 예상체결가가 바뀐다
     eng._tick(U)
     assert not eng._day(U).ls_started       # 15:44:55.000 < 주문시각 15:44:55.100
-    # 주문시각 전: 지금 값으로 나갈 행만 표시(사용자 2026-10-26 색 표시) — 매수1·매수3(1,767,000 >
-    # 1,766,000), 매도2는 1,770,000 ≥ 라 아님
-    assert eng.live_snapshot()[U.value]["fires"] == {"buy:0": True, "buy:2": True}
+    # 주문시각 전: 지금 값으로 나갈 행만 표시(사용자 2026-10-26 색 표시) — 매도3(1,764,000 <
+    # 1,766,000)·매수1·매수3(1,767,000 > 1,766,000), 매도2는 1,770,000 ≥ 라 아님
+    assert eng.live_snapshot()[U.value]["fires"] == {"sell:2": True, "buy:0": True,
+                                                     "buy:2": True}
     clk.wall = _wall(15, 44, 55.12)
     eng._tick(U)
     await _settle(4)
     d = eng._day(U)
     assert d.ls_started
-    assert [(i.tag, i.qty, i.price) for i in sys_.placed] == [("매수1", 20, 1_767_000.0)]
-    # 매수1 접수 뒤 인터벌 동안 예상체결가가 1,771,000으로 오르면 다음 행들은 그 값으로 판정한다
+    assert [(i.tag, i.qty, i.price) for i in sys_.placed] == [("매도3", 5, 1_764_000.0)]
+    # 매도3 접수 뒤 인터벌 동안 예상체결가가 1,771,000으로 오르면 다음 행들은 그 값으로 판정한다
+    # — 주문시각 전엔 "나갈 행"이던 매수1·매수3도 차례엔 건너뛴다
     sys_.expected_prices[(U, SF)] = 1_771_000.0
     await asyncio.sleep(0.15)
-    assert [i.tag for i in sys_.placed] == ["매수1", "매도2"]   # 매도2 1,770,000 < 1,771,000
+    assert [i.tag for i in sys_.placed] == ["매도3"]
+    assert d.rows[("buy", 0)].skipped.startswith("1,767,000 ≤")
     assert d.rows[("buy", 1)].skipped.startswith("1,765,000 ≤")
     assert d.rows[("buy", 2)].skipped.startswith("1,767,000 ≤")
     assert d.rows[("sell", 0)].skipped.startswith("1,775,000 ≥")
-    assert d.ls_done and d.note == "프로세스1 끝 — 발주 2, 실패 0, 건너뜀 3 → 예약 전부 끔"
+    assert d.rows[("sell", 1)].skipped.startswith("1,770,000 ≥")
+    assert d.ls_done and d.note == "프로세스1 끝 — 발주 1, 실패 0, 건너뜀 5 → 예약 전부 끔"
     assert not any(r.on for r in b.buy + b.sell)   # 끝나면 예약 행 자동 끔(화면 잠금 해제)
     snap = eng.live_snapshot()[U.value]
-    assert snap["rows"]["buy:0"]["order_id"] == "O1" and snap["prices"]["buy:0"] == 1_767_000.0
-    assert snap["rows"]["buy:1"]["skipped"] and snap["ls_done"]
+    assert snap["rows"]["sell:2"]["order_id"] == "O1" and snap["prices"]["sell:2"] == 1_764_000.0
+    assert snap["rows"]["buy:0"]["skipped"] and snap["ls_done"]
     assert snap["fires"] == {}                       # 이미 본 행은 "나갈 행" 표시에서 빠진다
     # 건너뛴 행은 뒤에 조건이 맞아져도 다시 안 낸다(한 번만)
     sys_.expected_prices[(U, SF)] = 1_700_000.0
     await _settle(8)
-    assert len(sys_.placed) == 2
+    assert len(sys_.placed) == 1
 
 
 async def test_process1_fails_rows_rejected_after_market_close_without_retry() -> None:
@@ -206,7 +212,7 @@ async def test_process2_hedges_net_fillable_qty_in_splits() -> None:
     b.settings.fx_unit = 20
     eng._tick(U)
     await _settle(8)
-    assert [i.tag for i in sys_.placed] == ["매수1", "매수2", "매도2"]
+    assert [i.tag for i in sys_.placed] == ["매도2", "매수1", "매수2"]  # 매도 행이 위(10-29)
     eng.set_run(U, "fx", True)
     clk.wall = _wall(15, 44, 58.25)
     # 예상체결가 1,766,500: 매수 둘(25계약)·매도2(1,765,000 < 1,766,500)는 체결될 것 → 순 매수
@@ -267,6 +273,15 @@ async def test_process3_fills_to_four_hl_orders_then_amend_and_cancel() -> None:
     snap = eng.live_snapshot()[U.value]["hl"]
     assert snap["a"]["order_id"] == "O6" and snap["a"]["open"] and snap["a"]["remaining"] == 7.5
     assert snap["c"]["status"] == "취소" and snap["c"]["order_id"] is None
+    # 체결 표시(§5, 2026-10-29): b 전량 7.5@1332.5 + a 정정 신규(O6) 2.5@1331.3 → 10/30, 평균 1332.2
+    # (정정 전 원주문 O2의 체결도 a 몫으로 합친다 — 여기선 0)
+    assert eng.live_snapshot()[U.value]["hl_fill"] == {"side": "sell", "qty": 0.0,
+                                                       "total": 30.0, "avg": None}
+    sys_.order_book.on_fill(Fill(fill_id="h1", order_id="O3", qty=7.5, price=1332.5, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="h2", order_id="O6", qty=2.5, price=1331.3, ts=0))
+    fill = eng.live_snapshot()[U.value]["hl_fill"]
+    assert (fill["side"], fill["qty"], fill["total"]) == ("sell", 10.0, 30.0)
+    assert abs(fill["avg"] - 1332.2) < 1e-9
     # 늦게 온 체결은 다시 HL을 내지 않는다(하루 한 번)
     sys_.on_fill[0](Fill(fill_id="x3", order_id="O1", qty=1.0, price=1_767_000.0, ts=0,
                          account=Account.KR_DERIV))
@@ -280,6 +295,9 @@ async def test_process3_fills_to_four_hl_orders_then_amend_and_cancel() -> None:
     await asyncio.sleep(FILL_DEBOUNCE_S + 0.05)
     again = [i for i in sys_.placed if i.venue is Venue.HYPERLIQUID][6:]
     assert len(again) == 4 and sum(i.qty for i in again) == 20.0 and d.hl_done and not d.hl_run
+    # 새 바퀴 발주 뒤 체결 표시는 새 4건 기준으로 비워진다(전 바퀴 체결은 안 섞임)
+    assert eng.live_snapshot()[U.value]["hl_fill"] == {"side": "sell", "qty": 0.0,
+                                                       "total": 20.0, "avg": None}
 
 
 async def test_hl_not_fired_when_run_off_and_net_zero() -> None:

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
@@ -167,10 +168,11 @@ def row_fires(side: Side, order_px: float, sf_expected: float) -> bool:
 
 
 def fire_order(book: AuctionBook) -> list[tuple[Side, int]]:
-    """발주 순서(§3, ver2 P25) — 켜진 행을 **위에서 아래로**(화면 순: 매수 1~8, 매도 1~8).
-    수량·스프레드가 없는 행은 켜져 있어도 뺀다(화면이 켜기를 막지만 저장 복원 뒤를 대비)."""
+    """발주 순서(§3, ver2 P25) — 켜진 행을 **위에서 아래로**(화면 순: 매도 1~8, 매수 1~8 —
+    호가창처럼 매도 위·매수 아래, 사용자 2026-10-29). 수량·스프레드가 없는 행은 켜져 있어도
+    뺀다(화면이 켜기를 막지만 저장 복원 뒤를 대비)."""
     out: list[tuple[Side, int]] = []
-    for side in (Side.BUY, Side.SELL):
+    for side in (Side.SELL, Side.BUY):
         for i, row in enumerate(book.rows_of(side)):
             if row.on and row.valid():
                 out.append((side, i))
@@ -256,6 +258,22 @@ def hl_base_price(bid: float | None, ask: float | None, n_sig_figs: int | None,
     if mid is None:
         return None
     return snap_nearest(mid, hl_grid_step(mid, n_sig_figs, mantissa, sz_decimals))
+
+
+def hl_fill_summary(fills: Iterable[tuple[float, float]]) -> tuple[float, float | None]:
+    """HL 4건(정정으로 바뀐 주문 포함)의 (체결수량 합, 평균체결가 — 수량 가중)(§5 체결 표시,
+    사용자 2026-10-29). 입력은 주문별 (체결수량, 그 주문의 평균체결가). 체결이 없으면 (0, None).
+    수량 0 이하인 항목은 뺀다."""
+    qty = 0.0
+    amount = 0.0
+    for q, px in fills:
+        if q <= 0:
+            continue
+        qty += q
+        amount += q * px
+    if qty <= 0:
+        return 0.0, None
+    return qty, amount / qty
 
 
 def hl_order_price(base: float, offset: float, side: Side, sz_decimals: int | None) -> float:

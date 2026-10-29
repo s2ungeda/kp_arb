@@ -94,8 +94,9 @@ FUTURES_FILL_TRS: tuple[str, ...] = ("O01", "C01", "H01")                  # 선
 ACCOUNT_TRS: tuple[str, ...] = STOCK_FILL_TRS + FUTURES_FILL_TRS
 STATUS_TR = "JIF"
 # 종목 VI(변동성완화장치) 발동/해제 실시간 — tr_key 6자리 종목코드, body {vi_gubun, shcode,
-# time, svi_recprice, dvi_recprice, vi_trgprice, ref_shcode}(LS Open API 카탈로그 예시,
-# 2026-09-17 확인). vi_gubun: "0" 해제, 그 외(1 정적·2 동적·3 둘 — xingAPI 코드표 추정) 발동.
+# time, svi_recprice, dvi_recprice, vi_trgprice, ref_shcode, exchname(거래소명 3자)}
+# (Res 파일 C:\meme\Res\VI_.res, 2026-10-29 확인). vi_gubun: "0" 해제, "1" 정적 발동,
+# "2" 동적 발동, "3" 정적&동적(Res 코드표). 운영 수신은 미실측 — 거래소명·가격은 로그 확인용.
 VI_TR = "VI_"
 
 
@@ -130,6 +131,10 @@ class ViEvent(BaseModel):
     gubun: str
     active: bool
     time: str = ""
+    exchange: str = ""  # 거래소명(exchname, 3자) — KRX·NXT 어느 쪽 VI인지 로그 확인용(2026-10-29)
+    trigger_price: str = ""  # VI 발동가(vi_trgprice)
+    static_base: str = ""  # 정적 VI 기준가(svi_recprice)
+    dynamic_base: str = ""  # 동적 VI 기준가(dvi_recprice)
 
 
 def _depth(body: dict[str, Any], px_prefix: str, qty_prefix: str,
@@ -659,15 +664,22 @@ class LSWebSocketClient:
         # 알 수 없는 tr_cd는 무시
 
     def _parse_vi(self, msg: dict[str, Any]) -> ViEvent | None:
-        """VI_ body → ViEvent. 취급 종목이 아니면 None. 필드는 카탈로그 예시 기준(미실측)."""
+        """VI_ body → ViEvent. 취급 종목이 아니면 None. 필드는 Res(VI_.res) 기준, 운영 수신 미실측
+        — 거래소명·발동가·기준가는 판정에 안 쓰고 로그 확인용으로만 실어 보낸다(2026-10-29)."""
         body = msg.get("body") or {}
         code = _norm_code(str(body.get("shcode") or msg.get("header", {}).get("tr_key", "")))
         underlying = Underlying.from_krx_code(code)
         if underlying is None:
             return None
         gubun = str(body.get("vi_gubun", "")).strip()
+
+        def field(name: str) -> str:
+            return str(body.get(name, "")).strip()
+
         return ViEvent(underlying=underlying, code=code, gubun=gubun,
-                       active=gubun not in ("", "0"), time=str(body.get("time", "")))
+                       active=gubun not in ("", "0"), time=field("time"),
+                       exchange=field("exchname"), trigger_price=field("vi_trgprice"),
+                       static_base=field("svi_recprice"), dynamic_base=field("dvi_recprice"))
 
     def _parse_fx_spot(self, msg: dict[str, Any]) -> float | None:
         """CUR(원달러 현물환율) body → 환율. 필드는 ``price``(현재가, 실측 2026-08-21).

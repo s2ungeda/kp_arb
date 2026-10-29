@@ -873,13 +873,16 @@ class LiveSystem:
         return self.vi_state.get(underlying, "0") not in ("", "0")
 
     def _on_vi(self, ev: Any) -> None:
-        """VI_ 수신 → 종목별 vi_gubun 보관 + 로그(발동/해제 모두 — 코드표 실측 확인용)."""
+        """VI_ 수신 → 종목별 vi_gubun 보관 + 로그(발동/해제 모두 — 운영 미실측이라 거래소명·
+        발동가·기준가까지 찍어 첫 발동 때 포맷을 확인, 사용자 2026-10-29). 코드표는 Res 확인."""
         import logging
 
         self.vi_state[ev.underlying] = ev.gubun
         logging.getLogger("kp_arb.core").warning(
-            "VI %s %s 구분 %s(0 해제·1 정적·2 동적·3 둘 — 추정) %s",
-            "해제" if not ev.active else "발동", ev.underlying.value, ev.gubun, ev.time)
+            "VI %s %s 구분 %s(0 해제·1 정적·2 동적·3 둘) %s 거래소 %r 발동가 %s 기준가 %s/%s",
+            "해제" if not ev.active else "발동", ev.underlying.value, ev.gubun, ev.time,
+            getattr(ev, "exchange", ""), getattr(ev, "trigger_price", ""),
+            getattr(ev, "static_base", ""), getattr(ev, "dynamic_base", ""))
 
     async def query_credit_loans(self, underlying: Underlying) -> Sequence[tuple[str, float]]:
         """신용융자 (대출일, 수량) 조회 — 주식 신용 세트의 상환 선주문 LoanDt용(2026-09-18)."""

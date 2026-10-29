@@ -1,9 +1,9 @@
 """동시호가 주문 화면(DESIGN-auction-order.md §1·§2·§4·§5, ver2 2026-10-22) — 화면 먼저(코어 연결
 전).
 
-배치는 엑셀 ver2 셀 자리를 따른다: 윗줄(종목·월물·호가단위·적) / 왼쪽 예약주문 16행(매수 8·매도 8:
-주문Sprd·수량·예상주문가·예약주문 버튼) / 오른쪽 주문시각 6칸 → 원달러 대응 설정 행 → HL주문설정
-a~d.
+배치는 엑셀 ver2 셀 자리를 따른다: 윗줄(종목·월물·호가단위·적) / 왼쪽 예약주문 16행(매도 8 위·
+매수 8 아래: 주문Sprd·수량·예상주문가·예약주문 버튼) / 오른쪽 주문시각 6칸 → 원달러 대응 설정 행 →
+HL주문설정 a~d.
 `--preview`로 코어 없이 뜬다. 코어 연결(§9-3, 2026-10-26): 행·설정은 예약 버튼·예약실행·정정·'적'을
 누를 때와 종목 바꿀 때·닫을 때 코어로(auction_rows / auction_settings — 체결쏴 결정 74 방식),
 예약실행은 auction_run, 정정·취소는 auction_amend/auction_cancel.
@@ -34,9 +34,9 @@ SAMPLE_SELL = (("-0.1", "20"), ("-0.1", "20"), ("-0.15", "15"), ("-0.15", "15"),
 
 
 def side_label(side: str) -> str:
-    """예약주문 버튼 글 — 매수 행 "정(HL매도)", 매도 행 "역(HL매수)"(ver2 D23·D31, 뜻은
-    매수/매도)."""
-    return "정(HL매도)" if side == "buy" else "역(HL매수)"
+    """예약주문 버튼 글 — 매도 행 "LS매도", 매수 행 "LS매수"(사용자 2026-10-29; ver2 D23·D31의
+    "정(HL매도)"/"역(HL매수)"는 버림)."""
+    return "LS매수" if side == "buy" else "LS매도"
 
 
 def row_missing(spread_text: str, qty_text: str) -> str | None:
@@ -214,6 +214,23 @@ def px_style(row: Mapping[str, Any] | None, fires: bool) -> tuple[str, str]:
     return ("black", "white") if fires else ("gray25", "SystemButtonFace")
 
 
+def hl_fill_text(info: Mapping[str, Any] | None) -> str:
+    """HL주문설정 아래 'HL체결' 한 줄(§5 체결 표시, 사용자 2026-10-29) — "매도 30/30 평균 1332.2
+    완료". 낸 주문이 없으면 "-", 체결 전이면 "매도 0/30". 순수."""
+    if not info or not info.get("total"):
+        return "-"
+    total = float(info["total"])
+    qty = float(info.get("qty") or 0.0)
+    word = {"buy": "매수", "sell": "매도"}.get(str(info.get("side") or ""), "")
+    text = f"{word} {qty:g}/{total:g}".strip()
+    avg = info.get("avg")
+    if isinstance(avg, int | float) and qty > 0:
+        text += f" 평균 {avg:g}"
+    if qty >= total - 1e-9:
+        text += " 완료"
+    return text
+
+
 def hl_buttons_enabled(row: Mapping[str, Any]) -> bool:
     """정정·취소 버튼 — 그 행의 HL 주문이 열려 있을 때만(§5 접수 확인 뒤 활성). 순수."""
     return bool(row.get("open"))
@@ -226,6 +243,7 @@ def any_reserved(res_on: Mapping[tuple[str, int], bool]) -> bool:
 
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
+    import os
     import queue
     import sys
     import threading
@@ -333,11 +351,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     w["test"] = tk.Checkbutton(top, text="시험(현재가)", variable=w["test_var"],
                                fg="dark red", font=T.FONT_LABEL)
     # 윗줄 오른쪽 끝 = 현재 시각(PC 시계, 주문시각과 같은 기준 — 사용자 2026-10-26), 그 왼쪽에 시험
-    # 체크. 배포판(exe)에도 당분간 둔다(사용자 2026-10-27 "당분간 포함" — 10-26 "배포 때 제외"를
-    # 되돌림). 다시 빼려면 아래 pack을 `if not getattr(sys, "frozen", False):`로 감싼다.
+    # 체크. 시험 체크와 아래 시험 매수/매도 띠는 **화면에서 뺐다**(사용자 2026-10-29 "테스트
+    # 완료했으니 제거" — 10-26 "배포 때 제외" → 10-27 "당분간 포함"의 매듭). 코어 쪽 시험 모드·가상
+    # 체결은 그대로 있어 환경변수 KP_AUCTION_TEST=1로 켜면 다시 보인다(개발 전용).
+    show_test = os.environ.get("KP_AUCTION_TEST") == "1"
     w["clock"] = tk.Label(top, text="--:--:--", font=T.FONT_NUM_LG, fg="gray25")
     w["clock"].pack(side="right")
-    w["test"].pack(side="right", padx=(0, 10))
+    if show_test:
+        w["test"].pack(side="right", padx=(0, 10))
 
     def tick_clock() -> None:
         try:
@@ -379,8 +400,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     def paint_res(key: tuple[str, int]) -> None:
         on = bool(w["res_on"].get(key))
-        # 색은 버튼 글의 HL 방향 기준(사용자 2026-10-23): 정(HL매도) 파랑, 역(HL매수) 빨강
-        color = T.C_SELL if key[0] == "buy" else T.C_BUY
+        # 색은 버튼 글(LS 쪽) 기준: LS매수 빨강, LS매도 파랑(2026-10-29 글을 LS로 바꾸며 10-23의
+        # HL 방향 기준 색도 같이 뒤집음)
+        color = T.C_BUY if key[0] == "buy" else T.C_SELL
         # 평소엔 글자만 그 색(파랑/빨강), 켜지면 바탕이 그 색·글자 흰색(사용자 2026-10-26)
         bg = color if on else "SystemButtonFace"
         fg = "white" if on else color
@@ -421,9 +443,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         send_rows(force=True)
 
     r = 1
-    for side, samples in (("buy", SAMPLE_BUY), ("sell", SAMPLE_SELL)):
-        if side == "sell":
-            tk.Frame(left, height=6).grid(row=r, column=0, columnspan=4)  # 매수·매도 사이 빈 줄
+    # 매도 8행이 위, 매수 8행이 아래 — 호가창 관례(사용자 2026-10-29; ver2 목업은 매수가 위였으나
+    # 목업 오류)
+    for side, samples in (("sell", SAMPLE_SELL), ("buy", SAMPLE_BUY)):
+        if side == "buy":
+            tk.Frame(left, height=6).grid(row=r, column=0, columnspan=4)  # 매도·매수 사이 빈 줄
             r += 1
         for i in range(ROWS_PER_SIDE):
             key = (side, i)
@@ -439,7 +463,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 cells[k].grid(row=r, column=c, padx=1, pady=0, sticky="nsew")
             # 행 높이는 버튼이 정한다(입력칸 24px보다 큼) — 버튼 글꼴을 한 단계 작게(10pt) 해서
             # 행을 낮춘다(사용자 2026-10-23 "높이 10% 더")
-            idle_fg = T.C_SELL if side == "buy" else T.C_BUY  # 평소 글자색(사용자 2026-10-26)
+            idle_fg = T.C_BUY if side == "buy" else T.C_SELL  # 평소 글자색(LS 기준, 10-29)
             btn = tk.Button(left, text=side_label(side), width=10, padx=0, pady=0, bd=1,
                             highlightthickness=0, font=(T.FAMILY, 10), fg=idle_fg,
                             activeforeground=idle_fg, command=partial(toggle_res, key))
@@ -550,12 +574,20 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         put(cancel, rr, 4, sticky="ew")
         w["hl"][name] = {"off": off, "pt": pt, "amend": amend, "cancel": cancel}
 
+    # --- HL체결 한 줄(§5 체결 표시, 사용자 2026-10-29 "체결수량과 평균체결가를 HL주문설정 아래 남는
+    # 공간에"): 이 바퀴 4건의 체결수량 합/낸 수량, 평균체결가, 전량이면 '완료' ---
+    fb = tk.Frame(right)
+    fb.grid(row=3, column=0, sticky="w", pady=(4, 0))
+    tk.Label(fb, text="HL체결", anchor="w", font=T.FONT_LABEL).grid(row=0, column=0, sticky="w")
+    w["hl_fill"] = tk.Label(fb, text="-", anchor="w", font=T.FONT_NUM_LG)
+    w["hl_fill"].grid(row=0, column=1, sticky="w", padx=GAP)
+
     # --- 두 묶음의 세로선 맞추기(사용자 2026-10-23 "정렬이 안 되어 있네", 목업 Form2): 왼쪽(이름+
     # 입력칸) 끝과 오른쪽(예약실행·정정/취소) 시작을 같은 x에 — 칸 수가 달라(2 vs 3, 2 vs 2) grid의
     # uniform으로는 안 되니 자연 폭을 잰 뒤 좁은 쪽 마지막 칸을 minsize로 늘린다. 그러면 예약실행
     # 둘의 폭도 같아진다.
     right.update_idletasks()
-    # HL주문설정 묶음의 윗선(제목 글 가운데를 지나는 테두리)을 왼쪽 첫 역(HL매수) 버튼의 위에
+    # HL주문설정 묶음의 윗선(제목 글 가운데를 지나는 테두리)을 왼쪽 아래 묶음(LS매수) 첫 버튼의 위에
     # 맞춘다(사용자 2026-10-23 빨간 줄) — 위 묶음 간격(pady)을 그만큼 늘린다. 이미 더 아래면 그대로.
     from tkinter import font as tkfont
 
@@ -569,7 +601,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         return y
 
     title_half = tkfont.Font(font=T.FONT_LABEL).metrics("linespace") // 2
-    gap = y_in_root(w["res"][("sell", 0)]) - (y_in_root(p3) + title_half)
+    gap = y_in_root(w["res"][("buy", 0)]) - (y_in_root(p3) + title_half)
     if gap > 0:
         p3.grid_configure(pady=(6 + gap, 0))
 
@@ -642,9 +674,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
 
     # --- 3단계 시험용 가상 체결(§7a, 사용자 2026-10-28): HL주문설정 아래 오른쪽 — 매수·매도
     # 계약수를 체결된 셈 치고(주식선물 실주문 없음) 확인창을 거쳐 코어 auction_test_order.
-    # HL 예약실행이 켜져 있어야 하고, 바로 3단계가 나간다(HL은 실거래).
+    # HL 예약실행이 켜져 있어야 하고, 바로 3단계가 나간다(HL은 실거래). 화면에는 KP_AUCTION_TEST=1일
+    # 때만 보인다(사용자 2026-10-29 "테스트 완료했으니 제거").
     tb = tk.Frame(right)
-    tb.grid(row=3, column=0, sticky="e", pady=(4, 0))
+    if show_test:
+        tb.grid(row=4, column=0, sticky="e", pady=(4, 0))
     # '시험 허용' 체크 — 켜져 있을 때만 버튼이 살고, 버튼을 누르는 순간 풀린다(사용자 2026-10-28
     # "체크 되어 있을 때만 시험매수/매도, 클릭 시 체크 해제"). 창을 열면 꺼짐, 저장 안 함.
     w["test_allow_var"] = tk.BooleanVar(value=False)
@@ -926,6 +960,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 if row.get("status") and cur["seen_hl"].get(n) != sig:
                     cur["seen_hl"][n] = sig
                     w["status"].show(hl_line(n, row))
+            w["hl_fill"].config(text=hl_fill_text(live.get("hl_fill")))
             if live.get("note") and live["note"] != cur["note"]:
                 cur["note"] = live["note"]
                 w["status"].show(live["note"])
@@ -1015,6 +1050,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         w["mon_rev"].config(text="-0.12")
         w["mon_fwd"].config(text="0.21")
         w["net_qty"].config(text="+35")
+        w["hl_fill"].config(text=hl_fill_text({"side": "sell", "qty": 22.5, "total": 30.0,
+                                               "avg": 1332.2}))
         for (side, i), cells in w["rows"].items():
             sign = 1 if side == "buy" else -1
             cells["px"].config(text=f"{1_766_000 + (3 - i) * 1000 * sign:,}")
