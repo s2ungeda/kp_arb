@@ -5,16 +5,22 @@ import time
 
 from kp_arb.domain.enums import Side, Underlying
 from kp_arb.nxt_open import (
+    AutoExit,
     NxtOpenScreen,
     NxtOpenSettings,
     Tier,
     accept_t0,
     apply_settings,
+    base_due,
     day_over,
     disparity,
+    hl_current,
     judge,
     level_price,
+    opposite,
     order_price,
+    range_block,
+    range_limits,
     remaining_tiers,
     run_block_error,
     screen_from_dict,
@@ -143,6 +149,21 @@ def test_settings_roundtrip_and_validation() -> None:
     assert back.start_s == 1.0 and back.end_s == 4.0 and back.ref_qty == 100
     assert back.entries[0] == Tier(0.012, 100, 0.009) and back.exits[2] == Tier(-0.010, 100, -0.008)
     assert back.run_entry is False and back.run_exit is False  # 실행은 복원 안 함
+    # 2026-10-29 추가 칸(저장·복원만): HL기준시간·범위제한, 단의 청산가·자동청산
+    st.hl_base_hms, st.range_limit = "07:59:55", 0.03
+    st.entries[0] = Tier(0.012, 100, 0.009, 0.005, True)
+    back2 = settings_from_dict(asdict(st))
+    assert (back2.hl_base_hms, back2.range_limit) == ("07:59:55", 0.03)
+    assert back2.entries[0] == Tier(0.012, 100, 0.009, 0.005, True)
+    assert back2.entries[1] == Tier(0.010, 100, 0.007) and back2.entries[1].auto_exit is False
+    # 기본값 07:59:55·3%(사용자 2026-10-29) — 틀린 값·없는 값은 기본값
+    base = settings_from_dict({"hl_base_hms": "7:59", "range_limit": "x"})
+    assert (base.hl_base_hms, base.range_limit) == ("07:59:55", 0.03)
+    assert NxtOpenSettings().hl_base_hms == "07:59:55" and NxtOpenSettings().range_limit == 0.03
+    st3 = NxtOpenSettings()
+    assert apply_settings(st3, {"hl_base_hms": "7:59:55"}) == ["HL기준시간은 HH:MM:SS"]
+    assert apply_settings(st3, {"hl_base_hms": "07:58:00", "range_limit": 0.025}) == []
+    assert (st3.hl_base_hms, st3.range_limit) == ("07:58:00", 0.025)
     # 틀린 값은 그 항목만 기본값
     bad = settings_from_dict({"start_s": 6.0, "end_s": 1.0, "open_hms": "8:00",
                               "entries": [{"spread": "x", "qty": -1}]})
@@ -182,3 +203,40 @@ def test_run_guard_needs_one_complete_tier_only() -> None:
         "청산 단 없음")
     assert Tier(0.002, 0, None).missing() == ["수량", "주문가"] and empty.missing() == [
         "Sprd", "수량", "주문가"]
+    # 자동청산 체크 단은 청산가도 있어야 켠다(§4a-5, 사용자 2026-10-29 확인 4)
+    assert run_block_error([full, Tier(0.002, 1, -0.005, None, True)], "진입") == (
+        "진입2 자동청산 단 청산가 없음")
+    assert run_block_error([Tier(0.002, 1, -0.005, 0.001, True)], "진입") is None
+    assert run_block_error([Tier(0.002, 0, -0.005, None, True), full], "진입") is None  # 무효 단
+
+
+def test_auto_exit_and_range_block_pure() -> None:
+    # §4a: 판정 결과(Plan)에 체크+청산가 있는 단만 청산가 스프레드가 실린다; 반대 방향; 체결 누적
+    st = NxtOpenSettings()
+    st.run_entry = True
+    st.entries = [Tier(0.010, 100, 0.009, 0.002, True), Tier(0.008, 50, 0.007, 0.001, False),
+                  Tier(0.006, 10, 0.005, None, True)]
+    plans = judge(0.012, None, st)
+    assert [p.exit_spread for p in plans] == [0.002, None, None]
+    assert opposite(Side.SELL) is Side.BUY and opposite(Side.BUY) is Side.SELL
+    ae = AutoExit("O1", "entry", 0, Side.BUY, 100.0, 1294.4)
+    assert not ae.add_fill("f1", 40.0) and not ae.add_fill("f1", 40.0)  # 같은 체결번호 한 번
+    assert ae.filled == 40.0 and ae.add_fill("f2", 60.0)                  # 전량 → True
+    # §4b: HL 현재가 = 마지막 체결가, 없으면 중간값(확인 5); 기준시간 + 10초 안의 첫 시세만
+    assert hl_current(1310.2, 1310.0, 1310.5) == 1310.2
+    assert hl_current(None, 1310.0, 1310.5) == 1310.25 and hl_current(None, None, 1310.5) is None
+    lt = time.localtime()
+    t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 7, 59, 55, 0, 0, -1))
+    assert base_due(t, "07:59:55") and base_due(t + 9.9, "07:59:55")
+    assert not base_due(t - 0.1, "07:59:55") and not base_due(t + 10.1, "07:59:55")
+    assert range_limits(1000.0, 0.03) == (970.0, 1030.0)
+    # 금지(확인 6·7): 기준가 없음 → 금지, HL 현재가 기준 등호 포함
+    assert range_block(Side.SELL, 990.0, None, 0.03) == "HL 기준가 없음"
+    assert range_block(Side.SELL, None, 1000.0, 0.03) == "HL 현재가 없음"
+    assert range_block(Side.SELL, 970.0, 1000.0, 0.03) == (
+        "매도 금지 — HL 970.0 ≤ 한도 970.0(기준 1,000.0 −3%)")
+    assert range_block(Side.SELL, 970.1, 1000.0, 0.03) is None
+    assert range_block(Side.BUY, 1030.0, 1000.0, 0.03) == (
+        "매수 금지 — HL 1,030.0 ≥ 한도 1,030.0(기준 1,000.0 +3%)")
+    assert range_block(Side.BUY, 1029.9, 1000.0, 0.03) is None
+    assert range_block(Side.BUY, 970.0, 1000.0, 0.03) is None  # 매수는 아래쪽 급락엔 안 막음

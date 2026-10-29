@@ -9,6 +9,7 @@ from kp_arb.core_server import _nxt_open_command
 from kp_arb.domain.enums import Instrument, Side, Underlying, Venue
 from kp_arb.domain.models import InstrumentInfo, OrderIntent, Quote
 from kp_arb.gateways.base import PlaceResult
+from kp_arb.gateways.ls_ws import Fill
 from kp_arb.nxt_open import NxtOpenScreen, Tier
 from kp_arb.nxt_open_engine import NxtOpenEngine
 from kp_arb.strategy_core import CoreState
@@ -21,6 +22,9 @@ class FakeSystem:
         self.on_trade: list[Any] = []
         self.on_quote: list[Any] = []
         self.on_fx: list[Any] = []
+        self.on_fill: list[Any] = []
+        # 꼬리표 → 발주 응답 전에 이만큼 체결 통보(HL 즉시 체결 흉내)
+        self.fill_on_place: dict[str, float] = {}
         self.quotes: dict[tuple[Underlying, Instrument, str], Quote] = {
             (U, Instrument.HL_PERP, "hl"): Quote(
                 underlying=U, instrument=Instrument.HL_PERP, bid=1310.0, ask=1310.5, ts=0,
@@ -40,7 +44,15 @@ class FakeSystem:
 
     async def place_many(self, intents: Any, cloids: Any = None) -> list[PlaceResult]:
         self.placed.append(list(intents))
-        return [PlaceResult(f"O{i + 1}") for i, _ in enumerate(intents)]
+        base = sum(len(batch) for batch in self.placed[:-1])
+        outs = [PlaceResult(f"O{base + i + 1}") for i, _ in enumerate(intents)]
+        for it, out in zip(intents, outs, strict=True):  # HL 즉시 체결 — 통보가 응답보다 먼저
+            q = self.fill_on_place.get(it.tag)
+            if q:
+                for h in self.on_fill:
+                    h(Fill(fill_id=f"early-{out.order_id}", order_id=str(out.order_id), qty=q,
+                           price=float(it.price or 0.0), ts=0))
+        return outs
 
 
 def _wall(h: int, m: int, s: float) -> float:
@@ -69,6 +81,9 @@ def _engine(wall: float) -> tuple[NxtOpenEngine, FakeSystem, Clock, NxtOpenScree
     st.exits = [Tier(-0.004, 100, -0.002), Tier(-0.008, 100, -0.006), Tier(-0.010, 100, -0.008)]
     st.run_entry = st.run_exit = True
     eng = NxtOpenEngine(screen, sys_, clock=lambda: clk.mono, wall=lambda: clk.wall)
+    # §4b 기준가(2026-10-29): 없으면 전부 금지라 기존 시나리오엔 호가 중간값 1310.25를 잡아 둔다
+    d = eng._day(U)
+    d.hl_base, d.hl_base_wall = 1310.25, clk.wall
     return eng, sys_, clk, screen
 
 
@@ -280,7 +295,7 @@ async def test_each_tier_fires_once_and_rest_keep_running_until_window_end() -> 
     await _settle()
     assert len(sys_.placed) == 2 and [o.tag for o in sys_.placed[1]] == ["청산2"]
     snap = eng.live_snapshot()[U.value]
-    assert [r["order_id"] for r in snap["results"]] == ["O1", "O1"] and snap["fired"]
+    assert [r["order_id"] for r in snap["results"]] == ["O1", "O2"] and snap["fired"]
     assert snap["fired_tiers"] == [["exit", 0], ["exit", 1]]
     clk.advance(0.5)
     eng._on_quote(_nxt(1_769_000.0))  # 같은 괴리 — 이미 나간 단은 다시 안 냄
@@ -290,3 +305,130 @@ async def test_each_tier_fires_once_and_rest_keep_running_until_window_end() -> 
     eng.live_snapshot()
     assert not st.run_entry and not st.run_exit and eng.chance_over(U) == "오늘 창 끝"
 
+
+
+async def test_auto_exit_places_opposite_order_when_strategy_order_fully_filled() -> None:
+    # §4a(사용자 2026-10-29 확인 1~3): 체크한 단은 발주 시점 S·환으로 청산가 스프레드를 풀어 두고,
+    # 그 주문이 전량 체결되면 곧바로 반대 방향 GTC 지정가. 부분 체결엔 안 냄, 같은 체결번호는 한 번.
+    eng, sys_, clk, screen = _engine(_wall(8, 0, 1.2))
+    st = screen.of(U)
+    st.entries[0] = Tier(0.012, 100, 0.009, 0.002, True)   # 진입1 자동청산(청산가 +0.2%)
+    st.entries[1] = Tier(0.010, 100, 0.007, 0.001, False)  # 체크 안 함
+    eng._on_quote(_nxt(1_729_000.0))
+    clk.advance(1.0)
+    eng._on_quote(_nxt(1_729_000.0))
+    await _settle()
+    assert len(sys_.placed) == 1 and [o.tag for o in sys_.placed[0]] == ["진입1", "진입2", "진입3"]
+    snap = eng.live_snapshot()[U.value]
+    # 1,729,000 × 1.002 / 1338.4 = 1294.43 → 매수는 내림 1294.4
+    assert snap["results"][0]["auto_price"] == 1294.4
+    assert snap["results"][1]["auto_price"] is None
+    assert [p["order_id"] for p in snap["auto_pending"]] == ["O1"]
+    sys_.on_fill[0](Fill(fill_id="f1", order_id="O1", qty=40.0, price=1303.5, ts=0))
+    sys_.on_fill[0](Fill(fill_id="f1", order_id="O1", qty=40.0, price=1303.5, ts=0))  # 중복 통보
+    sys_.on_fill[0](Fill(fill_id="f2", order_id="O2", qty=100.0, price=1301.5, ts=0))  # 체크 없음
+    await _settle()
+    assert len(sys_.placed) == 1
+    assert eng.live_snapshot()[U.value]["auto_pending"][0]["filled"] == 40.0
+    sys_.on_fill[0](Fill(fill_id="f3", order_id="O1", qty=60.0, price=1303.5, ts=0))
+    await _settle()
+    assert len(sys_.placed) == 2
+    o = sys_.placed[1][0]
+    assert (o.side, o.qty, o.price, o.tag, o.source) == (
+        Side.BUY, 100, 1294.4, "진입1청산", "NXT개장")
+    snap = eng.live_snapshot()[U.value]
+    assert snap["auto_pending"] == []
+    last = snap["results"][-1]
+    assert last["auto"] and last["order_id"] == "O4" and last["side"] == "buy"
+    # 늦은 중복 통보는 아무 일도 안 한다
+    sys_.on_fill[0](Fill(fill_id="f4", order_id="O1", qty=1.0, price=1303.5, ts=0))
+    await _settle()
+    assert len(sys_.placed) == 2
+
+
+async def test_auto_exit_handles_fill_notified_before_place_response() -> None:
+    # §4a-3 구현: HL 테이커 즉시 체결은 통보가 발주 응답보다 먼저 — 등록 전 체결을 보관했다 합친다
+    eng, sys_, clk, screen = _engine(_wall(8, 0, 1.2))
+    st = screen.of(U)
+    st.entries = [Tier(0.012, 100, 0.009, 0.002, True)]
+    sys_.fill_on_place["진입1"] = 100.0
+    eng._on_quote(_nxt(1_729_000.0))
+    clk.advance(1.0)
+    eng._on_quote(_nxt(1_729_000.0))
+    await _settle()
+    assert [[o.tag for o in b] for b in sys_.placed] == [["진입1"], ["진입1청산"]]
+    assert eng.live_snapshot()[U.value]["auto_pending"] == []
+
+
+async def test_range_block_skips_tier_but_keeps_trying_until_window_end() -> None:
+    # §4b(사용자 2026-10-29 확인 6~8): 기준가 없으면 금지, HL 현재가(마지막 체결가) ≤ 매도 한도면
+    # 매도 금지 — 그 단은 발주된 단으로 치지 않고 창 끝까지 계속 시도, 사유는 단마다 한 번
+    eng, sys_, clk, screen = _engine(_wall(8, 0, 1.2))
+    d = eng._day(U)
+    d.hl_base = None
+    screen.of(U).hl_base_hms = "07:30:00"  # 기준시간 + 10초가 지나 이 날은 기준가를 못 잡는다
+    screen.of(U).entries = [Tier(0.012, 100, 0.009)]  # 진입 한 단만(상태줄 사유는 마지막 단 것)
+    eng._on_quote(_nxt(1_729_000.0))
+    clk.advance(1.0)
+    eng._on_quote(_nxt(1_729_000.0))
+    await _settle()
+    snap = eng.live_snapshot()[U.value]
+    assert not sys_.placed and snap["fired_tiers"] == [] and snap["note"] == "진입1 HL 기준가 없음"
+    assert snap["hl_base"] is None and snap["sell_limit"] is None
+    # 기준가 1,360 → 매도 한도 1,319.2; HL 마지막 체결가 1,310 ≤ 한도 → 매도 금지
+    d.hl_base, d.hl_base_wall = 1360.0, clk.wall
+    sys_.trades[(U, Instrument.HL_PERP, "hl")] = 1310.0
+    clk.advance(0.5)
+    eng._on_quote(_nxt(1_729_000.0))
+    await _settle()
+    snap = eng.live_snapshot()[U.value]
+    assert not sys_.placed and snap["fired_tiers"] == []
+    assert snap["note"] == "진입1 매도 금지 — HL 1,310.0 ≤ 한도 1,319.2(기준 1,360.0 −3%)"
+    assert (snap["sell_limit"], snap["buy_limit"], snap["hl_last"]) == (1319.2, 1400.8, 1310.0)
+    # HL이 범위 안으로 돌아오면(1,320 > 1,319.2) 그제야 낸다 — 창 안이면 계속 시도
+    sys_.trades[(U, Instrument.HL_PERP, "hl")] = 1320.0
+    clk.advance(0.5)
+    eng._on_quote(_nxt(1_729_000.0))
+    await _settle()
+    assert len(sys_.placed) == 1 and [o.tag for o in sys_.placed[0]] == ["진입1"]
+    # 자동청산도 금지 검사(§4a-4): 청산1(HL 매수)의 자동청산은 매도 — HL 1,300 ≤ 매도 한도 1,319.2면
+    # 안 내고 실패 사유만
+    st = screen.of(U)
+    st.exits = [Tier(-0.004, 10, -0.002, -0.001, True)]
+    d.fired_tiers.clear()
+    sys_.trades[(U, Instrument.HL_PERP, "hl")] = 1320.0
+    eng._on_quote(_nxt(1_770_000.0))   # 청산괴리 −0.9% → 청산1(HL 매수) 발주
+    await _settle()
+    assert [o.tag for o in sys_.placed[-1]] == ["청산1"]
+    oid = eng.live_snapshot()[U.value]["auto_pending"][0]["order_id"]
+    sys_.trades[(U, Instrument.HL_PERP, "hl")] = 1300.0
+    sys_.on_fill[0](Fill(fill_id="x", order_id=oid, qty=10.0, price=1300.0, ts=0))
+    await _settle()
+    last = eng.live_snapshot()[U.value]["results"][-1]
+    assert last["auto"] and last["order_id"] is None and last["side"] == "sell"
+    assert last["error"] == "매도 금지 — HL 1,300.0 ≤ 한도 1,319.2(기준 1,360.0 −3%)"
+    assert [o.tag for o in sys_.placed[-1]] == ["청산1"]  # 자동청산 주문은 안 나감
+
+
+async def test_hl_base_captured_at_base_time_only_within_grace() -> None:
+    # §4b-1: HL기준시간(07:59:55)을 지난 첫 시세의 HL 현재가(마지막 체결가, 없으면 중간값)를
+    # 기준가로, 10초 안에만. 늦게 켠 코어는 기준가 없음.
+    eng, sys_, clk, _ = _engine(_wall(7, 59, 54.0))
+    d = eng._day(U)
+    d.hl_base = None
+    eng._on_quote(sys_.quotes[(U, Instrument.HL_PERP, "hl")])
+    assert eng.live_snapshot()[U.value]["hl_base"] is None     # 아직 기준시간 전
+    clk.advance(2.0)                                            # 07:59:56
+    eng._on_quote(sys_.quotes[(U, Instrument.HL_PERP, "hl")])
+    snap = eng.live_snapshot()[U.value]
+    assert snap["hl_base"] == 1310.25 and snap["hl_base_at"] == "07:59:56.000"  # 체결 없음 → 중간값
+    assert (snap["sell_limit"], snap["buy_limit"]) == (1310.25 * 0.97, 1310.25 * 1.03)
+    sys_.trades[(U, Instrument.HL_PERP, "hl")] = 1300.0
+    clk.advance(1.0)
+    eng._on_quote(sys_.quotes[(U, Instrument.HL_PERP, "hl")])
+    assert eng.live_snapshot()[U.value]["hl_base"] == 1310.25  # 하루 한 번 — 안 바뀜
+    eng2, sys2, _clk2, _ = _engine(_wall(8, 0, 6.0))             # 기준시간 + 11초에 켬
+    eng2._day(U).hl_base = None
+    sys2.trades[(U, Instrument.HL_PERP, "hl")] = 1300.0
+    eng2._on_quote(sys2.quotes[(U, Instrument.HL_PERP, "hl")])
+    assert eng2.live_snapshot()[U.value]["hl_base"] is None

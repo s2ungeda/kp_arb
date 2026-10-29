@@ -15,6 +15,9 @@ TIERS = 3                      # 진입·청산 각 3단(엑셀 A90~A96)
 DEFAULT_START_S = 0.5          # 창 시작 = 첫 체결 + 0.5초(엑셀 C87)
 DEFAULT_END_S = 5.0            # 창 끝 = 첫 체결 + 5초(엑셀 F87)
 DEFAULT_OPEN_HMS = "08:00:00"  # NXT 프리마켓 개장(첫 체결을 받아들이는 기준 시각, 화면 입력)
+DEFAULT_HL_BASE_HMS = "07:59:55"  # HL기준시간 기본값(사용자 2026-10-29, §4b)
+DEFAULT_RANGE_LIMIT = 0.03        # 범위제한 기본값 3%(사용자 2026-10-29, §4b)
+HL_BASE_GRACE_S = 10.0            # HL기준시간 뒤 이 안의 첫 시세만 기준가로(§4b-1, 늦은 시동 없음)
 OPEN_GRACE_S = 10.0            # 개장 시각 뒤 이 안에 온 첫 체결만 T0로 — 코어를 늦게 켠 날의
                                # 첫 수신(예 08:41)을 개장으로 오인해 창을 여는 일을 막는다
 SOURCE = "NXT개장"             # OrderIntent.source(주문 리스트 출처·쌍 대조 로그 구분)
@@ -28,6 +31,9 @@ class Tier:
     spread: float | None = None
     qty: float = 0.0
     price_spread: float | None = None
+    # 자동청산(§4a, 2026-10-29): 체크된 단은 전략주문이 전량 체결되면 청산가 스프레드로 반대 주문.
+    exit_price_spread: float | None = None  # 청산가(주문가 옆 입력, % → 소수)
+    auto_exit: bool = False                 # 자동청산 체크
 
     def valid(self) -> bool:
         return self.spread is not None and self.qty > 0 and self.price_spread is not None
@@ -51,7 +57,39 @@ def run_block_error(tiers: list[Tier], label: str) -> str | None:
     그때부터 판정에 들어간다(judge가 valid()만 본다)."""
     if not any(t.valid() for t in tiers):
         return f"{label} 단 없음"
+    # 자동청산을 체크한 단은 청산가도 있어야 켠다(§4a-5, 사용자 2026-10-29 확인 4)
+    bad = [i + 1 for i, t in enumerate(tiers) if t.valid() and t.auto_exit
+           and t.exit_price_spread is None]
+    if bad:
+        return f"{label}{bad[0]} 자동청산 단 청산가 없음"
     return None
+
+
+def opposite(side: Side) -> Side:
+    """자동청산 방향 = 전략주문의 반대(§4a-1: 진입이 매도면 매수, 매수면 매도)."""
+    return Side.BUY if side is Side.SELL else Side.SELL
+
+
+@dataclass
+class AutoExit:
+    """자동청산 대기 한 건(§4a) — 전략주문 주문번호에 걸어 두고 전량 체결되면 낸다."""
+
+    order_id: str
+    block: str
+    index: int
+    side: Side        # 자동청산 주문 방향(전략주문의 반대)
+    qty: float        # 전략주문 수량 = 자동청산 수량
+    price: float      # 발주 시점에 청산가 스프레드로 푼 HL 가격(§4a-2)
+    filled: float = 0.0
+    fill_ids: set[str] = field(default_factory=set)
+
+    def add_fill(self, fill_id: str, qty: float) -> bool:
+        """체결 누적(같은 체결번호는 한 번). 전량(수량 − 1e-9 이상)이 되면 True."""
+        if fill_id in self.fill_ids:
+            return False
+        self.fill_ids.add(fill_id)
+        self.filled += max(0.0, qty)
+        return self.filled >= self.qty - 1e-9
 
 
 def _tiers() -> list[Tier]:
@@ -69,6 +107,9 @@ class NxtOpenSettings:
     open_hms: str = DEFAULT_OPEN_HMS
     # 모니터 수치용 기준수량 — 이 수량만큼 HL 호가창을 쓸어담은 est 가격(체결쏴 모니터와 같음)
     ref_qty: int = 1
+    # 리스크 방지(§4b, 2026-10-29). 비우면 기본값(개장 시각과 같은 규칙).
+    hl_base_hms: str = DEFAULT_HL_BASE_HMS   # HL기준시간(HH:MM:SS) — 그 시각의 HL 현재가를 기준가로
+    range_limit: float = DEFAULT_RANGE_LIMIT  # 주문범위제한(% → 소수)
     entries: list[Tier] = field(default_factory=_tiers)
     exits: list[Tier] = field(default_factory=_tiers)
     run_entry: bool = False   # 진입(HL매도) 실행 — 화면 표의 병합 버튼(사용자 2026-10-20 목업)
@@ -95,6 +136,7 @@ class Plan:
     side: Side        # entry → SELL, exit → BUY
     qty: float
     price_spread: float
+    exit_spread: float | None = None  # 자동청산(§4a) 청산가 스프레드 — 체크된 단만, 아니면 None
 
 
 # --- 계산 ---
@@ -165,6 +207,47 @@ def t0_verdict(first_wall: float, open_hms: str, grace_s: float = OPEN_GRACE_S) 
     return "ok" if now_sec <= open_sec + grace_s else "late"
 
 
+def hl_current(last: float | None, bid: float | None, ask: float | None) -> float | None:
+    """§4b "HL 현재가" = 마지막 체결가, 없으면 호가 중간값(사용자 2026-10-29 확인 5). 둘 다 없으면
+    None."""
+    if last is not None and last > 0:
+        return float(last)
+    if bid and ask and bid > 0 and ask > 0:
+        return (float(bid) + float(ask)) / 2.0
+    return None
+
+
+def base_due(now_wall: float, base_hms: str, grace_s: float = HL_BASE_GRACE_S) -> bool:
+    """HL기준시간을 지났고 아직 유예(10초) 안인가 — 그 첫 시세가 기준가(§4b-1). 유예를 넘기면
+    그날은 기준가 없음(코어를 늦게 켠 날)."""
+    sec = _sec_of_day(now_wall)
+    base = _hms_sec(base_hms)
+    return base <= sec <= base + grace_s
+
+
+def range_limits(base: float, limit: float) -> tuple[float, float]:
+    """(매도 한도, 매수 한도) = 기준가 × (1 − 범위), 기준가 × (1 + 범위)(§4b-2)."""
+    return base * (1.0 - limit), base * (1.0 + limit)
+
+
+def range_block(side: Side, hl_now: float | None, base: float | None, limit: float,
+                ) -> str | None:
+    """§4b-3 금지 판정 — 막히면 사유, 아니면 None. 그 순간의 HL 현재가 기준(주문가 아님, 확인 7):
+    매도는 HL ≤ 매도 한도, 매수는 HL ≥ 매수 한도(등호 포함). 기준가·HL 현재가가 없으면 금지
+    (확인 6)."""
+    if base is None:
+        return "HL 기준가 없음"
+    if hl_now is None:
+        return "HL 현재가 없음"
+    sell_lim, buy_lim = range_limits(base, limit)
+    pct = f"{limit * 100:g}%"
+    if side is Side.SELL and hl_now <= sell_lim:
+        return f"매도 금지 — HL {hl_now:,.1f} ≤ 한도 {sell_lim:,.1f}(기준 {base:,.1f} −{pct})"
+    if side is Side.BUY and hl_now >= buy_lim:
+        return f"매수 금지 — HL {hl_now:,.1f} ≥ 한도 {buy_lim:,.1f}(기준 {base:,.1f} +{pct})"
+    return None
+
+
 def accept_t0(first_wall: float, open_hms: str, grace_s: float = OPEN_GRACE_S) -> bool:
     """그날 첫 NXT 체결의 PC 시각이 개장 시각 ~ +grace 안이면 T0로 받아들인다(t0_verdict "ok")."""
     return t0_verdict(first_wall, open_hms, grace_s) == "ok"
@@ -209,7 +292,8 @@ def judge(entry_disp: float | None, exit_disp: float | None, settings: NxtOpenSe
             if ("entry", i) in fired:
                 continue
             if t.valid() and t.spread is not None and entry_disp >= t.spread:
-                plans.append(Plan("entry", i, Side.SELL, t.qty, float(t.price_spread or 0.0)))
+                plans.append(Plan("entry", i, Side.SELL, t.qty, float(t.price_spread or 0.0),
+                                  _auto_spread(t)))
     if plans:
         return plans
     if exit_disp is not None and settings.run_exit:
@@ -217,8 +301,14 @@ def judge(entry_disp: float | None, exit_disp: float | None, settings: NxtOpenSe
             if ("exit", i) in fired:
                 continue
             if t.valid() and t.spread is not None and exit_disp <= t.spread:
-                plans.append(Plan("exit", i, Side.BUY, t.qty, float(t.price_spread or 0.0)))
+                plans.append(Plan("exit", i, Side.BUY, t.qty, float(t.price_spread or 0.0),
+                                  _auto_spread(t)))
     return plans
+
+
+def _auto_spread(t: Tier) -> float | None:
+    """자동청산 체크 + 청산가가 있는 단만 청산가 스프레드(§4a)."""
+    return t.exit_price_spread if t.auto_exit and t.exit_price_spread is not None else None
 
 
 # --- 저장·복원(core_state.json) ---
@@ -227,14 +317,19 @@ def _tier_from(raw: object) -> Tier:
     if not isinstance(raw, dict):
         return Tier()
     out = Tier()
-    for key in ("spread", "price_spread"):
+    for key in ("spread", "price_spread", "exit_price_spread"):
         v = raw.get(key)
         if isinstance(v, int | float) and not isinstance(v, bool):
             setattr(out, key, float(v))
     q = raw.get("qty")
     if isinstance(q, int | float) and not isinstance(q, bool) and q >= 0:
         out.qty = float(q)
+    out.auto_exit = raw.get("auto_exit") is True
     return out
+
+
+def _is_hms(text: object) -> bool:
+    return isinstance(text, str) and len(text) == 8 and text[2] == ":" and text[5] == ":"
 
 
 def qty_decimals_ok(qty: float, sz_decimals: int | None) -> bool:
@@ -259,8 +354,14 @@ def settings_from_dict(raw: object) -> NxtOpenSettings:
     if isinstance(rq, int) and not isinstance(rq, bool) and rq >= 0:
         st.ref_qty = rq
     hms = raw.get("open_hms")
-    if isinstance(hms, str) and len(hms) == 8 and hms[2] == ":" and hms[5] == ":":
-        st.open_hms = hms
+    if _is_hms(hms):
+        st.open_hms = str(hms)
+    base = raw.get("hl_base_hms")
+    if _is_hms(base):
+        st.hl_base_hms = str(base)
+    lim = raw.get("range_limit")
+    if isinstance(lim, int | float) and not isinstance(lim, bool) and lim >= 0:
+        st.range_limit = float(lim)
     for key in ("entries", "exits"):
         rows = raw.get(key)
         if isinstance(rows, list):
@@ -299,11 +400,14 @@ def apply_settings(st: NxtOpenSettings, body: dict[str, Any],
             errors.append("매매시간은 0 ≤ 시작 ≤ 끝")
     if "open_hms" in body and new.open_hms != body["open_hms"]:
         errors.append("개장 시각은 HH:MM:SS")
+    if "hl_base_hms" in body and new.hl_base_hms != body["hl_base_hms"]:
+        errors.append("HL기준시간은 HH:MM:SS")
     if errors:
         return errors
     st.start_s, st.end_s = new.start_s, new.end_s
     st.open_hms, st.entries, st.exits = new.open_hms, new.entries, new.exits
     st.ref_qty = new.ref_qty
+    st.hl_base_hms, st.range_limit = new.hl_base_hms, new.range_limit  # 10-29 추가 칸
     return []
 
 

@@ -13,7 +13,14 @@ from __future__ import annotations
 from typing import Any
 
 from .domain.enums import Underlying
-from .nxt_open import DEFAULT_END_S, DEFAULT_OPEN_HMS, DEFAULT_START_S, TIERS
+from .nxt_open import (
+    DEFAULT_END_S,
+    DEFAULT_HL_BASE_HMS,
+    DEFAULT_OPEN_HMS,
+    DEFAULT_RANGE_LIMIT,
+    DEFAULT_START_S,
+    TIERS,
+)
 
 UNDERLYINGS = (Underlying.SK_HYNIX, Underlying.SAMSUNG)  # 체결쏴와 같이 현대차 제외
 NAMES = {Underlying.SK_HYNIX: "하이닉스", Underlying.SAMSUNG: "삼성"}
@@ -74,18 +81,25 @@ def row_complete(spread: str, qty: str, price: str) -> bool:
     return frac_of(spread) is not None and qty_of(qty) > 0 and frac_of(price) is not None
 
 
-def tiers_payload(rows: list[tuple[str, str, str]]) -> list[dict[str, Any]]:
-    """표 입력(스프레드 %, 수량, 주문가격 %) 3행 → 코어 설정 dict 목록."""
+def tiers_payload(rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
+    """표 입력 3행 → 코어 설정 dict 목록. 행 = (스프레드 %, 수량, 주문가격 %[, 청산가 %, 자동청산
+    bool]) — 뒤 둘은 2026-10-29 추가 칸(§2, 저장만)."""
     out: list[dict[str, Any]] = []
-    for spread, qty, price in rows:
-        out.append({"spread": frac_of(spread), "qty": qty_of(qty), "price_spread": frac_of(price)})
+    for row in rows:
+        spread, qty, price = row[0], row[1], row[2]
+        exit_px = frac_of(str(row[3])) if len(row) > 3 else None
+        auto = bool(row[4]) if len(row) > 4 else False
+        out.append({"spread": frac_of(spread), "qty": qty_of(qty), "price_spread": frac_of(price),
+                    "exit_price_spread": exit_px, "auto_exit": auto})
     return out
 
 
 def settings_payload(u: Underlying, open_hms: str, start: str, end: str,
-                     entries: list[tuple[str, str, str]],
-                     exits: list[tuple[str, str, str]]) -> dict[str, Any]:
-    """입력 → nxt_open_settings 명령 본문. HL 호가단위는 manual_hl_merge로 따로(코어 공용 상태)."""
+                     entries: list[tuple[Any, ...]],
+                     exits: list[tuple[Any, ...]], hl_base_hms: str = "",
+                     range_limit: str = "") -> dict[str, Any]:
+    """입력 → nxt_open_settings 명령 본문. HL 호가단위는 manual_hl_merge로 따로(코어 공용 상태).
+    hl_base_hms·range_limit = 2026-10-29 추가 칸(빈 글 = 기본값 07:59:55·3%)."""
 
     def _f(text: str, default: float) -> float:
         try:
@@ -96,7 +110,10 @@ def settings_payload(u: Underlying, open_hms: str, start: str, end: str,
     return {"cmd": "nxt_open_settings", "underlying": u.value,
             "open_hms": open_hms.strip() or DEFAULT_OPEN_HMS,
             "start_s": _f(start, DEFAULT_START_S), "end_s": _f(end, DEFAULT_END_S),
-            "entries": tiers_payload(entries), "exits": tiers_payload(exits)}
+            "entries": tiers_payload(entries), "exits": tiers_payload(exits),
+            "hl_base_hms": hl_base_hms.strip() or DEFAULT_HL_BASE_HMS,
+            "range_limit": (frac_of(range_limit) if frac_of(range_limit) is not None
+                            else DEFAULT_RANGE_LIMIT)}
 
 
 def merge_choices(ticks: list[dict[str, Any]]) -> tuple[list[str], dict[str, tuple[Any, Any]]]:
@@ -127,11 +144,25 @@ def results_summary(results: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for r in results:
         name = f"{'진입' if r.get('block') == 'entry' else '청산'}{int(r.get('index', 0)) + 1}"
+        if r.get("auto"):  # 자동청산 주문(§4a, 2026-10-29) — "진입1청산 #124 100@1294.4"
+            name += "청산"
         if r.get("order_id"):
             parts.append(f"{name} #{r['order_id']} {r.get('qty', '')}@{r.get('price', '')}")
         else:
             parts.append(f"{name} 실패 {str(r.get('error') or '')[:30]}")
     return ", ".join(parts)
+
+
+def base_text(live: dict[str, Any]) -> str:
+    """윗줄 'HL기준' 글(§4b-5) — 기준가·매도 한도(↓)·매수 한도(↑). 잡기 전엔 "HL기준 -". 순수."""
+    base = live.get("hl_base")
+    if not isinstance(base, int | float):
+        return "HL기준 -"
+    sell_lim, buy_lim = live.get("sell_limit"), live.get("buy_limit")
+    text = f"HL기준 {base:,.1f}"
+    if isinstance(sell_lim, int | float) and isinstance(buy_lim, int | float):
+        text += f" ↓{sell_lim:,.1f} ↑{buy_lim:,.1f}"
+    return text
 
 
 def status_text(live: dict[str, Any]) -> str:
@@ -175,7 +206,7 @@ def top_states(locked: bool) -> dict[str, str]:
     combo = "disabled" if locked else "readonly"
     plain = "disabled" if locked else "normal"
     return {"agg": combo, "apply": plain, "ref": plain, "open": plain, "start": plain,
-            "end": plain}
+            "end": plain, "hl_base": plain, "range": plain}
 
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
@@ -273,6 +304,19 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     w["end"].insert(0, f"{DEFAULT_END_S:g}")
     w["end"].pack(side="left")
     tk.Label(top, text="초").pack(side="left", padx=(1, 0))
+    # 추가 칸(사용자 2026-10-29 "우선 화면부터"): HL기준시간·범위제한 — 뜻·동작은 [OPEN], 저장만.
+    # 시각 칸이 둘이라 작은 회색 글로 구분한다.
+    tk.Label(top, text="HL기준", fg="gray25", font=T.FONT_LABEL).pack(side="left", padx=(10, 2))
+    w["hl_base"] = tk.Entry(top, width=9, justify="center", validate="key",
+                            validatecommand=vcmd_time, font=T.FONT_NUM_LG)
+    w["hl_base"].insert(0, DEFAULT_HL_BASE_HMS)  # 기본값 07:59:55(사용자 2026-10-29)
+    w["hl_base"].pack(side="left", padx=(0, 4))
+    tk.Label(top, text="범위", fg="gray25", font=T.FONT_LABEL).pack(side="left", padx=(4, 2))
+    w["range"] = tk.Entry(top, width=4, justify="right", validate="key",
+                          validatecommand=vcmd_dec, font=T.FONT_NUM_LG)
+    w["range"].insert(0, f"{DEFAULT_RANGE_LIMIT * 100:g}")  # 기본값 3(%)
+    w["range"].pack(side="left")
+    tk.Label(top, text="%").pack(side="left", padx=(1, 0))
 
     # ===== 표(사용자 2026-10-20): 진입 세트 | 청산 세트를 좌우로, 구분 열 없음 =====
     # 0행 = 모니터 수치(각 Sprd 헤더 위)·환율, 1행 = 헤더(Sprd 수량 주문가 역산가 실행),
@@ -280,9 +324,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 2026-10-22 — 숨은 패널 대신), 결과 열은 없다.
     tbl = tk.Frame(root)
     tbl.grid(row=2, column=0, sticky="ew", padx=6, pady=(4, 0))
-    heads = ("Sprd", "수량", "주문가", "역산가", "실행")  # Sprd = 체결쏴 표기
-    widths = (5, 6, 5, 8, 7)   # 입력칸 폭은 체결쏴 세트 행과 같게(5·6·5), 역산가 8(1,303.50)
-    head_w = (7, 7, 7, 8, 7)   # 헤더 폭이 곧 칸 폭(입력칸은 nsew로 채움 — 체결쏴 세트 행과 같음)
+    # 청산가(주문가 옆 입력)·자동(자동청산 체크, 실행 버튼 왼쪽)은 2026-10-29 추가 칸(§2, 저장만)
+    heads = ("Sprd", "수량", "주문가", "청산가", "역산가", "자동청산", "실행")  # Sprd = 체결쏴 표기
+    widths = (5, 6, 5, 5, 8, 3, 7)   # 입력칸 폭은 체결쏴 세트 행과 같게(5·6·5), 역산가 8(1,303.50)
+    head_w = (7, 7, 7, 7, 8, 8, 7)   # 헤더 폭이 곧 칸 폭(입력칸은 nsew로 채움 — 체결쏴와 같음)
+    col_px, col_auto, col_run = 4, 5, 6
     gap_col = len(heads)       # 두 세트 사이 빈 열
     w["px"] = {}
     w["rows"] = {}
@@ -306,15 +352,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         for c, (h, hw) in enumerate(zip(heads, head_w, strict=True)):  # 헤더 9pt 회색, 테두리 없음
             tk.Label(tbl, text=h, width=hw, fg="gray25", font=T.FONT_LABEL).grid(
                 row=1, column=base + c, padx=1, sticky="nsew")
-        btn = tk.Button(tbl, text=cond, width=widths[4], padx=0, pady=0, bd=1,
+        btn = tk.Button(tbl, text=cond, width=widths[col_run], padx=0, pady=0, bd=1,
                         highlightthickness=0)  # command는 toggle_run 정의 뒤에 붙인다
-        btn.grid(row=2, column=base + 4, rowspan=TIERS, padx=(4, 1), pady=1, sticky="nsew")
+        btn.grid(row=2, column=base + col_run, rowspan=TIERS, padx=(4, 1), pady=1,
+                 sticky="nsew")
         w["run"][block] = btn
         for i in range(TIERS):
             r = 2 + i
             cells: dict[str, Any] = {}
             for c, key, vc in ((0, "spread", vcmd_dec), (1, "qty", vcmd_qty),
-                               (2, "price", vcmd_dec)):
+                               (2, "price", vcmd_dec), (3, "exit_price", vcmd_dec)):
                 e = tk.Entry(tbl, width=widths[c], justify="right", validate="key",
                              validatecommand=vc, font=T.FONT_NUM_LG,
                              disabledforeground="black", disabledbackground="#f0f0f0")
@@ -324,10 +371,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 cells[key] = e
             # 역산가 — 주문가 옆 표시 칸(입력 아님, 테두리 없는 회색 글). 그 세트의 실행이 켜진
             # 동안만 갱신하고 꺼지면 마지막 값을 둔다(사용자 2026-10-21·22).
-            lbl = tk.Label(tbl, text="-", width=widths[3], anchor="e", fg="gray25",
+            lbl = tk.Label(tbl, text="-", width=widths[col_px], anchor="e", fg="gray25",
                            font=T.FONT_NUM_LG)
-            lbl.grid(row=r, column=base + 3, padx=1, pady=1, sticky="nsew")
+            lbl.grid(row=r, column=base + col_px, padx=1, pady=1, sticky="nsew")
             w["px"][(block, i)] = lbl
+            # 자동청산 체크(2026-10-29) — 값은 BooleanVar, 잠금은 위젯에
+            cells["auto"] = tk.BooleanVar(value=False)
+            cells["auto_w"] = tk.Checkbutton(tbl, variable=cells["auto"], padx=0, pady=0)
+            cells["auto_w"].grid(row=r, column=base + col_auto, padx=1, pady=1)
             tbl.grid_rowconfigure(r, minsize=row_h)
             w["rows"][(block, i)] = cells
     # 환율 — 0행 오른쪽 끝(체결쏴처럼 작은 회색 글씨)
@@ -335,8 +386,12 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 청산 세트의 수량·주문가·역산가·실행 열 위에 걸쳐 오른쪽 정렬 — 빈 열 하나에만 두면 창을 안
     # 넓힌 때 폭이 0이라 글이 잘린다(사용자 2026-10-21 "환율이 가려진다"). 늘어나는 빈 열은 걸치지
     # 않는다 — 걸치면 창을 넓힐 때 환율이 오른쪽 끝으로 따라간다(사용자 2026-10-21 "위치 고정").
-    w["fx"].grid(row=0, column=gap_col + 2, columnspan=4, sticky="e", padx=(0, 2))
-    tbl.grid_columnconfigure(gap_col + 6, weight=1)  # 남는 폭은 여기로(입력칸은 안 늘어남)
+    w["fx"].grid(row=0, column=gap_col + 2, columnspan=len(heads) - 1, sticky="e", padx=(0, 2))
+    # HL 기준가·한도(§4b-5) — 진입 세트 위 0행의 역산가~실행 열(사용자 2026-10-29 동그라미 자리),
+    # 환율과 같은 글꼴·색. 코어가 기준시간에 잡은 기준가와 매도(↓)·매수(↑) 한도.
+    w["base"] = tk.Label(tbl, text="HL기준 -", font=T.FONT_LABEL, fg="gray25", anchor="e")
+    w["base"].grid(row=0, column=col_px, columnspan=3, sticky="e", padx=(0, 2))
+    tbl.grid_columnconfigure(2 * len(heads) + 1, weight=1)  # 남는 폭은 여기로(입력칸은 안 늘어남)
 
     # ===== 상태줄: 창 상태 + 명령 결과 =====
     # width=1 + 가로 채움 — 긴 글이 창을 넓히지 않게(주문 리스트 상태줄과 같음, 사용자 2026-10-20)
@@ -356,13 +411,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         show_status(("거부 " if err and not text.startswith(("거부", "실패")) else "") + text)
         log.info("[NXT개장 화면] %s", text)
 
-    def rows_of(block: str) -> list[tuple[str, str, str]]:
+    def rows_of(block: str) -> list[tuple[Any, ...]]:
         return [(w["rows"][(block, i)]["spread"].get(), w["rows"][(block, i)]["qty"].get(),
-                 w["rows"][(block, i)]["price"].get()) for i in range(TIERS)]
+                 w["rows"][(block, i)]["price"].get(), w["rows"][(block, i)]["exit_price"].get(),
+                 bool(w["rows"][(block, i)]["auto"].get())) for i in range(TIERS)]
 
     def payload_of(u: Underlying) -> dict[str, Any]:
         return settings_payload(u, w["open"].get(), w["start"].get(), w["end"].get(),
-                                rows_of("entry"), rows_of("exit"))
+                                rows_of("entry"), rows_of("exit"),
+                                hl_base_hms=w["hl_base"].get(), range_limit=w["range"].get())
 
     ref_sent = {"qty": -1}
 
@@ -427,7 +484,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             complete = row_complete(cells["spread"].get(), cells["qty"].get(),
                                     cells["price"].get())
             lock = row_locked(on, complete, (block, i) in w["fired"])
-            for key in ("spread", "qty", "price"):
+            for key in ("spread", "qty", "price", "exit_price", "auto_w"):
                 cells[key].config(state="disabled" if lock else "normal")
 
     def toggle_run(block: str) -> None:
@@ -437,7 +494,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         u = cur["u"]
         value = not bool(w["run_painted"].get(block))
         label = "진입" if block == "entry" else "청산"
-        if value and not any(row_complete(*row) for row in rows_of(block)):
+        if value and not any(row_complete(*row[:3]) for row in rows_of(block)):
             # 완전한 단이 하나도 없으면 켜지 않고 알림(사용자 2026-10-21 "청산처럼 모든 세트가
             # 조건에 안 맞으면 알림") — 상태줄 한 줄로는 지나치기 쉬움
             set_status(f"{label} 켬 거부: 완전한 단 없음", err=True)
@@ -490,7 +547,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         ref_sent["qty"] = int_of(w["ref"].get())
         for key, val in (("open", st.get("open_hms") or DEFAULT_OPEN_HMS),
                          ("start", f"{float(st.get('start_s', DEFAULT_START_S)):g}"),
-                         ("end", f"{float(st.get('end_s', DEFAULT_END_S)):g}")):
+                         ("end", f"{float(st.get('end_s', DEFAULT_END_S)):g}"),
+                         ("hl_base", st.get("hl_base_hms") or DEFAULT_HL_BASE_HMS),
+                         ("range", f"{float(st.get('range_limit', DEFAULT_RANGE_LIMIT)) * 100:g}")):
             set_entry(w[key], str(val))
         for block, key in (("entry", "entries"), ("exit", "exits")):
             tiers = list(st.get(key) or [])
@@ -499,8 +558,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 cells = w["rows"][(block, i)]
                 for ck, val in (("spread", pct_text(t.get("spread"))),
                                 ("qty", qty_text(t.get("qty"))),
-                                ("price", pct_text(t.get("price_spread")))):
+                                ("price", pct_text(t.get("price_spread"))),
+                                ("exit_price", pct_text(t.get("exit_price_spread")))):
                     set_entry(cells[ck], val)
+                cells["auto"].set(t.get("auto_exit") is True)
         cur["loaded"] = True
 
     def on_under_change(_e: object = None) -> None:
@@ -531,6 +592,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         w["exit_disp"].config(text=monitor_text(live.get("exit_disp")) if shown else "-")
         fx = live.get("fx")
         w["fx"].config(text=f"환율 {fx:,.2f} ({live.get('fx_src') or '-'})" if fx else "환율 -")
+        w["base"].config(text=base_text(live))
         for block, key in (("entry", "entry_prices"), ("exit", "exit_prices")):
             # 역산가는 그 세트의 실행이 켜진 동안만 갱신(사용자 2026-10-21 — 저장 전 값과 헷갈리지
             # 않게). 꺼지면 마지막 값을 그대로 둔다("-"로 지우지 않음).

@@ -4,6 +4,7 @@ from __future__ import annotations
 from kp_arb.domain.enums import Underlying
 from kp_arb.nxt_open_screen import (
     active_label,
+    base_text,
     frac_of,
     merge_choices,
     monitor_text,
@@ -37,12 +38,23 @@ def test_settings_payload_from_inputs() -> None:
         exits=[("-0.4", "100", "-0.2"), ("", "", ""), ("", "", "")])
     assert body["cmd"] == "nxt_open_settings" and body["underlying"] == "sk_hynix"
     assert body["open_hms"] == "08:00:00" and (body["start_s"], body["end_s"]) == (0.5, 5.0)
-    assert body["entries"][0] == {"spread": 0.012, "qty": 100, "price_spread": 0.009}
-    assert body["entries"][2] == {"spread": None, "qty": 0, "price_spread": None}
+    assert body["entries"][0] == {"spread": 0.012, "qty": 100, "price_spread": 0.009,
+                                  "exit_price_spread": None, "auto_exit": False}
+    assert body["entries"][2] == {"spread": None, "qty": 0, "price_spread": None,
+                                  "exit_price_spread": None, "auto_exit": False}
     assert body["exits"][0]["spread"] == -0.004
+    # 10-29 추가 칸: 빈 칸은 기본값 07:59:55·3%(사용자 2026-10-29)
+    assert body["hl_base_hms"] == "07:59:55" and body["range_limit"] == 0.03
     body2 = settings_payload(Underlying.SAMSUNG, "", "", "", [], [])  # 빈 칸은 기본값
     assert body2["open_hms"] == "08:00:00" and (body2["start_s"], body2["end_s"]) == (0.5, 5.0)
     assert body2["entries"] == []
+    # 2026-10-29 추가 칸: 윗줄 HL기준시간·범위제한(%), 단의 청산가(%)·자동청산 체크 — 저장만
+    body3 = settings_payload(Underlying.SAMSUNG, "08:00:00", "0.5", "5",
+                             entries=[("1.2", "100", "0.9", "0.5", True)], exits=[],
+                             hl_base_hms=" 07:58:00 ", range_limit="2.5")
+    assert body3["hl_base_hms"] == "07:58:00" and body3["range_limit"] == 0.025
+    assert body3["entries"][0]["exit_price_spread"] == 0.005
+    assert body3["entries"][0]["auto_exit"] is True
     assert tiers_payload([("1,2", "1,000", "0.9")])[0]["qty"] == 1000
     # 수량 소수(사용자 2026-10-21 — HL 주문) — 칸 글은 뒤 0 없이
     assert tiers_payload([("1.2", "0.5", "0.9")])[0]["qty"] == 0.5
@@ -57,6 +69,12 @@ def test_result_and_status_text() -> None:
             "order_id": None, "error": "주문가 계산 불가(S·환율 없음)"}]
     assert results_summary(res) == "진입1 #123 100@1303.5, 진입2 실패 주문가 계산 불가(S·환율 없음)"
     assert results_summary([]) == ""
+    # 자동청산 주문(§4a, 2026-10-29)은 "진입1청산"; HL 기준가 글(§4b-5)
+    assert results_summary([{"block": "entry", "index": 0, "auto": True, "order_id": "124",
+                             "qty": 100, "price": 1294.4}]) == "진입1청산 #124 100@1294.4"
+    assert base_text({}) == "HL기준 -"
+    assert base_text({"hl_base": 1332.5, "sell_limit": 1292.525, "buy_limit": 1372.475}) == (
+        "HL기준 1,332.5 ↓1,292.5 ↑1,372.5")
     assert status_text({"window": "none"}) == "대기"
     assert status_text({"window": "open", "t0": "08:00:00.512"}) == "창 열림 08:00:00.512"
     assert status_text({"window": "closed", "t0": "08:00:00.5", "fired": True,
@@ -103,11 +121,13 @@ def test_top_row_locks_all_but_underlying_while_running() -> None:
     # 사용자 2026-10-21: 진입 or 청산 실행 중이면 종목 콤보 빼고 윗줄(호가단위·적·기준수량·시간)
     # 입력 불가
     locked = top_states(True)
-    assert set(locked) == {"agg", "apply", "ref", "open", "start", "end"}  # 종목 콤보 제외
+    assert set(locked) == {"agg", "apply", "ref", "open", "start", "end",
+                           "hl_base", "range"}  # 종목 콤보 제외(hl_base·range는 10-29 추가 칸)
     assert all(v == "disabled" for v in locked.values())
     free = top_states(False)
     assert free["agg"] == "readonly"  # 콤보는 글 입력 없이 고르기만
-    assert all(free[k] == "normal" for k in ("apply", "ref", "open", "start", "end"))
+    assert all(free[k] == "normal" for k in ("apply", "ref", "open", "start", "end",
+                                             "hl_base", "range"))
 
 
 def test_merge_combo_helpers_follow_core_ticks() -> None:

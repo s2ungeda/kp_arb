@@ -837,7 +837,8 @@ def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
         open_before = st.open_hms
         errors = apply_settings(st, {k: v for k, v in body.items()
                                      if k in ("start_s", "end_s", "open_hms", "ref_qty",
-                                              "entries", "exits")},
+                                              "entries", "exits", "hl_base_hms",
+                                              "range_limit")},
                                 sz_decimals=engine.sz_decimals(u) if engine else None)
         if errors:
             return _fail(errors)
