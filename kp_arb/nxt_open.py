@@ -207,6 +207,15 @@ def t0_verdict(first_wall: float, open_hms: str, grace_s: float = OPEN_GRACE_S) 
     return "ok" if now_sec <= open_sec + grace_s else "late"
 
 
+def hotime_text(ts: float | None) -> str:
+    """LS 호가의 거래소 시각(hotime HHMMSS, Quote.ts)을 "HH:MM:SS"로. 없거나(0) 범위 밖이면 "-".
+    순수. §6 임시 진단 로그용(2026-10-30)."""
+    if ts is None or ts <= 0 or ts >= 240000:
+        return "-"
+    h = int(ts)
+    return f"{h // 10000:02d}:{h // 100 % 100:02d}:{h % 100:02d}"
+
+
 def hl_current(last: float | None, bid: float | None, ask: float | None) -> float | None:
     """§4b "HL 현재가" = 마지막 체결가, 없으면 호가 중간값(사용자 2026-10-29 확인 5). 둘 다 없으면
     None."""

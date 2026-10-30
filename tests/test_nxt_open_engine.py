@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any
 
@@ -11,7 +12,7 @@ from kp_arb.domain.models import InstrumentInfo, OrderIntent, Quote
 from kp_arb.gateways.base import PlaceResult
 from kp_arb.gateways.ls_ws import Fill
 from kp_arb.nxt_open import NxtOpenScreen, Tier
-from kp_arb.nxt_open_engine import NxtOpenEngine
+from kp_arb.nxt_open_engine import DIAG_EVAL_LOG, NxtOpenEngine
 from kp_arb.strategy_core import CoreState
 
 U = Underlying.SK_HYNIX
@@ -432,3 +433,34 @@ async def test_hl_base_captured_at_base_time_only_within_grace() -> None:
     sys2.trades[(U, Instrument.HL_PERP, "hl")] = 1300.0
     eng2._on_quote(sys2.quotes[(U, Instrument.HL_PERP, "hl")])
     assert eng2.live_snapshot()[U.value]["hl_base"] is None
+
+
+async def test_diag_eval_log_once_per_change_and_decision_time(caplog: Any) -> None:
+    # §6 임시 진단 로그(2026-10-30): 창 안 판정마다 한 줄 — 값·결과가 같으면 안 남김,
+    # 발주 로그엔 판정 시각
+    assert DIAG_EVAL_LOG  # 원인 확인 뒤 끄면 이 테스트도 같이 지운다
+    caplog.set_level(logging.INFO, logger="kp_arb.nxt_open")
+    eng, sys_, clk, _ = _engine(_wall(8, 0, 1.2))
+    eng.settings(U).entries = [Tier(0.020, 100, 0.009)]  # 괴리 +1.406% < 2% → 미달
+    q = _nxt(1_729_000.0)
+    q = q.model_copy(update={"ts": 80001.0})
+    eng._on_quote(q)                                  # T0 — 창 전이라 판정 로그 없음
+    clk.advance(1.0)
+    eng._on_quote(q)
+    eng._on_quote(q)                                  # 같은 값 → 두 번째는 안 남김
+    eng._on_quote(sys_.quotes[(U, Instrument.HL_PERP, "hl")])
+    await _settle()
+    lines = [r.getMessage() for r in caplog.records if "판정 " in r.getMessage()]
+    assert len(lines) == 1 and "판정 08:00:02.200(NXT)" in lines[0]
+    assert "NXT호가시각 08:00:01 S 1,729,000 HL매수est 1310.00" in lines[0]
+    # 매도1 1310.5 × 1338.4 / 1,729,000 − 1 = +1.444%
+    assert lines[0].endswith("HL매도est 1310.50 환 1338.40 진입괴리 +1.406% 청산괴리 +1.444% "
+                             "→ 미달")
+    # 스프레드를 낮추면 결과가 바뀌어 다시 남고, 발주 로그엔 판정 시각과 발주 시각이 같이
+    eng.settings(U).entries = [Tier(0.010, 100, 0.009)]
+    clk.advance(0.5)
+    eng._on_quote(q)
+    await _settle()
+    lines = [r.getMessage() for r in caplog.records if "판정 " in r.getMessage()]
+    assert len(lines) == 3 and lines[1].endswith("→ 발주 진입1")
+    assert "판정 08:00:02.700 발주 08:00:02.700 —" in lines[2] and len(sys_.placed) == 1

@@ -3,10 +3,8 @@ from __future__ import annotations
 
 from kp_arb.domain.enums import Underlying
 from kp_arb.nxt_open_screen import (
-    active_label,
     base_text,
     frac_of,
-    merge_choices,
     monitor_text,
     pct_text,
     qty_text,
@@ -121,23 +119,9 @@ def test_top_row_locks_all_but_underlying_while_running() -> None:
     # 사용자 2026-10-21: 진입 or 청산 실행 중이면 종목 콤보 빼고 윗줄(호가단위·적·기준수량·시간)
     # 입력 불가
     locked = top_states(True)
-    assert set(locked) == {"agg", "apply", "ref", "open", "start", "end",
-                           "hl_base", "range"}  # 종목 콤보 제외(hl_base·range는 10-29 추가 칸)
+    # 종목 콤보 제외(hl_base·range는 10-29 추가 칸). 호가단위는 10-30부터 글자뿐이라 잠글 게 없다
+    assert set(locked) == {"apply", "ref", "open", "start", "end", "hl_base", "range"}
     assert all(v == "disabled" for v in locked.values())
     free = top_states(False)
-    assert free["agg"] == "readonly"  # 콤보는 글 입력 없이 고르기만
     assert all(free[k] == "normal" for k in ("apply", "ref", "open", "start", "end",
                                              "hl_base", "range"))
-
-
-def test_merge_combo_helpers_follow_core_ticks() -> None:
-    # 코어 hl_merge_ticks(일반주문창·체결쏴와 같은 모양) → 콤보 글과 (n_sig_figs, mantissa) 표
-    ticks = [{"tick": "0.1", "n_sig_figs": None, "mantissa": None},
-             {"tick": "0.2", "n_sig_figs": 5, "mantissa": 2},
-             {"tick": "0.5", "n_sig_figs": 5, "mantissa": 5}]
-    labels, table = merge_choices(ticks)
-    assert labels == ["0.1", "0.2", "0.5"] and table["0.5"] == (5, 5)
-    assert active_label(table, {"n_sig_figs": 5, "mantissa": 2}) == "0.2"
-    # 틱 글이 오면 그것으로(2026-10-27 — 가격대가 바뀌어 인자가 달라도 라벨은 틱)
-    assert active_label(table, {"n_sig_figs": 9, "mantissa": None, "tick": "0.5"}) == "0.5"
-    assert active_label(table, None) is None and active_label(table, {"n_sig_figs": 9}) is None

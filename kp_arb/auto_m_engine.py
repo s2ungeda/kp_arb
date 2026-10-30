@@ -57,7 +57,7 @@ from .domain.models import InstrumentInfo, OrderIntent, Quote
 from .gateways.base import PlaceResult
 from .gateways.ls import OrderGoneError
 from .gateways.ls_rest import RestTimeoutError
-from .hl_merge import merge_tick_options
+from .hl_merge import merge_active_dict, merge_tick_options
 from .hl_price import hl_price_step, hl_round_price
 from .logs import attach_daily_file
 from .routing import account_for
@@ -1892,8 +1892,7 @@ class AutoMEngine:
                 "next_month": self._next_month_info(u),
                 "market": book.market,  # 주식 거래소(KRX/NXT) — 화면 콤보 복원용
                 "hl_merge_ticks": merge_ticks,
-                "hl_merge_active": ({"n_sig_figs": active[0], "mantissa": active[1]}
-                                    if active is not None else None)}
+                "hl_merge_active": merge_active_dict(active, ref)}  # 틱 글 포함(화면 글자)
 
     @staticmethod
     def _set_row(s: AutoMSet, mono: float) -> dict[str, Any]:

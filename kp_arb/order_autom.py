@@ -590,13 +590,11 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     cb_under.set("하이닉스")
     cb_under.pack(side="left", padx=(0, 4))
     cb_under.bind("<<ComboboxSelected>>", lambda e: on_under_change(e))  # 종목별 세트 상태 전환
-    # HL 호가단위(틱) — 일반주문창처럼 코어가 계산한 실제 틱 숫자(autom_live.hl_merge_ticks)로
-    # 채운다. 코어 가격 수신 전엔 "-" 하나.
-    cb_agg = ttk.Combobox(top, values=["-"], width=6, state="readonly")
-    cb_agg.set("-")
-    cb_agg.pack(side="left", padx=(0, 4))
-    agg_map: dict[str, tuple[int | None, int | None]] = {}  # 틱 라벨 → (nSigFigs, mantissa)
-    agg_shown = {"under": ""}  # 어느 종목 기준으로 콤보를 채웠나
+    # HL 호가단위(틱) — 코어 공용 값을 글자로만 보여 준다(바꾸는 콤보는 일반주문창 한 곳뿐,
+    # 사용자 2026-10-30). 코어 가격 수신 전엔 "-".
+    lbl_agg = tk.Label(top, text="-", fg="black", bg="white", relief="solid", bd=1, width=5)
+    lbl_agg.pack(side="left", padx=(0, 4))
+    agg_shown = {"label": "-"}  # 지금 보이는 틱 글
     # 선물 월물(근/차근) — 화면(종목) 단위, 모든 세트 공통 (DESIGN §5.11, 사용자 확정 2026-09-03).
     # 목업 layout_1.png에는 없는 항목 — 호가단위 콤보 오른쪽. '적'으로 코어에 보낸다.
     cb_month = ttk.Combobox(top, values=list(MONTH_MAP), width=4, state="readonly")
@@ -626,11 +624,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     def apply_market() -> None:
         u = cur_under()
         _guard_next_month()  # 차근 구간 밖이면 알림 + 최근(콤보 선택 때 이미 걸렀지만 '적' 때도)
-        if cb_agg.get() in agg_map:  # 틱 목록이 아직 없으면(가격 미수신) 머지는 건너뜀
-            nsf, mant = agg_map[cb_agg.get()]
-            send({"cmd": "manual_hl_merge", "underlying": u,
-                  "tick": cb_agg.get().replace(",", ""), "n_sig_figs": nsf, "mantissa": mant},
-                 "호가단위")
+        # HL 호가단위는 여기서 안 보낸다 — 바꾸는 콤보는 일반주문창뿐(사용자 2026-10-30)
         if spec.has_month:
             send({"cmd": "autom_month", "underlying": u, "month": MONTH_MAP[cb_month.get()]},
                  "선물 월물")
@@ -640,7 +634,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # 로그로 짚게 — 화면이 보는 코어 종목 상태(기준수량·모니터)와 상태 수신 여부를 함께 남긴다
         live = _live_book()
         screen_log().info("%s 적 — 종목 %s 호가단위 %s 기준수량칸 %r | 코어 ref_qty %s monitor %s "
-                          "| 상태 수신 %s", spec.log_tag, u, cb_agg.get(), ent_refqty.get(),
+                          "| 상태 수신 %s", spec.log_tag, u, agg_shown["label"], ent_refqty.get(),
                           live.get("ref_qty"), live.get("monitor"),
                           box_is_live(state_box, time.time()))
 
@@ -649,10 +643,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         실행 중에도 바꿀 수 있다(사용자 2026-10-01) — 실행 중이던 종목은 코어에서 계속 돈다."""
         state_box["_loaded_under"] = None  # 다음 갱신 때 그 종목 상태으로 입력값 다시 채움
         state_box["_applied"] = False  # 종목을 바꾸면 '적'을 다시 눌러야(결정 86, 옛 44의 구멍)
-        agg_shown["under"] = ""
-        agg_map.clear()
-        cb_agg.config(values=["-"])
-        cb_agg.set("-")
+        agg_shown["label"] = "-"
+        lbl_agg.config(text="-")
         ref_sent["qty"] = -1
 
     # 마지막으로 보낸 기준수량(같으면 다시 안 보냄) · 입력칸 평소 배경(깜빡임 뒤 복귀)
@@ -1771,7 +1763,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # 세트 값(목표·1회·기준값·RT·체결차)은 코어가 종목별로 든다(단일 진실, 2026-09-08) —
         # 창은 종목·호가단위·기준수량 표시값과 체결쏴 설정(공통)만 저장한다.
         return {
-            "under": cb_under.get(), "agg": cb_agg.get(), "refqty": ent_refqty.get(),
+            "under": cb_under.get(), "refqty": ent_refqty.get(),
             "bg": bg_state["name"],  # 콤보 이름 또는 '#rrggbb'
             "fg": fg_state["cur"],   # 글자색 '#rrggbb' 또는 None(기본)
             "common": {"windows": list(common["windows"]),
@@ -1791,8 +1783,6 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
             return
         if saved.get("under") in cb_under["values"]:  # 현대차 등 제외된 종목은 복원 안 함
             cb_under.set(saved["under"])
-        if isinstance(saved.get("agg"), str):
-            state_box["_want_agg"] = saved["agg"]  # 틱 목록이 오면 그때 고른다
         if isinstance(saved.get("refqty"), str):
             ent_refqty.delete(0, "end")
             ent_refqty.insert(0, saved["refqty"])
@@ -2102,29 +2092,13 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         refresh_windows_bar()
 
     def _refresh_merge_combo(data: dict[str, Any]) -> None:
-        """코어가 준 hl_merge_ticks로 호가단위 콤보를 채운다 — 종목이 바뀌거나 처음일 때만 set.
-        우선순위: 코어 적용값(hl_merge_active) > 창 저장값 > 최소 틱 (일반주문창과 동일)."""
-        live = _live_book()
-        ticks = live.get("hl_merge_ticks") or []
-        under = cb_under.get()
-        if not ticks:
-            return
-        vals = [str(t.get("tick")) for t in ticks]
-        # 틱 표가 바뀌면(가격이 자릿수를 넘음 — 하이닉스 1,000달러, 2026-10-27) 다시 채운다
-        if agg_shown["under"] == under and agg_map and list(cb_agg["values"]) == vals:
-            return
-        agg_map.clear()
-        for t, label in zip(ticks, vals, strict=True):
-            agg_map[label] = (t.get("n_sig_figs"), t.get("mantissa"))
-        cb_agg.config(values=vals)
-        active = live.get("hl_merge_active")
-        core_label = None
-        if isinstance(active, dict):
-            key = (active.get("n_sig_figs"), active.get("mantissa"))
-            core_label = next((s for s, v in agg_map.items() if v == key), None)
-        want = state_box.get("_want_agg")
-        cb_agg.set(core_label or (want if want in vals else vals[0]))
-        agg_shown["under"] = under
+        """코어가 지금 적용 중인 HL 호가단위(hl_merge_active의 틱 글)를 글자로 — 바뀔 때만 set.
+        바꾸는 콤보는 일반주문창뿐(사용자 2026-10-30)."""
+        active = _live_book().get("hl_merge_active")
+        label = str(active.get("tick") or "-") if isinstance(active, dict) else "-"
+        if label != agg_shown["label"]:
+            agg_shown["label"] = label
+            lbl_agg.config(text=label)
 
     def apply_live() -> None:
         data = state_box.get("data") or {}
@@ -2252,8 +2226,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # 주식선물의 09-17 잠금은 폐기). 다른 종목 상태를 보러 갈 수 있고, 실행 중이던 종목은
         # 코어에서 계속 돈다.
         running = _any_running()
-        for cb in (cb_agg, cb_month):
-            cb.config(state="disabled" if running else "readonly")
+        cb_month.config(state="disabled" if running else "readonly")
         btn_apply.config(state="disabled" if running else "normal")
         if details:  # 진행 중인 세트의 상세(선주문 번호·가격·체결·HL 대기·중지 사유) — 최근 순
             seen = state_box.get("_detail_seen") or {}

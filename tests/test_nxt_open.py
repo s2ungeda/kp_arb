@@ -15,6 +15,7 @@ from kp_arb.nxt_open import (
     day_over,
     disparity,
     hl_current,
+    hotime_text,
     judge,
     level_price,
     opposite,
@@ -240,3 +241,9 @@ def test_auto_exit_and_range_block_pure() -> None:
         "매수 금지 — HL 1,030.0 ≥ 한도 1,030.0(기준 1,000.0 +3%)")
     assert range_block(Side.BUY, 1029.9, 1000.0, 0.03) is None
     assert range_block(Side.BUY, 970.0, 1000.0, 0.03) is None  # 매수는 아래쪽 급락엔 안 막음
+
+
+def test_hotime_text_for_diag_log() -> None:
+    # §6 임시 진단 로그(2026-10-30): LS 호가의 거래소 시각 HHMMSS → "HH:MM:SS", 없으면 "-"
+    assert hotime_text(80001.0) == "08:00:01" and hotime_text(235959.0) == "23:59:59"
+    assert hotime_text(0.0) == "-" and hotime_text(None) == "-" and hotime_text(240000.0) == "-"

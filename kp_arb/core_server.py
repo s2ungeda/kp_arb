@@ -37,6 +37,7 @@ from .domain.models import OrderIntent, Quote
 from .fx_auction import FxAuctionSettings
 from .hl_merge import (
     fmt_tick,
+    merge_active_dict,
     merge_band,
     merge_choice_for_tick,
     merge_tick_options,
@@ -656,10 +657,7 @@ def manual_snapshot(system: LiveSystem | None) -> dict[str, Any]:
                 # 현재 적용 중인 머지(단일 진실=코어) — 새 창·다른 창이 콤보를 맞추는 기준.
                 _ma = (system.hl_merge_active(u)
                        if hasattr(system, "hl_merge_active") else None)
-                entry["merge_active"] = (
-                    {"n_sig_figs": _ma[0], "mantissa": _ma[1],
-                     "tick": (fmt_tick(merge_tick_size(float(_ref), _ma[0], _ma[1]))
-                              if _ref else None)} if _ma is not None else None)
+                entry["merge_active"] = merge_active_dict(_ma, _ref)
             if is_spot_stock(inst):
                 entry["sellable"] = sellable_qty(
                     held, pending_sell.get((u, inst), 0.0))
@@ -844,11 +842,17 @@ def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
             return _fail(errors)
         if engine is not None and st.open_hms != open_before:
             engine.reset_day(u)  # 개장 시각이 바뀌면 오늘 상태 다시(사용자 2026-10-21)
+        # 단 = (스프레드, 수량, 주문가, 청산가, 자동청산) — 기준수량·HL기준·범위도 같이
+        # (2026-10-30, 운영 로그 역추적용)
         logging.getLogger("kp_arb.nxt_open").info(
-            "[NXT개장] %s 설정 저장: 창 +%.1f~+%.1f초 개장 %s 진입 %s 청산 %s",
-            u.value, st.start_s, st.end_s, st.open_hms,
-            [(t.spread, t.qty, t.price_spread) for t in st.entries],
-            [(t.spread, t.qty, t.price_spread) for t in st.exits])
+            "[NXT개장] %s 설정 저장: 창 +%.1f~+%.1f초 개장 %s 기준수량 %g HL기준 %s 범위 %g%% "
+            "진입 %s 청산 %s",
+            u.value, st.start_s, st.end_s, st.open_hms, st.ref_qty, st.hl_base_hms,
+            st.range_limit * 100,
+            [(t.spread, t.qty, t.price_spread, t.exit_price_spread, t.auto_exit)
+             for t in st.entries],
+            [(t.spread, t.qty, t.price_spread, t.exit_price_spread, t.auto_exit)
+             for t in st.exits])
         return _ok()
     if cmd == "nxt_open_run":
         if engine is None:
@@ -1290,10 +1294,7 @@ def monitor_snapshot(
             active = system.hl_merge_active(u)
             hq = system.quotes.get((u, Instrument.HL_PERP, "hl"))
             ref = (hq.ask or hq.bid) if hq is not None else None
-            merges[u.value] = ({"n_sig_figs": active[0], "mantissa": active[1],
-                                "tick": (fmt_tick(merge_tick_size(float(ref), active[0],
-                                                                  active[1])) if ref else None)}
-                               if active is not None else None)
+            merges[u.value] = merge_active_dict(active, ref)
             merge_ticks[u.value] = ([{"tick": s, "n_sig_figs": nsf, "mantissa": mant}
                                      for s, nsf, mant in merge_tick_options(float(ref))]
                                     if ref else [])

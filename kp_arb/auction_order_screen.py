@@ -255,7 +255,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     from . import ui_theme as T
     from . import win_state
     from .core_client import core_request, run_state_feed, screen_log, watch_parent_exit
-    from .nxt_open_screen import active_label, merge_choices
     from .ui_close import attach_auto_close, main_closing
     from .ui_dialog import ask_yes_no, show_message
     from .ui_fields import (
@@ -309,10 +308,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             return
         jobs.put(({**payload, "sent_at": time.time()}, label))
 
-    cur: dict[str, Any] = {"u": UNDERLYINGS[0], "loaded": False, "agg_under": None,
+    cur: dict[str, Any] = {"u": UNDERLYINGS[0], "loaded": False,
                            "sent_rows": None, "sent_settings": None, "seen_rows": set(),
                            "seen_hl": {}, "fx_note": "", "note": ""}
-    agg_map: dict[str, tuple[Any, Any]] = {}
     w: dict[str, Any] = {"rows": {}, "res": {}, "res_on": {}, "hl": {}, "hold": {}}
 
     def entry(parent: tk.Misc, width: int, vc: Any, text: str = "",
@@ -340,8 +338,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     w["month"] = ttk.Combobox(top, values=["최근", "차근"], width=4, state="readonly")
     w["month"].set("최근")
     w["month"].pack(side="left", padx=(0, 4))
-    w["agg"] = ttk.Combobox(top, values=["-"], width=6, state="readonly")
-    w["agg"].set("-")
+    # HL 호가단위 — 코어 공용 값을 글자로만(바꾸는 콤보는 일반주문창 한 곳뿐, 사용자 2026-10-30)
+    w["agg"] = tk.Label(top, text="-", fg="black", bg="white", relief="solid", bd=1, width=5)
     w["agg"].pack(side="left", padx=(0, 4))
     w["apply"] = ttk.Button(top, text="적", width=3)
     w["apply"].pack(side="left", padx=(0, 8))
@@ -409,11 +407,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         w["res"][key].config(bg=bg, fg=fg, activebackground=bg, activeforeground=fg)
         for k in ("spread", "qty"):  # 켜진 행은 입력 잠금, 끄면 풀림(사용자 2026-10-26)
             w["rows"][key][k].config(state="disabled" if on else "normal")
-        # 한 행이라도 켜져 있으면 월물·호가단위 콤보와 '적'을 잠근다(종목 콤보는 둔다 — 체결쏴와
-        # 같음)
+        # 한 행이라도 켜져 있으면 월물 콤보와 '적'을 잠근다(종목 콤보는 둔다 — 체결쏴와 같음)
         locked = any_reserved(w["res_on"])
-        for k in ("month", "agg"):
-            w[k].config(state="disabled" if locked else "readonly")
+        w["month"].config(state="disabled" if locked else "readonly")
         w["apply"].config(state="disabled" if locked else "normal")
         # LS주식선물 주문시각 줄(시각·ms·인터벌)도 같이 잠근다(사용자 2026-10-26)
         for k in ("ls_hms", "ls_ms", "ls_itv"):
@@ -796,14 +792,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 하고, **예약 버튼·예약실행·정정을 누를 때와 종목을 바꿀 때·창을 닫을 때** 그 순간 값이 코어로
     # 간다('적'은 윗줄만). "저장 안 된 값" 알림은 두지 않는다(사용자 2026-10-26 "안 남겨도 됨").
     def apply_top() -> None:
-        """'적' — 윗줄만: 호가단위(manual_hl_merge, 코어 공용) + 월물(체결쏴와 같은 역할). 설정 칸·
-        행은 예약 버튼·예약실행을 누를 때 간다(사용자 2026-10-26 "'적' 눌러서 저장은 안 하기로")."""
-        label = w["agg"].get()
-        if label in agg_map:
-            nsf, mant = agg_map[label]
-            send({"cmd": "manual_hl_merge", "underlying": cur["u"].value,
-                  "tick": label.replace(",", ""), "n_sig_figs": nsf, "mantissa": mant},
-                 "호가단위")
+        """'적' — 윗줄만: 월물(체결쏴와 같은 역할; 호가단위는 2026-10-30부터 일반주문창 콤보만).
+        설정 칸·행은 예약 버튼·예약실행을 누를 때 간다(사용자 2026-10-26 "'적' 눌러서 저장은 안
+        하기로")."""
         send({"cmd": "auction_settings", "underlying": cur["u"].value,
               "month": "next" if w["month"].get() == "차근" else "near"}, "월물")
 
@@ -860,29 +851,19 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     paint_res((side_k, i))
 
     def refresh_agg(live: dict[str, Any]) -> None:
-        # 종목이 바뀌거나 처음, 또는 틱 표가 바뀌었을 때(가격이 자릿수를 넘음, 2026-10-27) 다시 채움
-        ticks = live.get("hl_merge_ticks") or []
-        if not ticks:
-            return
-        labels, table = merge_choices(ticks)
-        if cur["agg_under"] == cur["u"] and agg_map and list(w["agg"]["values"]) == labels:
-            return
-        agg_map.clear()
-        agg_map.update(table)
-        w["agg"].config(values=labels)
-        w["agg"].set(active_label(agg_map, live.get("hl_merge_active")) or labels[0])
-        cur["agg_under"] = cur["u"]
+        # 코어가 지금 적용 중인 HL 호가단위(hl_merge_active의 틱 글)를 글자로 — 바뀔 때만
+        active = live.get("hl_merge_active")
+        label = str(active.get("tick") or "-") if isinstance(active, dict) else "-"
+        if w["agg"].cget("text") != label:
+            w["agg"].config(text=label)
 
     def on_under_change(_e: object = None) -> None:
         if cur["loaded"]:
             send_rows()
             send_settings()
-        cur["u"], cur["loaded"], cur["agg_under"] = BY_NAME.get(w["under"].get(),
-                                                                UNDERLYINGS[0]), False, None
+        cur["u"], cur["loaded"] = BY_NAME.get(w["under"].get(), UNDERLYINGS[0]), False
         cur["seen_rows"], cur["seen_hl"], cur["fx_note"], cur["note"] = set(), {}, "", ""
-        agg_map.clear()
-        w["agg"].config(values=["-"])
-        w["agg"].set("-")
+        w["agg"].config(text="-")
         for key in ("fx_run", "hl_run"):
             set_run_state(key, False)
         w["test_var"].set(False)
@@ -1008,7 +989,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if name is None or name == w["under"].get():
             return
         w["under"].set(name)  # on_under_change를 부르지 않는다 — 아직 받은 값이 없어 저장할 게 없음
-        cur["u"], cur["loaded"], cur["agg_under"] = BY_NAME[name], False, None
+        cur["u"], cur["loaded"] = BY_NAME[name], False
 
     def persist_fields() -> None:
         try:

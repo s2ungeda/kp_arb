@@ -1,6 +1,6 @@
 """오전 NXT 개장 매매 화면 — DESIGN-nxt-open.md §8a, 체결쏴 주식 화면 골격(사용자 2026-10-20).
 
-체결쏴와 같은 틀: 1줄 = 종목 콤보·HL 호가단위 콤보(일반주문창·체결쏴와 같은 틱 머지)·개장 시각·
+체결쏴와 같은 틀: 1줄 = 종목 콤보·HL 호가단위 글자(코어 공용 값, 콤보는 일반주문창뿐)·개장 시각·
 창(+초 ~ +초) 입력(제목 글자 없이 칸만 — 사용자 2026-10-20),
 2줄 = 진입 수치(빨강)·청산 수치(파랑)·환율(출처), 그 아래 표 = 진입 1~3단, 그 밑에 청산 1~3단
 (스프레드 %·수량·주문가 %·역산가·결과), 맨 아래 상태줄(창 상태·명령 결과).
@@ -98,7 +98,7 @@ def settings_payload(u: Underlying, open_hms: str, start: str, end: str,
                      entries: list[tuple[Any, ...]],
                      exits: list[tuple[Any, ...]], hl_base_hms: str = "",
                      range_limit: str = "") -> dict[str, Any]:
-    """입력 → nxt_open_settings 명령 본문. HL 호가단위는 manual_hl_merge로 따로(코어 공용 상태).
+    """입력 → nxt_open_settings 명령 본문. HL 호가단위는 코어 공용 값(일반주문창에서만 바꿈).
     hl_base_hms·range_limit = 2026-10-29 추가 칸(빈 글 = 기본값 07:59:55·3%)."""
 
     def _f(text: str, default: float) -> float:
@@ -114,29 +114,6 @@ def settings_payload(u: Underlying, open_hms: str, start: str, end: str,
             "hl_base_hms": hl_base_hms.strip() or DEFAULT_HL_BASE_HMS,
             "range_limit": (frac_of(range_limit) if frac_of(range_limit) is not None
                             else DEFAULT_RANGE_LIMIT)}
-
-
-def merge_choices(ticks: list[dict[str, Any]]) -> tuple[list[str], dict[str, tuple[Any, Any]]]:
-    """코어 hl_merge_ticks → (콤보 글 목록, 글 → (n_sig_figs, mantissa)). 체결쏴와 같은 요령."""
-    labels: list[str] = []
-    table: dict[str, tuple[Any, Any]] = {}
-    for t in ticks:
-        label = str(t.get("tick"))
-        labels.append(label)
-        table[label] = (t.get("n_sig_figs"), t.get("mantissa"))
-    return labels, table
-
-
-def active_label(table: dict[str, tuple[Any, Any]], active: Any) -> str | None:
-    """코어가 지금 적용 중인 머지에 해당하는 콤보 글 — 틱 글(tick)이 있으면 그것, 없으면
-    (n_sig_figs, mantissa)로 찾는다."""
-    if not isinstance(active, dict):
-        return None
-    tick = active.get("tick")
-    if tick is not None and str(tick) in table:
-        return str(tick)
-    key = (active.get("n_sig_figs"), active.get("mantissa"))
-    return next((s for s, v in table.items() if v == key), None)
 
 
 def results_summary(results: list[dict[str, Any]]) -> str:
@@ -201,11 +178,10 @@ def saved_under(saved: dict[str, Any]) -> str | None:
 
 def top_states(locked: bool) -> dict[str, str]:
     """윗줄 칸의 잠금 상태(사용자 2026-10-21): 진입·청산 어느 쪽이든 실행 중이면 종목 콤보만 빼고
-    호가단위·적·기준수량·시간을 전부 잠근다. 콤보는 평소 readonly(고르기만), 버튼·입력칸은 normal.
-    순수 — 화면은 이 표대로 config(state=…)만 한다."""
-    combo = "disabled" if locked else "readonly"
+    적·기준수량·시간을 전부 잠근다(호가단위는 글자뿐 — 콤보는 일반주문창, 2026-10-30). 버튼·입력칸은
+    normal. 순수 — 화면은 이 표대로 config(state=…)만 한다."""
     plain = "disabled" if locked else "normal"
-    return {"agg": combo, "apply": plain, "ref": plain, "open": plain, "start": plain,
+    return {"apply": plain, "ref": plain, "open": plain, "start": plain,
             "end": plain, "hl_base": plain, "range": plain}
 
 
@@ -265,10 +241,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         jobs.put(({**payload, "sent_at": time.time()}, label))
 
     # applied: 모니터 수치는 '적'을 누른 뒤부터 표시(체결쏴와 같은 규칙, 사용자 2026-09-04·10-20)
-    cur: dict[str, Any] = {"u": UNDERLYINGS[0], "loaded": False, "agg_under": None,
-                           "applied": False}
+    cur: dict[str, Any] = {"u": UNDERLYINGS[0], "loaded": False, "applied": False}
     local: dict[Underlying, dict[str, Any]] = {}  # 종목 바꿀 때 화면에 기억해 둔 입력값
-    agg_map: dict[str, tuple[Any, Any]] = {}      # 호가단위 글 → (n_sig_figs, mantissa)
     w: dict[str, Any] = {}
 
     # ===== 1줄: 종목·HL 호가단위·적·기준수량·시간 (체결쏴 주식 윗줄 순서, 사용자 2026-10-20) =====
@@ -278,10 +252,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                               state="readonly")
     w["under"].set(NAMES[UNDERLYINGS[0]])
     w["under"].pack(side="left", padx=(0, 4))
-    # HL 호가단위(틱 머지) — 일반주문창·체결쏴와 같은 코어 공용 상태(hl_merge). 코어가 준
-    # hl_merge_ticks로 채우고, '적'을 누르면 manual_hl_merge + 기준수량을 보낸다(체결쏴와 같음).
-    w["agg"] = ttk.Combobox(top, values=["-"], width=6, state="readonly")
-    w["agg"].set("-")
+    # HL 호가단위(틱 머지) — 코어 공용 값(hl_merge)을 글자로만. 바꾸는 콤보는 일반주문창 한 곳뿐
+    # (사용자 2026-10-30).
+    w["agg"] = tk.Label(top, text="-", fg="black", bg="white", relief="solid", bd=1, width=5)
     w["agg"].pack(side="left", padx=(0, 4))
     w["apply"] = ttk.Button(top, text="적", width=3, command=lambda: apply_top())
     w["apply"].pack(side="left", padx=(0, 4))
@@ -434,15 +407,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                  "기준수량")
 
     def apply_top() -> None:
-        """'적' — 호가단위(manual_hl_merge) + 기준수량을 코어에(체결쏴 apply_market과 같은 역할).
-        누른 뒤부터 모니터 수치를 보여 준다."""
+        """'적' — 기준수량을 코어에(체결쏴 apply_market과 같은 역할; 호가단위는 2026-10-30부터
+        일반주문창 콤보만). 누른 뒤부터 모니터 수치를 보여 준다."""
         cur["applied"] = True
-        label = w["agg"].get()
-        if label in agg_map and not preview:
-            nsf, mant = agg_map[label]
-            send({"cmd": "manual_hl_merge", "underlying": cur["u"].value,
-                  "tick": label.replace(",", ""), "n_sig_figs": nsf, "mantissa": mant},
-                 "호가단위")
         send_ref_qty(force=True)
         save_if_changed()  # 단 값도 '적'을 누르면 함께(결정 74 방식)
 
@@ -528,19 +495,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             save_current()
 
     def refresh_agg(live: dict[str, Any]) -> None:
-        """코어 hl_merge_ticks로 호가단위 콤보 채우기 — 종목이 바뀌거나 처음, 또는 틱 표가 바뀌었을
-        때(가격이 자릿수를 넘음 — 하이닉스 1,000달러, 2026-10-27) set."""
-        ticks = live.get("hl_merge_ticks") or []
-        if not ticks:
-            return
-        labels, table = merge_choices(ticks)
-        if cur["agg_under"] == cur["u"] and agg_map and list(w["agg"]["values"]) == labels:
-            return
-        agg_map.clear()
-        agg_map.update(table)
-        w["agg"].config(values=labels)
-        w["agg"].set(active_label(agg_map, live.get("hl_merge_active")) or labels[0])
-        cur["agg_under"] = cur["u"]
+        """코어가 지금 적용 중인 HL 호가단위(hl_merge_active의 틱 글)를 글자로 — 바뀔 때만 set."""
+        active = live.get("hl_merge_active")
+        label = str(active.get("tick") or "-") if isinstance(active, dict) else "-"
+        if w["agg"].cget("text") != label:
+            w["agg"].config(text=label)
 
     def load_inputs(st: dict[str, Any]) -> None:
         set_entry(w["ref"], str(st.get("ref_qty", 1)))  # 윗줄도 잠겨 있을 수 있어 set_entry로
@@ -568,10 +527,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if cur["loaded"]:  # 보던 종목의 입력값을 코어에(미리보기면 화면에만) 남기고
             save_current()  # (아직 코어 값을 못 받았으면 빈 칸을 저장해 지우는 일이 없게)
         u = BY_NAME.get(w["under"].get(), UNDERLYINGS[0])
-        cur["u"], cur["loaded"], cur["agg_under"] = u, False, None
-        agg_map.clear()
-        w["agg"].config(values=["-"])
-        w["agg"].set("-")
+        cur["u"], cur["loaded"] = u, False
+        w["agg"].config(text="-")
         if u in local:
             load_inputs(local[u])  # 화면이 기억한 값 먼저, 코어 값은 다음 갱신에서
             cur["loaded"] = True
@@ -664,7 +621,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if name is None or name == w["under"].get():
             return
         w["under"].set(name)  # on_under_change를 부르지 않는다 — 아직 받은 값이 없어 저장할 게 없음
-        cur["u"], cur["loaded"], cur["agg_under"] = BY_NAME[name], False, None
+        cur["u"], cur["loaded"] = BY_NAME[name], False
 
     def persist_fields() -> None:
         try:

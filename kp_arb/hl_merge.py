@@ -12,6 +12,7 @@ HL 서버의 머지 인자(nSigFigs, mantissa)는 유효숫자 기준이라 가�
 from __future__ import annotations
 
 import math
+from typing import Any
 
 # (기준틱 배수, nSigFigs, mantissa) — HL은 유효숫자 기준으로 뭉치므로, 종목별 실제 틱 =
 # 기준틱×배수로 표시한다(원시/2배 라벨 대신). nSigFigs=5일 때만 mantissa(1·2·5) 유효.
@@ -68,6 +69,17 @@ def merge_tick_size(price: float, n_sig_figs: int | None, mantissa: int | None) 
     mult = next((m for m, nsf, mant in _MERGE_LEVELS if (nsf, mant) == (n_sig_figs, mantissa)),
                 1)
     return _base_tick(price) * mult
+
+
+def merge_active_dict(active: tuple[int | None, int | None] | None,
+                      ref: float | None) -> dict[str, Any] | None:
+    """지금 적용 중인 머지를 화면용 dict로 — n_sig_figs·mantissa + 그 가격대의 틱 글(ref 없으면
+    None). 일반주문창·체결쏴·NXT 개장·동시호가 스냅샷이 전부 이것을 쓴다(한 규칙 — 2026-10-30 체결쏴
+    호가단위 글자가 "-"로 남은 실증: 틱 글 없는 스냅샷을 화면이 못 읽음). 순수."""
+    if active is None:
+        return None
+    tick = fmt_tick(merge_tick_size(float(ref), active[0], active[1])) if ref else None
+    return {"n_sig_figs": active[0], "mantissa": active[1], "tick": tick}
 
 
 def merge_choice_for_tick(price: float,

@@ -45,7 +45,7 @@ from .auction_order import (
 from .domain.enums import Account, Instrument, OrderType, SessionPhase, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .gateways.ls_ws import Fill
-from .hl_merge import merge_tick_options
+from .hl_merge import merge_active_dict, merge_tick_options
 from .theory import quote_price
 
 FUTURES_MARKET = "5"           # JIF 선물 시장(session_service.FUTURES_MARKET)
@@ -690,8 +690,7 @@ class AuctionOrderEngine:
                 "hl_merge_ticks": ([{"tick": t, "n_sig_figs": nsf, "mantissa": mant}
                                     for t, nsf, mant in merge_tick_options(float(ref))]
                                    if ref else []),
-                "hl_merge_active": ({"n_sig_figs": merge[0], "mantissa": merge[1]}
-                                    if merge is not None else None),
+                "hl_merge_active": merge_active_dict(merge, ref),  # 틱 글 포함(화면 글자)
                 "hl_mid": inp["hl_mid"], "s": inp["s"], "theory": inp["theory"],
                 "prices": {f"{s}:{i}": px for (s, i), px in d.px.items()},
                 # 지금 값으로 차례가 오면 나갈 행(§2 표시, 사용자 2026-10-26) — 켜져 있고 아직 안 본

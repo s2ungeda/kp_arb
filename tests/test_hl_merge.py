@@ -1,5 +1,10 @@
 """HL 호가단위(틱) 옵션 순수 로직 — 가격 자릿수 기반 단계."""
-from kp_arb.hl_merge import merge_band, merge_choice_for_tick, merge_tick_options
+from kp_arb.hl_merge import (
+    merge_active_dict,
+    merge_band,
+    merge_choice_for_tick,
+    merge_tick_options,
+)
 
 
 def test_choice_for_tick_follows_price_band() -> None:
@@ -37,3 +42,13 @@ def test_options_scale_with_price() -> None:
 def test_nonpositive_price_empty() -> None:
     assert merge_tick_options(0.0) == []
     assert merge_tick_options(-5.0) == []
+
+
+def test_merge_active_dict_carries_tick_text_for_screens() -> None:
+    # 2026-10-30: 체결쏴·NXT 개장·동시호가 화면은 콤보 대신 글자라 스냅샷에 틱 글이 있어야 한다
+    # (실증: 틱 글 없는 자동M 스냅샷 → 화면 "-"). 163달러대 nSigFigs 5·mantissa 1 = 0.01
+    assert merge_active_dict((5, 1), 163.4) == {"n_sig_figs": 5, "mantissa": 1, "tick": "0.01"}
+    assert merge_active_dict((None, None), 1081.0) == {"n_sig_figs": None, "mantissa": None,
+                                                        "tick": "0.1"}
+    assert merge_active_dict((5, 1), None) == {"n_sig_figs": 5, "mantissa": 1, "tick": None}
+    assert merge_active_dict(None, 163.4) is None
