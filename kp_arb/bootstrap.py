@@ -21,7 +21,6 @@ import re
 from collections import deque
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from datetime import date, datetime, time
-from time import monotonic as _monotonic
 from typing import Any
 
 from . import order_log
@@ -62,7 +61,7 @@ from .limits import (
     would_exceed_daily_limit,
 )
 from .order_book import OrderBook, TrackedOrder
-from .quote_plan import FX_EXPECTED_TR, FX_TRADE_TR, QuotePlanInput, plan
+from .quote_plan import FX_EXPECTED_TR, FX_NIGHT_TRADE_TR, FX_TRADE_TR, QuotePlanInput, plan
 from .risk import RiskManager, RiskState
 from .routing import account_for
 from .session import reference_instrument
@@ -82,7 +81,8 @@ from .theory import (
 from .ticks import ceil_to_tick, floor_to_tick, maker_cap, tick_for
 from .ws_status import WsStatus
 
-FX_PLAN_TRS = frozenset({FX_TRADE_TR, FX_EXPECTED_TR})  # 원달러선물 채널로 가는 계획 TR
+# 원달러선물 채널로 가는 계획 TR(야간 DC0 포함 — 2026-11-04 복원)
+FX_PLAN_TRS = frozenset({FX_TRADE_TR, FX_NIGHT_TRADE_TR, FX_EXPECTED_TR})
 
 # HL 발주가 통신 오류로 끝난 뒤 cloid를 기억해 두는 유예(초) — 살아 있는 주문의 늦은 통보를 받아
 # 주고, 끝에 orderStatus(cloid)로 한 번 더 확인한다(DESIGN §HL cloid ③, 검토 2026-09-11 §A).
@@ -367,9 +367,6 @@ class LiveSystem:
         self.usdkrw_spot: float | None = None
         self._fx_spot_ts = 0.0  # 마지막 LS 현물환율(CUR) 수신 시각(로그·진단용)
         self.usdkrw_spot_src: str | None = None
-        # 시세 신선도(exec 결정 86) — 호가 키별·환율의 마지막 수신 단조시계. 한 번도 없으면 키 없음
-        self.quote_rx: dict[tuple[Underlying, Instrument, str], float] = {}
-        self.fx_rx: float | None = None
         self._spot_ls: float | None = None    # LS CUR 최종 체결가(시동 뒤 받은 것)
         self._spot_hana: float | None = None  # 하나고시 마지막 조회값
         # LS가 한 번 출처가 되면 그 뒤론 하나고시를 안 쓰고 조회도 안 한다
@@ -727,15 +724,6 @@ class LiveSystem:
             "LS 호가 수신 지연 — 10분 %d건 평균 %.1fs 최대 %.1fs "
             "(거래소 호가시각 HHMMSS 대비, 초 단위·PC 시계 오차 포함)",
             n, avg / 1000.0, mx / 1000.0)
-
-    def quote_age(self, key: tuple[Underlying, Instrument, str]) -> float | None:
-        """그 호가를 마지막으로 받은 지 몇 초인가(결정 86). 한 번도 없으면 None."""
-        rx = self.quote_rx.get(key)
-        return None if rx is None else _monotonic() - rx
-
-    def fx_age(self) -> float | None:
-        """환율(현물환 또는 원달러선물 체결)을 마지막으로 받은 지 몇 초인가. 없으면 None."""
-        return None if self.fx_rx is None else _monotonic() - self.fx_rx
 
     def set_hl_risk_limits(self, price_pct: float, max_qty: float) -> None:
         """리스크 한도 주입(공통설정 저장·시동 때) — DESIGN-settings §1a."""
@@ -1474,7 +1462,6 @@ class LiveSystem:
         def fan_quote(quote: Quote) -> None:
             # 최신 호가판 보관(다단계 포함) 후 콜백 전달.
             self.quotes[(quote.underlying, quote.instrument, quote.market)] = quote
-            self.quote_rx[(quote.underlying, quote.instrument, quote.market)] = _monotonic()
             if quote.instrument is Instrument.KR_STOCK and quote.market == "uni":
                 self._note_stock_last(quote)
             # LS 호가 지연 계측 — UH1 한 건이 Quote 셋(uni/krx/nxt)으로 갈라져 오므로 주식은 uni만
@@ -1834,7 +1821,6 @@ class LiveSystem:
         if self._fx_futures is None or code != self._fx_futures[0]:
             return  # 차근월물 등은 환율이론가에 안 먹인다(최근월물 기준 유지)
         self.usdkrw_futures = price
-        self.fx_rx = _monotonic()  # 시세 신선도(결정 86)
         self._recompute_fx_theory()
         for handler in self.on_fx:
             handler()
@@ -1886,8 +1872,6 @@ class LiveSystem:
                 "현물환 출처 %s → %s (%s)", self.usdkrw_spot_src or "없음", src or "없음",
                 f"{value:.2f}" if value is not None else "-")
         self.usdkrw_spot, self.usdkrw_spot_src = value, src
-        if value is not None:
-            self.fx_rx = _monotonic()  # 시세 신선도(결정 86)
 
     def hana_spot_needed(self) -> bool:
         """지금 하나고시를 조회해야 하는가 — LS가 아직 출처가 된 적 없을 때(결정 70)."""

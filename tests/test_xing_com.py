@@ -315,6 +315,38 @@ async def test_order_lane_is_separate_and_timeout_is_result_unknown(res_dir: Pat
         s.close()
 
 
+async def test_query_object_reused_per_lane_replaced_after_timeout(res_dir: Path) -> None:
+    # 검토 2026-11-03 §5A: 차선당 XAQuery 하나를 재사용(요청마다 sink만 교체). 응답 없이 정리된
+    # 요청의 객체만 버리고 새로 만든다 — 그 객체의 늦은 응답은 옛 순번이라 무시(★7 (b) 유지)
+    fake_now = [100.0]
+    s, fac = await _session(res_dir, clock=lambda: fake_now[0])
+    try:
+        fac.responses["t1102"] = ("00000", "", {"t1102OutBlock": {"hname": "h", "price": "1"}})
+        for _ in range(3):
+            assert (await s.query("t1102", {"t1102InBlock": {"shcode": "1"}})).rsp_cd == "00000"
+        assert len(fac.queries) == 1  # 세 번 요청, 객체 하나
+        del fac.responses["t1102"]  # 응답 없음 → 시간 초과
+        pending = asyncio.ensure_future(
+            s.query("t1102", {"t1102InBlock": {"shcode": "2"}}, timeout_s=5.0))
+        await asyncio.sleep(0.05)
+        fake_now[0] = 106.0
+        with pytest.raises(XingTimeout):
+            await asyncio.wait_for(pending, 1.0)
+        assert LANE_QUERY in s._stale and LANE_QUERY not in s._queries
+        fac.responses["t1102"] = ("00000", "", {"t1102OutBlock": {"hname": "h", "price": "2"}})
+        r = await s.query("t1102", {"t1102InBlock": {"shcode": "3"}})
+        assert r.rsp_cd == "00000" and len(fac.queries) == 2  # 늦은 응답 위험 객체는 버리고 새로
+        assert LANE_QUERY not in s._stale
+        stale = fac.queries[0]
+        stale.sink("message", False, "00000", "늦은 응답")  # 옛 객체의 늦은 이벤트 — 무시
+        stale.sink("data", "t1102")
+        await asyncio.sleep(0.05)
+        assert (await s.query("t1102", {"t1102InBlock": {"shcode": "4"}})).rsp_cd == "00000"
+        assert len(fac.queries) == 2  # 다시 재사용
+    finally:
+        s.close()
+
+
 async def test_realtime_advise_and_event_to_asyncio(res_dir: Path) -> None:
     s, fac = await _session(res_dir)
     got: list[tuple[str, str, dict[str, str]]] = []

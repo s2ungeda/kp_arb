@@ -4,7 +4,13 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from kp_arb.logs import DailyFileHandler, QueuedHandler, attach_daily_file, has_file_handler
+from kp_arb.logs import (
+    DailyFileHandler,
+    QueuedHandler,
+    attach_daily_file,
+    has_file_handler,
+    queued_backlog,
+)
 
 
 def _read(path: Path) -> str:
@@ -61,3 +67,8 @@ def test_attach_daily_file_uses_queue_and_does_not_duplicate(tmp_path: Path) -> 
     assert len(files) == 1
     lines = _read(files[0]).splitlines()
     assert len(lines) == 50 and lines[-1].endswith("INFO 줄 49")
+
+
+def test_queued_backlog_counts_unwritten_records() -> None:
+    # 메모리 계측(2026-11-03): 쓰기 스레드가 아직 안 쓴 레코드 수 — 평소 0, 밀리면 양수
+    assert queued_backlog() >= 0

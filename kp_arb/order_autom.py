@@ -89,6 +89,9 @@ class ScreenSpec:
     set_rows: dict[str, int] | None = None  # 방향별 세트 줄 수(None = 코어 SET_ROWS, 주식은 4)
     alt_row_bg: bool = False      # 짝수 세트 행 하늘색 바탕(주식선물 8세트, 사용자 09-16)
     snapshot_rows: int = 0        # 마지막 판 스냅샷 줄 수(4 = Sprd·HP·SF·환, 1 = Sprd만, 0 = 없음)
+    # n번째 세트 뒤에 작은 간격(주식 12세트를 6·6으로 — 사용자 2026-11-03 "살짝 구분", 결정 87).
+    # 0 = 없음
+    group_gap_after: int = 0
     # 주식(결정 80, 2026-10-15): 주문가능시간 4구간(사용·시작~끝·거래소)과 '지금 거래소' 라벨(옛
     # 거래소 콤보 자리). 코어가 구간에 맞춰 거래소를 정하므로 화면은 표시만
     market_combo: bool = False
@@ -128,9 +131,9 @@ STOCK_SPEC = ScreenSpec(
     has_en_sf=False, has_month=False, qty_unit="주", settings_title="체결쏴 설정(주식)",
     pre_tick={"sk_hynix": 1000, "samsung": 100, "hyundai": 500},
     diff_head="체결차", entry_s_label="진입", qty_commas=True,
-    # 주식 5세트·아래 2개 기본 신용(09-16: 4→6→5) — 값은 코어 상수(코어 기본값과 한 값)
+    # 주식 12세트(11-03 결정 87, 전엔 5)·아래 2개 기본 신용 — 값은 코어 상수(코어 기본값과 한 값)
     credit_boxes=True, credit_default_rows=STOCK_CREDIT_DEFAULT_ROWS,
-    set_rows={"fwd": STOCK_SET_ROWS},
+    set_rows={"fwd": STOCK_SET_ROWS}, group_gap_after=6,
     snapshot_rows=1,  # 누적 블록은 위, 남는 줄에 마지막 판 Sprd 한 줄
     market_combo=True,  # 주식 API는 통합 미지원 → 구간별 거래소 KRX/NXT(결정 80)
     slot_count=STOCK_SLOT_COUNT)
@@ -156,6 +159,10 @@ SET_ROWS: dict[str, int] = {"fwd": SET_COUNT_FWD, "rev": SET_COUNT_REV}
 # 사양의 snapshot_rows 줄(주식선물 4 = Sprd·HP·SF·환, 주식 1 = Sprd만). 세트 줄이 4+n 이상일
 # 때만(주식선물 8세트, 주식 5세트) 누적 블록을 위에 두고 스냅샷을 놓는다. 미만이면 결정 35대로
 # 끝 줄 맞춤.
+
+
+# 세트 묶음 사이 간격(픽셀) — ScreenSpec.group_gap_after 다음 줄 위 여백(주식 6·7 사이, 결정 87)
+SET_GROUP_GAP_PX = 8
 
 
 def section_height(rows: int) -> int:
@@ -895,6 +902,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
 
         for i in range(rows_by[dtag]):  # 세트 줄(기본 3)
             r = rbase + i + 2
+            # 묶음 구분(결정 87): group_gap_after 다음 줄은 위 여백을 더 둔다
+            py: int | tuple[int, int] = (
+                (SET_GROUP_GAP_PX, 1) if spec.group_gap_after and i == spec.group_gap_after
+                else 1)
             w = sets[(dtag, i)]
             # 목표수량·1회주문·초는 행에서 바로 입력(사용자 2026-10-14, exec 결정 72 — 전엔 라벨이라
             # 설정 창으로만). 실행 중(진입이든 청산이든)엔 잠근다. 색은 전과 같게(노랑·회색)
@@ -902,32 +913,32 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                               disabledbackground="#fffbcc", disabledforeground="black",
                               validate="key", validatecommand=vcmd_qty_row,
                               font=T.FONT_BASE_LG)  # 목표수량(노랑)
-            lbl_tg.grid(row=r, column=col["tg"], padx=1, pady=1, sticky="nsew")
+            lbl_tg.grid(row=r, column=col["tg"], padx=1, pady=py, sticky="nsew")
             lbl_per = tk.Entry(grid, width=5, justify="right", bg="#f0f0f0",
                                disabledbackground="#f0f0f0", disabledforeground="black",
                                validate="key", validatecommand=vcmd_qty_row,
                                font=T.FONT_BASE_LG)  # 1회주문
-            lbl_per.grid(row=r, column=col["per"], padx=1, pady=1, sticky="nsew")
+            lbl_per.grid(row=r, column=col["per"], padx=1, pady=py, sticky="nsew")
             e_en_sf = tk.Entry(grid, width=5, justify="right", validate="key",
                                validatecommand=vcmd_dec, font=T.FONT_NUM_LG)  # 진입 SF
             if spec.has_en_sf:  # 주식은 칸을 만들되 안 붙인다(값은 비어 있음 — 아래 코드 공용)
-                e_en_sf.grid(row=r, column=col["en_sf"], padx=1, pady=1, sticky="nsew")
+                e_en_sf.grid(row=r, column=col["en_sf"], padx=1, pady=py, sticky="nsew")
             e_en_s = tk.Entry(grid, width=5, justify="right", validate="key",
                               validatecommand=vcmd_dec, font=T.FONT_NUM_LG)  # 진입 S
-            e_en_s.grid(row=r, column=col["en_s"], padx=1, pady=1, sticky="nsew")
+            e_en_s.grid(row=r, column=col["en_s"], padx=1, pady=py, sticky="nsew")
             btn_en = tk.Button(grid, text="진입", width=3, padx=0, pady=0,
                                bd=1, highlightthickness=0)
-            btn_en.grid(row=r, column=col["btn_en"], padx=1, pady=1, sticky="nsew")
+            btn_en.grid(row=r, column=col["btn_en"], padx=1, pady=py, sticky="nsew")
             e_ex_sf = tk.Entry(grid, width=5, justify="right", validate="key",
                                validatecommand=vcmd_dec, font=T.FONT_NUM_LG)  # 청산 SF(주식: S)
-            e_ex_sf.grid(row=r, column=col["ex_sf"], padx=1, pady=1, sticky="nsew")
+            e_ex_sf.grid(row=r, column=col["ex_sf"], padx=1, pady=py, sticky="nsew")
             btn_ex = tk.Button(grid, text="청산", width=3, padx=0, pady=0,
                                bd=1, highlightthickness=0)
-            btn_ex.grid(row=r, column=col["btn_ex"], padx=1, pady=1, sticky="nsew")
+            btn_ex.grid(row=r, column=col["btn_ex"], padx=1, pady=py, sticky="nsew")
             btn_set = tk.Button(grid, text="설정", width=3, padx=0, pady=0,
                                 bd=1, highlightthickness=0,
                                 command=partial(open_set_dialog, dtag, i))
-            btn_set.grid(row=r, column=col["set"], padx=1, pady=1, sticky="nsew")
+            btn_set.grid(row=r, column=col["set"], padx=1, pady=py, sticky="nsew")
             # RT선진입 — 행에서 바로 입력(사용자 2026-10-14, 결정 74): 고친 값은 **진입·청산 실행을
             # 켤 때** 세트설정의 'RT 진입수량 수동 입력'과 같은 1회성 값으로 같이 나간다(Enter 없음,
             # 사용자
@@ -938,17 +949,17 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                               validate="key",
                               validatecommand=vcmd_sint if dtag == "rev" else vcmd_int,
                               font=T.FONT_BASE_LG)  # RT선진입
-            lbl_rt.grid(row=r, column=col["rt"], padx=1, pady=1, sticky="nsew")
+            lbl_rt.grid(row=r, column=col["rt"], padx=1, pady=py, sticky="nsew")
             lbl_rt.bind("<KeyRelease>", partial(mark_rt_edited, dtag, i))
             lbl_rt.bind("<Escape>", partial(revert_rt, dtag, i))
             lbl_diff = tk.Label(grid, text="-", width=6, anchor="e", bg="white",
                                 relief="solid", bd=1, font=T.FONT_BASE_LG)  # 체결차
-            lbl_diff.grid(row=r, column=col["diff"], padx=1, pady=1, sticky="nsew")
+            lbl_diff.grid(row=r, column=col["diff"], padx=1, pady=py, sticky="nsew")
             lbl_sec = tk.Entry(grid, width=3, justify="right", bg="#f0f0f0",
                                disabledbackground="#f0f0f0", disabledforeground="black",
                                validate="key", validatecommand=vcmd_int,
                                font=T.FONT_BASE_LG)  # 전환딜레이 초
-            lbl_sec.grid(row=r, column=col["sec"], padx=1, pady=1, sticky="nsew")
+            lbl_sec.grid(row=r, column=col["sec"], padx=1, pady=py, sticky="nsew")
             w.update({"tg": lbl_tg, "per_lbl": lbl_per, "e_en_sf": e_en_sf,
                       "e_en_s": e_en_s, "e_ex_sf": e_ex_sf, "btn_en": btn_en,
                       "btn_ex": btn_ex, "rt": lbl_rt, "diff": lbl_diff,

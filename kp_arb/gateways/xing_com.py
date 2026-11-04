@@ -218,9 +218,13 @@ class XingSession:
         self._ready = threading.Event()
         # COM 스레드 전용 상태
         self._session: Any = None
-        self._queries: dict[str, Any] = {}          # lane → 마지막 XAQuery(한도 조회용)
+        self._queries: dict[str, Any] = {}          # lane → 재사용하는 XAQuery(한도 조회에도 씀)
+        # 늦은 응답이 올 수 있는 차선(시간 초과·호출자 포기로 응답을 못 받고 정리한 요청의 객체) —
+        # 다음 요청은 새 객체로(검토 2026-11-03 §5A: 평소엔 재사용, 늦은 응답 위험이 있을 때만 새로)
+        self._stale: set[str] = set()
         self._pending: dict[str, _Pending] = {}     # lane → 진행 중 요청
         self._seq = itertools.count(1)              # 요청 순번(★7 (b))
+        self.requests = 0                           # 누적 요청 수(메모리 계측용, 2026-11-03)
         self._reals: dict[str, Any] = {}            # tr → XAReal
         self.last_beat = 0.0  # COM 스레드 루프가 마지막으로 돈 시각(_clock) — 정지 감시용
         self._iter_counts: dict[str, int] = {}      # 이번 바퀴 펌프에서 처리한 이벤트 수(종류별)
@@ -427,6 +431,7 @@ class XingSession:
         fut: asyncio.Future[QueryResult] = self._loop.create_future()
         deadline = self._clock() + timeout_s
         seq = next(self._seq)
+        self.requests = seq
 
         def _do() -> None:
             # 줄 서는 동안 호출자가 포기했거나(asyncio 쪽 시간 초과) 마감이 지났으면 보내지 않는다
@@ -447,8 +452,14 @@ class XingSession:
             except ResError as exc:
                 self._resolve(fut, exc=XingError(str(exc)))
                 return
-            # 요청마다 XAQuery를 새로 — 이벤트가 그 요청의 순번으로 온다(★7 (b))
-            q = self._factory.create_query()
+            # 차선당 XAQuery 하나를 재사용하고 요청마다 sink(순번)만 바꾼다(검토 2026-11-03 §5A —
+            # 10-14의 "요청마다 새 객체"는 하루 5만 8천 개를 만들어 메모리 사고 용의자). 앞 요청이
+            # 응답 없이 정리돼 늦은 응답이 올 수 있는 객체(_stale)는 버리고 새로 만든다 — 그 객체의
+            # 늦은 이벤트는 옛 순번 sink로 가 ★7 (b)대로 무시된다
+            q = None if lane in self._stale else self._queries.get(lane)
+            if q is None:
+                q = self._factory.create_query()
+                self._stale.discard(lane)
             q.sink = lambda kind, *a, ln=lane, sq=seq: self._on_query_event(ln, sq, kind, *a)
             self._queries[lane] = q
             q.ResFileName = str(self._res_dir / f"{tr}.res")
@@ -483,6 +494,7 @@ class XingSession:
         p = self._pending.get(lane)
         if p is not None and p.seq == seq:
             del self._pending[lane]
+            self._mark_stale(lane)
 
     def _on_query_event(self, lane: str, seq: int, kind: str, *args: Any) -> None:
         """XAQuery 이벤트(COM 스레드): ('message', sys_err, code, msg) / ('data', tr).
@@ -532,11 +544,18 @@ class XingSession:
         운영 실측 2026-09-29: 스레드가 멈춰도 세션은 '연결'로 보여 감지 못 했다."""
         return self.last_beat > 0 and (self._clock() - self.last_beat) > max_gap_s
 
+    def _mark_stale(self, lane: str) -> None:
+        """응답 없이 정리한 요청의 XAQuery는 늦은 응답이 올 수 있다 — 재사용하지 않고 다음 요청은
+        새 객체."""
+        self._stale.add(lane)
+        self._queries.pop(lane, None)
+
     def _expire(self) -> None:
         now = self._clock()
         for lane, p in list(self._pending.items()):
             if now >= p.deadline:
                 del self._pending[lane]
+                self._mark_stale(lane)
                 self._resolve(p.future, exc=XingTimeout(f"{p.tr} 응답 없음(시간 초과)"))
 
     async def limits(self, tr: str) -> tuple[int, int, int, int]:

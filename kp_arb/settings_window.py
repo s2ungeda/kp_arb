@@ -150,15 +150,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     e_risk_qty.pack(side="left", padx=(4, 0))
     tk.Label(risk_row, text="이상 거부 (HL 수량)  0 = 없음", fg=T.C_MUTED).pack(side="left",
                                                                           padx=(2, 0))
-    # 시세 신선도(exec 결정 86, 2026-10-21) — 호가·환율 마지막 수신이 이 초를 넘으면 시세 없음으로
-    tk.Label(form, text="시세 신선도").grid(row=2, column=0, sticky="w", pady=2)
-    stale_row = tk.Frame(form)
-    stale_row.grid(row=2, column=1, columnspan=3, sticky="w", padx=6, pady=2)
-    e_stale = tk.Entry(stale_row, width=6, justify="right", font=T.FONT_NUM)
-    e_stale.pack(side="left")
-    tk.Label(stale_row, text="초  — 호가·환율 마지막 수신이 이보다 오래되면 시세 없음으로"
-                             "(자동M 안 냄)  0 = 검사 없음", fg=T.C_MUTED).pack(
-        side="left", padx=(4, 0))
 
     # 이론가 연이자율(공통설정) — 화면은 %, 저장은 비율(/100). 환율=fx / 주식선물=eq.
     tk.Label(form, text="환율 이자율(%)").grid(row=3, column=0, sticky="w", pady=2)
@@ -269,7 +260,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             limit = float(e_limit.get().replace(",", "").strip() or "0")
             risk_pct = float(e_risk_pct.get().strip() or "0") / 100.0  # % → 소수
             risk_qty = float(e_risk_qty.get().replace(",", "").strip() or "0")
-            stale_s = float(e_stale.get().strip() or "0")
             fx_rate = float(e_fx_rate.get().strip() or "0") / 100.0   # % → 비율
             eq_rate = float(e_eq_rate.get().strip() or "0") / 100.0
         except ValueError:
@@ -286,7 +276,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         payload: dict[str, Any] = {
             "cmd": "settings_global", "hl_daily_limit_usdc": limit,
             "hl_price_limit_pct": risk_pct, "hl_max_qty_per_order": risk_qty,
-            "quote_stale_s": stale_s,
             "fx_carry_rate": fx_rate, "eq_carry_rate": eq_rate,
             "fx_fut_start": spot_s, "fx_fut_end": spot_e,
             "fx_fut_start2": spot_s2, "fx_fut_end2": spot_e2,
@@ -335,8 +324,6 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             e_risk_pct.insert(0, f"{float(settings.get('hl_price_limit_pct', 0) or 0) * 100:g}")
             e_risk_qty.delete(0, "end")
             e_risk_qty.insert(0, f"{float(settings.get('hl_max_qty_per_order', 0) or 0):g}")
-            e_stale.delete(0, "end")
-            e_stale.insert(0, f"{float(settings.get('quote_stale_s', 1800) or 0):g}")
             e_fx_rate.delete(0, "end")
             e_fx_rate.insert(0, f"{float(settings.get('fx_carry_rate', 0.010) or 0) * 100:g}")
             e_eq_rate.delete(0, "end")

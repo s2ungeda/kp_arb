@@ -660,3 +660,25 @@ def test_replay_pending_needs_account_when_same_number_open_on_both_accounts(
     assert any("보관 통보 미반영" in r.getMessage() for r in caplog.records)
     ob.replay_pending("1871", account=Account.KR_DERIV)              # 계좌를 넘기면 반영
     assert fut.filled_qty == 2 and not fut.is_open and stock.filled_qty == 0
+
+
+def test_prune_closed_keeps_open_recent_and_protected() -> None:
+    # 검토 2026-11-03 §5B: 닫힌 지(낸 지) keep_s 넘은 주문만 빼고, 열린 주문·최근 주문·엔진 추적
+    # 번호는 남긴다. 키는 (계좌, 번호) — LS 주식 주문은 KR_STOCK 계좌
+    ob = OrderBook()
+    old_done = ob.track("D1", intent())
+    old_done.placed_ts = 100.0
+    ob.on_fill(fill("D1", 10, 70_000.0))           # 전량 체결 → 닫힘
+    old_open = ob.track("O1", intent())
+    old_open.placed_ts = 100.0                     # 오래됐지만 열려 있음
+    kept = ob.track("K1", intent())
+    kept.placed_ts = 100.0
+    ob.on_cancel("K1")                             # 닫혔지만 엔진이 아직 추적
+    fresh = ob.track("F1", intent())
+    fresh.placed_ts = 1000.0
+    ob.on_cancel("F1")                             # 닫혔지만 방금
+    removed = ob.prune_closed(now=1100.0, keep_s=900.0, protect={"K1"})
+    assert [oid for _a, oid in removed] == ["D1"] and removed[0][0] is Account.KR_STOCK
+    assert ob.order("O1") is not None and ob.order("K1") is not None
+    assert ob.order("F1") is not None and ob.order("D1") is None
+    assert [oid for _a, oid in ob.prune_closed(now=2000.0, keep_s=900.0)] == ["K1", "F1"]

@@ -23,6 +23,12 @@ from .session import build_session
 # 시장구분(jangubun). 실측: "1"=주식(KOSPI). "5"=선물/옵션(자동M 대상, JIF 코드표).
 STOCK_MARKET = "1"
 FUTURES_MARKET = "5"
+# NXT(실측 추정 2026-11-03, 공식 코드표 없음 — [OPEN]): 07:50/55/59/59:50 A5·A4·A3·A2(개장
+# 카운트다운) → 08:00 55(프리마켓 개시) → 08:45~ C4·C3·C2 → 08:50 57(종료) → 09:00:30 21(메인)
+# → 15:20 41 → 15:30~ B5·B4·B3·B2 → 15:40 56(애프터 개시). 세션 단계·정지를 바꾸지 않는 정보로만
+# 둔다(전엔 미지 → 경고 + 시장 6 DEAD — 무해했지만 하루 20줄 경고). 이 값을 읽는 엔진은 없다
+# (개장매매 결정 88은 2026-11-04 사용자 지시로 원복).
+NXT_MARKET = "6"
 
 # jstatus → SessionPhase. 실측(개장 카운트다운) + xingAPI 코드표 부합분만. 미지는 DEAD.
 _JSTATUS_PHASE: dict[str, SessionPhase] = {
@@ -106,6 +112,8 @@ def classify_jstatus(jangubun: str, jstatus: str) -> tuple[str, SessionPhase | s
     - ``("unknown", None)`` — 미분류(보수적으로 상위에서 DEAD 처리)
     """
     g, j = str(jangubun), str(jstatus)
+    if g == NXT_MARKET:  # NXT 장운영 — 정보(단계·정지 안 바꿈)
+        return ("info", f"NXT {j}")
     if j in _JSTATUS_PHASE:  # 시간대 코드(공통)
         return ("phase", _JSTATUS_PHASE[j])
     if (g in ("1", "2") and j == "69") or (g == FUTURES_MARKET and j == "61"):

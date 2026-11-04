@@ -1568,12 +1568,14 @@ class AutoMBook:
         self.apply_stock_defaults()
 
     def apply_stock_defaults(self) -> None:
-        """주식 종목 상태의 세트 기본값 — 화면 5세트 중 아래 2개는 기본 신용(사용자 2026-09-16).
-        코어가 원본이라 여기서 정한다(2026-09-17 실측: 화면만 기본 신용이라 코어에 붙자 풀렸음).
-        새 종목 상태에서만(복원은 저장값 우선)."""
+        """주식 종목 상태의 세트 기본값 — 세트 12개(결정 87, 전엔 5) 중 아래 2개는 기본 신용(사용자
+        2026-09-16). 코어가 원본이라 여기서 정한다(2026-09-17 실측: 화면만 기본 신용이라 코어에 붙자
+        풀렸음). 새 종목 상태에서만(복원은 저장값 우선 — 복원 전에 불려 세트 수를 먼저 맞춘다)."""
         if self.product != "stock":
             return
         self.market = "nxt"  # 거래소 기본 NXT(사용자 2026-09-17)
+        while len(self.sets) < STOCK_SET_ROWS:  # 주식은 주식선물(8)보다 세트가 많다(12)
+            self.sets.append(AutoMSet())
         for i, st in enumerate(self.sets):
             st.credit = STOCK_SET_ROWS - STOCK_CREDIT_DEFAULT_ROWS <= i < STOCK_SET_ROWS
 
@@ -1616,9 +1618,11 @@ class AutoMBook:
                 else Instrument.KR_STOCK_FUTURE)
 
 
-# 주식 화면 세트 수와 기본 신용 세트 수(사용자 2026-09-16: 5세트, 아래 2개 기본 신용) — 화면
-# 스펙(order_autom.STOCK_SPEC)과 코어 기본값(AutoMBook.apply_stock_defaults)이 같은 값을 쓴다.
-STOCK_SET_ROWS = 5
+# 주식 화면 세트 수와 기본 신용 세트 수(사용자 2026-09-16: 5세트, 아래 2개 기본 신용; 2026-11-03
+# 12세트, 결정 87) — 화면 스펙(order_autom.STOCK_SPEC)과 코어 기본값
+# (AutoMBook.apply_stock_defaults)이 같은 값을 쓴다. 주식 종목 상태의 정방향 세트 목록도 이 수
+# (주식선물 SET_COUNT_FWD 8과 별개).
+STOCK_SET_ROWS = 12
 STOCK_CREDIT_DEFAULT_ROWS = 2
 
 # 주식 신용 세트의 LS 신용거래코드(MgntrnCode) — ui_fields.ORDER_TYPES 표에서 고른 **추측값**

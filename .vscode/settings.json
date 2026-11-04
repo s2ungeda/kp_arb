@@ -1,3 +1,4 @@
 {
-    "delphi.configFile": "no_config_available"
+    "delphi.configFile": "no_config_available",
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }

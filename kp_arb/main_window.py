@@ -460,9 +460,10 @@ def main() -> None:
     closing = {"flag": False}
     launched: list[tuple[str, int, subprocess.Popen[bytes]]] = []  # (token, slot, proc)
 
-    # 코어 자동 재시작(Phase 8-5) — 연속 미접속이 임계 이상이면 재기동. cooldown은 시작
-    # 직후 부팅 유예(초기값으로 시동 자체를 크래시로 오인하지 않게).
-    RESTART_AFTER = 3       # 연속 미접속 3회(~6초)면 재기동
+    # 코어 응답 없음 감지(옛 Phase 8-5 자동 재시작 → **알림만, 재기동 없음** — 사용자 2026-11-03
+    # (b)). 11-03 실증: 메모리 부족으로 응답 없는 옛 코어를 안 죽인 채 새 코어 5개가 같은 ID로 떠
+    # LS 세션이 밀렸다. 되살리기는 사람이 메인을 다시 시작. cooldown은 시작 직후 부팅 유예.
+    RESTART_AFTER = 3       # 연속 미접속 3회(~6초)면 알림
     # 시작/재기동 후 부팅 유예. 코어 시동은 LS 순차 조회(초당 한도) 때문에 30~60초 걸린다 —
     # 유예가 짧으면(옛 12초) 멀쩡히 뜨는 중인 코어 옆에 두 번째 코어를 띄워 LS 조회·토큰을
     # 두 배로 쏘고("주식 WS 중단: Server disconnected"), 포트 충돌로 죽는다(실측 2026-09-07).
@@ -479,13 +480,15 @@ def main() -> None:
             pass
 
     def maybe_restart_core(alive: bool) -> None:
+        """코어 응답 없음 → 알림만(재기동 없음, 사용자 2026-11-03 (b)). 한 번 알린 뒤엔 다시 살아날
+        때까지 조용히(gave_up) — 팝업 '코어 응답 없음'은 core_down_event가 따로 띄운다."""
         action = _restart_step(restart, alive, after=RESTART_AFTER,
                                cooldown=RESTART_COOLDOWN, max_restarts=MAX_RESTARTS)
-        if action == "restart":
-            launch_module("kp_arb.core_server", console=False, watch_parent=True)
-            _alert("코어 미접속 감지 — 자동 재기동", "error")
-        elif action == "give_up":
-            _alert("코어 자동 재기동 반복 실패 — 중단. 수동 점검 필요", "error")
+        if action in ("restart", "give_up"):
+            restart["gave_up"] = True
+            _slog().error("코어 응답 없음 %d회 연속 — 자동 재기동 안 함(사용자 11-03 (b)), 메인을 "
+                          "다시 시작해야 함", RESTART_AFTER)
+            _alert("코어 응답 없음 — 자동 재기동 안 함, 메인을 다시 시작하세요", "error")
 
     def save_ui_state() -> None:
         """마지막 상태 저장 — 다음 실행 때 그대로 복원."""
@@ -535,14 +538,22 @@ def main() -> None:
     # LS(xing) 끊김 때 할 일(DESIGN-settings §2a, 사용자 2026-10-14) — 판정은 여기(코어가 죽어도
     # 알림).
     # 폴링 스레드는 사운드·텔레그램을 바로 하고, 팝업은 글만 남겨 화면 루프(refresh)가 띄운다.
-    dc_box: dict[str, Any] = {"ws": {}, "alive": None, "settings": {}, "popup_text": None}
+    # popup = (제목, 글) — 화면 루프가 띄운다. LS 끊김과 코어 응답 없음은 제목·글이 다르다(사용자
+    # 2026-11-03: "코어 응답 없음"을 'LS 끊김'이라 알리면 네트워크 문제로 헷갈림)
+    dc_box: dict[str, Any] = {"ws": {}, "alive": None, "settings": {}, "popup": None}
 
     def check_ls_disconnect(data: dict[str, Any] | None, alive: bool) -> None:
         if data and isinstance(data.get("settings"), dict):
             dc_box["settings"] = data["settings"]  # 코어가 죽은 뒤에도 마지막 설정으로
         events = ls_disconnect_events(dc_box["ws"], (data or {}).get("ws") or []) if data else []
         if core_down_event(dc_box, alive):
-            events.append("코어 응답 없음")
+            # 코어 응답 없음은 LS 끊김이 아니다(사용자 2026-11-03, 두 번째 지시 "xing 접속이 끊겼을
+            # 때만 끊김 처리") — 제목·글이 다른 팝업 "코어 응답 없음"으로 알린다. 11-03 실증: 코어가
+            # 메모리 부족으로 응답을 못 하자 "LS 접속이 끊겼습니다"가 떠 네트워크 문제로 헷갈림
+            _slog().warning("코어 응답 없음 — '코어 응답 없음' 팝업(LS 끊김 아님)")
+            dc_box["popup"] = ("코어 응답 없음",
+                               "코어가 응답하지 않습니다.\n"
+                               "메인 상태줄 '코어: 미접속'을 확인하고 메인을 다시 시작하세요.")
         if not events:
             return
         settings = dc_box["settings"]
@@ -573,7 +584,7 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001 - 알림 실패가 감시를 멈추지 않게
                 _slog().warning("LS 끊김 텔레그램 실패 — %s", exc)
         if dc.get("popup"):
-            dc_box["popup_text"] = text  # 화면 루프가 띄운다(화면 스레드 규칙)
+            dc_box["popup"] = ("LS 접속 끊김", text)  # 화면 루프가 띄운다(화면 스레드 규칙)
 
     def poll_core() -> None:
         while True:
@@ -886,12 +897,12 @@ def main() -> None:
             if errs and not closing["flag"] and not _load_err["shown"]:
                 _on_load_error(errs)
                 return  # 종료 진행 — 다음 refresh 예약 안 함
-            popup_text = dc_box.get("popup_text")
-            if popup_text and not closing["flag"]:
-                dc_box["popup_text"] = None
+            popup = dc_box.get("popup")
+            if popup and not closing["flag"]:
+                dc_box["popup"] = None
                 from .ui_dialog import show_message
 
-                show_message(root, "LS 접속 끊김", popup_text)
+                show_message(root, popup[0], popup[1])
             if alive_box["alive"]:
                 lbl_core.config(text="코어: 연결됨 (127.0.0.1:8787)", fg="dark green")
                 if status.cget("text") == "코어 시작 중 ...":  # 시작 요청 → 실제 연결 확인

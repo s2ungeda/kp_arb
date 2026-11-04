@@ -23,6 +23,10 @@ from .routing import account_for
 # 스냅샷 재조정 유예(초): 방금 낸 주문은 아직 거래소 미체결조회에 안 뜰 수 있어, 이 시간
 # 안에 tracked된 주문은 스냅샷에 없어도 지우지 않는다(그보다 오래된 phantom만 정리).
 _SNAPSHOT_GRACE_S = 15.0
+# 닫힌(체결·취소·거부) 주문을 장부에 두는 시간 — 늦은 통보(취소 직전 체결 등)를 받을 여유.
+# 지나면 주기 정리(검토 2026-11-03 §5B: 재동기 때만 지우던 탓에 하루 2만 8천 건이 남아 메모리·
+# 번호 찾기 비용)
+CLOSED_ORDER_KEEP_S = 900.0
 
 
 class OrderStatus(StrEnum):
@@ -262,6 +266,19 @@ class OrderBook:
                 "주문번호 #%s가 계좌 %s에 겹침 — 계좌 없이는 가릴 수 없음", order_id,
                 [str(self._acct_of(o.intent)) for o in matches])
         return None
+
+    def prune_closed(self, now: float, keep_s: float = CLOSED_ORDER_KEEP_S,
+                     protect: Collection[str] = ()) -> list[tuple[Account | None, str]]:
+        """닫힌 주문 중 낸 지 keep_s 넘은 것을 장부에서 뺀다(검토 2026-11-03 §5B). protect(엔진이
+        아직 추적하는 번호)는 남긴다 — 엔진은 "장부에서 사라짐"을 취소로 해석하므로. 반환 = 뺀
+        (계좌, 번호)."""
+        removed: list[tuple[Account | None, str]] = []
+        for key, order in list(self._orders.items()):
+            if order.is_open or key[1] in protect or now - order.placed_ts < keep_s:
+                continue
+            del self._orders[key]
+            removed.append(key)
+        return removed
 
     def track(self, order_id: str, intent: OrderIntent) -> TrackedOrder:
         order = TrackedOrder(order_id=order_id, intent=intent, placed_ts=time.monotonic(),

@@ -642,10 +642,9 @@ def test_settings_global_risk_limits_roundtrip() -> None:
     assert not bad["ok"] and state.settings.hl_price_limit_pct == 0.02
     keep = apply_command(state, {"cmd": "settings_global", "hl_daily_limit_usdc": 5})
     assert keep["ok"] and state.settings.hl_max_qty_per_order == 300
-    assert state.settings.quote_stale_s == 1800.0  # 기본 30분(결정 86)
+    assert not hasattr(state.settings, "quote_stale_s")  # 시세 신선도 폐지(사용자 2026-11-04)
+    # 옛 저장·화면이 보내는 quote_stale_s 키는 무시
     assert apply_command(state, {"cmd": "settings_global", "quote_stale_s": 600})["ok"]
-    assert state.settings.quote_stale_s == 600.0
-    assert not apply_command(state, {"cmd": "settings_global", "quote_stale_s": -1})["ok"]
     restored = CoreState()
     _global_settings_from_dict(restored.settings, {"hl_price_limit_pct": 0.01,
                                                    "hl_max_qty_per_order": -5})

@@ -39,6 +39,14 @@ def test_phase_from_jif_unknown_is_dead() -> None:
 # --- jstatus 분류: 시간대 / 정지 / 변동성 (순수 함수, §8) ---
 
 
+def test_classify_nxt_market_is_info_not_dead() -> None:
+    # 2026-11-03 실측: jangubun 6 = NXT 장운영(A2·55·57·21·41·56…) — 단계·정지를 바꾸지 않는 정보.
+    # 전엔 미지 코드 → 경고 + 시장 6 DEAD(무해했지만 하루 20줄 경고)
+    assert classify_jstatus("6", "A2") == ("info", "NXT A2")
+    assert classify_jstatus("6", "55") == ("info", "NXT 55")
+    assert classify_jstatus("6", "21") == ("info", "NXT 21")  # 공통 코드도 NXT면 정보
+
+
 def test_classify_time_phase() -> None:
     assert classify_jstatus("1", "21") == ("phase", SessionPhase.REGULAR)
     assert classify_jstatus("1", "11") == ("phase", SessionPhase.PRE_OPEN)

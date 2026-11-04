@@ -20,10 +20,11 @@ def test_plan_subscribes_only_checked_symbols_with_three_stock_trs() -> None:
     assert ("JH0", "A116B000") in got and ("YJC", "A506B000") in got  # 근월물만
     assert ("JH0", "A116C000") not in got and ("JH0", "A166B000") not in got
     assert ("FC9", "A756B000") in got and ("YF9", "A756B000") in got
+    assert ("DC0", "A756B000") in got  # 야간 체결 — 결정 47 2구간(18시 이후) 환율 역산(11-04 복원)
     assert not any(k.endswith("005380") or "005380" in k for _t, k in got)  # 현대차 없음
-    assert all(t not in ("US3", "S3_", "NS3", "YS3", "H1_", "NH1", "S2_", "NS2", "US2", "JC0",
-                         "DC0") for t, _k in got)
-    assert len(got) == 2 * 3 + 2 * 2 + 2                             # 12건(통보·CUR·JIF는 밖)
+    assert all(t not in ("US3", "S3_", "NS3", "YS3", "H1_", "NH1", "S2_", "NS2", "US2", "JC0")
+               for t, _k in got)
+    assert len(got) == 2 * 3 + 2 * 2 + 3                             # 13건(통보·CUR·JIF는 밖)
 
 
 def test_plan_follows_futures_month_choice_and_symbol_toggle() -> None:
@@ -44,10 +45,10 @@ def test_plan_diff_adds_and_removes_only_changed() -> None:
     after = plan(QuotePlanInput(symbols_on=frozenset({S}), futures_codes=CODES,
                                 fx_code="A756C000"))
     add, remove = plan_diff(before, after)
-    assert add == [("FC9", "A756C000"), ("YF9", "A756C000")]          # 원달러 월물 교체
+    assert add == [("FC9", "A756C000"), ("DC0", "A756C000"), ("YF9", "A756C000")]  # 월물 교체
     assert ("UH1", "U005930   ") not in remove                        # 삼성 호가는 그대로
     assert all("000660" in k or "A506" in k or k == "A756B000" for _t, k in remove)
-    assert ("FC9", "A756B000") in remove
+    assert ("FC9", "A756B000") in remove and ("DC0", "A756B000") in remove
     assert plan_diff(after, after) == ([], [])
     # 옛 등록(H1_/NH1/US3)이 남아 있으면 해제 쪽으로 나온다(계획엔 더 없음)
     stale = [*before, ("H1_", "005930"), ("NH1", "N005930   ")]

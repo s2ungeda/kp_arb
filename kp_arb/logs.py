@@ -64,6 +64,12 @@ def _stop_listener(listener: QueueListener) -> None:
         _LISTENERS.remove(listener)
 
 
+def queued_backlog() -> int:
+    """쓰기 스레드가 아직 파일에 안 쓴 로그 레코드 수(큐 핸들러 전부 합) — 메모리 계측용
+    (2026-11-03)."""
+    return sum(int(getattr(listener.queue, "qsize", lambda: 0)()) for listener in _LISTENERS)
+
+
 def stop_queued_logging() -> None:
     """큐에 남은 레코드를 전부 파일에 쓰고 쓰기 스레드를 멈춘다 — 종료 직전·atexit."""
     for listener in list(_LISTENERS):

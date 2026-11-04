@@ -259,6 +259,11 @@ class LSApiGateway(LSGateway):
         order_log.order_amended(Venue.LS, order_id, new_id, qty, price)
         return new_id
 
+    def forget_order(self, account: Account, order_id: str) -> None:
+        """닫힌 주문의 문맥을 버린다(검토 2026-11-03 §5B) — 장부가 주기 정리한 번호만. 정정·취소는
+        열린 주문에만 오므로 닫힌 문맥은 더 쓰이지 않는다."""
+        self._orders.pop((account, order_id), None)
+
     def open_orders_supported(self, account: Account) -> bool:
         """주식 계좌는 항상 실제 조회(CSPAQ13700). 선물 계좌는 t0434가 **실제로 성공한 뒤**에만
         참 — 모의 미제공(01900)·형식 거부면 빈 결과라 유령 정리에 쓰면 안 된다."""

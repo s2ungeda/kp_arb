@@ -864,17 +864,35 @@ def test_stock_book_propagates_product_and_ratio() -> None:
 
 def test_stock_book_credit_defaults_live_in_core() -> None:
     # 2026-09-17 실측: 화면만 아래 2세트를 기본 신용으로 그렸더니 코어에 붙자(코어 값이 원본)
-    # 풀렸다. 기본값은 코어 종목 상태에 — 새 주식 종목 상태는 5세트 중 4·5번 세트 신용, 복원은
-    # 저장값 우선, 저장본에 credit이 없는 옛 세트는 기본 규칙. 주식선물 종목 상태는 전부 False.
-    from kp_arb.auto_m import AutoMBook, _book_from_dict
+    # 풀렸다. 기본값은 코어 종목 상태에 — 새 주식 종목 상태는 12세트(결정 87, 전엔 5) 중 11·12번
+    # 세트 신용, 복원은 저장값 우선, 저장본에 credit이 없는 옛 세트는 기본 규칙. 주식선물 종목
+    # 상태는 8세트 전부 False.
+    from kp_arb.auto_m import SET_COUNT_FWD, STOCK_SET_ROWS, AutoMBook, _book_from_dict
 
     book = AutoMBook(product="stock")
-    assert [s.credit for s in book.sets[:5]] == [False, False, False, True, True]
-    assert not any(s.credit for s in AutoMBook().sets)
+    assert len(book.sets) == STOCK_SET_ROWS == 12
+    assert [i for i, s in enumerate(book.sets) if s.credit] == [10, 11]
+    sf = AutoMBook()
+    assert len(sf.sets) == SET_COUNT_FWD == 8 and not any(s.credit for s in sf.sets)
     restored = AutoMBook()
     _book_from_dict(restored, {"product": "stock",
                                "sets": [{"credit": True}, {}, {}, {"credit": False}]})
-    assert [s.credit for s in restored.sets[:5]] == [True, False, False, False, True]
+    assert len(restored.sets) == 12
+    assert [i for i, s in enumerate(restored.sets) if s.credit] == [0, 10, 11]
+
+
+def test_stock_book_restore_from_old_8_set_save_keeps_saved_and_extends() -> None:
+    # 결정 87(2026-11-03): 옛 저장본(코어 세트 8개, 4·5번 신용)을 12세트로 복원 — 앞 8개는 저장값
+    # 그대로(4·5번 신용 유지), 9~12번은 새 기본(11·12번 신용). 값은 사람이 체크로 맞춘다.
+    from kp_arb.auto_m import AutoMBook, _book_from_dict
+
+    saved = [{"target_qty": 100 + i, "credit": i in (3, 4)} for i in range(8)]
+    restored = AutoMBook()
+    _book_from_dict(restored, {"product": "stock", "sets": saved})
+    assert [s.target_qty for s in restored.sets[:8]] == [100 + i for i in range(8)]
+    assert all(s.target_qty == 0 for s in restored.sets[8:])
+    assert [i for i, s in enumerate(restored.sets) if s.credit] == [3, 4, 10, 11]
+    assert all(s.product == "stock" and s.hl_ratio == 1 for s in restored.sets)
 
 
 def test_credit_code_for_stock_sets() -> None:
