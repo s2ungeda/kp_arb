@@ -90,7 +90,7 @@ class _FakePegSystem:
 
     async def place(self, intent: OrderIntent) -> str:
         if getattr(self, "timeout_place", False):
-            from kp_arb.gateways.ls_rest import RestTimeoutError
+            from kp_arb.gateways.ls_tr import RestTimeoutError
 
             raise RestTimeoutError("REST CSPAT00600 응답 없음: TimeoutError")
         self._n += 1

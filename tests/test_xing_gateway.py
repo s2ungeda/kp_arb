@@ -10,7 +10,7 @@ import pytest
 from kp_arb.config import LSAccount, LSAccounts
 from kp_arb.domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent
-from kp_arb.gateways.ls_rest import RateLimitError, RestError, RestTimeoutError
+from kp_arb.gateways.ls_tr import RateLimitError, RestError, RestTimeoutError
 from kp_arb.gateways.xing import XingGateway, XingQueryClient, in_block_name, to_blocks
 from kp_arb.gateways.xing_com import LANE_ORDER, LANE_QUERY, QueryResult, XingTimeout
 

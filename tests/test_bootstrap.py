@@ -288,6 +288,27 @@ def _system(
     return system, stock_connector, deriv_connector
 
 
+def test_stock_last_market_is_that_exchanges_weighted_first_level() -> None:
+    # 체결쏴 주식 종목 상태의 현재가 = 그 거래소(krx/nxt) 1호가 가중값(2026-11-04, §7C).
+    # 통합(uni)은 stock_last와 같다. 그 거래소 호가가 없으면 None, 동시호가 땐 통합 직전 값.
+    system, _, _ = _system([], deriv_frames=[])
+    assert system.stock_last_market(SAMSUNG, "nxt") is None
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK, "nxt")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=99_000.0, ask=99_100.0, ts=0,
+        bid_qty=40.0, ask_qty=60.0, market="nxt")
+    system.quotes[(SAMSUNG, Instrument.KR_STOCK, "uni")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=100_000.0, ask=100_100.0, ts=0,
+        bid_qty=50.0, ask_qty=50.0, market="uni")
+    assert system.stock_last_market(SAMSUNG, "nxt") == 99_040.0    # 99,000 + 100 × 40/100
+    assert system.stock_last_market(SAMSUNG, "uni") == system.stock_last(SAMSUNG) == 100_050.0
+    assert system.stock_last_market(SAMSUNG, "krx") is None         # KRX 호가 없음(마감 뒤)
+    from kp_arb.gateways.ls_ws import MarketStatus
+    system.session.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "1",
+                                                                     "jstatus": "31"}))
+    assert system.session.stock_auction()                            # 주식 장마감 동시호가
+    assert system.stock_last_market(SAMSUNG, "nxt") == 100_050.0    # 멈춘 구간: 통합 직전 값
+
+
 def test_fx_entry_rate_priority_by_futures_window() -> None:
     # 자동M 정산용 환진입가(§10, exec 결정 47 — 사용자 확정 2026-09-28): HL 방향 무관 한 값.
     # 외환선물 우선시간(기본 08:45:00~15:45:00) 안 = 선물 역산현물가 → LS 현물환,
@@ -349,7 +370,7 @@ async def test_refresh_snapshot_open_orders_500_keeps_balance_and_positions(
     import logging
     import time as _t
 
-    from kp_arb.gateways.ls_rest import RestError
+    from kp_arb.gateways.ls_tr import RestError
 
     system, _, _ = _system([])
     gw = system._gw
@@ -1843,7 +1864,7 @@ async def test_fill_symbol_check_rejects_other_kind_and_passes_unknown_same_kind
 async def test_refresh_snapshot_keeps_positions_of_account_whose_query_failed() -> None:
     # 검토 2026-10-13 10번 ②: 포지션 조회에 실패한 계좌의 포지션·잔고를 빈 값으로 덮지 않는다 —
     # 옛 코드는 scope=None이면 전부 비워 선물 계좌 조회가 한 번 실패하면 공매도 검증이 오거부.
-    from kp_arb.gateways.ls_rest import RestError
+    from kp_arb.gateways.ls_tr import RestError
 
     system, _, _ = _system([])
     system.order_book.load_snapshot(
@@ -1988,12 +2009,12 @@ async def test_stock_last_is_weighted_unified_quote() -> None:
     # 멈춘 동안 온 호가로는 갱신 안 함, 풀리면 다시 호가
     fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=70_000.0, ask=70_100.0,
               ts=0.0, bid_qty=1.0, ask_qty=1.0, market="uni"))
-    system.vi_state[SAMSUNG] = "1"
+    system.vi_state[(SAMSUNG, "nxt")] = "1"  # 어느 거래소 VI든 가중값은 멈춘다(결정 89)
     assert system.stock_last(SAMSUNG) == 70_050.0
     fan(Quote(underlying=SAMSUNG, instrument=Instrument.KR_STOCK, bid=70_400.0, ask=70_500.0,
               ts=0.0, bid_qty=1.0, ask_qty=1.0, market="uni"))   # VI 중 호가 — 무시
     assert system.stock_last(SAMSUNG) == 70_050.0
-    system.vi_state[SAMSUNG] = "0"
+    system.vi_state[(SAMSUNG, "nxt")] = "0"
     assert system.stock_last(SAMSUNG) == 70_450.0
     from kp_arb.gateways.ls_ws import MarketStatus
     system.session.on_market_status(MarketStatus(tr_key="0", body={"jangubun": "1",
@@ -2047,5 +2068,5 @@ async def test_stock_last_seeded_from_snapshot_when_started_in_auction() -> None
                                          ask_qty=1.0, market="uni"))
     system2._gw.seed_last_price(SAMSUNG, Instrument.KR_STOCK, 70_300.0)  # type: ignore[attr-defined]
     await system2._seed_prices()
-    system2.vi_state[SAMSUNG] = "1"
+    system2.vi_state[(SAMSUNG, "krx")] = "1"
     assert system2.stock_last(SAMSUNG) == 70_050.0

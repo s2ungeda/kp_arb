@@ -22,7 +22,7 @@ from typing import Any
 from ..config import LSAccounts
 from ..domain.enums import Account, Underlying
 from .ls import _LS_ACCOUNTS, LSApiGateway
-from .ls_rest import (
+from .ls_tr import (
     RateLimitError,
     RestError,
     RestResponse,

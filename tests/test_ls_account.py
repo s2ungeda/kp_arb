@@ -5,10 +5,24 @@ import pytest
 
 from kp_arb.domain.enums import Account, Instrument, Side, Underlying
 from kp_arb.gateways.ls import LSApiGateway
-from kp_arb.gateways.ls_auth import TokenManager, TokenResponse
-from kp_arb.gateways.ls_rest import LSRestClient, RateLimiter, RestError, RestResponse
+from kp_arb.gateways.ls_tr import RestError, RestResponse
 
 BASE_URL = "https://openapi.ls-sec.co.kr:8080"
+
+
+class _Requester:
+    """TrRequester 어댑터 — 옛 REST 전송 가짜(method, url, headers, body)를 그대로 재사용한다
+    (2026-11-09 REST 경로 제거 뒤에도 TR 본문·응답 파싱 테스트는 전송 방식과 무관)."""
+
+    supports_continuation = False
+
+    def __init__(self, transport: Any) -> None:
+        self.t = transport
+
+    async def request(self, tr_cd: str, body: dict[str, Any] | None = None, *,
+                      path: str = "/", method: str = "POST", tr_cont: str = "N") -> RestResponse:
+        return await self.t.request(method, BASE_URL + path,
+                                    {"tr_cd": tr_cd, "tr_cont": tr_cont}, body)
 
 # 녹화 픽스처: TR별 응답.
 FIXTURES: dict[str, dict[str, Any]] = {
@@ -74,10 +88,6 @@ class _Clock:
         return self.t
 
 
-class _TokenStub:
-    async def fetch_token(self, appkey: str, appsecret: str) -> TokenResponse:
-        return TokenResponse(access_token="tok", expires_in=3600.0)
-
 
 class AccountTransport:
     """headers의 tr_cd로 녹화 픽스처를 골라 돌려준다. 사용된 tr_cd·요청 body를 기록."""
@@ -106,10 +116,7 @@ def _gateway(
     futures_symbols: dict[Underlying, str] | None = None,
     next_futures_symbols: dict[Underlying, str] | None = None,
 ) -> LSApiGateway:
-    clock = _Clock()
-    tm = TokenManager("k", "s", _TokenStub(), now=clock)
-    rl = RateLimiter(now=clock, default_per_second=100)
-    rest = LSRestClient(BASE_URL, tm, transport, rl)
+    rest = _Requester(transport)
     return LSApiGateway({Account.KR_STOCK: rest, Account.KR_DERIV: rest},
                         etf_symbols=etf_symbols,
                         futures_symbols=futures_symbols
@@ -384,7 +391,7 @@ async def test_deriv_open_orders_follow_all_pages_when_transport_can_continue() 
     # InBlock에 넣고 tr_cont="Y"로 이어 받는다 — 전송 단이 이어 받기를 지원할 때(xing). 페이지마다
     # 행을
     # 모으고, 같은 주문은 한 번만.
-    from kp_arb.gateways.ls_rest import RestResponse
+    from kp_arb.gateways.ls_tr import RestResponse
 
     def row(ordno: int, rem: int = 1) -> dict[str, Any]:
         return {"orgordno": 0, "hogatype": "L", "ordrem": rem, "ordgb": "지정가", "cheqty": 0,

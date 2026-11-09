@@ -647,6 +647,21 @@ def test_price_offset_survives_restore() -> None:
     assert book.sets[0].price_offset == 1000 and book.sets[1].price_offset == 0
 
 
+def test_restore_recomputes_fill_diff_with_product_ratio() -> None:
+    # 운영 11-09 화면: 주식 세트(주식 −80·HL +80 = 완전 헤지)가 재시동 뒤 체결차 −720으로 보임 —
+    # 복원이 세트 product가 아직 "sf"(비율 10)일 때 체결차를 계산한 것. 주식은 1:1로 0이어야 한다.
+    from kp_arb.auto_m import AutoMBook, _book_from_dict
+
+    stock = AutoMBook()
+    _book_from_dict(stock, {"product": "stock", "sets": [{"sf_net": -80, "hl_net": 80.0},
+                                                         {"sf_net": -100, "hl_net": 100.0}]})
+    assert stock.product == "stock" and stock.sets[0].product == "stock"
+    assert stock.sets[0].fill_diff == 0 and stock.sets[1].fill_diff == 0
+    sf = AutoMBook()
+    _book_from_dict(sf, {"product": "sf", "sets": [{"sf_net": -8, "hl_net": 80.0}]})
+    assert sf.sets[0].fill_diff == 0  # 주식선물은 1계약 = HL 10
+
+
 def test_post_fill_without_fx_is_excluded_from_fx_average() -> None:
     # 사용자 확정 2026-09-15: 환진입가는 원달러선물 1호가 → LS 현물환 → 없음. 없으면 그 체결은
     # 환 없이 쌓여 환평균·Sprd 분모에서 빠진다(0으로 희석하지 않는다).

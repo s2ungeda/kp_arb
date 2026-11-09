@@ -770,6 +770,36 @@ async def test_nxt_quote_and_vi_event() -> None:
     assert any(f"N{SAMSUNG_CODE}   " in m and '"NH1"' in m for m in session.sent)
     assert any(f"N{SAMSUNG_CODE}   " in m and '"NS3"' in m for m in session.sent)
     assert any(f'"{SAMSUNG_CODE}"' in m and '"VI_"' in m for m in session.sent)
+    # 결정 89(2026-11-09): VI_ 이벤트의 판정 거래소는 거래소명 기준(KRX → "krx"), 구독엔 통합 UVI도
+    assert vis[0].market == "krx" and vis[1].market == "krx"
+    assert any(f"U{SAMSUNG_CODE}   " in m and '"UVI"' in m for m in session.sent)
+
+
+async def test_unified_vi_splits_krx_and_nxt_events() -> None:
+    # 결정 89(2026-11-09): UVI(KRX+NXT 통합 VI) 한 메시지에 krx_*·nxt_* 가 나란히 — 구분 칸이 있는
+    # 쪽마다 ViEvent 한 건(market "krx"/"nxt"). 11-06 08:00 NXT VI는 VI_(KRX 키)로 못 받았다.
+    nxt_on = json.dumps({"header": {"tr_cd": "UVI", "tr_key": f"U{SAMSUNG_CODE}   "},
+                         "body": {"ex_shcode": f"U{SAMSUNG_CODE}   ", "shcode": SAMSUNG_CODE,
+                                  "krx_vi_gubun": "", "nxt_vi_gubun": "1", "nxt_time": "080003",
+                                  "nxt_svi_recprice": "126400", "nxt_dvi_recprice": "0",
+                                  "nxt_vi_trgprice": "112500", "exchname": "NXT"}})
+    both = json.dumps({"header": {"tr_cd": "UVI", "tr_key": f"U{SAMSUNG_CODE}   "},
+                       "body": {"ex_shcode": f"U{SAMSUNG_CODE}   ", "krx_vi_gubun": "2",
+                                "krx_time": "090025", "krx_vi_trgprice": "109000",
+                                "nxt_vi_gubun": "0", "nxt_time": "090200"}})
+    session = FakeConnection([nxt_on, both])
+    client = LSWebSocketClient(FakeConnector([session]))
+    client.subscribe_vi(Underlying.SAMSUNG)
+    vis = []
+    client.on_vi.append(vis.append)
+
+    await client.run()
+
+    assert [(v.market, v.gubun, v.active) for v in vis] == [
+        ("nxt", "1", True), ("krx", "2", True), ("nxt", "0", False)]
+    assert vis[0].underlying is Underlying.SAMSUNG and vis[0].code == SAMSUNG_CODE
+    assert (vis[0].time, vis[0].trigger_price, vis[0].static_base) == ("080003", "112500", "126400")
+    assert (vis[1].exchange, vis[1].trigger_price) == ("KRX", "109000")
 
 
 async def test_expected_price_for_futures_and_etf() -> None:

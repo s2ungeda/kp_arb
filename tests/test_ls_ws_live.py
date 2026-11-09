@@ -59,14 +59,6 @@ async def test_bytes_frames_decoded() -> None:
     assert frames == ["hello"]
 
 
-def test_ls_ws_url_by_mode() -> None:
-    from kp_arb.config import RunMode
-    from kp_arb.gateways.ls_ws_live import ls_ws_url
-
-    assert ls_ws_url(RunMode.PAPER).endswith(":29443/websocket")  # 모의
-    assert ls_ws_url(RunMode.LIVE).endswith(":9443/websocket")    # 실전
-
-
 async def test_closed_becomes_connection_error() -> None:
     ws = FakeWs(["a"], closed=True)
 

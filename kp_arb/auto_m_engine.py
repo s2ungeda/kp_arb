@@ -41,6 +41,7 @@ from .auto_m import (
     on_post_recovered,
     on_post_reject,
     on_pre_ack,
+    on_pre_cancel_closed,
     on_pre_cancel_failed,
     on_pre_cancelled,
     on_pre_fill,
@@ -55,8 +56,8 @@ from .disparity import disp, est_price
 from .domain.enums import Account, Block, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import InstrumentInfo, OrderIntent, Quote
 from .gateways.base import PlaceResult
-from .gateways.ls import OrderGoneError
-from .gateways.ls_rest import RestTimeoutError
+from .gateways.ls import MarketClosedError, OrderGoneError
+from .gateways.ls_tr import RestTimeoutError
 from .hl_merge import merge_active_dict, merge_tick_options
 from .hl_price import hl_price_step, hl_round_price
 from .logs import attach_daily_file
@@ -132,6 +133,7 @@ class _SystemLike(Protocol):
     def stock_futures_theory(self, underlying: Underlying,
                              instrument: Instrument = ...) -> float | None: ...
     def stock_last(self, underlying: Underlying) -> float | None: ...
+    def stock_last_market(self, underlying: Underlying, market: str) -> float | None: ...
     def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]: ...
     def fx_entry_rate(self) -> float | None: ...
     def futures_halted(self) -> bool: ...
@@ -300,11 +302,11 @@ class AutoMEngine:
         return (book.market,) if book.product == "stock" else ("uni", "krx", "nxt")
 
     def _stock_last_for(self, u: Underlying, book: AutoMBook) -> float | None:
-        """주식 현재가 — 주식 종목 상태는 그 거래소 체결가, 주식선물은 통합(uni) 우선 현재가."""
+        """주식 현재가 — 주식 종목 상태는 **그 거래소(KRX/NXT) 1호가 가중값**, 주식선물은 통합(uni)
+        가중값. (10-27 주식 체결 구독 중단 뒤에도 여기가 거래소별 체결가(trades)를 읽어 NXT 구간엔
+        값이 없었다 — 2026-11-04 수정, DESIGN-auto-m-exec §7C.)"""
         if book.product == "stock":
-            trades = getattr(self._system, "trades", {})
-            last = trades.get((u, Instrument.KR_STOCK, book.market))
-            return float(last) if last else None
+            return self._system.stock_last_market(u, book.market)
         return self._system.stock_last(u)
 
     def ulog(self, u: Underlying) -> logging.Logger:
@@ -465,6 +467,7 @@ class AutoMEngine:
                     # 기준으로 잰다(지속 실패도 알려야 하므로)
                     if ((leg.cancel_sent or leg.replace_pending) and leg.pre_order_id
                             and leg.cancel_sent_mono is not None
+                            and not leg.cancel_closed  # 장마감 거부는 통보가 안 와도 정상(결정 90)
                             and not leg.cancel_wait_alarmed
                             and mono - leg.cancel_sent_mono >= CANCEL_WAIT_ALARM_S):
                         leg.cancel_wait_alarmed = True
@@ -517,7 +520,9 @@ class AutoMEngine:
                 # 종목 VI(exec §8, 사용자 2026-09-17): 주식은 그 종목 VI 발동 중에도 정지로 본다
                 # — 단일가 전환이라 호가에 걸어 두는 선주문이 무의미. 해제 뒤 재개 딜레이는 시장
                 # 정지와 같다.
-                vi_on = self.product == "stock" and not halted and self._vi_halted(u)
+                # 결정 89(2026-11-09): VI는 거래소마다 따로 — 주식 세트는 자기 거래소(KRX/NXT) VI만
+                vi_on = (self.product == "stock" and not halted
+                         and self._vi_halted(u, book.market))
                 self._track_vi(u, vi_on, mono)
                 if self.product == "stock":  # 주문가능시간 구간의 거래소로(결정 80)
                     self._follow_slot_market(u, book, now)
@@ -539,10 +544,11 @@ class AutoMEngine:
             if cancels:
                 self._spawn(self._cancel_pre_batch(cancels))
 
-    def _vi_halted(self, u: Underlying) -> bool:
-        """코어의 종목 VI 상태(LS 실시간 VI_) — 없는 시스템(테스트·옛 코어)은 False."""
+    def _vi_halted(self, u: Underlying, market: str = "krx") -> bool:
+        """코어의 종목 VI 상태(LS 실시간 UVI/VI_) — 그 거래소 것만(결정 89). 없는 시스템(테스트·옛
+        코어)은 False."""
         fn = getattr(self._system, "stock_vi", None)
-        return bool(fn(u)) if callable(fn) else False
+        return bool(fn(u, market)) if callable(fn) else False
 
     def _track_vi(self, u: Underlying, vi_on: bool, mono: float) -> None:
         """종목 VI 발동·해제 시각 추적 + 종목 로그(상태가 바뀔 때 1회)."""
@@ -579,11 +585,14 @@ class AutoMEngine:
         stock = self._stock_last_for(u, book)
         hl_bid_d = hl_ask_d = None
         est_bid = est_ask = None
-        if hl is not None and fx is not None and stock:
+        if hl is not None and fx is not None:
+            # est는 HL 호가창·환율만으로 — 주식 상품(§7C)은 현재가를 안 쓰므로 현재가 없이도 계산
+            # (2026-11-04: 현재가 조건에 묶여 NXT 구간 모니터 "-"·"G6 입력 없음"이던 결함 수정)
             est_bid = est_price(hl.bids or [(hl.bid, hl.bid_qty or 1.0)], qty * ratio)
             est_ask = est_price(hl.asks or [(hl.ask, hl.ask_qty or 1.0)], qty * ratio)
-            hl_bid_d = disp(est_bid * fx if est_bid else None, stock)
-            hl_ask_d = disp(est_ask * fx if est_ask else None, stock)
+            if stock:
+                hl_bid_d = disp(est_bid * fx if est_bid else None, stock)
+                hl_ask_d = disp(est_ask * fx if est_ask else None, stock)
         sf_quote = next((self._system.quotes.get((u, inst, m)) for m in self._markets(book)
                          if self._system.quotes.get((u, inst, m)) is not None), None)
         asks: tuple[tuple[float, float], ...] = ()
@@ -1190,6 +1199,16 @@ class AutoMEngine:
                 # 상태는 곧 오는 체결/취소 통보가 정리하니 표시도 되돌리지 않는다.
                 self._log.info("[자동M] 취소 불필요 #%s — 이미 체결/취소됨(통보로 정리): %s",
                                order_id, exc)
+                return
+            except MarketClosedError as exc:
+                # 장마감 거부(LS 02611 + '장마감', 결정 90) — 다시 보내도 같은 거부(운영 2026-11-06
+                # 20:00 NXT 마감 뒤 10분간 1,407건). 재시도·표시 되돌림 없이 끝내고 LS 마감 정리
+                # (취소·만료 통보, 재시동 재동기)를 기다린다. 30초 "취소 확인 대기" 알람도 안 냄.
+                self._log.warning("[자동M] 취소 장마감 거부 #%s — 재시도 안 함, LS 마감 정리 "
+                                  "대기: %s", order_id, exc)
+                s = self._set(u, index, reverse)
+                if s.leg(block).pre_order_id == order_id:
+                    on_pre_cancel_closed(s, block)
                 return
             except Exception as exc:  # noqa: BLE001 - 한도 등 거부 응답(아래) / 통신 오류(여기)
                 if _is_comm_error(exc):
@@ -1884,6 +1903,7 @@ class AutoMEngine:
                 "hl_unhedged": leg.hl_unhedged, "post_pending": leg.post_pending,
                 # 취소 재전송 한도 초과 → 상태줄 "취소실패 #번호 n회"(exec ㅂ3)
                 "cancel_failed": leg.cancel_alarmed, "cancel_tries": leg.cancel_tries,
+                "cancel_closed": leg.cancel_closed,  # 장마감 거부 — 취소 불가(결정 90)
                 # 취소 확인 대기 시간(초) — 보낸 뒤 통보가 안 온 동안만 값, 아니면 None
                 "cancel_wait_s": (round(mono - leg.cancel_sent_mono)
                                   if (leg.cancel_sent or leg.replace_pending)

@@ -44,7 +44,7 @@ from .gateways.base import HLGateway, PlaceResult
 from .gateways.hl import Mark
 from .gateways.hl_ws import HLWebSocketClient, OrderUpdate
 from .gateways.ls import LSApiGateway, OrderGoneError
-from .gateways.ls_rest import RestError
+from .gateways.ls_tr import RestError
 from .gateways.ls_ws import (
     ExpectedPrice,
     Fill,
@@ -443,7 +443,8 @@ class LiveSystem:
         # 체결·취소·거부 행 일련번호(전체 공용) — 화면 '이전 N건' 조회 기준(2026-09-29)
         self._row_seq = 0
         # 종목 VI 상태(vi_gubun, "0" = 해제) — LS 실시간 VI_(exec §8, 체결쏴 주식 정지)
-        self.vi_state: dict[Underlying, str] = {}
+        # 종목 VI 상태 — (종목, 거래소 "krx"|"nxt") → vi_gubun(결정 89, 2026-11-09: VI는 거래소마다)
+        self.vi_state: dict[tuple[Underlying, str], str] = {}
         # 주식 동시호가·VI 직전의 현재가(통합 1호가 가중값) — 호가가 멈춘 동안 이 값을 쓴다(사용자
         # 2026-10-28 "직전 가중값으로"). 동시호가·VI가 아닐 때 통합 호가가 올 때마다 갱신.
         self._stock_last_before_pause: dict[Underlying, float] = {}
@@ -856,16 +857,19 @@ class LiveSystem:
         """주식시장 동시호가 중인가 — 체결쏴 주식선물·HL선이 S괴리 필터를 건너뛴다(exec 결정 57)."""
         return self.session.stock_auction()
 
-    def stock_vi(self, underlying: Underlying) -> bool:
-        """종목 VI 발동 중인가(LS 실시간 VI_, exec §8) — 체결쏴 주식은 그 종목 선주문을 멈춘다."""
-        return self.vi_state.get(underlying, "0") not in ("", "0")
+    def stock_vi(self, underlying: Underlying, market: str | None = None) -> bool:
+        """종목 VI 발동 중인가(LS 실시간 UVI/VI_, exec §8·결정 89). market "krx"|"nxt"면 그 거래소만
+        (체결쏴 주식은 자기 거래소 VI만 본다), None이면 어느 거래소든(가중값 '직전 값' 규칙용)."""
+        markets = ("krx", "nxt") if market is None else (market,)
+        return any(self.vi_state.get((underlying, m), "0") not in ("", "0") for m in markets)
 
     def _on_vi(self, ev: Any) -> None:
-        """VI_ 수신 → 종목별 vi_gubun 보관 + 로그(발동/해제 모두 — 운영 미실측이라 거래소명·
-        발동가·기준가까지 찍어 첫 발동 때 포맷을 확인, 사용자 2026-10-29). 코드표는 Res 확인."""
+        """UVI/VI_ 수신 → (종목, 거래소)별 vi_gubun 보관 + 로그(발동/해제 모두 — 거래소명·발동가·
+        기준가까지, 사용자 2026-10-29). 대조 기간엔 VI_와 UVI의 KRX 쪽이 같은 칸에 두 번 쓰여도
+        값이 같아 무해(결정 89). 코드표는 Res 확인."""
         import logging
 
-        self.vi_state[ev.underlying] = ev.gubun
+        self.vi_state[(ev.underlying, getattr(ev, "market", "krx") or "krx")] = ev.gubun
         logging.getLogger("kp_arb.core").warning(
             "VI %s %s 구분 %s(0 해제·1 정적·2 동적·3 둘) %s 거래소 %r 발동가 %s 기준가 %s/%s",
             "해제" if not ev.active else "발동", ev.underlying.value, ev.gubun, ev.time,
@@ -1181,7 +1185,7 @@ class LiveSystem:
             try:
                 order_id = await self._gw.place_order(intent)
             except Exception as exc:  # 거부·응답 없음 → 거부내역(주문리스트 '거부' 행)
-                from .gateways.ls_rest import RestTimeoutError
+                from .gateways.ls_tr import RestTimeoutError
 
                 self._record_reject(
                     intent, str(exc),
@@ -2008,6 +2012,21 @@ class LiveSystem:
         if v is not None:
             self._stock_last_before_pause[quote.underlying] = v
 
+    def stock_last_market(self, underlying: Underlying, market: str) -> float | None:
+        """주식 종목 상태(체결쏴 주식, 결정 80)의 "현재가" = **그 거래소(krx/nxt) 1호가 가중값** —
+        통합 호가(UH1)가 거래소별 잔량을 실어 와 Quote 셋(uni/krx/nxt)으로 갈라지므로 그 거래소
+        Quote에 stock_last와 같은 식을 쓴다. 호가가 멈춘(동시호가·VI) 구간엔 통합 직전 가중값.
+        그 거래소 호가가 없으면(마감 뒤 KRX 등) None. (2026-11-04 — 10-27 주식 체결 구독 중단 뒤
+        거래소별 체결가를 읽던 자리를 바꿈, DESIGN-auto-m-exec §7C.)"""
+        if market == "uni":
+            return self.stock_last(underlying)
+        if self._stock_paused(underlying):
+            return self._stock_last_before_pause.get(underlying)
+        q = self.quotes.get((underlying, Instrument.KR_STOCK, market))
+        if q is None:
+            return None
+        return quote_price(q.bid, q.ask, q.bid_qty, q.ask_qty)
+
     @staticmethod
     def _levels(
         quote: Quote | None,
@@ -2455,12 +2474,9 @@ async def bootstrap_live(
 
     HL 비밀 미등록 시 LS-only로 동작.
     """
-    from .config import ConfigError, current_mode, default_secrets, load_config
+    from .config import ConfigError, default_secrets, load_config
     from .gateways.hl_live import HLSdkGateway
     from .gateways.hl_ws import HLWebSocketConnector
-    from .gateways.ls import LIVE_BASE_URL
-    from .gateways.ls_http import AiohttpRestTransport, AiohttpTokenTransport
-    from .gateways.ls_ws_live import LSWebSocketConnector, ls_ws_url
 
     config = load_config(config_path) if config_path else load_config()
     etf_symbols = config.etf_symbols()
@@ -2468,41 +2484,29 @@ async def bootstrap_live(
     import logging as _logging
 
     _blog = _logging.getLogger("kp_arb.bootstrap")
-    # LS 접근 방식(DESIGN-ls-xing.md): xing이면 COM 세션 하나(로그인은 여기서 1회, 끊기면
-    # XingRealClient가 ensure_login으로 다시), REST/WS는 만들지 않는다.
+    # LS 접근은 xingAPI 하나(DESIGN-ls-xing.md): COM 세션 하나(로그인은 여기서 1회, 끊기면
+    # XingRealClient가 ensure_login으로 다시). OpenAPI REST/WS 경로·KP_LS_API 스위치는
+    # 2026-11-09 제거(사용자 "REST 쓰는 곳 없으면 제거해").
     import time as _time_mod
     from pathlib import Path
 
-    from .config import LsApi, XingCredentials, ls_api
+    from .config import XingCredentials
+    from .gateways.xing import XingGateway
+    from .gateways.xing_com import Win32ComFactory, XingSession
 
-    use_xing = ls_api() is LsApi.XING
-    xing_session = None
-    xing_creds: XingCredentials | None = None
-    if use_xing:
-        from .gateways.xing import XingGateway
-        from .gateways.xing_com import Win32ComFactory, XingSession
-
-        xing_creds = XingCredentials.load()
-        # 설치 폴더를 DLL 탐색 경로에(실서버 공동인증 모듈 — 운영 PC 2006 실측 2026-09-28)
-        xing_session = XingSession(Win32ComFactory(xing_creds.path),
-                                   Path(xing_creds.path) / "Res")
-        await xing_session.start()
-        _t_login = _time_mod.perf_counter()
-        xing_accounts = await xing_session.login(
-            xing_creds.host, xing_creds.port, xing_creds.user_id, xing_creds.password,
-            xing_creds.cert_password, xing_creds.server_type)
-        _blog.info("xing 로그인 %.2fs — 계좌 %d개 %s", _time_mod.perf_counter() - _t_login,
-                   len(xing_accounts), [a[:4] + "…" for a in xing_accounts])
-        gateway: LSApiGateway = XingGateway.from_session(
-            xing_session, accounts, res_dir=Path(xing_creds.path) / "Res")
-    else:
-        token_tx = AiohttpTokenTransport(session, LIVE_BASE_URL)
-        gateway = LSApiGateway.from_accounts(
-            accounts,
-            token_transport=token_tx,
-            rest_transport=AiohttpRestTransport(session),
-            base_url=LIVE_BASE_URL,
-        )
+    xing_creds = XingCredentials.load()
+    # 설치 폴더를 DLL 탐색 경로에(실서버 공동인증 모듈 — 운영 PC 2006 실측 2026-09-28)
+    xing_session = XingSession(Win32ComFactory(xing_creds.path),
+                               Path(xing_creds.path) / "Res")
+    await xing_session.start()
+    _t_login = _time_mod.perf_counter()
+    xing_accounts = await xing_session.login(
+        xing_creds.host, xing_creds.port, xing_creds.user_id, xing_creds.password,
+        xing_creds.cert_password, xing_creds.server_type)
+    _blog.info("xing 로그인 %.2fs — 계좌 %d개 %s", _time_mod.perf_counter() - _t_login,
+               len(xing_accounts), [a[:4] + "…" for a in xing_accounts])
+    gateway: LSApiGateway = XingGateway.from_session(
+        xing_session, accounts, res_dir=Path(xing_creds.path) / "Res")
     # 주식선물 근·차근 월물 자동 조회(만기 롤오버 대응, §5.11) 후 게이트웨이 재조립.
     # 조회 실패·월물 누락은 아래 startup_symbol_error가 "종목" 로드 실패로 판정한다.
     try:
@@ -2549,46 +2553,12 @@ async def bootstrap_live(
         _blog.info("원달러선물 월물 로드: %s", [c for c, _ in fx_months])
     else:
         _blog.warning("원달러선물 월물 0개 — 환율이론가·FX 대응주문 대상 없음")
-    if use_xing:
-        assert xing_session is not None and xing_creds is not None
-        from .gateways.xing import XingGateway as _XingGateway
+    from .gateways.xing import XingGateway as _XingGateway
 
-        gateway = _XingGateway.from_session(
-            xing_session, accounts, res_dir=Path(xing_creds.path) / "Res",
-            futures_symbols=futures_symbols, etf_symbols=etf_symbols,
-            next_futures_symbols=next_futures_symbols)
-    else:
-        gateway = LSApiGateway.from_accounts(
-            accounts,
-            token_transport=token_tx,
-            rest_transport=AiohttpRestTransport(session),
-            base_url=LIVE_BASE_URL,
-            futures_symbols=futures_symbols,
-            etf_symbols=etf_symbols,
-            next_futures_symbols=next_futures_symbols,
-        )
-
-    url = ls_ws_url(current_mode())
-
-    async def ws_for(account: Account) -> LSWebSocketClient:
-        cred = accounts.for_account(account)
-        name = "LS 주식" if account == Account.KR_STOCK else "LS 선물"
-
-        async def fresh_token() -> str:
-            # 재연결 시마다 새 토큰 — LS 토큰 만료(약 1일) 후 재접속 거부 방지
-            return (await token_tx.fetch_token(cred.appkey, cred.appsecret)).access_token
-
-        return LSWebSocketClient(
-            LSWebSocketConnector(url), token_provider=fresh_token,
-            etf_symbols=etf_symbols, account_numbers=accounts.numbers(),
-            # 선물 WS는 계좌 통보(O01/C01/H01)만 받아 평소 데이터가 없다 — "시세 지연(무데이터)"
-            # 헛경고(하루 10회+, 2026-09-03 실측)를 막기 위해 스트림 기대를 끈다.
-            status=WsStatus(venue="LS", name=name,
-                            kind="시세/주문" if account == Account.KR_STOCK else "주문통보",
-                            expects_stream=account == Account.KR_STOCK),
-            # 장시간 운영: 사실상 무제한 재연결 + 2초 대기 (한도는 연속 실패에만)
-            max_reconnects=1_000_000, reconnect_backoff_s=2.0,
-        )
+    gateway = _XingGateway.from_session(
+        xing_session, accounts, res_dir=Path(xing_creds.path) / "Res",
+        futures_symbols=futures_symbols, etf_symbols=etf_symbols,
+        next_futures_symbols=next_futures_symbols)
 
     # HL 슬롯 — 비밀(HL_AGENT_KEY/HL_ACCOUNT_ADDRESS) 없으면 LS-only.
     hl_gateway = None
@@ -2605,39 +2575,34 @@ async def bootstrap_live(
     except ConfigError:
         pass
 
-    if use_xing:
-        # xing 실시간 하나가 주식·선물 계좌 통보·시세를 다 받는다 — 두 자리에 같은 객체(§2.2)
-        from .gateways.xing_ws import XingRealClient
+    # xing 실시간 하나가 주식·선물 계좌 통보·시세를 다 받는다 — 두 자리에 같은 객체(§2.2)
+    from .gateways.xing_ws import XingRealClient
 
-        assert xing_session is not None and xing_creds is not None
-        _xs, _xc = xing_session, xing_creds
+    _xs, _xc = xing_session, xing_creds
 
-        async def ensure_login() -> None:
-            """끊기면 2초 간격으로 재로그인 — 자격은 메모리의 XingCredentials(로그에 안 남김)."""
-            while not _xs.logged_in:
-                try:
-                    await _xs.login(_xc.host, _xc.port, _xc.user_id, _xc.password,
-                                    _xc.cert_password, _xc.server_type)
-                except Exception as exc:  # noqa: BLE001 - 재시도(서버 점검 등)
-                    _blog.warning("xing 재로그인 실패 — 2초 뒤 재시도: %s", exc)
-                    await asyncio.sleep(2.0)
+    async def ensure_login() -> None:
+        """끊기면 2초 간격으로 재로그인 — 자격은 메모리의 XingCredentials(로그에 안 남김)."""
+        while not _xs.logged_in:
+            try:
+                await _xs.login(_xc.host, _xc.port, _xc.user_id, _xc.password,
+                                _xc.cert_password, _xc.server_type)
+            except Exception as exc:  # noqa: BLE001 - 재시도(서버 점검 등)
+                _blog.warning("xing 재로그인 실패 — 2초 뒤 재시도: %s", exc)
+                await asyncio.sleep(2.0)
 
-        # 시세 원문 기록(임시 진단, DESIGN-ls-xing §8, 2026-10-02) — 공통설정 "시세 원문 기록"으로
-        # 켜고 끈다(기본 끔, 코어가 시동·저장 때 set_quote_probe로 반영). 꺼진 채 만들어 둔다.
-        # logs/probe/quote_trade_YYYYMMDD.jsonl(배포판은 exe 옆), 5일 지난 파일은 시동 때 삭제
-        from .logs import base_dir
-        from .quote_probe import QuoteProbe
+    # 시세 원문 기록(임시 진단, DESIGN-ls-xing §8, 2026-10-02) — 공통설정 "시세 원문 기록"으로
+    # 켜고 끈다(기본 끔, 코어가 시동·저장 때 set_quote_probe로 반영). 꺼진 채 만들어 둔다.
+    # logs/probe/quote_trade_YYYYMMDD.jsonl(배포판은 exe 옆), 5일 지난 파일은 시동 때 삭제
+    from .logs import base_dir
+    from .quote_probe import QuoteProbe
 
-        probe = QuoteProbe(base_dir() / "logs" / "probe")
-        xing_real = XingRealClient(
-            xing_session, ensure_login=ensure_login, etf_symbols=etf_symbols,
-            status=WsStatus(venue="LS", name="LS xing", kind="시세/주문", expects_stream=True),
-            reconnect_backoff_s=2.0, probe=probe, account_numbers=accounts.numbers())
-        stock_ws: LSWebSocketClient = xing_real
-        deriv_ws: LSWebSocketClient | None = xing_real
-    else:
-        stock_ws = await ws_for(Account.KR_STOCK)
-        deriv_ws = await ws_for(Account.KR_DERIV)
+    probe = QuoteProbe(base_dir() / "logs" / "probe")
+    xing_real = XingRealClient(
+        xing_session, ensure_login=ensure_login, etf_symbols=etf_symbols,
+        status=WsStatus(venue="LS", name="LS xing", kind="시세/주문", expects_stream=True),
+        reconnect_backoff_s=2.0, probe=probe, account_numbers=accounts.numbers())
+    stock_ws: LSWebSocketClient = xing_real
+    deriv_ws: LSWebSocketClient | None = xing_real
     system = LiveSystem(
         gateway=gateway,
         order_book=OrderBook(),
@@ -2657,10 +2622,8 @@ async def bootstrap_live(
         fx_fut_window=(config.fx_fut_window.start, config.fx_fut_window.end),
         board_ref_qty=config.disparity.ref_qty,
     )
-    if use_xing:
-        assert xing_session is not None
-        system.closers.append(xing_real.stop)      # 실시간 루프 정지
-        system.closers.append(xing_session.close)  # COM 스레드 종료
+    system.closers.append(xing_real.stop)      # 실시간 루프 정지
+    system.closers.append(xing_session.close)  # COM 스레드 종료
     # 종목 로드 판정 — 취급 종목(config.symbols)마다 주식선물 근·차근 월물 + 원달러선물 월물이
     # 있어야 한다. 하나라도 빠지면 "종목" 로드 실패 → 시동 초기화가 멈추고 메인창이 팝업
     # (하이닉스 근월물 누락·원달러 월물 0개가 여기 걸린다 — 2026-09-03 사용자 확정, 차근 포함).

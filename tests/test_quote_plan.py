@@ -16,6 +16,8 @@ def test_plan_subscribes_only_checked_symbols_with_three_stock_trs() -> None:
     got = plan(inp)
     assert ("UYS", "U005930   ") in got and ("UYS", "U000660   ") in got
     assert ("UH1", "U005930   ") in got and ("UH1", "U000660   ") in got
+    # 종목 VI는 통합 UVI(U 키, KRX·NXT 둘 다 — 결정 89 2026-11-09) + 대조용 VI_(하루 뒤 제거)
+    assert ("UVI", "U005930   ") in got and ("UVI", "U000660   ") in got
     assert ("VI_", "005930") in got and ("VI_", "000660") in got
     assert ("JH0", "A116B000") in got and ("YJC", "A506B000") in got  # 근월물만
     assert ("JH0", "A116C000") not in got and ("JH0", "A166B000") not in got
@@ -24,7 +26,7 @@ def test_plan_subscribes_only_checked_symbols_with_three_stock_trs() -> None:
     assert not any(k.endswith("005380") or "005380" in k for _t, k in got)  # 현대차 없음
     assert all(t not in ("US3", "S3_", "NS3", "YS3", "H1_", "NH1", "S2_", "NS2", "US2", "JC0")
                for t, _k in got)
-    assert len(got) == 2 * 3 + 2 * 2 + 3                             # 13건(통보·CUR·JIF는 밖)
+    assert len(got) == 2 * 4 + 2 * 2 + 3                             # 15건(통보·CUR·JIF는 밖)
 
 
 def test_plan_follows_futures_month_choice_and_symbol_toggle() -> None:

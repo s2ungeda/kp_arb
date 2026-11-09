@@ -1,18 +1,18 @@
 """LS Open API 게이트웨이 — 현물 주문 (DESIGN.md §5.1).
 
-블록 1-3 범위: 현물(주식/ETF) 주문/정정/취소를 REST(CSPAT006/007/008 계열)로.
+블록 1-3 범위: 현물(주식/ETF) 주문/정정/취소를 TR(CSPAT006/007/008 계열)로.
 - 계좌 라우팅은 ``routing.account_for``로 결정한다(불변식, 깨지 않음).
 - 선물 주문 TR은 ``[OPEN §13 #3]`` 미정 → 추측하지 않고 ``NotImplementedError``로 가드.
 - 잔고/포지션 조회는 블록 1-5에서 채운다(여기선 미구현 가드).
 - 실제 계좌상품코드(계좌번호) 매핑은 config ``[OPEN §13 #3]``. 여기선 Account enum으로만 라우팅.
 
-라이브 없음: 실제 전송은 ``LSRestClient`` → ``RestTransport``(Protocol) 뒤로 격리.
-테스트는 녹화 픽스처만 사용.
+전송은 계좌별 ``TrRequester``(xing ``XingQueryClient``) 뒤로 격리 — LS OpenAPI REST 경로
+(LSRestClient·토큰·aiohttp)는 2026-11-09 제거(사용자 "REST 쓰는 곳 없으면 제거해").
+테스트는 가짜 요청자 + 녹화 픽스처만 사용.
 """
 from __future__ import annotations
 
-import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,25 +24,37 @@ from ..etf_theory import EtfTheoryInputs
 from ..order_book import OrderStatus, TrackedOrder
 from ..routing import account_for
 from .base import LSGateway, placed_at_from_hhmmss, placed_epoch_from_hhmmss
-from .ls_auth import TokenManager, TokenTransport
-from .ls_rest import (
-    LS_PER_SECOND,
-    LSRestClient,
-    RateLimiter,
+from .ls_tr import (
     RateLimitError,
     RestError,
     RestResponse,
-    RestTransport,
     TrRequester,
 )
 
-LIVE_BASE_URL = "https://openapi.ls-sec.co.kr:8080"
 _LS_ACCOUNTS: tuple[Account, ...] = (Account.KR_STOCK, Account.KR_DERIV)
 
 
 class OrderGoneError(RestError):
     """정정/취소할 잔량이 없음(이미 체결·취소된 주문). 오류가 아니라 정상 흐름의 거부 —
     체결과의 경합에서 종종 발생하므로 호출부는 체결 확인으로 이어가면 된다."""
+
+
+class MarketClosedError(RestError):
+    """장마감 뒤의 주문·취소 거부(LS 02611 "장시작 전 또는 장마감 되었습니다."). 주문은 LS에
+    그대로 걸려 있지만 **다시 보내도 같은 거부**라 재시도 대상이 아니다 — 하루 주문은 LS가 마감
+    정리로 없앤다(운영 실측 2026-11-06 20:00 NXT 애프터마켓 마감: 취소 거부 1,407건을 10분간
+    0.6초마다 되풀이, 20:10:29부터 03416 "잔량 없음"). 판정은 **코드와 문구 둘 다**로 — 같은 코드가
+    "장시작 전"에도 쓰이므로 문구에 '장마감'이 있어야 한다(사용자 2026-11-09 "반드시 '장마감'")."""
+
+
+# 장마감 거부 — 코드 + 문구('장마감') 둘 다 맞아야 MarketClosedError.
+_MARKET_CLOSED_RSP_CD = "02611"
+_MARKET_CLOSED_WORD = "장마감"
+
+
+def is_market_closed_reject(rsp_cd: object, rsp_msg: object) -> bool:
+    """장마감 거부인가 — LS 02611 이고 문구에 '장마감'이 있을 때만(둘 중 하나로는 안 본다). 순수."""
+    return str(rsp_cd) == _MARKET_CLOSED_RSP_CD and _MARKET_CLOSED_WORD in str(rsp_msg or "")
 
 
 # "잔량 없음" 거부 코드 — 취소·정정 대상이 이미 체결/취소된 경우(정상 흐름의 경합).
@@ -82,7 +94,7 @@ def merge_stock_positions(positions: Sequence[Position]) -> list[Position]:
 
 
 class LSApiGateway(LSGateway):
-    """LS REST 기반 현물 주문 게이트웨이. ``LSRestClient`` 위에 TR 매핑을 얹는다."""
+    """LS 게이트웨이 — 계좌별 ``TrRequester``(xing) 위에 TR 매핑(본문 만들기·응답 파싱)을 얹는다."""
 
     SPOT_ORDER_TR = "CSPAT00601"
     SPOT_AMEND_TR = "CSPAT00701"
@@ -137,36 +149,6 @@ class LSApiGateway(LSGateway):
         # 제외(빈 결과를 "조회 성공"으로 봐 걸린 선주문을 지운 사고, 실측 2026-09-09 #20851).
         self._deriv_open_orders_ok = False
         self.connected = False
-
-    @classmethod
-    def from_accounts(
-        cls,
-        accounts: LSAccounts,
-        *,
-        token_transport: TokenTransport,
-        rest_transport: RestTransport,
-        base_url: str = LIVE_BASE_URL,
-        futures_symbols: Mapping[Underlying, str] | None = None,
-        etf_symbols: Mapping[Underlying, str] | None = None,
-        next_futures_symbols: Mapping[Underlying, str] | None = None,
-        now: Callable[[], float] = time.monotonic,
-    ) -> LSApiGateway:
-        """계좌별 키로 계좌별 토큰·REST 클라이언트를 조립. (레이트리밋은 계좌별 독립.)"""
-        rest_by_account: dict[Account, LSRestClient] = {}
-        load = list(_LS_ACCOUNTS)
-        if accounts.has(Account.KR_FX):  # 원달러선물 헤지 계좌(선택 §9.1) — 있으면 로드
-            load.append(Account.KR_FX)
-        for account in load:
-            cred = accounts.for_account(account)
-            tokens = TokenManager(cred.appkey, cred.appsecret, token_transport, now=now)
-            limiter = RateLimiter(now=now, per_tr_per_second=LS_PER_SECOND)  # 공식 TR별 한도
-            # 재시도에 지수 백오프 — LS 서버가 가끔 뱉는 일시적 500을 텀 없는 3연속
-            # 재시도로는 못 벗어난다. 0.3s→0.6s 간격을 줘 순간 500이 지나가면 회복.
-            rest_by_account[account] = LSRestClient(
-                base_url, tokens, rest_transport, limiter, backoff_base_s=0.3)
-        return cls(rest_by_account, accounts=accounts,
-                   futures_symbols=futures_symbols, etf_symbols=etf_symbols,
-                   next_futures_symbols=next_futures_symbols)
 
     def _rest_for(self, account: Account) -> TrRequester:
         return self._rest_by_account[account]
@@ -877,6 +859,8 @@ class LSApiGateway(LSGateway):
             message = f"{tr_cd} rejected ({rsp_cd}): {resp.body.get('rsp_msg')}"
             if str(rsp_cd) in _ORDER_GONE_RSP_CDS:
                 raise OrderGoneError(message)
+            if is_market_closed_reject(rsp_cd, resp.body.get("rsp_msg")):
+                raise MarketClosedError(message)
             raise RestError(message)
 
     def _parse_order_id(self, resp: RestResponse, tr_cd: str) -> str:

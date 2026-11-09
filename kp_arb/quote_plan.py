@@ -4,7 +4,8 @@
 것과의 차이(추가·해제)를 낸다. 종목·월물에 따라 바뀌는 것만 다룬다 — 종목과 무관한 CUR·JIF·계좌
 통보(SC*/O01/C01/H01)는 게이트웨이가 시동 때 고정으로 단다.
 
-종목당 3건: UYS 통합 예상체결 · UH1 통합 호가 · VI_. 주식 호가는 통합(UH1) 하나(사용자 2026-10-27
+종목당 3건: UYS 통합 예상체결 · UH1 통합 호가 · UVI 통합 VI(대조 기간엔 VI_ 추가 — 결정 89,
+2026-11-09). 주식 호가는 통합(UH1) 하나(사용자 2026-10-27
 오후 "통합호가 하나로 다 해결") — 단계마다 KRX·NXT·통합 잔량이 따로 와 거래소별 1호가가 다 나오므로
 체결쏴 주식의 거래소 선택·동시호가·NXT 개장과 무관하게 늘 1건(읽는 칸은
 xing_com.read_unified_quote).
@@ -25,7 +26,11 @@ STOCK_EXPECTED_TR = "UYS"   # KOSPI+KOSDAQ 예상체결(통합)
 # 통합 호가 — KRX·NXT·통합 1호가가 한 건에서 나온다(2026-10-27 오후). 10-16 운영 실측 분당 건수는
 # H1_ 하나와 비슷(H1_+NH1의 절반쯤).
 STOCK_QUOTE_TR = "UH1"
-STOCK_VI_TR = "VI_"
+# 종목 VI — 통합 UVI(KRX·NXT 구분이 한 메시지에, 키 U+코드; exec 결정 89 2026-11-09). VI_는 KRX
+# 코드 키라 NXT VI가 안 왔음(11-06 08:00 실증). 실서버 수신 대조를 위해 하루는 VI_도 같이 등록하고
+# 대조 뒤 뺀다(DESIGN-ls-xing §9).
+STOCK_VI_TR = "UVI"
+STOCK_VI_LEGACY_TR = "VI_"
 FUTURES_QUOTE_TR = "JH0"    # 주식선물 호가(1호가 넷만 읽는다 — xing_com.REAL_FIELD_LIMIT)
 FUTURES_EXPECTED_TR = "YJC"
 FX_TRADE_TR = "FC9"         # 원달러선물 체결(1호가 포함 — 선물역산 환율), 공통설정이 고른 월물만
@@ -68,7 +73,8 @@ def plan(inp: QuotePlanInput) -> list[Sub]:
         code = u.krx_code
         add(STOCK_EXPECTED_TR, unified_key(code))
         add(STOCK_QUOTE_TR, unified_key(code))
-        add(STOCK_VI_TR, code)
+        add(STOCK_VI_TR, unified_key(code))
+        add(STOCK_VI_LEGACY_TR, code)  # 대조용(하루) — 결정 89
         months = inp.futures_months.get(u) or frozenset({"near"})
         for month in ("near", "next"):
             if month not in months:

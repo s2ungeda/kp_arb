@@ -1,4 +1,6 @@
-"""xingAPI 설정 — 전환 스위치(KP_LS_API)와 로그인 자격 로드(마스킹). 라이브 없음."""
+"""xingAPI 설정 — 로그인 자격 로드(마스킹). 라이브 없음.
+
+전환 스위치 KP_LS_API는 2026-11-09 REST 제거와 함께 삭제."""
 from __future__ import annotations
 
 import pytest
@@ -6,9 +8,7 @@ import pytest
 from kp_arb.config import (
     SECRET_NAMES,
     ConfigError,
-    LsApi,
     XingCredentials,
-    ls_api,
 )
 
 
@@ -18,17 +18,6 @@ class _Secrets:
 
     def get(self, name: str) -> str | None:
         return self._v.get(name)
-
-
-def test_ls_api_switch_defaults_to_openapi(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("KP_LS_API", raising=False)
-    monkeypatch.setattr("kp_arb.config.KeyringSecrets.get", lambda self, name: None)
-    assert ls_api() is LsApi.OPENAPI
-    monkeypatch.setenv("KP_LS_API", "XING")
-    assert ls_api() is LsApi.XING
-    monkeypatch.setenv("KP_LS_API", "com")
-    with pytest.raises(ConfigError):
-        ls_api()
 
 
 def test_xing_credentials_load_and_masking(monkeypatch: pytest.MonkeyPatch) -> None:

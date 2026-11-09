@@ -77,7 +77,8 @@ class PlaceResult:
 
 
 class LSGateway(ABC):
-    """LS Open API 게이트웨이 (주식계좌 + 선물옵션계좌). REST+WS, OAuth2."""
+    """LS 게이트웨이 계약 (주식계좌 + 선물옵션계좌). 구현은 xingAPI(COM) — REST/OAuth2 경로는
+    2026-11-09 제거."""
 
     @abstractmethod
     async def connect(self) -> None: ...

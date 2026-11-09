@@ -57,7 +57,7 @@
 | **전략 로직** | **미정. ArbEngine은 Strategy 인터페이스 뒤 플러그인** | 인프라를 전략 비종속으로 구축 |
 | **FX 헤지** | **외부 #2 프로세스에 위임. 본 시스템은 USD 노출만 보고** | 기존 환헤지 프로그램 재사용 |
 | 언어/런타임 | 64비트 Python, 단일 프로세스, asyncio | 생산성 우선 |
-| 국내 브로커 | LS 신규 Open API(REST+WS, OAuth2). xingAPI 미사용 | 64비트·언어 무관 |
+| 국내 브로커 | ~~LS 신규 Open API(REST+WS, OAuth2). xingAPI 미사용~~ → **xingAPI(COM, 32비트) 하나**(2026-09-23 전환, OpenAPI REST 코드는 2026-11-09 제거 — DESIGN-ls-xing) | 코어·메인 32비트 빌드 |
 | 영속화 | SQLite | 단일 프로세스 재시작 복구 |
 
 ---
@@ -105,26 +105,26 @@
 > ⚠️ 메서드 이름은 **우리 래퍼 인터페이스**이며 브로커 실제 함수명이 아니다. LS는 TR 코드 기반, HL은 `hyperliquid-python-sdk` 함수에 대응.
 
 ### 5.1 LSGateway (2계좌: 주식 1 + 선물옵션 1)
-- **책임:** LS Open API(REST `https://openapi.ls-sec.co.kr:8080`, OAuth2 Bearer + `tr_cd`) 연결·인증·시세·**장운영데이터**·주문·잔고. **주식계좌·선물옵션계좌 2개를 보유하고 instrument로 라우팅.**
-- **인증은 계좌별(확정 v0.4):** appkey/appsecret이 계좌마다 다르므로 **계좌별 OAuth2 토큰·REST 컨텍스트**를 분리한다. 주문/조회는 대상 계좌의 토큰으로 전송.
+- **책임:** LS xingAPI(COM, `gateways/xing*.py`; 옛 OpenAPI REST/OAuth2 경로는 2026-11-09 제거) 연결·로그인·시세·**장운영데이터**·주문·잔고. **주식계좌·선물옵션계좌 2개를 보유하고 instrument로 라우팅.**
+- ~~**인증은 계좌별(확정 v0.4):** appkey/appsecret이 계좌마다 다르므로 계좌별 OAuth2 토큰·REST 컨텍스트를 분리~~ → xing은 로그인 세션 하나로 전 계좌를 다루고 계좌번호·비번은 TR 본문에 싣는다. appkey/appsecret 칸은 키링 등록 호환으로만 남음(2026-11-09).
 - **계좌 라우팅:** 주식·ETF → 주식계좌(`CSPAT00601` 등) / 주식선물·야간선물 → **단일 선물옵션계좌**(선물옵션 주문 TR, 주간·야간 공용). 잔고·증거금·미체결은 **계좌별로 분리 추적**.
 - **인터페이스 → LS TR 매핑:**
 
-| 래퍼 메서드 | LS TR (REST/WS) | 계좌 |
+| 래퍼 메서드 | LS TR (xing 조회·실시간) | 계좌 |
 |---|---|---|
 | `connect()` / 토큰관리 | OAuth2 access_token 발급·자동 갱신 | 공통 |
 | `subscribe_market_status()` | WS `JIF`(장운영정보) + 휴장일/운영시간 조회 TR (구현 시 확인) | 공통 |
 | `subscribe_quotes()` | WS 주식 `H1_`·`NH1`, 선물 호가 TR | 공통 |
 | `subscribe_fills()` | WS `SC0`~`SC4` | 양 계좌 |
-| `place_order(stock)` | REST `CSPAT00601` | 주식 |
-| `place_order(future)` | REST 선물옵션 주문 TR (구현 시 확인) | 선물옵션 |
+| `place_order(stock)` | `CSPAT00601`(xing Res 이름은 00600 — 게이트웨이가 별칭) | 주식 |
+| `place_order(future)` | `CFOAT00100` | 선물옵션 |
 | `amend/cancel_order()` | `CSPAT00701`/`CSPAT00801` (선물은 선물 TR) | 해당 계좌 |
 | `get_positions()` | `CSPAQ12300`·`t0424`(현물) / 선물 잔고 TR | 계좌별 |
 | `get_balance()` | `CSPAQ22200`(예수금)·`CDPCQ04700` / `FOCCQ33600`(증거금) | 계좌별 |
 | `get_open_orders()` | `CSPAQ13700`(미체결) | 계좌별 |
 
 - **이벤트:** `on_market_status`, `on_quote`, `on_fill`, `on_order_ack`, `on_disconnect`
-- **제약:** TR별 초당 한도 — LS 공식 값 그대로(`ls_rest.LS_PER_SECOND`; 출처 openapi.ls-sec.co.kr 서비스 목록 `/api/apis/public/api-list/<그룹id>`의 `ThroughputQuotaRule[].requestLimit`, 2026-09-14 전 TR 재대조): 선물 주문·정정·취소 10, 현물 주문 10·정정/취소 3, 현재가 조회(t1102/t8402/t2111) 10, 주식선물 마스터 2, 선물 잔고(t0441)·미체결(t0434)·증거금·예수금·체결내역·ETF·상품선물 마스터 1. 표에 없는 TR은 2로 막히므로 **쓰는 REST TR은 전부 표에 넣는다**(테스트가 대조). 정정 2026-09-14: t0441·t0434는 2로 적혀 있었으나 공식 1, t2111은 표에 없어 기본 2로 막혀 시동 뒤 2초 대기가 붙어 있었음(삭제). 코어의 초당 한도 검사가 이 표로 먼저 막으므로 "per-second limit … exceeded"는 LS가 아니라 우리 쪽 메시지다. 일 호출수의 날짜 경계는 달력 날짜(로컬)로 센다. **요청 1건 대기 상한 10초**(사용자 확정 2026-09-14, `ls_http.REQUEST_TIMEOUT_S`; 전엔 aiohttp 기본 5분이라 걸린 잔고 조회 하나가 시동을 72초 붙잡음) — 넘기면 0.3·0.6초 뒤 재시도, 3회 실패면 RestError. 시동 초기값 현재가 9건 사이의 0.6초 쉼(근거 없던 초당 2회 시절)은 삭제(5초 단축). ~~일 5,000 REST~~ → **일 호출수는 막지 않고 경고만**(정정 2026-09-14): 5,000은 초기 골격의 가정값이고 LS 공식 안내엔 초당 한도뿐인데, 운영 실측 13:11 하이닉스 자동M 재발주 왕복이 5,000에 닿자 우리 가드가 그날 남은 시간 동안 선물 계좌 REST(취소 포함)를 전부 막아 걸린 선주문을 못 지웠다(`daily cap 5000 exceeded`). 자체 가드가 취소를 막는 쪽이 더 위험하다. 넘기면 코어 로그 WARNING "LS REST 일 호출수 n — 참고 한도 5,000 초과(차단 안 함)"(이후 1,000건마다). 시세·체결·장운영은 WS, REST는 주문·주기 대사. 참고 래퍼: `LsApiHelper`/`programgarden-finance`(현물·선물·실시간 포함).
+- **제약:** TR별 초당 한도 — **xing 보고값(`GetTRCountPerSec`, DESIGN-ls-xing §2)으로 판정**(옛 REST 공식표 `LS_PER_SECOND`는 2026-11-09 코드와 함께 삭제). 옛 기록: LS 공식 값 그대로(`ls_rest.LS_PER_SECOND`; 출처 openapi.ls-sec.co.kr 서비스 목록 `/api/apis/public/api-list/<그룹id>`의 `ThroughputQuotaRule[].requestLimit`, 2026-09-14 전 TR 재대조): 선물 주문·정정·취소 10, 현물 주문 10·정정/취소 3, 현재가 조회(t1102/t8402/t2111) 10, 주식선물 마스터 2, 선물 잔고(t0441)·미체결(t0434)·증거금·예수금·체결내역·ETF·상품선물 마스터 1. 표에 없는 TR은 2로 막히므로 **쓰는 REST TR은 전부 표에 넣는다**(테스트가 대조). 정정 2026-09-14: t0441·t0434는 2로 적혀 있었으나 공식 1, t2111은 표에 없어 기본 2로 막혀 시동 뒤 2초 대기가 붙어 있었음(삭제). 코어의 초당 한도 검사가 이 표로 먼저 막으므로 "per-second limit … exceeded"는 LS가 아니라 우리 쪽 메시지다. 일 호출수의 날짜 경계는 달력 날짜(로컬)로 센다. **요청 1건 대기 상한 10초**(사용자 확정 2026-09-14, `ls_http.REQUEST_TIMEOUT_S`; 전엔 aiohttp 기본 5분이라 걸린 잔고 조회 하나가 시동을 72초 붙잡음) — 넘기면 0.3·0.6초 뒤 재시도, 3회 실패면 RestError. 시동 초기값 현재가 9건 사이의 0.6초 쉼(근거 없던 초당 2회 시절)은 삭제(5초 단축). ~~일 5,000 REST~~ → **일 호출수는 막지 않고 경고만**(정정 2026-09-14): 5,000은 초기 골격의 가정값이고 LS 공식 안내엔 초당 한도뿐인데, 운영 실측 13:11 하이닉스 자동M 재발주 왕복이 5,000에 닿자 우리 가드가 그날 남은 시간 동안 선물 계좌 REST(취소 포함)를 전부 막아 걸린 선주문을 못 지웠다(`daily cap 5000 exceeded`). 자체 가드가 취소를 막는 쪽이 더 위험하다. 넘기면 코어 로그 WARNING "LS REST 일 호출수 n — 참고 한도 5,000 초과(차단 안 함)"(이후 1,000건마다). 시세·체결·장운영은 WS, REST는 주문·주기 대사. 참고 래퍼: `LsApiHelper`/`programgarden-finance`(현물·선물·실시간 포함).
 
 ### 5.2 HLGateway
 - **메서드:** `connect()`, `subscribe_mark(coin)`, `subscribe_fills()`, `place_order(...)`, `cancel_order(...)`, `get_positions()`, `get_margin()`, `get_funding(coin)`
@@ -164,7 +164,7 @@
 - **[확정 v6.9] 세션 초기화 정책:** LS REST에는 "현재 장상태" 조회 TR이 **없다**(364 TR 카탈로그 확인 — JIF는 변화 push만). 따라서 ① **표준 운영 = 개장 전 시동**(JIF 카운트다운 자연 수신) ② 장중 재시작은 **`KP_SESSION_INIT`**(env, 예: regular)으로 운영자가 명시 시딩 — 이미 수신한 JIF는 덮지 않고, 이후 JIF가 항상 우선. 미설정/미지 값은 보수적 DEAD. 휴장일도 조회 TR 부재 → 시세·JIF 무수신 시 DEAD 유지로 안전.
 
 ### 5.9 OrderBook — 주문·포지션·잔고의 실시간 관리 (확정 v0.5)
-- **운영 모델:** ① **최초 실행 시 REST 스냅샷 1회**(계좌·포지션·잔고·미체결 주문 조회) → ② 이후는 **실시간 이벤트(WS 체결통보)가 기본** — 주문 상태 전이·포지션·잔고를 체결 이벤트로 증분 갱신한다(체결 대기 폴링 금지). ③ 동일 스냅샷 조회는 **온디맨드**(추후 UI 조회 버튼)로 재사용.
+- **운영 모델:** ① **최초 실행 시 조회 TR 스냅샷 1회**(xing)(계좌·포지션·잔고·미체결 주문 조회) → ② 이후는 **실시간 이벤트(WS 체결통보)가 기본** — 주문 상태 전이·포지션·잔고를 체결 이벤트로 증분 갱신한다(체결 대기 폴링 금지). ③ 동일 스냅샷 조회는 **온디맨드**(추후 UI 조회 버튼)로 재사용.
 - **같은 체결은 한 번만(2026-10-13):** 같은 주문의 같은 체결번호(LS yakseq/execno, HL tid)는 두 번째부터 반영하지 않고
 - **닫힌 주문 주기 정리(2026-11-03, 검토 docs/review-2026-11-03-MemoryError-검토.md §5B):** 체결·취소·거부로 닫힌 주문은 낸 지
   15분(`CLOSED_ORDER_KEEP_S`)이 지나면 60초 주기 정리(`core_server.closed_order_prune_loop`)로 장부와 LS 게이트웨이
@@ -433,7 +433,7 @@
 
 - Python 3.11+ / asyncio
 - `hyperliquid-python-sdk`, `eth-account`(EIP-712)
-- LS: `aiohttp`(REST) + `websockets`(WS); `LsApiHelper`/`programgarden-finance` 참고
+- LS: xingAPI COM(pywin32, 32비트). 옛 `aiohttp`/`websockets` REST·WS 경로는 2026-11-09 제거(`websockets`는 HL WS가 계속 씀)
 - `aiosqlite`, `pydantic`(설정·검증), `structlog`(로깅), `pandas`(분석)
 - 외부 #2 연동: 기존 #1↔#2 채널과 동일 스택
 
@@ -545,7 +545,7 @@
 
 - (2026-07-22) 전략 화면 1개(모드 콤보 수동/자동T/자동M + 총진입/1회/진입/청산 세트 3개 + 시작/PAUSE 체크 + 재시도 옵션) → **주문 화면 2개(자동T=HL-S, 자동M=HL-SF, entry/exit 각 3세트)**로 전면 개정(주문화면0722.xlsx). 재시도 옵션 폐기(자동M 후주문 HL 거부만 재시도), 수동 모드 폐기, 모니터링 전용 수량 폐기(est-pr는 1회주문수량으로).
 - C++/Boost.Beast → 생산성 우선이라 Python.
-- xingAPI(OCX, 32비트) → LS 신규 REST/WS로 회피.
+- ~~xingAPI(OCX, 32비트) → LS 신규 REST/WS로 회피.~~ → 결국 xingAPI로 전환(2026-09-23), REST 코드 제거(2026-11-09).
 - 멀티프로세스 IPC(시스템 내부) → 단일 프로세스로 단순화.
 - 주식 spot 공매도 → 미사용(숏은 선물/인버스).
 - 세션 시간 하드코딩 → LS 장운영데이터로 대체.

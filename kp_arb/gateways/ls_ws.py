@@ -41,7 +41,7 @@ STOCK_TRADE_TRS: tuple[str, ...] = ("S3_", "NS3", "US3")  # 체결: KRX/NXT/통�
 # 종목·월물에 따라 바뀌는 시세 TR — apply_plan(§9)이 다루는 범위. 종목과 무관한 CUR·JIF·통보는 밖.
 # 주식 호가는 통합(UH1) 하나(2026-10-27 오후) — 단계별 KRX·NXT·통합 잔량이 따로 와 한 건에서
 # Quote 셋(uni/krx/nxt)을 만든다. H1_/NH1은 더 안 쓰지만 남은 등록을 지우도록 계획 범위엔 둔다.
-PLAN_TRS: frozenset[str] = frozenset({"NS3", "UYS", "UH1", "H1_", "NH1", "VI_", "JH0", "YJC",
+PLAN_TRS: frozenset[str] = frozenset({"NS3", "UYS", "UH1", "H1_", "NH1", "VI_", "UVI", "JH0", "YJC",
                                       "FC9", "YF9"})
 UNIFIED_QUOTE_TR = "UH1"
 # UH1 Quote 셋 — (market, 잔량 칸 접두). krx/nxt는 그 거래소 잔량이 0보다 큰 첫 단계가 1호가.
@@ -98,6 +98,11 @@ STATUS_TR = "JIF"
 # (Res 파일 C:\meme\Res\VI_.res, 2026-10-29 확인). vi_gubun: "0" 해제, "1" 정적 발동,
 # "2" 동적 발동, "3" 정적&동적(Res 코드표). 운영 수신은 미실측 — 거래소명·가격은 로그 확인용.
 VI_TR = "VI_"
+# KRX+NXT 통합 VI(exec 결정 89, 2026-11-09) — 키는 UH1과 같은 "U"+코드+공백3(Res UVI.res key=10
+# ex_shcode). body에 KRX 쪽(krx_vi_gubun/krx_svi_recprice/krx_dvi_recprice/krx_vi_trgprice/
+# krx_time)과 NXT 쪽(nxt_…)이 나란히 실린다 → 거래소별 ViEvent로 가른다. VI_는 KRX 코드 키라
+# NXT VI가 안 왔다(11-06 08:00 NXT 프리마켓 VI 2분 동안 주식 선주문이 나가 해제 단일가 160주 체결).
+UVI_TR = "UVI"
 
 
 def _unified_key(code: str) -> str:
@@ -132,6 +137,7 @@ class ViEvent(BaseModel):
     active: bool
     time: str = ""
     exchange: str = ""  # 거래소명(exchname, 3자) — KRX·NXT 어느 쪽 VI인지 로그 확인용(2026-10-29)
+    market: str = "krx"  # 판정용 거래소 "krx"|"nxt"(결정 89, 2026-11-09) — UVI는 쪽마다 한 건
     trigger_price: str = ""  # VI 발동가(vi_trgprice)
     static_base: str = ""  # 정적 VI 기준가(svi_recprice)
     dynamic_base: str = ""  # 동적 VI 기준가(dvi_recprice)
@@ -472,7 +478,9 @@ class LSWebSocketClient:
         self._add(STATUS_TR, "0")
 
     def subscribe_vi(self, underlying: Underlying) -> None:
-        """종목 VI 발동/해제(VI_) 구독 — tr_key 6자리 종목코드(카탈로그 예시 "145270")."""
+        """종목 VI 발동/해제 구독 — 통합 UVI(키 "U"+코드+공백3, KRX·NXT 둘 다; 결정 89) + 실서버
+        수신 대조용 VI_(tr_key 6자리 KRX 코드, 대조 뒤 제거 — DESIGN-ls-xing §9 2026-11-09)."""
+        self._add(UVI_TR, _unified_key(underlying.krx_code))
         self._add(VI_TR, underlying.krx_code)
 
     def _add(self, tr_cd: str, tr_key: str, *, tr_type: str = "3") -> None:
@@ -661,11 +669,16 @@ class LSWebSocketClient:
             if vi is not None:
                 for vi_handler in self.on_vi:
                     vi_handler(vi)
+        elif tr_cd == UVI_TR:
+            for vi in self._parse_uvi(msg):
+                for vi_handler in self.on_vi:
+                    vi_handler(vi)
         # 알 수 없는 tr_cd는 무시
 
     def _parse_vi(self, msg: dict[str, Any]) -> ViEvent | None:
-        """VI_ body → ViEvent. 취급 종목이 아니면 None. 필드는 Res(VI_.res) 기준, 운영 수신 미실측
-        — 거래소명·발동가·기준가는 판정에 안 쓰고 로그 확인용으로만 실어 보낸다(2026-10-29)."""
+        """VI_ body → ViEvent. 취급 종목이 아니면 None. 필드는 Res(VI_.res) 기준(운영 실측
+        2026-11-06 09:00:25 KRX VI) — 거래소명·발동가·기준가는 로그 확인용. market은 거래소명이
+        NXT면 "nxt", 아니면 "krx"(VI_는 KRX 코드 키라 사실상 KRX만 온다)."""
         body = msg.get("body") or {}
         code = _norm_code(str(body.get("shcode") or msg.get("header", {}).get("tr_key", "")))
         underlying = Underlying.from_krx_code(code)
@@ -676,10 +689,43 @@ class LSWebSocketClient:
         def field(name: str) -> str:
             return str(body.get(name, "")).strip()
 
+        exch = field("exchname")
         return ViEvent(underlying=underlying, code=code, gubun=gubun,
                        active=gubun not in ("", "0"), time=field("time"),
-                       exchange=field("exchname"), trigger_price=field("vi_trgprice"),
+                       exchange=exch, market="nxt" if exch.upper().startswith("NXT") else "krx",
+                       trigger_price=field("vi_trgprice"),
                        static_base=field("svi_recprice"), dynamic_base=field("dvi_recprice"))
+
+    def _parse_uvi(self, msg: dict[str, Any]) -> list[ViEvent]:
+        """UVI(KRX+NXT 통합 VI, 결정 89) body → 거래소별 ViEvent 목록. 한 메시지에 KRX 쪽(krx_*)과
+        NXT 쪽(nxt_*)이 나란히 오므로 구분 칸이 빈 쪽은 빼고 쪽마다 한 건. 실서버 수신 미실측이라
+        첫 프레임 원문을 1회 남긴다."""
+        body = msg.get("body") or {}
+        raw = str(body.get("ex_shcode") or body.get("shcode")
+                  or msg.get("header", {}).get("tr_key", ""))
+        code = _norm_code(raw)[:6]
+        underlying = Underlying.from_krx_code(code)
+        if underlying is None:
+            return []
+        if not getattr(self, "_uvi_first_logged", False):
+            self._uvi_first_logged = True
+            import logging
+            logging.getLogger("kp_arb.ls_ws").info("[실측] UVI 첫 수신 body=%s", body)
+
+        def field(name: str) -> str:
+            return str(body.get(name, "")).strip()
+
+        out: list[ViEvent] = []
+        for market, pre in (("krx", "krx_"), ("nxt", "nxt_")):
+            gubun = field(f"{pre}vi_gubun")
+            if not gubun:
+                continue
+            out.append(ViEvent(
+                underlying=underlying, code=code, gubun=gubun, active=gubun != "0",
+                time=field(f"{pre}time"), exchange=market.upper(), market=market,
+                trigger_price=field(f"{pre}vi_trgprice"),
+                static_base=field(f"{pre}svi_recprice"), dynamic_base=field(f"{pre}dvi_recprice")))
+        return out
 
     def _parse_fx_spot(self, msg: dict[str, Any]) -> float | None:
         """CUR(원달러 현물환율) body → 환율. 필드는 ``price``(현재가, 실측 2026-08-21).

@@ -383,6 +383,9 @@ class Leg:
     # 아무 표시가 없었다
     cancel_sent_mono: float | None = None
     cancel_wait_alarmed: bool = False
+    # 취소가 **장마감 거부**(LS 02611 + '장마감')로 끝남 — 다시 보내도 같은 거부라 재시도·30초 알람
+    # 없이 LS 마감 정리(통보·재동기)를 기다린다(결정 90, 2026-11-09). 상태줄 "장마감 — 취소 불가"
+    cancel_closed: bool = False
     await_post_then_delay: bool = False  # 취소 확인됨, 병행 후주문 체결 확인 뒤 딜레이
     reject_streak: int = 0          # 선주문 연속 거부 횟수 — 접수 뒤 체결·취소가 있으면 0으로
     # 마지막 선주문 거부 — 화면 상태줄에 "거부(n/3): 사유"로(사용자 2026-09-15: 거부났는지·사유를
@@ -430,6 +433,7 @@ class Leg:
         self.cancel_alarmed = False
         self.cancel_sent_mono = None
         self.cancel_wait_alarmed = False
+        self.cancel_closed = False
         # 선주문이 끝났으면(체결·취소·거부) 재발주 취소 대기도 끝 — 역산가 변경으로 취소를 보냈는데
         # 취소보다 체결이 먼저 된 경우(LS 01433) 이 표시가 남아 판이 끝나도 '쉼'에서 못 나왔다
         # (실측 2026-09-11 오후: 1·2세트 청산이 딜레이대기에 굳음).
@@ -644,6 +648,9 @@ def _cancel_if_resting(leg: Leg, force: bool = False) -> list[Action]:
     if not resting or (leg.pre_qty > 0 and leg.pre_filled >= leg.pre_qty):
         return []
     if leg.cancel_sent and not force:
+        return []
+    if leg.cancel_closed:
+        # 장마감 거부(결정 90) — 실행 끔·종료의 강제 재전송도 같은 거부만 돌아온다. 마감 정리 대기
         return []
     # 한 번만 보낸다 — 관문에 막힌 채 판정마다 재전송하면 취소 확인이 오기 전 같은 요청이 여러 번
     # 나간다(실측 2026-09-08: 0.2초에 3번). 확인(취소/거부/체결)이 오면 _clear_pre가 되돌린다.
@@ -1077,6 +1084,14 @@ def on_pre_ack(s: AutoMSet, block: Block, order_id: str) -> list[Action]:
     if not leg.running or leg.status in (LegStatus.IDLE, LegStatus.HALTED):
         return _cancel_if_resting(leg, force=True)
     return []
+
+
+def on_pre_cancel_closed(s: AutoMSet, block: Block) -> None:
+    """취소가 **장마감 거부**로 끝남(결정 90, 사용자 2026-11-09 "마감 거부면 재시도 중단") — 주문은
+    LS에 걸려 있지만 장이 끝나 다시 보내도 같은 거부. 표시를 되돌리지 않고(다음 판정이 다시 보내지
+    않게) '장마감 — 취소 불가'로 두어 LS 마감 정리(취소·만료 통보, 재시동 재동기)를 기다린다."""
+    leg = s.leg(block)
+    leg.cancel_closed = True
 
 
 def on_pre_cancel_failed(s: AutoMSet, block: Block) -> None:
@@ -1584,6 +1599,9 @@ class AutoMBook:
         ratio = self.hl_ratio
         for _r, _i, st in self.all_sets():
             st.product = self.product
+            # 체결차는 상품 비율로 다시 센다 — 복원(_sets_from_dict)은 세트 product가 아직 기본
+            # "sf"일 때 계산해 주식 세트가 ×10으로 보였다(운영 11-09 화면: 주식 80/−80 세트가 −720).
+            st.fill_diff = round(fill_diff(st.sf_net, st.hl_net, ratio), 6)
             for leg in (st.entry, st.exit):
                 leg.hl_first = st.hl_first  # 선·후주문 다리(§7D)
                 for acc in (leg.acc, leg.pending, leg.last_round):

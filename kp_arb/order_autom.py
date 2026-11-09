@@ -1951,6 +1951,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                          f" (체결 {leg.get('pre_filled', 0)}/{leg.get('pre_qty', 0)})")
         if leg.get("cancel_failed"):  # 취소 재전송 한도 초과(exec ㅂ3) — 수동 취소 유도
             parts.append(f"취소실패 {leg.get('cancel_tries', 0)}회 — 수동 취소 확인")
+        if leg.get("cancel_closed"):  # 장마감 거부 — 재전송 없이 LS 마감 정리 대기(결정 90)
+            parts.append("장마감 — 취소 불가(LS 마감 정리 대기)")
         wait = leg.get("cancel_wait_s")
         if isinstance(wait, int | float) and wait >= 30:  # 취소 확인 통보가 오래 안 옴(ㅂ3)
             parts.append(f"취소 확인 대기 {int(wait)}초")

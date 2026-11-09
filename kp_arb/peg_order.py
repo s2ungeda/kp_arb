@@ -20,7 +20,7 @@ from .bootstrap import LiveSystem
 from .domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .gateways.ls import OrderGoneError
-from .gateways.ls_rest import RateLimitError, RestError, RestTimeoutError
+from .gateways.ls_tr import RateLimitError, RestError, RestTimeoutError
 from .gateways.ls_ws import Fill
 from .logs import setup_logging
 from .order_book import OrderStatus

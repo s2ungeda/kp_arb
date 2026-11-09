@@ -26,7 +26,7 @@ KEYRING_SERVICE = "kp-arb"
 SECRET_NAMES: tuple[tuple[str, str], ...] = (
     # xingAPI 로그인(DESIGN-ls-xing.md §3, 2026-09-23) — 한 로그인이 주식·선물·FX 계좌를 다 본다.
     # 계좌번호·비밀번호는 아래 LS_*_ACCT/ACCT_PW를 그대로 쓴다. AppKey/AppSecret는 OpenAPI(REST)
-    # 전용이라 xing 전환 뒤엔 비워 둬도 된다(전환 스위치 KP_LS_API가 openapi일 때만 필요).
+    # 전용이라 xing 전환 뒤엔 비워 둬도 된다(REST 제거 2026-11-09 뒤엔 안 씀).
     ("LS_XING_ID", "LS xingAPI 로그인 아이디"),
     ("LS_XING_PW", "LS xingAPI 로그인 비밀번호"),
     ("LS_XING_CERT_PW", "LS 공인인증서 비밀번호 (xingAPI)"),
@@ -75,24 +75,6 @@ class SecretProvider(Protocol):
     """비밀 조회 계약. 없으면 None."""
 
     def get(self, name: str) -> str | None: ...
-
-
-class LsApi(StrEnum):
-    """LS 접근 방식(DESIGN-ls-xing.md §0) — 검증 끝날 때까지 기본은 OpenAPI(REST/WS)."""
-
-    OPENAPI = "openapi"
-    XING = "xing"
-
-
-def ls_api() -> LsApi:
-    """``KP_LS_API`` 환경변수(.env) → 자격증명관리자 → 기본 openapi. 값이 틀리면 ConfigError."""
-    raw = os.environ.get("KP_LS_API")
-    if not raw:
-        raw = KeyringSecrets().get("KP_LS_API") or LsApi.OPENAPI.value
-    try:
-        return LsApi(raw.strip().lower())
-    except ValueError as exc:
-        raise ConfigError(f"invalid KP_LS_API {raw!r} (openapi|xing)") from exc
 
 
 XING_DEFAULT_PATH = r"C:\meme"  # 설치 폴더(사용자 2026-09-23) — Res 하위. KP_XING_PATH로 바꿈
@@ -194,7 +176,8 @@ def default_secrets() -> SecretProvider:
 
 @dataclass(frozen=True, repr=False)
 class LSAccount:
-    """계좌별 자격 — 번호·비번·appkey·appsecret. appsecret/password는 repr 마스킹."""
+    """계좌별 자격 — 번호·비번(+ 옛 REST용 appkey·appsecret: 키링 등록 호환으로 칸만 남김, xing은
+    안 씀 — 2026-11-09 REST 제거). appsecret/password는 repr 마스킹."""
 
     number: str
     password: str

@@ -25,7 +25,8 @@ class FakeSystem:
         self.placed: list[OrderIntent] = []
         self.cancelled: list[str] = []
         self.halted = False
-        self.vi: set[Underlying] = set()      # VI 발동 중인 종목
+        # VI 발동 중 — 종목(어느 거래소든) 또는 (종목, "krx"|"nxt") (결정 89)
+        self.vi: set[Underlying | tuple[Underlying, str]] = set()
         self.loans: list[tuple[str, float]] = []  # 신용융자 (대출일, 수량) — 상환 LoanDt
         self.loan_queries = 0
         self.query_fail = False
@@ -64,6 +65,13 @@ class FakeSystem:
     def stock_last(self, underlying: Underlying) -> float | None:
         return 1_600_000.0
 
+    def stock_last_market(self, underlying: Underlying, market: str) -> float | None:
+        # 주식 종목 상태의 현재가 = 그 거래소 1호가 가중값(LiveSystem.stock_last_market과 같은 식)
+        from kp_arb.theory import quote_price
+
+        q = self.quotes.get((underlying, Instrument.KR_STOCK, market))
+        return None if q is None else quote_price(q.bid, q.ask, q.bid_qty, q.ask_qty)
+
     def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]:
         return 1356.0, "현물"
 
@@ -85,8 +93,12 @@ class FakeSystem:
     def stock_auction(self) -> bool:  # 주식 동시호가(결정 57) — 테스트 기본 False
         return getattr(self, "auction", False)
 
-    def stock_vi(self, underlying: Underlying) -> bool:  # 종목 VI(exec §8) — 주식 엔진용
-        return underlying in self.vi
+    def stock_vi(self, underlying: Underlying, market: str | None = None) -> bool:
+        # 종목 VI(exec §8·결정 89) — self.vi 에 종목(어느 거래소든) 또는 (종목, 거래소)를 넣는다
+        if underlying in self.vi:
+            return True
+        markets = ("krx", "nxt") if market is None else (market,)
+        return any((underlying, m) in self.vi for m in markets)
 
     async def query_credit_loans(self, underlying: Underlying) -> list[tuple[str, float]]:
         self.loan_queries += 1
@@ -103,11 +115,11 @@ class FakeSystem:
             await asyncio.sleep(delay)
         fail_pre = getattr(self, "fail_pre", None)  # LS 선주문 거부 흉내(RestError 문구)
         if fail_pre and intent.instrument is SF:
-            from kp_arb.gateways.ls_rest import RestError
+            from kp_arb.gateways.ls_tr import RestError
 
             raise RestError(fail_pre)
         if getattr(self, "timeout_pre", False) and intent.instrument is SF:  # 응답 없음 흉내
-            from kp_arb.gateways.ls_rest import RestTimeoutError
+            from kp_arb.gateways.ls_tr import RestTimeoutError
 
             raise RestTimeoutError("REST CFOAT00100 응답 없음: TimeoutError")
         self._ids += 1
@@ -142,8 +154,13 @@ class FakeSystem:
             from kp_arb.gateways.ls import OrderGoneError
 
             raise OrderGoneError("CFOAT00300 rejected (03416): 정정취소가능수량이 없습니다.")
+        if getattr(self, "cancel_market_closed", False):  # 장마감 거부 흉내(LS 02611, 결정 90)
+            from kp_arb.gateways.ls import MarketClosedError
+
+            raise MarketClosedError(
+                "CSPAT00801 rejected (02611): 장시작 전 또는 장마감 되었습니다.")
         if getattr(self, "cancel_timeout", False):  # 취소 요청 응답 없음 흉내(결과 모름)
-            from kp_arb.gateways.ls_rest import RestTimeoutError
+            from kp_arb.gateways.ls_tr import RestTimeoutError
 
             raise RestTimeoutError("xing CFOAT00300 응답 없음: TimeoutError")
         if getattr(self, "cancel_comm_error", False):  # 통신 오류 흉내(결과 모름)
@@ -624,6 +641,47 @@ async def test_partial_cancel_confirmation_waits_for_pending_fill_then_closes() 
     sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=10, price=1184.0, ts=0))
     await _settle()
     assert s.fill_diff == 0 and abs(s.hl_net + 10) < 1e-9                # 헤지 완성
+
+
+async def test_cancel_market_closed_reject_stops_retries_until_notice(monkeypatch: Any) -> None:
+    # 결정 90(사용자 2026-11-09 "마감 거부면 재시도 중단"): 운영 2026-11-06 20:00 NXT 마감 뒤 걸린
+    # 선주문 취소가 LS 02611 "장마감"으로 거부되자 0.6초×3회 → 표시 되돌림 → 다음 판정 재전송을
+    # 10분간 되풀이(1,407건). 장마감 거부는 다시 보내도 같은 거부 — 한 번으로 끝내고 다시 보내지
+    # 않으며(실행 끔의 강제 재전송도), 30초 "취소 확인 대기" 알람도 내지 않고 LS 마감 정리(통보)를
+    # 기다린다. 상태줄엔 "장마감 — 취소 불가".
+    monkeypatch.setattr("kp_arb.auto_m_engine.CANCEL_RETRY_S", 0.0)
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    sys_.cancel_market_closed = True
+    before = sys_.error_seq
+    eng.set_running(U, 0, Block.ENTRY, False)     # 실행 끔 → 강제 취소 1회
+    await _settle()
+    assert sys_.cancel_calls == 1                 # 재시도 없음(3회 아님)
+    assert s.entry.cancel_closed and s.entry.cancel_sent and s.entry.pre_order_id == "O1"
+    mono = 100.0
+    for _ in range(3):                            # 다음 판정들도 다시 보내지 않는다
+        mono += 1.0
+        eng.tick(datetime(2026, 9, 4, 10, 0, 0), mono)
+        await _settle()
+    eng.set_running(U, 0, Block.ENTRY, False)     # 실행 끔을 또 눌러도(강제) 안 보냄
+    await _settle()
+    assert sys_.cancel_calls == 1 and not s.entry.cancel_alarmed
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), mono + 40.0)  # 30초 지나도 알람 없음
+    await _settle()
+    assert sys_.error_seq == before and not s.entry.cancel_wait_alarmed
+    row = eng.live_snapshot()[U.value]["sets"][0]["entry"]
+    assert row["cancel_closed"] is True and row["cancel_failed"] is False
+    # LS 마감 정리(취소 통보)가 오면 평소대로 정리된다
+    sys_.order_book.on_cancel("O1")
+    await _settle()
+    assert s.entry.pre_order_id is None and not s.entry.cancel_closed
+    for task in list(eng._bg):
+        task.cancel()
+    await _settle()
 
 
 async def test_cancel_alarm_raises_error_seq_and_snapshot_flags_it(monkeypatch: Any) -> None:
@@ -1307,7 +1365,7 @@ def _stock_engine() -> tuple[AutoMEngine, FakeSystem, CoreState]:
     sys_.quotes[(U, Instrument.HL_PERP, "hl")] = Quote(
         underlying=U, instrument=Instrument.HL_PERP, bid=74.3, ask=74.4, ts=0, market="hl",
         bids=[(74.3, 500.0)], asks=[(74.4, 500.0)])
-    sys_.trades[(U, Instrument.KR_STOCK, "krx")] = 100_000.0  # 주식 현재가는 거래소별 체결가
+    # 주식 현재가는 체결가가 아니라 그 거래소 1호가 가중값(2026-11-04) — trades는 안 넣는다
     eng = AutoMEngine(state, sys_, product="stock")  # type: ignore[arg-type]
     state.autom.book(U, "stock").market = "krx"  # 기본은 NXT — 이 준비물은 KRX 시세만 있음
     s = state.autom.book(U, "stock").sets[0]
@@ -1368,7 +1426,9 @@ async def test_stock_engine_uses_selected_market_only() -> None:
     sys_.quotes[(U, Instrument.KR_STOCK, "nxt")] = Quote(
         underlying=U, instrument=Instrument.KR_STOCK, bid=99_000.0, ask=99_100.0, ts=0,
         market="nxt", bids=[(99_000.0, 40.0)], asks=[(99_100.0, 50.0)])
-    sys_.trades[(U, Instrument.KR_STOCK, "nxt")] = 99_000.0
+    # NXT 호가만 있고 체결(trades)은 없어도 수치가 나와야 한다(2026-11-04 — 10-27 체결 구독 중단
+    # 뒤 운영 NXT 구간 모니터 "-"·"G6 입력 없음"이던 결함)
+    assert not sys_.trades
     mon = eng.live_snapshot()[f"{U.value}|stock"]["monitor"]["fwd"]
     assert abs(mon["en_s"] - (100_751 - 99_000) / 99_000) < 1e-4  # NXT 매수1호가 기준
     # 신용 세트 + NXT 실행 → 선주문에 신용 코드(진입 003)와 시장 nxt(LS 본문 MbrNo NXT)가 실린다
@@ -1469,6 +1529,24 @@ async def test_stock_engine_holds_during_stock_vi_then_resumes() -> None:
     eng.tick(datetime(2026, 9, 4, 10, 0, 1), 101.0)
     await _settle()
     assert len(sys_.placed) == 1 and sys_.placed[0].instrument is Instrument.KR_STOCK
+
+
+async def test_stock_engine_vi_is_per_exchange() -> None:
+    # 결정 89(2026-11-09): VI는 거래소마다 따로 — KRX 거래소 세트는 NXT VI에 멈추지 않고, 자기
+    # 거래소(KRX) VI에만 멈춘다(11-06 08:00 NXT VI를 KRX 키 VI_로 못 받은 결함의 반대편).
+    eng, sys_, state = _stock_engine()
+    state.autom.settings_stock.resume_delay_s = 0
+    sys_.vi.add((U, "nxt"))  # NXT만 VI — 이 세트는 KRX
+    await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": 0,
+                                      "block": "entry", "value": True, "product": "stock"})
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    assert len(sys_.placed) == 1 and sys_.placed[0].market == "krx"  # NXT VI는 무관
+    sys_.vi.clear()
+    sys_.vi.add((U, "krx"))  # 자기 거래소 VI → 걸린 선주문 취소(시장 정지 규칙)·신규 없음
+    eng.tick(datetime(2026, 9, 4, 10, 0, 1), 101.0)
+    await _settle()
+    assert len(sys_.placed) == 1 and sys_.cancelled  # 새 주문 없음, 걸린 선주문은 취소 요청
 
 
 def _hl_first_engine() -> tuple[AutoMEngine, FakeSystem, CoreState]:
@@ -2006,7 +2084,6 @@ async def test_stock_slot_change_cancels_and_replaces_on_new_market() -> None:
                   {"enabled": True, "start": "10:00:30", "end": "15:20:00", "market": "nxt"}]})
     assert res["ok"]
     sys_.quotes[(U, Instrument.KR_STOCK, "nxt")] = sys_.quotes[(U, Instrument.KR_STOCK, "krx")]
-    sys_.trades[(U, Instrument.KR_STOCK, "nxt")] = 100_000.0
     await _autom_command(eng, state, {"cmd": "autom_run", "underlying": U.value, "set": 0,
                                       "block": "entry", "value": True, "product": "stock"})
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)         # 1구간(KRX)

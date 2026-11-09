@@ -6,12 +6,31 @@ import pytest
 from kp_arb.config import LSAccount, LSAccounts
 from kp_arb.domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent
-from kp_arb.gateways.ls import LSApiGateway, OrderGoneError
-from kp_arb.gateways.ls_auth import TokenManager, TokenResponse
-from kp_arb.gateways.ls_rest import LSRestClient, RateLimiter, RestError, RestResponse
+from kp_arb.gateways.ls import (
+    LSApiGateway,
+    MarketClosedError,
+    OrderGoneError,
+    is_market_closed_reject,
+)
+from kp_arb.gateways.ls_tr import RestError, RestResponse
 from kp_arb.routing import account_for
 
 BASE_URL = "https://openapi.ls-sec.co.kr:8080"
+
+
+class _Requester:
+    """TrRequester 어댑터 — 옛 REST 전송 가짜(method, url, headers, body)를 그대로 재사용한다
+    (2026-11-09 REST 경로 제거 뒤에도 TR 본문·응답 파싱 테스트는 전송 방식과 무관)."""
+
+    supports_continuation = False
+
+    def __init__(self, transport: Any) -> None:
+        self.t = transport
+
+    async def request(self, tr_cd: str, body: dict[str, Any] | None = None, *,
+                      path: str = "/", method: str = "POST", tr_cont: str = "N") -> RestResponse:
+        return await self.t.request(method, BASE_URL + path,
+                                    {"tr_cd": tr_cd, "tr_cont": tr_cont}, body)
 
 
 class _Clock:
@@ -21,10 +40,6 @@ class _Clock:
     def __call__(self) -> float:
         return self.t
 
-
-class _TokenStub:
-    async def fetch_token(self, appkey: str, appsecret: str) -> TokenResponse:
-        return TokenResponse(access_token="tok", expires_in=3600.0)
 
 
 class OrderTransport:
@@ -81,10 +96,7 @@ def _gateway(
     accounts: LSAccounts | None = None,
     next_futures_symbols: dict[Underlying, str] | None = None,
 ) -> LSApiGateway:
-    clock = _Clock()
-    tm = TokenManager("k", "s", _TokenStub(), now=clock)
-    rl = RateLimiter(now=clock, default_per_second=100)
-    rest = LSRestClient(BASE_URL, tm, transport, rl)
+    rest = _Requester(transport)
     return LSApiGateway(
         # 테스트는 세 계좌 같은 mock rest (KR_FX 포함 — 원달러선물 발주 테스트용).
         {Account.KR_STOCK: rest, Account.KR_DERIV: rest, Account.KR_FX: rest},
@@ -235,10 +247,7 @@ async def test_fx_futures_buy_bnstpcode() -> None:
 async def test_fx_futures_missing_kr_fx_raises() -> None:
     # KR_FX 미등록(선택 계좌) 환경에서 발주하면 명확히 거부.
     transport = OrderTransport()
-    clock = _Clock()
-    tm = TokenManager("k", "s", _TokenStub(), now=clock)
-    rl = RateLimiter(now=clock, default_per_second=100)
-    rest = LSRestClient(BASE_URL, tm, transport, rl)
+    rest = _Requester(transport)
     gw = LSApiGateway({Account.KR_STOCK: rest})  # KR_FX 없음
     with pytest.raises(RestError):
         await gw.place_fx_futures("175V9000", Side.SELL, 1, 1420.5)
@@ -259,42 +268,9 @@ async def test_order_injects_account_number_and_password() -> None:
     assert "account" not in blk  # 플레이스홀더 대신 실 계좌필드
 
 
-class _AppkeyTokenTransport:
-    """appkey별로 다른 토큰을 발급 → 계좌별 토큰 라우팅 확인용."""
-
-    async def fetch_token(self, appkey: str, appsecret: str) -> TokenResponse:
-        return TokenResponse(access_token=f"tok-{appkey}", expires_in=3600.0)
-
-
-async def test_from_accounts_uses_per_account_token() -> None:
-    accounts = LSAccounts(
-        LSAccount("STK-1", "spw", "stock-ak", "stock-as"),
-        LSAccount("DRV-1", "dpw", "deriv-ak", "deriv-as"),
-    )
-    rest_tx = OrderTransport()
-    gw = LSApiGateway.from_accounts(
-        accounts,
-        token_transport=_AppkeyTokenTransport(),
-        rest_transport=rest_tx,
-        futures_symbols={Underlying.SAMSUNG: "1AB3000"},
-    )
-    await gw.place_order(_intent(Instrument.KR_STOCK))          # 주식계좌 토큰
-    await gw.place_order(_intent(Instrument.KR_STOCK_FUTURE))   # 선물계좌 토큰
-
-    # 계좌별로 서로 다른 appkey→토큰으로 요청됨.
-    assert rest_tx.requests[0]["headers"]["authorization"] == "Bearer tok-stock-ak"
-    assert rest_tx.requests[1]["headers"]["authorization"] == "Bearer tok-deriv-ak"
-    blk = inblk(rest_tx.requests[0], LSApiGateway.SPOT_ORDER_TR)
-    assert blk["AcntNo"] == "STK1"  # 계좌 자격 주입(대시 제거)
-
-
 async def test_routes_to_per_account_client() -> None:
-    clock = _Clock()
-
-    def _rest(tx: OrderTransport) -> LSRestClient:
-        tm = TokenManager("k", "s", _TokenStub(), now=clock)
-        rl = RateLimiter(now=clock, default_per_second=100)
-        return LSRestClient(BASE_URL, tm, tx, rl)
+    def _rest(tx: OrderTransport) -> _Requester:
+        return _Requester(tx)
 
     stock_tx, deriv_tx = OrderTransport(), OrderTransport()
     gw = LSApiGateway(
@@ -376,6 +352,47 @@ class Reject03416Transport:
             status_code=200,
             body={"rsp_cd": "03416", "rsp_msg": "정정취소가능수량이 없습니다."},
         )
+
+
+class RejectCodeTransport:
+    """임의 거부 코드·문구 픽스처(장마감 02611 등)."""
+
+    def __init__(self, rsp_cd: str, rsp_msg: str) -> None:
+        self.body = {"rsp_cd": rsp_cd, "rsp_msg": rsp_msg}
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any] | None,
+    ) -> RestResponse:
+        return RestResponse(status_code=200, body=dict(self.body))
+
+
+async def test_reject_02611_with_market_closed_word_is_market_closed() -> None:
+    # 운영 실측 2026-11-06 20:00 NXT 애프터마켓 마감 뒤 취소: CSPAT00801 rsp_cd=02611
+    # "장시작 전 또는 장마감 되었습니다." → 재시도 대상이 아닌 전용 오류(결정 90).
+    gw = _gateway(RejectCodeTransport("02611", "장시작 전 또는 장마감 되었습니다."))
+    with pytest.raises(MarketClosedError, match="02611"):
+        await gw.place_order(_intent(Instrument.KR_STOCK))
+
+
+async def test_reject_02611_without_market_closed_word_is_plain_reject() -> None:
+    # 사용자 2026-11-09 "반드시 '장마감'": 코드만 같고 문구에 '장마감'이 없으면 일반 거부로 둔다
+    # (같은 코드가 다른 문구로 올 가능성 — 추측으로 넓히지 않음).
+    gw = _gateway(RejectCodeTransport("02611", "주문 가능 시간이 아닙니다."))
+    with pytest.raises(RestError, match="02611") as info:
+        await gw.place_order(_intent(Instrument.KR_STOCK))
+    assert not isinstance(info.value, MarketClosedError)
+
+
+def test_is_market_closed_reject_needs_both_code_and_word() -> None:
+    assert is_market_closed_reject("02611", "장시작 전 또는 장마감 되었습니다.")
+    assert not is_market_closed_reject("02611", "장시작 전입니다.")      # 문구에 '장마감' 없음
+    assert not is_market_closed_reject("03416", "장마감 되었습니다.")    # 코드 다름
+    assert not is_market_closed_reject("02611", None)
+    assert not is_market_closed_reject(None, "장마감")
 
 
 async def test_live_cancel_reject_03416_is_order_gone() -> None:
