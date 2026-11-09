@@ -40,6 +40,10 @@ def main() -> None:
         from kp_arb.xing_check import main as xing_check
 
         raise SystemExit(xing_check(sys.argv[2:]))
+    elif arg == "blockfees":  # HL 블록 우선순위 수수료 조회(탐색기 읽기 전용) — block_fees.bat
+        from kp_arb.hl_block_fees_tool import main as block_fees
+
+        raise SystemExit(block_fees(sys.argv[2:]))
     elif arg == "monitor":
         from kp_arb.monitor import main as run
         run()

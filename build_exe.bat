@@ -36,6 +36,22 @@ rem auto-M report from logs (today, or pass YYYYMMDD) -> logs\report_DATE.md + l
     echo "%%~dp0meme-core.exe" xingcheck %%*
     echo pause
 ) > "dist\meme\xing_check.bat"
+rem HL block priority-fee probe (public explorer, read-only, no orders) -> logs\probe\hl_block_fees_DATE_TIME.txt
+(
+    echo @echo off
+    echo cd /d "%%~dp0"
+    echo echo HL block priority-fee probe, read-only, no orders. p / 10000 = bp.
+    echo set /p D=Date YYYY-MM-DD: 
+    echo set /p T=Time HH:MM:SS this PC timezone: 
+    echo set /p S=Seconds, default 2: 
+    echo if "%%S%%"=="" set S=2
+    echo set /p F=Coins ours or all, default ours: 
+    echo if "%%F%%"=="" set F=ours
+    echo set OPT=
+    echo if "%%F%%"=="ours" set OPT=--ours
+    echo "%%~dp0meme-core.exe" blockfees %%D%% %%T%% %%S%% %%OPT%%
+    echo pause
+) > "dist\meme\block_fees.bat"
 echo.
 echo build complete: dist\meme\
 echo copy that folder to the target PC and run meme.exe (edit .env if needed)
