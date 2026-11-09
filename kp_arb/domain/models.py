@@ -23,6 +23,15 @@ class Quote(BaseModel):
         return (self.bid + self.ask) / 2.0
 
 
+class PriceLimits(BaseModel):
+    """가격제한폭(상한가·하한가, exec 결정 91). 주식은 기준가 ±30% 하루 고정(t1102), 주식선물은
+    단계(±10→20→30%)가 장중에 넓어진다(t8402 초기값 + 실시간 JX0). source는 로그용."""
+
+    upper: float
+    lower: float
+    source: str = ""
+
+
 class InstrumentStatus(BaseModel):
     instrument: Instrument
     tradeable: bool = False

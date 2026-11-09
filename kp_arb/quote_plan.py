@@ -9,6 +9,7 @@
 오후 "통합호가 하나로 다 해결") — 단계마다 KRX·NXT·통합 잔량이 따로 와 거래소별 1호가가 다 나오므로
 체결쏴 주식의 거래소 선택·동시호가·NXT 개장과 무관하게 늘 1건(읽는 칸은
 xing_com.read_unified_quote).
+주식선물은 쓰는 월물의 JH0·YJC·JX0(가격제한폭, 결정 91).
 주식 체결은 어느 TR(US3/NS3)도 안 받는다(2026-10-27 "현재가는 1호가 가중값", 10-28 "NXT 개장도 호가
 가중치" — T0·S 모두 UH1의 NXT 1호가). 주식선물은 쓰는 월물의 JH0·YJC. 원달러선물은 공통설정에서
 고른 월물의 FC9·DC0(야간)·YF9.
@@ -33,6 +34,9 @@ STOCK_VI_TR = "UVI"
 STOCK_VI_LEGACY_TR = "VI_"
 FUTURES_QUOTE_TR = "JH0"    # 주식선물 호가(1호가 넷만 읽는다 — xing_com.REAL_FIELD_LIMIT)
 FUTURES_EXPECTED_TR = "YJC"
+# 주식선물 가격제한폭확대(적용 단계·상한가·하한가) — 역산가의 가격제한폭 관문(exec 결정 91,
+# 2026-11-09). 초기값은 t8402, 장중 확대는 이것으로
+FUTURES_LIMIT_TR = "JX0"
 FX_TRADE_TR = "FC9"         # 원달러선물 체결(1호가 포함 — 선물역산 환율), 공통설정이 고른 월물만
 # 야간 KRX파생 체결(같은 단축코드, 18:00~06:00) — 결정 47 "외환선물 우선시간" 2구간(18시 이후
 # 애프터마켓)에서 체결쏴 주식의 판정 환율이 이것으로 역산된다. 10-23 구독 축소 때 "쓰는 곳 없음"으로
@@ -83,6 +87,7 @@ def plan(inp: QuotePlanInput) -> list[Sub]:
             if fcode:
                 add(FUTURES_QUOTE_TR, fcode)
                 add(FUTURES_EXPECTED_TR, fcode)
+                add(FUTURES_LIMIT_TR, fcode)
     if inp.fx_code and inp.symbols_on:
         add(FX_TRADE_TR, inp.fx_code)
         add(FX_NIGHT_TRADE_TR, inp.fx_code)  # 야간 — 시간대별로 오는 쪽이 온다

@@ -28,6 +28,7 @@ class FakeSystem:
         # VI 발동 중 — 종목(어느 거래소든) 또는 (종목, "krx"|"nxt") (결정 89)
         self.vi: set[Underlying | tuple[Underlying, str]] = set()
         self.loans: list[tuple[str, float]] = []  # 신용융자 (대출일, 수량) — 상환 LoanDt
+        self.price_limits: dict[Any, Any] = {}    # (종목, 상품) → PriceLimits(결정 91)
         self.loan_queries = 0
         self.query_fail = False
         self._ids = 0
@@ -641,6 +642,29 @@ async def test_partial_cancel_confirmation_waits_for_pending_fill_then_closes() 
     sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=10, price=1184.0, ts=0))
     await _settle()
     assert s.fill_diff == 0 and abs(s.hl_net + 10) < 1e-9                # 헤지 완성
+
+
+async def test_price_limits_gate_holds_order_until_band_widens() -> None:
+    # 결정 91(사용자 2026-11-09): 역산가가 가격제한폭(상한가·하한가) 밖이면 선주문을 내지 않고
+    # 대기 — 거부 3회로 세트가 멈추지 않는다. 선물 단계가 넓어지면(JX0) 그 판정부터 재개.
+    from kp_arb.domain.models import PriceLimits
+
+    eng, sys_, state = _engine()
+    sys_.price_limits[(U, SF)] = PriceLimits(upper=1.0, lower=0.5, source="t8402")  # 폭이 아주 좁음
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert sys_.placed == [] and s.entry.pre_order_id is None
+    assert "G6 가격제한폭 밖" in s.entry.block_reason and "상한가 1 위" in s.entry.block_reason
+    assert s.entry.reject_streak == 0 and s.entry.status is not LegStatus.HALTED
+    sys_.price_limits[(U, SF)] = PriceLimits(upper=9_999_999.0, lower=1.0, source="JX0 단계 3/3")
+    eng.tick(datetime(2026, 9, 4, 10, 0, 1), 101.0)
+    await _settle()
+    assert len(sys_.placed) == 1 and s.entry.pre_order_id == "O1"
+    for task in list(eng._bg):
+        task.cancel()
+    await _settle()
 
 
 async def test_cancel_market_closed_reject_stops_retries_until_notice(monkeypatch: Any) -> None:

@@ -130,36 +130,6 @@ async def sync_quote_plan(state: CoreState, system: Any) -> None:
         logging.getLogger("kp_arb.core").exception("LS 구독 계획 적용 실패")
 
 
-async def mem_probe_loop(system: Any, every_s: float | None = None) -> None:
-    """코어 메모리 계측(임시 진단, 2026-11-03 운영 MemoryError) — 시동 직후 1회 + every_s(기본
-    10분)마다 코어 로그에 한 줄. KP_MEM_TRACE=1이면 tracemalloc을 켜 30분마다 파이썬 할당 상위
-    10줄도 남긴다.
-    원인이 잡히면 이 루프와 kp_arb/mem_probe.py를 지운다(DESIGN-ls-xing §7)."""
-    from . import mem_probe
-    from .logs import queued_backlog
-
-    lg = logging.getLogger("kp_arb.core")
-    wait_s = mem_probe.PROBE_INTERVAL_S if every_s is None else every_s
-    trace = mem_probe.trace_enabled()
-    if trace:
-        mem_probe.start_trace()
-        lg.info("[계측] tracemalloc 켬(KP_MEM_TRACE) — %d번째 계측마다 할당 상위 %d줄",
-                mem_probe.TRACE_EVERY, mem_probe.TRACE_TOP)
-    n = 0
-    while True:
-        try:
-            d = mem_probe.collect(system, log_backlog=queued_backlog(),
-                                  tasks=len(asyncio.all_tasks()))
-            lg.info("%s", mem_probe.format_line(d))
-            n += 1
-            if trace and n % mem_probe.TRACE_EVERY == 0:
-                for line in mem_probe.top_allocations():
-                    lg.info("[계측] 할당 상위 %s", line)
-        except Exception:  # noqa: BLE001 - 계측 실패가 코어를 흔들지 않게
-            lg.exception("[계측] 실패")
-        await asyncio.sleep(wait_s)
-
-
 async def closed_order_prune_loop(system: Any, engines: Sequence[Any],
                                   every_s: float = 60.0) -> None:
     """닫힌 주문 주기 정리(검토 2026-11-03 §5B): 장부에서 낸 지 CLOSED_ORDER_KEEP_S 넘은 닫힌
@@ -1984,7 +1954,6 @@ async def _serve() -> None:
         if system is not None:  # LS 구독 계획(§9) — 저장된 설정(종목 체크·월물)대로 등록
             await sync_quote_plan(state, system)
             tasks.append(asyncio.create_task(quote_plan_loop(state, system)))
-        tasks.append(asyncio.create_task(mem_probe_loop(system)))  # 메모리 계측(임시)
         if system is not None:  # 닫힌 주문 주기 정리(검토 2026-11-03 §5B)
             tasks.append(asyncio.create_task(closed_order_prune_loop(
                 system, (autom_engine, autom_engine_stock, autom_engine_hl_first))))

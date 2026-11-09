@@ -31,7 +31,6 @@ from .nxt_open import (
     day_over,
     disparity,
     hl_current,
-    hotime_text,
     judge,
     level_price,
     opposite,
@@ -75,9 +74,6 @@ class TierResult:
 
 # 등록 전 체결 보관함 크기 — HL 테이커 즉시 체결은 통보가 발주 응답보다 먼저 올 수 있다(§4a-3)
 EARLY_FILLS_KEEP = 200
-# [임시 진단 2026-10-30] 창 안 판정 로그(DESIGN-nxt-open §6) — 10-30 첫 호가 뒤 1.6초 늦은 발주의
-# 원인을 가리려고 넣음. 원인 확인 뒤 False 또는 제거(사용자 "결과 나오면 없앨 수 있게").
-DIAG_EVAL_LOG = True
 
 
 @dataclass
@@ -104,8 +100,6 @@ class DayState:
     hl_base_wall: float | None = None
     # 금지 사유를 남긴 단 → 그 사유(같은 사유는 한 번, 사유가 바뀌면 다시 남긴다)
     blocked_noted: dict[tuple[str, int], str] = field(default_factory=dict)
-    nxt_ts: float | None = None       # 마지막 NXT 호가의 거래소 시각(hotime) — 임시 진단 로그용
-    eval_sig: tuple[Any, ...] | None = None  # 직전 판정 로그의 (값·결과) — 같으면 안 남긴다
 
 
 class NxtOpenEngine:
@@ -220,9 +214,8 @@ class NxtOpenEngine:
         u = quote.underlying
         d = self._day(u)
         s = quote_price(quote.bid, quote.ask, quote.bid_qty, quote.ask_qty)
-        d.nxt_ts = quote.ts
         if s is None:
-            self._evaluate(u, "NXT")
+            self._evaluate(u)
             return
         d.s = s
         if d.t0 is None and not d.t0_rejected:
@@ -240,17 +233,17 @@ class NxtOpenEngine:
                 d.note = "오늘 판정 없음(개장 밖)"
                 self._log.warning("[NXT개장] %s 첫 NXT 호가가 %s(개장 %s 기준 유예 밖) — 오늘 창 "
                                   "없음", u.value, _hms(now_wall), st.open_hms)
-        self._evaluate(u, "NXT")
+        self._evaluate(u)
 
     def _on_quote(self, quote: Quote) -> None:
         if quote.instrument is Instrument.HL_PERP:
-            self._evaluate(quote.underlying, "HL")
+            self._evaluate(quote.underlying)
         elif quote.instrument is Instrument.KR_STOCK and quote.market == "nxt":
             self._on_nxt_quote(quote)
 
     def _on_fx(self) -> None:
         for u in Underlying:
-            self._evaluate(u, "환율")
+            self._evaluate(u)
 
     # --- 계산·판정 ---
 
@@ -305,7 +298,7 @@ class NxtOpenEngine:
         """§4b-3: 지금 HL 현재가가 범위 밖이면 사유(금지), 아니면 None."""
         return range_block(side, self._hl_now(u), d.hl_base, self.settings(u).range_limit)
 
-    def _evaluate(self, u: Underlying, src: str = "") -> None:
+    def _evaluate(self, u: Underlying) -> None:
         """시세 하나가 올 때마다 — src는 깨운 시세("NXT"/"HL"/"환율", 임시 진단 로그용)."""
         d = self._day(u)
         self._compute(u, d)
@@ -332,9 +325,6 @@ class NxtOpenEngine:
                 d.note = f"{_tier_name(p.block, p.index)} {why}"
                 self._log.warning("[NXT개장] %s %s", u.value, d.note)
         plans = allowed
-        verdict = (("발주 " + ",".join(_tier_name(p.block, p.index) for p in plans)) if plans
-                   else ("금지 " + "; ".join(blocked)) if blocked else "미달")
-        self._diag_eval(u, d, src, verdict)
         if not plans:
             return
         d.fired_tiers.update((p.block, p.index) for p in plans)  # 단마다 한 번 — 발주 전에 잠근다
@@ -342,24 +332,6 @@ class NxtOpenEngine:
         task = asyncio.create_task(self._fire(u, d, plans, d.fired_wall))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-
-    def _diag_eval(self, u: Underlying, d: DayState, src: str, verdict: str) -> None:
-        """[임시 진단 2026-10-30] 창 안 판정 한 줄 — 값(S·HL est·환율)이나 결과가 직전 로그와 같으면
-        안 남긴다(사용자 "많은 로그는 필요 없음"). DIAG_EVAL_LOG로 끈다."""
-        if not DIAG_EVAL_LOG:
-            return
-        fx = self._system.usdkrw_spot
-        sig = (d.s, d.hl_bid_n, d.hl_ask_n, fx, verdict)
-        if sig == d.eval_sig:
-            return
-        d.eval_sig = sig
-        self._log.info("[NXT개장] %s 판정 %s(%s) NXT호가시각 %s S %s HL매수est %s HL매도est %s "
-                       "환 %s 진입괴리 %s 청산괴리 %s → %s", u.value, _hms(self._wall()),
-                       src or "-",
-                       hotime_text(d.nxt_ts), f"{d.s:,.0f}" if d.s else "-",
-                       f"{d.hl_bid_n:.2f}" if d.hl_bid_n is not None else "-",
-                       f"{d.hl_ask_n:.2f}" if d.hl_ask_n is not None else "-",
-                       f"{fx:.2f}" if fx else "-", _pct(d.entry_disp), _pct(d.exit_disp), verdict)
 
     async def _fire(self, u: Underlying, d: DayState, plans: list[Plan],
                     decided_wall: float | None = None) -> None:

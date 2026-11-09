@@ -1143,3 +1143,47 @@ def test_effective_slots_falls_back_to_windows() -> None:
                                     TradeSlot(True, "15:35:30", "15:46:55", "krx"))
     st.slots = (TradeSlot(False, "09:00:00", "10:00:00", "krx"),)
     assert st.effective_slots() == st.slots
+
+
+def test_price_limit_breach_pure() -> None:
+    # 결정 91 — 폭 밖 판정은 방향과 무관(폭 밖 가격은 LS가 매수·매도 모두 거부), 모르면 통과
+    from kp_arb.auto_m import price_limit_breach
+
+    assert price_limit_breach(199_000.0, 198_000.0, 100_000.0) == "상한가 198,000 위"
+    assert price_limit_breach(99_000.0, 198_000.0, 100_000.0) == "하한가 100,000 아래"
+    assert price_limit_breach(150_000.0, 198_000.0, 100_000.0) == ""
+    assert price_limit_breach(150_000.0, None, None) == ""
+    assert price_limit_breach(198_000.0, 198_000.0, 100_000.0) == ""   # 상한가 자체는 낼 수 있다
+
+
+def test_evaluate_waits_outside_price_limits_and_cancels_resting() -> None:
+    # 결정 91(사용자 2026-11-09): 하이닉스 상한가 30% 때 청산(매도) 역산가가 상한가 위 → 옛 동작은
+    # LS 거부 3회 → 세트 중지. 이제는 내지 않고 "가격제한폭 밖 — 대기", 거부 횟수 0, 걸린 선주문은
+    # 취소(범위 밖과 같은 취급). 폭 안으로 돌아오면 그대로 재개.
+    s = AutoMSet(target_qty=100, per_qty=10, switch_delay_s=30, en_sf=0.005, en_s=0.005,
+                 ex_sf=-0.001, reverse=True, pre_tick=500)   # 역방향 진입 = SF 매도(199,000)
+    set_running(s, Block.ENTRY, True)
+    acts = evaluate(s, Block.ENTRY, _sig(s_spread_exit=-0.01, hl_disp_ask=-0.02,
+                                         limit_up=198_000.0, limit_dn=100_000.0), SETTINGS, U)
+    assert acts == [] and s.entry.pre_order_id is None
+    assert "G6 가격제한폭 밖 — 상한가 198,000 위 역산가 199,000" in s.entry.block_reason
+    assert s.entry.reject_streak == 0
+    # 폭 안(상한가가 역산가 위) → 평소대로 발주
+    acts = evaluate(s, Block.ENTRY, _sig(s_spread_exit=-0.01, hl_disp_ask=-0.02,
+                                         limit_up=260_000.0, limit_dn=140_000.0), SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"] and acts[0].price == 199_000
+    on_pre_ack(s, Block.ENTRY, "R1")
+    # 걸린 채 폭이 좁아져(또는 역산가가 밖으로) 밖이 되면 취소 + 대기
+    acts = evaluate(s, Block.ENTRY, _sig(s_spread_exit=-0.01, hl_disp_ask=-0.02,
+                                         limit_up=198_000.0, limit_dn=100_000.0), SETTINGS, U)
+    assert [a.kind for a in acts] == ["cancel_pre"] and acts[0].order_id == "R1"
+    assert "가격제한폭 밖" in s.entry.block_reason
+    # 매수(정방향 진입)가 하한가 아래면 같은 대기
+    b = AutoMSet(target_qty=100, per_qty=10, switch_delay_s=30, en_sf=0.005, en_s=0.005,
+                 ex_sf=-0.001, pre_tick=500)
+    set_running(b, Block.ENTRY, True)
+    acts = evaluate(b, Block.ENTRY, _sig(limit_up=260_000.0, limit_dn=250_000.0), SETTINGS, U)
+    assert acts == [] and "하한가 250,000 아래" in b.entry.block_reason
+    # 상한가·하한가를 모르면(None) 관문 건너뜀 — 종전 동작
+    acts = evaluate(b, Block.ENTRY, _sig(), SETTINGS, U)
+    assert [a.kind for a in acts] == ["place_pre"]

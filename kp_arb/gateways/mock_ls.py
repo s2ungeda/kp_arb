@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..domain.enums import Account, Side, Venue
 from ..domain.models import OrderIntent, Position
@@ -25,6 +25,8 @@ class MockLSGateway(LSGateway):
         self.fx_placed: list[tuple[str, Side, int, float]] = []  # 원달러선물 발주 기록
         self._ids = itertools.count(1)
         self._last_prices: dict[tuple[object, object], float] = {}  # (종목, 상품) → 현재가
+        # (종목, 상품) → (상한가, 하한가) — 시동 초기값 가격제한폭(exec 결정 91) 테스트용
+        self._price_limits: dict[tuple[object, object], tuple[float, float]] = {}
         self._positions: dict[Account, list[Position]] = {
             Account.KR_STOCK: [],
             Account.KR_DERIV: [],
@@ -76,6 +78,21 @@ class MockLSGateway(LSGateway):
 
     async def get_price_snapshots(self) -> dict[tuple[object, object], float]:
         return dict(self._last_prices)
+
+    def seed_price_limits(self, underlying: object, instrument: object,
+                          upper: float, lower: float) -> None:
+        """시동 초기값 가격제한폭 테스트용 — get_price_infos가 돌려줄 상한가·하한가."""
+        self._price_limits[(underlying, instrument)] = (upper, lower)
+
+    async def get_price_infos(self) -> dict[tuple[object, object], Any]:
+        from .ls import PriceInfo
+
+        out: dict[tuple[object, object], Any] = {}
+        for key in set(self._last_prices) | set(self._price_limits):
+            lim = self._price_limits.get(key)
+            out[key] = PriceInfo(price=self._last_prices.get(key),
+                                 upper=lim[0] if lim else None, lower=lim[1] if lim else None)
+        return out
 
     def seed_balance(self, account: Account, amount: float) -> None:
         self._balances[account] = amount

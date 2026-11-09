@@ -2070,3 +2070,28 @@ async def test_stock_last_seeded_from_snapshot_when_started_in_auction() -> None
     await system2._seed_prices()
     system2.vi_state[(SAMSUNG, "krx")] = "1"
     assert system2.stock_last(SAMSUNG) == 70_050.0
+
+
+async def test_price_limits_seeded_from_snapshot_and_updated_by_jx0() -> None:
+    # 결정 91: 시동 초기값 조회(t1102/t8402)에서 상한가·하한가를 같이 받아 두고, 주식선물은 실시간
+    # JX0(가격제한폭 확대)가 적용 상한가·하한가로 갱신한다. 엔진은 price_limits를 Signals로 받는다.
+    from kp_arb.gateways.ls_ws import PriceLimitEvent
+
+    system, _, _ = _system([])
+    system._wire()
+    system._gw.seed_last_price(SAMSUNG, Instrument.KR_STOCK, 70_300.0)  # type: ignore[attr-defined]
+    system._gw.seed_price_limits(SAMSUNG, Instrument.KR_STOCK,  # type: ignore[attr-defined]
+                                 91_300.0, 49_300.0)
+    system._gw.seed_price_limits(SAMSUNG, Instrument.KR_STOCK_FUTURE,  # type: ignore[attr-defined]
+                                 77_300.0, 63_300.0)  # 1단계 ±10%
+    await system._seed_prices()
+    assert system.trades[(SAMSUNG, Instrument.KR_STOCK, "krx")] == 70_300.0  # 가격은 종전대로
+    lim = system.price_limits[(SAMSUNG, Instrument.KR_STOCK)]
+    assert (lim.upper, lim.lower, lim.source) == (91_300.0, 49_300.0, "t1102")
+    assert system.price_limits[(SAMSUNG, Instrument.KR_STOCK_FUTURE)].source == "t8402"
+    system._stock_ws.on_price_limit[-1](PriceLimitEvent(
+        underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE, code="A1167000",
+        upper=84_300.0, lower=56_300.0, up_step="2", dn_step="2"))
+    lim = system.price_limits[(SAMSUNG, Instrument.KR_STOCK_FUTURE)]
+    assert (lim.upper, lim.lower) == (84_300.0, 56_300.0) and "2/2" in lim.source
+    assert system.price_limits[(SAMSUNG, Instrument.KR_STOCK)].upper == 91_300.0  # 주식은 그대로

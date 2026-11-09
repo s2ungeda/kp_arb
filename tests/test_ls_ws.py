@@ -906,3 +906,32 @@ async def test_token_provider_refreshes_on_reconnect() -> None:
     assert issued == ["tok1", "tok2"]              # 접속마다 발급
     assert any('"tok1"' in m for m in s1.sent)     # 1차 연결은 tok1로 구독
     assert any('"tok2"' in m for m in s2.sent)     # 재연결은 tok2로 구독
+
+
+async def test_futures_price_limit_expand_parsed() -> None:
+    # JX0 주식선물 가격제한폭확대(exec 결정 91): 적용 단계·상한가·하한가 → PriceLimitEvent. 코드는
+    # 선물 구독 때 등록한 코드→(종목, 월물) 표로 푼다. 모르는 코드는 무시.
+    from kp_arb.domain.enums import Instrument
+    from kp_arb.gateways.ls_ws import PriceLimitEvent
+
+    frames = [json.dumps({
+        "header": {"tr_cd": "JX0", "tr_key": "A1167000"},
+        "body": {"futcode": "A1167000", "upstep": "2", "dnstep": "2",
+                 "uplmtprice": "84000", "dnlmtprice": "56000"},
+    }), json.dumps({
+        "header": {"tr_cd": "JX0", "tr_key": "A9999000"},
+        "body": {"futcode": "A9999000", "upstep": "1", "dnstep": "1",
+                 "uplmtprice": "1000", "dnlmtprice": "500"},
+    })]
+    session = FakeConnection(frames)
+    client = LSWebSocketClient(FakeConnector([session]))
+    events: list[PriceLimitEvent] = []
+    client.on_price_limit.append(events.append)
+    client.subscribe_futures_quotes({Underlying.SAMSUNG: "A1167000"})
+
+    await client.run()
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.underlying is Underlying.SAMSUNG and ev.instrument is Instrument.KR_STOCK_FUTURE
+    assert (ev.upper, ev.lower, ev.up_step, ev.dn_step) == (84_000.0, 56_000.0, "2", "2")

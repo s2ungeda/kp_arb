@@ -54,7 +54,7 @@ from .auto_m import (
 from .auto_m import _halt_set as halt_set
 from .disparity import disp, est_price
 from .domain.enums import Account, Block, Instrument, OrderType, Side, Underlying, Venue
-from .domain.models import InstrumentInfo, OrderIntent, Quote
+from .domain.models import InstrumentInfo, OrderIntent, PriceLimits, Quote
 from .gateways.base import PlaceResult
 from .gateways.ls import MarketClosedError, OrderGoneError
 from .gateways.ls_tr import RestTimeoutError
@@ -126,6 +126,7 @@ class _SystemLike(Protocol):
     quotes: dict[tuple[Underlying, Instrument, str], Quote]
     trades: dict[tuple[Underlying, Instrument, str], float]  # 현재가(장 밖엔 호가 없고 이것만)
     instruments: dict[tuple[Underlying, Instrument], InstrumentInfo]  # HL szDecimals(가격 격자)
+    price_limits: dict[tuple[Underlying, Instrument], PriceLimits]  # 상한가·하한가(결정 91)
     error_seq: int
 
     def pair_signal(self, u: Underlying, instrument: Instrument, entry_qty: int,
@@ -607,6 +608,9 @@ class AutoMEngine:
         if hl is not None and hl.bid and hl.ask:
             hl_bids = tuple(hl.bids or [(hl.bid, hl.bid_qty or 1.0)])
             hl_asks = tuple(hl.asks or [(hl.ask, hl.ask_qty or 1.0)])
+        # 선주문 상품(주식 / 주식선물 월물)의 가격제한폭(결정 91) — 없으면 None(관문 건너뜀)
+        lim = self._system.price_limits.get(
+            (u, Instrument.KR_STOCK if book.product == "stock" else inst))
         # HL선 선주문 주문단위·시작호가는 세트설정 값(AutoMSet.hl_unit/hl_offset, 결정 55) — 09-22의
         # 화면 호가단위 콤보는 다른 창과 공유돼 주문 규칙에 쓰지 않는다(표시용으로만)
         return Signals(
@@ -624,7 +628,9 @@ class AutoMEngine:
             hl_sz_decimals=hl_info.sz_decimals if hl_info is not None else None,
             ls_feed_ok=self._system.ls_feed_ok(), hl_feed_ok=self._hl_feed_ok(),
             stock_auction=self._system.stock_auction(),
-            repay_wait=self._repay_wait_note(u, mono))
+            repay_wait=self._repay_wait_note(u, mono),
+            limit_up=lim.upper if lim is not None else None,
+            limit_dn=lim.lower if lim is not None else None)
 
     # ------------------------------------------------------------ 행동 실행 ---
     def _apply(self, u: Underlying, index: int, block: Block, actions: list[Action],

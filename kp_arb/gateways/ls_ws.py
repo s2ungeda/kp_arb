@@ -42,7 +42,7 @@ STOCK_TRADE_TRS: tuple[str, ...] = ("S3_", "NS3", "US3")  # 체결: KRX/NXT/통�
 # 주식 호가는 통합(UH1) 하나(2026-10-27 오후) — 단계별 KRX·NXT·통합 잔량이 따로 와 한 건에서
 # Quote 셋(uni/krx/nxt)을 만든다. H1_/NH1은 더 안 쓰지만 남은 등록을 지우도록 계획 범위엔 둔다.
 PLAN_TRS: frozenset[str] = frozenset({"NS3", "UYS", "UH1", "H1_", "NH1", "VI_", "UVI", "JH0", "YJC",
-                                      "FC9", "YF9"})
+                                      "FC9", "YF9", "JX0"})
 UNIFIED_QUOTE_TR = "UH1"
 # UH1 Quote 셋 — (market, 잔량 칸 접두). krx/nxt는 그 거래소 잔량이 0보다 큰 첫 단계가 1호가.
 UNIFIED_MARKETS: tuple[tuple[str, str], ...] = (("uni", "unt_"), ("krx", "krx_"), ("nxt", "nxt_"))
@@ -103,6 +103,9 @@ VI_TR = "VI_"
 # krx_time)과 NXT 쪽(nxt_…)이 나란히 실린다 → 거래소별 ViEvent로 가른다. VI_는 KRX 코드 키라
 # NXT VI가 안 왔다(11-06 08:00 NXT 프리마켓 VI 2분 동안 주식 선주문이 나가 해제 단일가 160주 체결).
 UVI_TR = "UVI"
+# 주식선물 가격제한폭확대(exec 결정 91) — 적용 단계(±10→20→30%)와 적용 상한가·하한가. 키 = 선물
+# 단축코드 8자(JH0와 같음). 실서버 수신 미실측 — 첫 프레임 원문 로그.
+FUTURES_LIMIT_TR = "JX0"
 
 
 def _unified_key(code: str) -> str:
@@ -126,6 +129,18 @@ def _norm_code(raw: str) -> str:
     if len(code) >= 7 and code[0] in "UN":
         code = code[1:].strip()
     return code
+
+
+class PriceLimitEvent(BaseModel):
+    """주식선물 가격제한폭 확대(JX0, exec 결정 91) — 적용 상한가·하한가와 단계."""
+
+    underlying: Underlying
+    instrument: Instrument
+    code: str
+    upper: float
+    lower: float
+    up_step: str = ""
+    dn_step: str = ""
 
 
 class ViEvent(BaseModel):
@@ -323,6 +338,7 @@ class LSWebSocketClient:
         self._sub_lock = asyncio.Lock()
         self._exchname_unknown_logged = False
         self.on_vi: list[Callable[[ViEvent], None]] = []  # 종목 VI 발동/해제(체결쏴 주식 정지)
+        self.on_price_limit: list[Callable[[PriceLimitEvent], None]] = []  # JX0(결정 91)
         self._fx_codes: set[str] = set()
         self.on_raw: list[Callable[[str], None]] = []  # 진단: 모든 원시 프레임
         # 재연결(최초 연결 제외) 후 재구독까지 끝나면 발화 — OrderBook 재스냅샷용(Phase 8-4).
@@ -673,6 +689,11 @@ class LSWebSocketClient:
             for vi in self._parse_uvi(msg):
                 for vi_handler in self.on_vi:
                     vi_handler(vi)
+        elif tr_cd == FUTURES_LIMIT_TR:
+            lim = self._parse_price_limit(msg)
+            if lim is not None:
+                for lim_handler in self.on_price_limit:
+                    lim_handler(lim)
         # 알 수 없는 tr_cd는 무시
 
     def _parse_vi(self, msg: dict[str, Any]) -> ViEvent | None:
@@ -726,6 +747,31 @@ class LSWebSocketClient:
                 trigger_price=field(f"{pre}vi_trgprice"),
                 static_base=field(f"{pre}svi_recprice"), dynamic_base=field(f"{pre}dvi_recprice")))
         return out
+
+    def _parse_price_limit(self, msg: dict[str, Any]) -> PriceLimitEvent | None:
+        """JX0 body → PriceLimitEvent(exec 결정 91). 칸은 Res(JX0.res): futcode·upstep·dnstep·
+        uplmtprice·dnlmtprice. 취급 선물 코드가 아니면 None. 실서버 수신 미실측 — 첫 프레임 원문
+        1회 로그."""
+        body = msg.get("body") or {}
+        code = str(body.get("futcode") or msg.get("header", {}).get("tr_key", "")).strip()
+        key = self._futures_underlying.get(code)
+        if key is None:
+            return None
+        if not getattr(self, "_jx0_first_logged", False):
+            self._jx0_first_logged = True
+            import logging
+            logging.getLogger("kp_arb.ls_ws").info("[실측] JX0 첫 수신 body=%s", body)
+        try:
+            upper = float(str(body.get("uplmtprice", "")).strip())
+            lower = float(str(body.get("dnlmtprice", "")).strip())
+        except ValueError:
+            return None
+        if upper <= 0 or lower <= 0:
+            return None
+        return PriceLimitEvent(underlying=key[0], instrument=key[1], code=code,
+                               upper=upper, lower=lower,
+                               up_step=str(body.get("upstep", "")).strip(),
+                               dn_step=str(body.get("dnstep", "")).strip())
 
     def _parse_fx_spot(self, msg: dict[str, Any]) -> float | None:
         """CUR(원달러 현물환율) body → 환율. 필드는 ``price``(현재가, 실측 2026-08-21).

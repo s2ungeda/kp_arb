@@ -36,7 +36,7 @@ from .disparity import (
     pair_spread,
 )
 from .domain.enums import Account, Instrument, Side, Underlying, Venue
-from .domain.models import InstrumentInfo, OrderIntent, Position, Quote
+from .domain.models import InstrumentInfo, OrderIntent, Position, PriceLimits, Quote
 from .engine import ArbEngine
 from .etf_theory import EtfTheoryInputs, theory_after, theory_regular
 from .fx_auction import FxAuctionController, FxAuctionSettings, HedgeAction
@@ -445,6 +445,9 @@ class LiveSystem:
         # 종목 VI 상태(vi_gubun, "0" = 해제) — LS 실시간 VI_(exec §8, 체결쏴 주식 정지)
         # 종목 VI 상태 — (종목, 거래소 "krx"|"nxt") → vi_gubun(결정 89, 2026-11-09: VI는 거래소마다)
         self.vi_state: dict[tuple[Underlying, str], str] = {}
+        # 가격제한폭(상한가·하한가, exec 결정 91) — 주식 t1102(하루 고정)·주식선물 t8402 초기값 +
+        # 실시간 JX0(단계 확대) 갱신. 없으면 엔진이 관문을 건너뛴다
+        self.price_limits: dict[tuple[Underlying, Instrument], PriceLimits] = {}
         # 주식 동시호가·VI 직전의 현재가(통합 1호가 가중값) — 호가가 멈춘 동안 이 값을 쓴다(사용자
         # 2026-10-28 "직전 가중값으로"). 동시호가·VI가 아닐 때 통합 호가가 올 때마다 갱신.
         self._stock_last_before_pause: dict[Underlying, float] = {}
@@ -862,6 +865,18 @@ class LiveSystem:
         (체결쏴 주식은 자기 거래소 VI만 본다), None이면 어느 거래소든(가중값 '직전 값' 규칙용)."""
         markets = ("krx", "nxt") if market is None else (market,)
         return any(self.vi_state.get((underlying, m), "0") not in ("", "0") for m in markets)
+
+    def _on_price_limit(self, ev: Any) -> None:
+        """JX0 수신(exec 결정 91) → 그 선물의 적용 상한가·하한가 갱신 + 경고 로그(단계 확대는 드문
+        사건이라 전부 남긴다)."""
+        import logging
+
+        self.price_limits[(ev.underlying, ev.instrument)] = PriceLimits(
+            upper=ev.upper, lower=ev.lower, source=f"JX0 단계 {ev.up_step}/{ev.dn_step}")
+        logging.getLogger("kp_arb.core").warning(
+            "주식선물 가격제한폭 확대 %s %s(%s) 단계 상 %s/하 %s → 하한 %s 상한 %s",
+            ev.underlying.value, ev.instrument.value, ev.code, ev.up_step, ev.dn_step,
+            f"{ev.lower:,.0f}", f"{ev.upper:,.0f}")
 
     def _on_vi(self, ev: Any) -> None:
         """UVI/VI_ 수신 → (종목, 거래소)별 vi_gubun 보관 + 로그(발동/해제 모두 — 거래소명·발동가·
@@ -1529,19 +1544,6 @@ class LiveSystem:
                     "취소 거부 통보 #%s (원주문 #%s) — 원주문은 그대로(이미 체결·취소), "
                     "체결 통보로 정리. rejcode=%s", event.order_id, event.org_order_id or "-",
                     event.body.get("rejcode", "-"))
-            # [임시 진단] fx-auction 감시 흐름 확인 — 선물 접수 수신·판정 근거를 한 줄로.
-            if event.kind == "ack" and str(event.body.get("trcode1", "")).startswith("FO"):
-                import logging as _lg
-
-                from .fx_auction import parse_futures_ack as _pfa
-                _s = self.fx_auction.settings
-                _lg.getLogger("kp_arb.fx_auction").info(
-                    "선물접수 code=%s→%s org=%r running=%s now=%s ack=%s settings=%s",
-                    event.body.get("fnoIsuno"),
-                    self._resolve_fut_code(str(event.body.get("fnoIsuno", ""))),
-                    event.org_order_id, self.fx_auction.running, self._now_hms(),
-                    _pfa(event.body),
-                    (_s.windows, _s.price, _s.tick, _s.hedge_ratio) if _s else None)
             # 원달러선물 동시호가 대응 — 주식선물 신규주문이면 대응주문 발주(실행중일 때만).
             action = self.fx_auction.decide(
                 kind=event.kind, org_order_id=event.org_order_id, body=event.body)
@@ -1575,6 +1577,7 @@ class LiveSystem:
         self._stock_ws.on_expected.append(fan_expected)
         self._stock_ws.on_market_status.append(self.session.on_market_status)
         self._stock_ws.on_vi.append(self._on_vi)
+        self._stock_ws.on_price_limit.append(self._on_price_limit)  # JX0(결정 91)
         self._stock_ws.on_fill.append(apply_fill)
         self._stock_ws.on_order_event.append(apply_event)
         # xing(같은 객체가 두 자리)은 재연결 재동기도 두 계좌 — "선물" 훅을 안 거니 라벨로 범위를
@@ -2275,12 +2278,25 @@ class LiveSystem:
         import logging
 
         try:
-            snapshot = await self._gw.get_price_snapshots()
+            infos = await self._gw.get_price_infos()
         except Exception:  # noqa: BLE001 - 초기값 없이도 실시간은 정상
             logging.getLogger("kp_arb.bootstrap").warning(
                 "초기 가격 스냅샷 실패 — 실시간 체결만 사용", exc_info=True
             )
             return
+        snapshot = {k: v.price for k, v in infos.items() if v.price is not None and v.price > 0}
+        # 가격제한폭(상한가·하한가, 결정 91)은 같은 응답에서 — 주식은 하루 고정, 선물은 JX0가 갱신
+        futures = (Instrument.KR_STOCK_FUTURE, Instrument.KR_STOCK_FUTURE_NEXT)
+        for (u, inst), info in infos.items():
+            if info.upper and info.lower:
+                self.price_limits[(u, inst)] = PriceLimits(
+                    upper=info.upper, lower=info.lower,
+                    source="t8402" if inst in futures else "t1102")
+        if self.price_limits:
+            logging.getLogger("kp_arb.bootstrap").info(
+                "시동 초기값: 가격제한폭(하한~상한) %s",
+                {f"{u.value}/{i.value}": f"{lim.lower:,.0f}~{lim.upper:,.0f}"
+                 for (u, i), lim in self.price_limits.items()})
         for (u, inst), price in snapshot.items():
             if inst is Instrument.KR_STOCK:
                 # 동시호가·VI 중에 켜면 "직전 가중값"이 없다 — 조회한 현재가(마지막 체결가)를

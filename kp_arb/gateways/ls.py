@@ -16,6 +16,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel
+
 from .. import order_log
 from ..config import LSAccounts
 from ..domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
@@ -37,6 +39,15 @@ _LS_ACCOUNTS: tuple[Account, ...] = (Account.KR_STOCK, Account.KR_DERIV)
 class OrderGoneError(RestError):
     """정정/취소할 잔량이 없음(이미 체결·취소된 주문). 오류가 아니라 정상 흐름의 거부 —
     체결과의 경합에서 종종 발생하므로 호출부는 체결 확인으로 이어가면 된다."""
+
+
+class PriceInfo(BaseModel):
+    """현재가 조회 1건(t1102/t8402) — 현재가 + 가격제한폭(상한가·하한가, exec 결정 91).
+    없는 칸·0은 None."""
+
+    price: float | None = None
+    upper: float | None = None
+    lower: float | None = None
 
 
 class MarketClosedError(RestError):
@@ -210,11 +221,8 @@ class LSApiGateway(LSGateway):
         resp = await self._rest_for(account).request(
             self.FUTURE_ORDER_TR, body, path=self.FUTURE_PATH)
         order_id = self._parse_order_id(resp, self.FUTURE_ORDER_TR)
-        _fxlog.info(
-            "발주 [동시호가] 원달러선물 %s %s %d @ %s → #%s | acct=%s resp=%r",  # 응답 원문
-            code, side.value, qty, price, order_id,
-            self._order_account_fields(account).get("AcntNo", "?"),
-            getattr(resp, "body", None))
+        _fxlog.info("발주 [동시호가] 원달러선물 %s %s %d @ %s → #%s",
+                    code, side.value, qty, price, order_id)
         return order_id
 
     async def amend_order(
@@ -495,8 +503,10 @@ class LSApiGateway(LSGateway):
                 await _asyncio.sleep(0.6)
         raise RateLimitError(f"{tr_cd} 초당 한도 지속")
 
-    async def get_last_price(self, code: str, *, futures: bool = False) -> float | None:
-        """종목 1개의 현재가(마감 후엔 종가) 조회. 모니터 초기 표시용."""
+    async def get_price_info(self, code: str, *, futures: bool = False) -> PriceInfo:
+        """종목 1개의 현재가(마감 후엔 종가) + 상한가·하한가(exec 결정 91) 조회 — 같은 TR의
+        같은 응답에서 읽는다(t1102/t8402 `price`·`uplmtprice`·`dnlmtprice`, Res 확인 2026-11-09).
+        없는 칸·0은 None."""
         if futures:
             tr, path, key = self.FUTURES_PRICE_TR, self.FUTURES_MARKET_PATH, "focode"
             account = Account.KR_DERIV
@@ -508,15 +518,24 @@ class LSApiGateway(LSGateway):
         )
         self._check_ok(resp, tr)
         block = resp.body.get(f"{tr}OutBlock", {})
-        try:
-            return float(block["price"])
-        except (KeyError, TypeError, ValueError):
-            return None
 
-    async def get_price_snapshots(
+        def num(field: str) -> float | None:
+            try:
+                v = float(block[field])
+            except (KeyError, TypeError, ValueError):
+                return None
+            return v if v > 0 else None
+
+        return PriceInfo(price=num("price"), upper=num("uplmtprice"), lower=num("dnlmtprice"))
+
+    async def get_last_price(self, code: str, *, futures: bool = False) -> float | None:
+        """종목 1개의 현재가(마감 후엔 종가) 조회. 모니터 초기 표시용."""
+        return (await self.get_price_info(code, futures=futures)).price
+
+    async def get_price_infos(
         self, *, pause_s: float = 0.0
-    ) -> dict[tuple[Underlying, Instrument], float]:
-        """취급 전 종목(주식/ETF/선물)의 현재가 일괄 조회 — 시동 초기값·창 오픈 시 1회용.
+    ) -> dict[tuple[Underlying, Instrument], PriceInfo]:
+        """취급 전 종목(주식/ETF/선물)의 현재가·상한가·하한가 일괄 조회 — 시동 초기값 1회용.
 
         순차 호출이되 사이에 쉬지 않는다(정정 2026-09-14). 옛 0.6초 쉼은 근거 없던 기본 한도
         "초당 2회" 시절 것 — 공식 한도는 t1102/t8402 모두 초당 10회라 9건이 한 초에 들어가고,
@@ -524,7 +543,7 @@ class LSApiGateway(LSGateway):
         """
         import asyncio as _asyncio
 
-        out: dict[tuple[Underlying, Instrument], float] = {}
+        out: dict[tuple[Underlying, Instrument], PriceInfo] = {}
         targets: list[tuple[Underlying, Instrument, str, bool]] = []
         for u in Underlying:
             targets.append((u, Instrument.KR_STOCK, u.krx_code, False))
@@ -533,11 +552,16 @@ class LSApiGateway(LSGateway):
         for (u, instrument), code in self._futures_codes.items():  # 근·차근 모두
             targets.append((u, instrument, code, True))
         for u, instrument, code, futures in targets:
-            price = await self.get_last_price(code, futures=futures)
-            if price is not None and price > 0:
-                out[(u, instrument)] = price
+            out[(u, instrument)] = await self.get_price_info(code, futures=futures)
             await _asyncio.sleep(pause_s)
         return out
+
+    async def get_price_snapshots(
+        self, *, pause_s: float = 0.0
+    ) -> dict[tuple[Underlying, Instrument], float]:
+        """취급 전 종목의 현재가 일괄 조회(창 오픈 시 초기 표시용) — get_price_infos의 가격만."""
+        infos = await self.get_price_infos(pause_s=pause_s)
+        return {k: v.price for k, v in infos.items() if v.price is not None and v.price > 0}
 
     ETF_INFO_TR = "t1901"       # ETF 현재가/NAV/배율 (ETF 이론가.md §2)
     ETF_INFO_PATH = "/stock/etf"

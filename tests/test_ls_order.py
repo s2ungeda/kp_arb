@@ -439,3 +439,41 @@ async def test_cancel_unknown_order_raises() -> None:
     gw = _gateway(OrderTransport())
     with pytest.raises(ValueError):
         await gw.cancel_order("nope")
+
+
+class PriceInfoTransport:
+    """t1102/t8402 현재가 응답 픽스처 — 현재가 + 상한가·하한가(Res 칸 uplmtprice/dnlmtprice)."""
+
+    def __init__(self, block: dict[str, Any]) -> None:
+        self.block = block
+        self.trs: list[str] = []
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any] | None,
+    ) -> RestResponse:
+        tr = next(iter(body or {})).replace("InBlock", "")
+        self.trs.append(tr)
+        return RestResponse(status_code=200,
+                            body={"rsp_cd": "00000", f"{tr}OutBlock": dict(self.block)})
+
+
+async def test_get_price_info_reads_price_and_limits() -> None:
+    # 결정 91: 현재가 조회 한 번으로 상한가·하한가까지 읽는다(주식 t1102 / 선물 t8402 같은 칸).
+    tr = PriceInfoTransport({"price": "70100", "uplmtprice": "91100", "dnlmtprice": "49100"})
+    gw = _gateway(tr, futures_symbols={Underlying.SAMSUNG: "A1167000"})
+    info = await gw.get_price_info("005930")
+    assert (info.price, info.upper, info.lower) == (70_100.0, 91_100.0, 49_100.0)
+    assert await gw.get_last_price("005930") == 70_100.0          # 옛 호출은 그대로
+    infos = await gw.get_price_infos()
+    assert infos[(Underlying.SAMSUNG, Instrument.KR_STOCK_FUTURE)].upper == 91_100.0
+    assert "t8402" in tr.trs and "t1102" in tr.trs
+    # 칸이 없거나 0이면 None(관문 건너뜀) — 가격 스냅샷은 가격만
+    tr2 = PriceInfoTransport({"price": "70100", "uplmtprice": "0"})
+    gw2 = _gateway(tr2)
+    info2 = await gw2.get_price_info("005930")
+    assert (info2.price, info2.upper, info2.lower) == (70_100.0, None, None)
+    assert (await gw2.get_price_snapshots())[(Underlying.SAMSUNG, Instrument.KR_STOCK)] == 70_100.0

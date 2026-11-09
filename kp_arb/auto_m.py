@@ -218,6 +218,10 @@ class Signals:
     # 잔고에 쓸 수 있는 대출일이 없을 때 엔진이 사유를 넣는다(빈 문자열 = 정상). 신용 세트의
     # 청산 선주문만 막는다
     repay_wait: str = ""
+    # 선주문 상품의 가격제한폭(상한가·하한가, exec 결정 91) — 주식 ±30% 고정, 주식선물 단계(JX0).
+    # None이면 모름 → 관문 건너뜀
+    limit_up: float | None = None
+    limit_dn: float | None = None
 
 
 # --------------------------------------------------------------- 행동(출력) ---
@@ -627,6 +631,17 @@ def fill_diff(sf_net_contracts: int, hl_net_contracts: float,
     return sf_net_contracts * ratio + hl_net_contracts
 
 
+def price_limit_breach(price: float, upper: float | None, lower: float | None) -> str:
+    """주문가가 가격제한폭 밖인가(exec 결정 91) — 밖이면 사유("상한가 n 위"/"하한가 n 아래"), 안이면
+    빈 문자열. 상한가·하한가를 모르면(None) 빈 문자열(관문 건너뜀). 매수·매도 무관하게 폭 밖은 LS가
+    거부하므로 방향을 보지 않는다. 순수."""
+    if upper is not None and price > upper:
+        return f"상한가 {upper:,.0f} 위"
+    if lower is not None and price < lower:
+        return f"하한가 {lower:,.0f} 아래"
+    return ""
+
+
 # ---------------------------------------------------------------- 상태변화 ---
 
 def _cancel_if_resting(leg: Leg, force: bool = False) -> list[Action]:
@@ -1009,6 +1024,12 @@ def evaluate(
     if round(price) % mkt_tick != 0:
         return hold(f"G6 주문가 {price:,.0f}이 시세 호가단위 {mkt_tick}에 안 맞음 "
                     f"(주문단위 {tick} 시작호가 {s.price_offset:,})",
+                    _cancel_if_resting(leg))
+    # 가격제한폭(결정 91): 상한가 위·하한가 아래 주문은 LS가 거부(연속 3회면 세트 중지) → 내지 않고
+    # 대기, 거부에 안 셈. 사용자 기억: 하이닉스 상한가 30% 때 청산 역산가가 위로 나가 청산이 멈춤
+    breach = price_limit_breach(price, sig.limit_up, sig.limit_dn)
+    if breach:
+        return hold(f"G6 가격제한폭 밖 — {breach} 역산가 {price:,.0f}{maker_txt} → 대기",
                     _cancel_if_resting(leg))
     if not within_limit(side, price, limit):
         return hold(f"G6 범위 밖 역산가 {raw_price:,.0f}{maker_txt} {rng_txt} 상대호가 {rel:,.0f}",
