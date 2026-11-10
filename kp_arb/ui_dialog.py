@@ -78,6 +78,12 @@ def center_on_parent(win: Any, parent: Any) -> None:
 
 def _dialog(parent: Any, title: str, message: str,
             buttons: list[tuple[str, bool]]) -> bool:
+    return bool(_choose(parent, title, message, buttons, cancel=False))
+
+
+def _choose(parent: Any, title: str, message: str,
+            buttons: list[tuple[str, Any]], cancel: Any) -> Any:
+    """버튼 하나 고르기 — 고른 버튼의 값, Esc/닫기는 cancel. Enter = 첫 버튼."""
     import tkinter as tk
 
     win = tk.Toplevel(parent)
@@ -85,9 +91,9 @@ def _dialog(parent: Any, title: str, message: str,
     win.resizable(False, False)
     win.transient(parent)
     tk.Label(win, text=message, justify="left", padx=20, pady=16, wraplength=440).pack()
-    result = {"v": False}
+    result = {"v": cancel}
 
-    def pick(value: bool) -> None:
+    def pick(value: Any) -> None:
         result["v"] = value
         win.destroy()
 
@@ -99,8 +105,8 @@ def _dialog(parent: Any, title: str, message: str,
         if i == 0:
             btn.focus_set()
     win.bind("<Return>", lambda _e: pick(buttons[0][1]))
-    win.bind("<Escape>", lambda _e: pick(False))
-    win.protocol("WM_DELETE_WINDOW", lambda: pick(False))
+    win.bind("<Escape>", lambda _e: pick(cancel))
+    win.protocol("WM_DELETE_WINDOW", lambda: pick(cancel))
     # -topmost를 geometry 뒤에 걸면 Windows가 창을 (0,0)으로 되돌린다(실측 2026-09-04) → 먼저 건다.
     win.attributes("-topmost", True)  # 다른 창 뒤에 숨지 않게
     center_on_parent(win, parent)
@@ -113,6 +119,13 @@ def _dialog(parent: Any, title: str, message: str,
 def ask_yes_no(parent: Any, title: str, message: str) -> bool:
     """예/아니오 — 예면 True. Enter=예, Esc/닫기=아니오."""
     return _dialog(parent, title, message, [("예", True), ("아니오", False)])
+
+
+def ask_yes_no_or_cancel(parent: Any, title: str, message: str) -> str:
+    """예/아니오 두 버튼이지만 **Esc·닫기는 '취소'로 구분** — "yes" | "no" | "cancel".
+    '아니오'에 동작이 있는 확인창용(예: 중지 해제창의 아니오 = 중지만 풀기, 2026-11-10)."""
+    v = _choose(parent, title, message, [("예", "yes"), ("아니오", "no")], cancel="cancel")
+    return str(v)
 
 
 def show_message(parent: Any, title: str, message: str) -> None:

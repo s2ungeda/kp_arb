@@ -134,7 +134,9 @@ STOCK_SPEC = ScreenSpec(
     # 주식 12세트(11-03 결정 87, 전엔 5)·아래 2개 기본 신용 — 값은 코어 상수(코어 기본값과 한 값)
     credit_boxes=True, credit_default_rows=STOCK_CREDIT_DEFAULT_ROWS,
     set_rows={"fwd": STOCK_SET_ROWS}, group_gap_after=6,
-    snapshot_rows=1,  # 누적 블록은 위, 남는 줄에 마지막 판 Sprd 한 줄
+    # 마지막 판 스냅샷 4줄(Sprd·HP·S·환) — 주식선물과 같게. 5세트 때는 Sprd 1줄뿐이었는데 12세트
+    # (결정 87)로 오른쪽이 비어 사용자 2026-11-10 "주식선물에서처럼 표시"
+    snapshot_rows=4,
     market_combo=True,  # 주식 API는 통합 미지원 → 구간별 거래소 KRX/NXT(결정 80)
     slot_count=STOCK_SLOT_COUNT)
 
@@ -989,7 +991,13 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
         # 2026-09-16: 주식선물 8세트 4줄, 주식 5세트 Sprd 1줄).
         n_snap = spec.snapshot_rows
         with_snapshot = n_snap > 0 and rows_by[dtag] >= 4 + n_snap
-        shift = 0 if with_snapshot else max(0, rows_by[dtag] - 3)
+        if with_snapshot:
+            # 스냅샷 블록과 한 줄 이상 떨어질 여유가 있으면 누적 블록을 한 줄 내려 **진입/청산 칸을
+            # 컬럼 머리 줄에 맞춘다**(제목 줄은 비움; 사용자 2026-11-10 "공간이 남으니 한 칸 내려서
+            # 제목 라인을 맞추는 게"). 주식선물 8세트는 스냅샷과 붙어 있어 그대로(0).
+            shift = 1 if rows_by[dtag] > 4 + n_snap else 0
+        else:
+            shift = max(0, rows_by[dtag] - 3)
         if shift:
             for lcol, vcol, _comps in acc_cols.values():
                 for acc_col in (lcol, vcol):
@@ -1012,13 +1020,17 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 # 방향("정방향"/"역방향")을 쓰고, 항목 이름의 부호(-HP/+SF/-환 ↔ +HP/-SF/+환)는
                 # 그 판의 방향에 맞춰 바꾼다. Sprd 칸은 누적(노랑)과 구분되게 하늘색.
                 # 방향이 하나뿐인 화면(주식)은 방향 대신 "마지막 판"
+                # 끝 줄을 마지막 세트에 맞춘다(누적 블록의 09-15 규칙과 같게) — 주식선물 8세트는
+                # 세트5~8 줄 그대로, 주식 12세트는 세트9~12 줄(사용자 2026-11-10: 위 블록은 위,
+                # 아래 블록은 아래, 빈 자리는 가운데)
+                r_snap0 = rbase + 2 + rows_by[dtag] - n_snap
                 dir_lbl = tk.Label(grid, text="마지막 판" if len(dirs) == 1 else "-",
                                    fg="gray30", font=T.FONT_LABEL)
-                dir_lbl.grid(row=rbase + 5, column=lcol, columnspan=2, sticky="ew")
+                dir_lbl.grid(row=r_snap0 - 1, column=lcol, columnspan=2, sticky="ew")
                 names: list[tk.Label] = []
                 vals: list[tk.Label] = []
                 for ri, comp in enumerate(("Sprd", *comps)[:n_snap]):
-                    r_snap = rbase + 6 + ri
+                    r_snap = r_snap0 + ri
                     n_lbl = tk.Label(grid, text=comp, fg="gray30", font=T.FONT_LABEL)
                     n_lbl.grid(row=r_snap, column=lcol, padx=(2, 0), sticky="e")
                     v2 = tk.Label(grid, text="-", width=7, anchor="e", relief="solid",
@@ -1056,18 +1068,30 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                            if isinstance(row_live, dict)
                            and (row_live.get(k) or {}).get("status") == "halted"]
             if halted_legs:
-                from .ui_dialog import ask_yes_no
+                from .ui_dialog import ask_yes_no_or_cancel
 
                 names = "·".join("진입" if k == "entry" else "청산" for k, _ in halted_legs)
                 reason = "\n".join(str(lg.get("halt_reason") or "") for _, lg in halted_legs)
                 diff = row_live.get("fill_diff") if isinstance(row_live, dict) else None
                 diff_txt = _fmt_num(diff) if isinstance(diff, int | float) else "-"
-                if not ask_yes_no(root, "중지 해제",
-                                  f"{i + 1}세트가 중지 상태입니다({names}).\n{reason}\n"
-                                  f"세트 체결차(장부): {diff_txt}\n\n"
-                                  "해제해도 체결차 장부는 그대로입니다. 헤지를 정리했으면\n"
-                                  "세트설정의 '체결차 Clear'로 0을 만든 뒤 해제하세요.\n"
-                                  "'예' — 세트 중지를 풀고(진입·청산 모두) 실행합니다."):
+                answer = ask_yes_no_or_cancel(
+                    root, "중지 해제",
+                    f"{i + 1}세트가 중지 상태입니다({names}).\n{reason}\n"
+                    f"세트 체결차(장부): {diff_txt}\n\n"
+                    "해제해도 체결차 장부는 그대로입니다. 헤지를 정리했으면\n"
+                    "세트설정의 '체결차 Clear'로 0을 만든 뒤 해제하세요.\n"
+                    "'예' — 세트 중지를 풀고(진입·청산 모두) 실행합니다.\n"
+                    "'아니오' — 세트 중지만 풀고(바탕색 원복) 실행은 켜지 않습니다.")
+                if answer == "no":
+                    # 중지만 해제(사용자 2026-11-10) — 실행 명령 없음. 검은 바탕은 코어 상태가
+                    # 돌아오면 풀린다(세트 단위, 장부는 그대로)
+                    block_rel = "entry" if side == "en" else "exit"
+                    send({"cmd": "autom_release", "underlying": cur_under(), "set": i,
+                          "block": block_rel, "direction": dtag}, "중지 해제")
+                    screen_log().info("%s 버튼 %s %d세트 %s: 중지만 해제(실행 안 켬)",
+                                      spec.log_tag, dtag, i + 1, side)
+                    return
+                if answer != "yes":
                     screen_log().info("%s 버튼 %s %d세트 %s: 실행 안 함 — 중지 해제 취소",
                                       spec.log_tag, dtag, i + 1, side)
                     return
