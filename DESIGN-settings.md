@@ -71,6 +71,19 @@ DESIGN-manual-order §1-3/1-4가 예고한 **"설정 화면"** — 계정 단위
   둘 다 켜져 있어도 한 번만). 셋 다 화면 로그에 남긴다.
 - 코어 계약: `settings_global`에 `ls_disconnect` dict(§4), 스냅샷 settings에 그대로 노출. 코어 쪽 행동은 없다.
 
+## 2b. 자동종료 — 사용자 지시 2026-11-10 ("사용자 설정 시간이 지나면 자동종료, 코어까지 완전 종료, 공통설정창에")
+- 설정 키 `auto_shutdown` {enabled: bool(기본 끔), time: "HH:MM:SS"}. 공통설정 화면 'LS 끊김 때' 아랫줄:
+  `자동종료  [ ] 켬  시각 [HH:MM:SS]  지나면 메인·화면·코어 모두 종료(확인창 없음)`. 켬인데 시각이 비거나 형식이
+  틀리면 코어가 거부(저장 안 됨).
+- **판정·실행은 메인 창**(코어는 메인과 함께 종료되는 구조 — DESIGN §메인 화면). 메인의 1초 시계 틱이 `/state`
+  설정의 자동종료를 읽어 **설정 시각을 "지나는 순간"**(지난 틱 < 시각 ≤ 이번 틱) 메인 X 종료와 **같은 길**을 확인창 없이
+  탄다: 화면 목록 저장 → 체결쏴 화면 저장·닫기 → 코어 안전종료(전 세트 정지·미체결 취소, 6초 안에 안 내려가면 강제
+  종료) → 나머지 화면 강제 종료 → 메인 종료. 실행 중 세트가 있어도 묻지 않고 멈춘다(사용자 "완전 종료").
+- 메인을 **설정 시각 뒤에 켜면 그날은 끄지 않는다**(지나는 순간이 없음 — 켜자마자 꺼지는 사고 방지). 자정을 넘겨 돌면
+  다음 날 그 시각에 다시 지난다. 설정 시각을 이미 지난 시각으로 바꿔도 즉시 안 끈다(다음 날).
+- 메인 로그: 설정을 읽으면 "자동종료 예약 HH:MM:SS"(이미 지났으면 "(이미 지남 — 오늘은 안 함)"), 도달하면 "자동종료
+  시각 도달 — 종료 시작". 코어 쪽 행동은 없다(저장·노출만).
+
 ## 3. 화면 (신규) — 메인 메뉴 "공통설정"
 - 상단: **HL 일일 한도(USDC)** 입력칸.
 - 그 아래 **리스크 한도**(§1a, 2026-10-20) 두 칸: `HL 주문가격한도 [  ] %`, `HL 1회수량한도 [  ] 계약`(0 = 없음).
@@ -85,6 +98,7 @@ DESIGN-manual-order §1-3/1-4가 예고한 **"설정 화면"** — 계정 단위
 - **시세 원문 기록 체크박스**(사용자 2026-10-02, 기본 **끔**) — 알람 위 한 줄. 켜면 코어가 호가·체결 TR 원문을 `logs\probe\quote_trade_YYYYMMDD.jsonl`에 남긴다(임시 진단, DESIGN-ls-xing.md §8; 하루 수백 MB, 5일 지나면 삭제). 저장 즉시 반영. 캡처 docs/preview/settings_quote_probe.png.
 - 하단: 알람 3줄 — `[체크박스] 이벤트명   [wav 경로]   [찾아보기]`.
 - 그 아래 **LS 끊김 때** 한 줄 — 체크박스 3개(팝업·텔레그램·사운드), §2a(2026-10-14).
+- 그 아래 **자동종료** 한 줄 — `[ ] 켬  시각 [HH:MM:SS]`, §2b(2026-11-10). 지나는 순간 메인·화면·코어 전부 종료.
 - `[저장]` → 코어에 `settings_global` 전송 → `core_state.json` 저장.
 - **창 하나만**(사용자 2026-10-21): 이미 떠 있으면 메뉴를 다시 눌러도 새로 안 띄우고 그 창을 앞으로 가져온다(메인이
   살아 있는 공통설정 프로세스를 보고, 창 제목 "공통설정"으로 찾아 복원·활성). 1회수량한도는 **이상이면 거부**(엑셀
@@ -93,10 +107,12 @@ DESIGN-manual-order §1-3/1-4가 예고한 **"설정 화면"** — 계정 단위
 
 ## 4. 코어 계약
 - 명령 `settings_global` {hl_daily_limit_usdc, hl_price_limit_pct, hl_max_qty_per_order, sound_fill, sound_error, sound_ws,
-  quote_probe, ls_disconnect, quote_stale_s, quote_symbols} → 저장. (`quote_symbols` {samsung, sk_hynix, hyundai}: LS 실시간
+  quote_probe, ls_disconnect, quote_stale_s, quote_symbols, auto_shutdown} → 저장. (`quote_symbols` {samsung, sk_hynix, hyundai}: LS 실시간
   구독 종목 체크, DESIGN-ls-xing §9 안 A — 2026-10-23, 키가 없으면 기본 삼성·하이닉스 켬·현대차 끔.) (`hl_price_limit_pct`·`hl_max_qty_per_order`는 §1a,
   `quote_stale_s`는 2026-11-04 폐지 — 보내도 무시.)
   - `ls_disconnect` {popup, telegram, sound}(§2a, 2026-10-14) — 키가 없으면 기존 값 유지.
+  - `auto_shutdown` {enabled, time}(§2b, 2026-11-10) — 키가 없으면 기존 값 유지. 켬인데 시각이 HH:MM:SS가 아니면 거부.
+    스냅샷 settings에 그대로 노출(메인이 읽어 판정).
   - `fx_futures_code`(원달러선물 월물 코드, 2026-09-28): 빈 문자열 = 최근월물. 키가 없으면 기존 값 유지(콤보가 빈 화면). 코어는 저장 뒤 바로 그 월물로 역산현물가를 다시 계산한다(`LiveSystem.set_fx_futures_code`). **차근은 최근월물 만기 5영업일 전부터**(exec 결정 75, 2026-10-14) — 밖이면 콤보에 차근이 안 보이고, 보내도 코어가 거부.
   - 화면 콤보용으로 `/state`의 `live.fx_futures`에 `months`([{code, ym}], 근·차근 순)와 `code`(지금 쓰는 월물)를 싣는다. `/manual_state`의 `fx_auction.code`도 같은 월물(동시호가 창 표시용).
 - 스냅샷(/state 또는 /manual_state)에 노출:

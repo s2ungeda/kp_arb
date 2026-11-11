@@ -154,15 +154,37 @@ def test_load_config_real_file() -> None:
     assert config.etf_leverage == 2.0
 
 
+# 시장 시간표는 필수 항목(DESIGN-market-hours §1) — 임시 config에도 넣는다
+MARKET_YAML = (
+    "market_hours:\n"
+    "  krx: ['09:00', '15:30']\n  nxt_pre: ['08:00', '08:50']\n  nxt_main: ['09:00', '15:20']\n"
+    "  nxt_after: ['15:30', '20:00']\n  stock_futures: ['08:45', '15:45']\n"
+    "  fx_futures: ['08:45', '15:45']\n  fx_night: ['18:00', '06:00']\n"
+    "fx_calc_start: '07:30'\n"
+)
+
+
 def test_load_config_rejects_wrong_stock_code(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from kp_arb.config import load_config
 
     bad = tmp_path / "config.yaml"
     bad.write_text(
-        "symbols:\n  samsung: {stock: '999999', hl: 'xyz:SMSN'}\n", encoding="utf-8"
+        "symbols:\n  samsung: {stock: '999999', hl: 'xyz:SMSN'}\n" + MARKET_YAML,
+        encoding="utf-8",
     )
     with pytest.raises(ConfigError):
         load_config(str(bad))  # 도메인 enum(005930)과 불일치 → 에러
+
+
+def test_load_config_requires_market_hours(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # 시각 상수는 코드에 없다 — market_hours/fx_calc_start가 빠지면 시동 때 ConfigError
+    # (사용자 2026-11-10 "설정파일값으로. 설정값은 사용자가 입력").
+    from kp_arb.config import load_config
+
+    p = tmp_path / "config.yaml"
+    p.write_text("symbols:\n  samsung: {stock: '005930', hl: 'xyz:SMSN'}\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="market_hours"):
+        load_config(str(p))
 
 
 def test_load_config_missing_file() -> None:

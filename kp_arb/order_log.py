@@ -11,6 +11,7 @@ core_server._setup_logging이 한다 — 이 모듈은 '어느 로거로 무엇�
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 from .domain.enums import Venue
@@ -71,6 +72,12 @@ def order_placed(intent: OrderIntent, order_id: str, response: Any = None) -> No
 def order_rejected(intent: OrderIntent, error: object) -> None:
     """발주 거부/오류 — 게이트웨이 예외(사유 포함)."""
     logger_for(intent.venue).warning("발주거부 %s%s — %s", _src(intent), _fmt(intent), error)
+
+
+def cancel_requested(venue: Venue, order_ids: Sequence[str]) -> None:
+    """취소요청 — 보내기 직전(응답 전). 취소는 HL 블록에 벌점 없이 실리므로 요청→응답 왕복이
+    "네트워크 + HL 경로" 바닥값이 되어, 주문 왕복과 견주면 테이커 벌점 몫이 갈린다(2026-11-10)."""
+    logger_for(venue).info("취소요청 %s", " ".join(f"#{o}" for o in order_ids))
 
 
 def order_canceled(venue: Venue, order_id: str) -> None:

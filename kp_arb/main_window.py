@@ -251,6 +251,30 @@ def _auto_running() -> bool:
     return False
 
 
+def hms_seconds(text: str) -> int:
+    """"HH:MM:SS" → 하루 중 초(순수). 형식이 틀리면 ValueError."""
+    parts = text.strip().split(":")
+    if len(parts) != 3:
+        raise ValueError(f"HH:MM:SS 형식이 아님: {text!r}")
+    h, m, s = (int(p) for p in parts)
+    if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
+        raise ValueError(f"시각 범위 밖: {text!r}")
+    return h * 3600 + m * 60 + s
+
+
+def auto_shutdown_due(prev_s: int | None, now_s: int, target_s: int) -> bool:
+    """자동종료 시각을 '지나는 순간'인가(순수, DESIGN-settings §2b). 값은 하루 중 초.
+
+    지난 틱 < 설정 시각 ≤ 이번 틱이면 참. 첫 틱(prev None)은 기준만 잡는다 — 메인을 설정 시각
+    뒤에 켜면 그날은 안 끈다. 자정을 넘긴 틱(prev > now)은 설정 시각이 prev 뒤거나 now 앞이면 참.
+    """
+    if prev_s is None:
+        return False
+    if prev_s <= now_s:
+        return prev_s < target_s <= now_s
+    return target_s > prev_s or target_s <= now_s
+
+
 def _restart_step(
     st: dict[str, Any], alive: bool, *, after: int, cooldown: int, max_restarts: int
 ) -> str:
@@ -458,6 +482,7 @@ def main() -> None:
         "main_ws": {"connected": False, "rx": 0, "disconnects": 0},
     }
     closing = {"flag": False}
+    special_box = {"shown": False}  # 특별 개장일 팝업(DESIGN-market-hours §4) — 시동 뒤 한 번
     launched: list[tuple[str, int, subprocess.Popen[bytes]]] = []  # (token, slot, proc)
 
     # 코어 응답 없음 감지(옛 Phase 8-5 자동 재시작 → **알림만, 재기동 없음** — 사용자 2026-11-03
@@ -600,6 +625,20 @@ def main() -> None:
             if alive:
                 alive_box["ws"] = (data or {}).get("ws") or []
                 alive_box["load_errors"] = (data or {}).get("load_errors") or []
+                # 자동종료 설정(DESIGN-settings §2b) — 화면 루프(시계 틱)가 읽어 판정
+                alive_box["auto_shutdown"] = ((data or {}).get("settings") or {}).get(
+                    "auto_shutdown")
+                # 특별 개장일(수능일 등, config special_days) — 처음 한 번 팝업 + 로그. 사용자
+                # 입력 시각은 코드가 안 바꾸므로(사용자 2026-11-10) 직접 확인하라고 알린다.
+                md = (data or {}).get("market_day") or {}
+                if md.get("special") and not special_box["shown"]:
+                    special_box["shown"] = True
+                    _slog().warning("특별 개장일 %s — %s", md["special"], md.get("text", ""))
+                    dc_box["popup"] = (
+                        "특별 개장일",
+                        f"오늘은 {md['special']}입니다.\n{md.get('text', '')}\n\n"
+                        "체결쏴 구간·동시호가 주문시각·외환선물 우선시간·NXT 개장매매는\n"
+                        "자동으로 바뀌지 않습니다 — 직접 확인하세요.")
                 bind_core_to_job((data or {}).get("pid"))  # 이미 떠 있던 코어도 묶는다(한 번만)
             # 조회 실패면 WS 표를 비우지 않는다(사용자 2026-09-29: LS·HL 줄이 사라져 "끊겼나" 오판).
             # 코어 미접속은 위 상태줄("코어: 미접속")이 보여 준다.
@@ -742,9 +781,35 @@ def main() -> None:
     lbl_clock = tk.Label(bottom, text="00:00:00", anchor="e", relief="groove", width=8)
     lbl_clock.pack(side="right", padx=(4, 0))
 
+    auto_box: dict[str, Any] = {"prev": None, "logged": None}
+
+    def check_auto_shutdown() -> None:
+        """자동종료(DESIGN-settings §2b, 사용자 2026-11-10) — 설정 시각을 지나는 순간 메인 X 종료와
+        같은 길(shutdown_all)을 확인창 없이 탄다. 1초 시계 틱에서 호출(화면 스레드)."""
+        cfg = alive_box.get("auto_shutdown")
+        now = time.localtime()
+        now_s = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
+        prev_s, auto_box["prev"] = auto_box["prev"], now_s
+        if not isinstance(cfg, dict) or not cfg.get("enabled") or closing["flag"]:
+            auto_box["logged"] = None
+            return
+        text = str(cfg.get("time", ""))
+        try:
+            target_s = hms_seconds(text)
+        except ValueError:
+            return
+        if auto_box["logged"] != text:
+            auto_box["logged"] = text
+            _slog().info("자동종료 예약 %s — 지나는 순간 메인·화면·코어 종료%s", text,
+                         "" if target_s > now_s else " (이미 지남 — 오늘은 안 함)")
+        if auto_shutdown_due(prev_s, now_s, target_s):
+            _slog().info("자동종료 시각 %s 도달 — 종료 시작", text)
+            shutdown_all("자동종료")
+
     def tick_clock() -> None:
         try:
             lbl_clock.config(text=time.strftime("%H:%M:%S"))
+            check_auto_shutdown()
             root.after(1000, tick_clock)
         except tk.TclError:
             pass  # 창 닫힘
@@ -961,6 +1026,13 @@ def main() -> None:
             msg = "메인을 종료하면 코어와 열린 화면이 모두 함께 종료됩니다.\n종료하시겠습니까?"
         if not ask_yes_no(root, "종료 확인", msg):
             return
+        shutdown_all("메인 종료")
+
+    def shutdown_all(reason: str) -> None:
+        """화면 저장 → 체결쏴 화면 닫기 → 코어 안전종료(안 내려가면 강제) → 나머지 화면 → 메인.
+        X 종료(확인 뒤)와 자동종료(DESIGN-settings §2b, 확인 없음)가 같이 쓴다."""
+        if closing["flag"]:
+            return
         save_ui_state()  # 닫기 직전 화면 목록 저장 — 다음 실행 때 다시 열림
         closing["flag"] = True
         restart["intentional"] = True  # 자동 재기동 금지
@@ -972,14 +1044,14 @@ def main() -> None:
         mark_main_closing()
         status.config(text="화면 저장·종료 중 …")
         root.update_idletasks()
-        _slog().info("메인 종료 — 체결쏴 화면 %s", close_screens_gracefully(
+        _slog().info("%s — 체결쏴 화면 %s", reason, close_screens_gracefully(
             [proc for tok, _slot, proc in launched
              if tok.split(" ", 1)[0].startswith("kp_arb.order_autom")]))
         # 메인 종료 = 전부 멈춤. 안전종료가 확인되지 않으면 강제 종료(2026-09-29 사고: 코어 HTTP가
         # 막혀 종료 명령이 안 닿아 메인을 닫아도 자동M이 계속 발주).
         status.config(text="코어 종료 중 …")
         root.update_idletasks()
-        _slog().info("메인 종료 — %s", ensure_core_down())
+        _slog().info("%s — %s", reason, ensure_core_down())
         clear_main_closing()
         for _tok, _slot, proc in launched:
             if proc.poll() is None:

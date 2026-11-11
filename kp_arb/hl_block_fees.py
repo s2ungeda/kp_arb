@@ -65,7 +65,8 @@ class BlockSummary:
     n_cancels: int = 0
     by_tif: dict[str, Counter[str]] = field(default_factory=dict)   # tif → 구간별 주문 건수
     max_p: dict[str, int] = field(default_factory=dict)             # tif → 최대 p
-    mine: list[tuple[int, dict[str, Any]]] = field(default_factory=list)  # (블록 안 위치, action)
+    # 내 tx — (블록 안 위치, action, tx 해시). 해시로 체결(userFills의 hash)과 잇는다
+    mine: list[tuple[int, dict[str, Any], str]] = field(default_factory=list)
     # 자산(a)별 수수료 낸 테이커(Ioc) 건수 — 어느 종목에서 순서 싸움이 났나
     paid_ioc_by_asset: Counter[int] = field(default_factory=Counter)
     # 주소별 행동 — 종류별 주문 건수·취소 수·낸 수수료 최대 p (LP형/테이커형 가르기용)
@@ -110,7 +111,7 @@ def summarize_block(height: int, block: dict[str, Any], me: str | None = None,
         kind = str(action.get("type", ""))
         user = str(tx.get("user", "")).lower()
         if me_l and user == me_l:
-            s.mine.append((i, action))
+            s.mine.append((i, action, str(tx.get("hash", ""))))
         if kind.startswith("cancel"):
             s.n_cancels += 1
             if assets is None:  # 취소는 자산을 몰라 종목 필터 땐 주소별로 안 센다
@@ -180,6 +181,56 @@ def top_paid_assets(summaries: list[BlockSummary], names: dict[int, str] | None 
     return out
 
 
+@dataclass
+class FillSummary:
+    """주문(tx 해시) 하나의 체인 체결 요약 — info userFillsByTime 조각들을 합친 것."""
+
+    oid: int
+    coin: str
+    side: str          # "B" 매수 / "A" 매도
+    qty: float
+    avg_px: float
+    pieces: int
+    first_ms: int
+    last_ms: int
+    crossed: bool      # True = 테이커로 가져감
+    fee: float
+    fee_token: str
+
+
+def summarize_fills(fills: list[dict[str, Any]]) -> dict[str, FillSummary]:
+    """체결 조각 목록 → tx 해시별 요약(수량 가중 평균가·조각 수·시각·수수료). 순수."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for f in fills:
+        h = str(f.get("hash", ""))
+        if h:
+            groups.setdefault(h, []).append(f)
+    out: dict[str, FillSummary] = {}
+    for h, fs in groups.items():
+        qty = sum(float(f.get("sz", 0)) for f in fs)
+        if qty <= 0:
+            continue
+        avg = sum(float(f.get("sz", 0)) * float(f.get("px", 0)) for f in fs) / qty
+        times = [int(f.get("time", 0)) for f in fs]
+        out[h] = FillSummary(
+            oid=int(fs[0].get("oid", 0)), coin=str(fs[0].get("coin", "")),
+            side=str(fs[0].get("side", "")), qty=qty, avg_px=avg, pieces=len(fs),
+            first_ms=min(times), last_ms=max(times), crossed=bool(fs[0].get("crossed", False)),
+            fee=sum(float(f.get("fee", 0) or 0) for f in fs),
+            fee_token=str(fs[0].get("feeToken", "")))
+    return out
+
+
+def format_fill(fs: FillSummary) -> str:
+    """내 주문 줄 아래 한 줄 — 체결 수량·평균가·조각·시각·테이커 여부·수수료."""
+    side = "매수" if fs.side == "B" else "매도"
+    when = (kst(fs.first_ms) if fs.first_ms == fs.last_ms
+            else f"{kst(fs.first_ms)}~{kst(fs.last_ms)}")
+    return (f"체결 {side} {fs.qty:g} @평균 {fs.avg_px:,.3f} ({fs.pieces}조각, {when}, "
+            f"{'테이커' if fs.crossed else '메이커'}) 수수료 {fs.fee:,.4f} {fs.fee_token} "
+            f"#{fs.oid}")
+
+
 def asset_id(dex_index: int, index: int) -> int:
     """HL 자산 번호 — 빌더 dex는 100000 + dex번호×10000 + 메타 순번(xyz = 1 → 110000+),
     본 dex(0)는 메타 순번 그대로."""
@@ -209,7 +260,7 @@ def kst(ms: int) -> str:
 def format_block_line(s: BlockSummary) -> str:
     tifs = {tif: sum(c.values()) for tif, c in s.by_tif.items()}
     paid = sum(v for c in s.by_tif.values() for k, v in c.items() if k not in BUCKETS[:2])
-    mine = f"  ← 내 tx 위치 {[i for i, _ in s.mine]}" if s.mine else ""
+    mine = f"  ← 내 tx 위치 {[i for i, _a, _h in s.mine]}" if s.mine else ""
     return (f"블록 {s.height} {kst(s.time_ms)} tx {s.n_tx:6,} 주문 {s.n_orders:5,}"
             f"(수수료 있음 {paid:5,}) 취소 {s.n_cancels:5,} {tifs}{mine}")
 

@@ -158,6 +158,15 @@ class DisconnectActions:
 
 
 @dataclass
+class AutoShutdown:
+    """자동종료(DESIGN-settings §2b, 사용자 2026-11-10) — 설정 시각을 지나는 순간 메인이
+    화면·코어까지 전부 종료. 판정·실행은 메인 창, 코어는 저장·노출만."""
+
+    enabled: bool = False
+    time: str = ""  # "HH:MM:SS"
+
+
+@dataclass
 class SoundSetting:
     """알람 사운드 1종 — 재생 여부 + wav 파일 경로 (DESIGN-settings §2)."""
 
@@ -201,6 +210,8 @@ class GlobalSettings:
     sound_ws: SoundSetting = field(default_factory=SoundSetting)     # WS 끊김
     # LS(xing) 접속 끊김 때 할 일(§2a) — 판정·행동은 메인 창, 코어는 저장·노출만
     ls_disconnect: DisconnectActions = field(default_factory=DisconnectActions)
+    # 자동종료(§2b, 2026-11-10) — 판정·실행은 메인 창
+    auto_shutdown: AutoShutdown = field(default_factory=AutoShutdown)
 
 
 @dataclass
@@ -404,6 +415,27 @@ def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
             snd.enabled = bool(rs.get("enabled", snd.enabled))
             snd.path = str(rs.get("path", snd.path))
     apply_disconnect_actions(s.ls_disconnect, raw.get("ls_disconnect"))
+    try:
+        apply_auto_shutdown(s.auto_shutdown, raw.get("auto_shutdown"))
+    except ValueError:  # 저장본의 시각이 깨졌으면 그 항목만 기본값(끔)
+        s.auto_shutdown = AutoShutdown()
+
+
+def apply_auto_shutdown(a: AutoShutdown, raw: object) -> None:
+    """`auto_shutdown` dict → 설정(§2b). 없거나 dict가 아니면 그대로. 켬인데 시각이 HH:MM:SS가
+    아니면 ValueError(명령은 거부, 저장본 복원은 기본값)."""
+    if not isinstance(raw, dict):
+        return
+    enabled = raw.get("enabled", a.enabled)
+    text = raw.get("time", a.time)
+    if not isinstance(enabled, bool) or not isinstance(text, str):
+        raise ValueError("자동종료 값 오류")
+    text = text.strip()
+    if enabled:
+        if len(text.split(":")) != 3:
+            raise ValueError("자동종료 시각은 HH:MM:SS 형식")
+        parse_hhmm(text)
+    a.enabled, a.time = enabled, text
 
 
 def apply_disconnect_actions(dc: DisconnectActions, raw: object) -> None:

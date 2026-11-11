@@ -58,10 +58,19 @@ def test_days_to_expiry_min_one() -> None:
     assert days_to_expiry(202607, "USD", date(2026, 7, 25)) == 1  # 지났어도 최소 1
 
 
-def test_is_rolled_at_1545_on_expiry() -> None:
-    assert not is_rolled(202607, "EQ", datetime(2026, 7, 9, 15, 44))
-    assert is_rolled(202607, "EQ", datetime(2026, 7, 9, 15, 45))
-    assert is_rolled(202607, "EQ", datetime(2026, 7, 10, 9, 0))
+def test_is_rolled_at_close_time_on_expiry() -> None:
+    # 거래종료 시각은 시장 시간표(config market_hours, DESIGN-market-hours §3)에서 받는다 —
+    # 코드 기본값 없음(사용자 2026-11-10 "설정파일값으로").
+    close = time(15, 45)
+    assert not is_rolled(202607, "EQ", datetime(2026, 7, 9, 15, 44), close)
+    assert is_rolled(202607, "EQ", datetime(2026, 7, 9, 15, 45), close)
+    assert is_rolled(202607, "EQ", datetime(2026, 7, 10, 9, 0), close)
+    # 특별일 16:45면 16:44는 아직
+    assert not is_rolled(202607, "EQ", datetime(2026, 7, 9, 16, 44), time(16, 45))
+    assert is_rolled(202607, "EQ", datetime(2026, 7, 9, 16, 45), time(16, 45))
+    # 그날 그 시장 없음(None) — 날짜가 지나야 롤
+    assert not is_rolled(202607, "EQ", datetime(2026, 7, 9, 23, 59), None)
+    assert is_rolled(202607, "EQ", datetime(2026, 7, 10, 0, 0), None)
 
 
 def test_carry_theory() -> None:
@@ -83,9 +92,10 @@ def test_select_usd_futures_near_month_skips_rolled_and_spread() -> None:
         {"hname": "금         F 202608", "shcode": "167W08"},          # 타상품 제외
     ]
     # 7월물 만기(7/20) 전 → 7월물.
-    assert select_usd_futures(rows, datetime(2026, 7, 7, 10, 0)) == ("175W07", 202607)
-    # 만기일 15:45 이후 → 8월물로 롤.
-    assert select_usd_futures(rows, datetime(2026, 7, 20, 16, 0)) == ("175W08", 202608)
+    close = time(15, 45)
+    assert select_usd_futures(rows, datetime(2026, 7, 7, 10, 0), close) == ("175W07", 202607)
+    # 만기일 마감(15:45) 이후 → 8월물로 롤.
+    assert select_usd_futures(rows, datetime(2026, 7, 20, 16, 0), close) == ("175W08", 202608)
 
 
 def test_select_usd_futures_months_near_and_next() -> None:
@@ -97,14 +107,15 @@ def test_select_usd_futures_months_near_and_next() -> None:
         {"hname": "미국달러    F 202608", "shcode": "175W08"},
         {"hname": "미국달러 SP F 202607-202608", "shcode": "475W07"},  # 스프레드 제외
     ]
+    close = time(15, 45)
     # 7월물 만기 전 → [최근=7월, 차근=8월]
-    assert select_usd_futures_months(rows, datetime(2026, 7, 7, 10, 0)) == [
+    assert select_usd_futures_months(rows, datetime(2026, 7, 7, 10, 0), close) == [
         ("175W07", 202607), ("175W08", 202608)]
     # 7월물 롤 이후 → [최근=8월, 차근=9월]
-    assert select_usd_futures_months(rows, datetime(2026, 7, 20, 16, 0)) == [
+    assert select_usd_futures_months(rows, datetime(2026, 7, 20, 16, 0), close) == [
         ("175W08", 202608), ("175W09", 202609)]
     # count=1이면 최근월물 하나만
-    assert select_usd_futures_months(rows, datetime(2026, 7, 7, 10, 0), count=1) == [
+    assert select_usd_futures_months(rows, datetime(2026, 7, 7, 10, 0), close, count=1) == [
         ("175W07", 202607)]
 
 

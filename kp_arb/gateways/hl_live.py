@@ -86,6 +86,41 @@ def install_nonce_clock(clock: NonceClock) -> bool:
     return True
 
 
+def install_ws_post(exchange: Any, client: Any, timeout_s: float = HL_SDK_TIMEOUT_S) -> bool:
+    """SDK ``Exchange._post_action``(서명 액션 전송)을 WS post로 바꿔 끼운다 — DESIGN-hl-ws-post §3.
+
+    본문은 SDK 원본과 똑같이 만들고(action·nonce·signature·vaultAddress·expiresAfter) 통로만 WS.
+    WS가 미접속이면(``HLWsPostUnavailable``) **원래 HTTP 전송**으로 그 요청을 보낸다. 그 밖의 예외
+    (오류 응답·시간 초과·응답 전 끊김)는 그대로 올린다 = HTTP 때와 같은 "결과 모름" 처리.
+    SDK에 ``_post_action``이 없으면(버전 변경) 아무것도 안 하고 False.
+    """
+    from .hl_ws_post import HLWsPostUnavailable
+
+    original = getattr(exchange, "_post_action", None)
+    if not callable(original):
+        return False
+    log = logging.getLogger("kp_arb.hl_post")
+
+    def _post_action(action: dict[str, Any], signature: Any, nonce: int) -> Any:
+        payload = {
+            "action": action,
+            "nonce": nonce,
+            "signature": signature,
+            "vaultAddress": (exchange.vault_address
+                             if action["type"] not in ["usdClassTransfer", "sendAsset"] else None),
+            "expiresAfter": exchange.expires_after,
+        }
+        try:
+            return client.post_action_threadsafe(payload, timeout_s)
+        except HLWsPostUnavailable as exc:
+            client.fallback_count += 1
+            log.warning("HL 주문 WS 미접속 → HTTP로 전송(%s): %s", action.get("type"), exc)
+            return original(action, signature, nonce)
+
+    exchange._post_action = _post_action  # noqa: SLF001 - SDK 내부 훅(nonce 발급기와 같은 수법)
+    return True
+
+
 def _safe_float(v: Any) -> float | None:
     """표시용 안전 파싱 — 없거나 숫자가 아니면 None (잔고표 상세)."""
     try:
@@ -165,6 +200,16 @@ class HLSdkGateway(HLGateway):
         self._action_lock = asyncio.Lock()
         self._last_action_ms = 0
         self.connected = False
+        self.ws_post: Any | None = None  # HLWsPostClient(붙였으면) — ws_statuses 표시용
+
+    def attach_ws_post(self, client: Any) -> bool:
+        """주문 전송을 WS post로(DESIGN-hl-ws-post). 못 붙이면 False(HTTP 유지)."""
+        if not install_ws_post(self._ex, client):
+            logging.getLogger("kp_arb.hl_post").warning(
+                "HL WS post를 SDK에 못 붙임(_post_action 없음, SDK 변경?) — HTTP로 전송")
+            return False
+        self.ws_post = client
+        return True
 
     @classmethod
     def from_secrets(
@@ -561,9 +606,14 @@ class HLSdkGateway(HLGateway):
         coin = self._order_coin.get(order_id)
         if coin is None:
             raise HLError(f"unknown order_id {order_id} (coin required for cancel)")
+        order_log.cancel_requested(Venue.HYPERLIQUID, [order_id])
+        sent_ms = int(time.time() * 1000)
         resp = await self._exchange_action("cancel", self._ex.cancel, coin, int(order_id))
         self._check_ok(resp)
         order_log.order_canceled(Venue.HYPERLIQUID, order_id)
+        # 취소 왕복 — 벌점 없는 요청의 바닥값(주문 왕복과 견줘 테이커 벌점 몫을 가른다, 11-10)
+        logging.getLogger("kp_arb.hl").info(
+            "HL 취소 왕복 %d ms #%s", int(time.time() * 1000) - sent_ms, order_id)
 
     async def cancel_orders(self, order_ids: Sequence[str]) -> list[str | None]:
         """여러 건을 `cancel` 액션 하나(cancels 배열)로 — SDK bulk_cancel. 응답 statuses가 건별로
@@ -579,7 +629,11 @@ class HLSdkGateway(HLGateway):
             reqs.append((i, {"coin": coin, "oid": int(oid)}))
         if not reqs:
             return out
+        order_log.cancel_requested(Venue.HYPERLIQUID, [str(r["oid"]) for _i, r in reqs])
+        sent_ms = int(time.time() * 1000)
         resp = await self._exchange_action("cancel", self._ex.bulk_cancel, [r for _i, r in reqs])
+        logging.getLogger("kp_arb.hl").info(
+            "HL 묶음 취소 왕복 %d ms — %d건", int(time.time() * 1000) - sent_ms, len(reqs))
         try:
             self._check_ok(resp)
             statuses = list(resp["response"]["data"]["statuses"])

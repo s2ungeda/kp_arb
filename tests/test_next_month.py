@@ -1,5 +1,5 @@
 """주식선물 차근월물(KR_STOCK_FUTURE_NEXT) — 도메인·순수 로직 매핑 (DESIGN §5.11, ①단계)."""
-from datetime import datetime
+from datetime import datetime, time
 
 from kp_arb.bootstrap import LiveSystem, select_months
 from kp_arb.domain.enums import Account, Instrument, SessionPhase, Underlying
@@ -128,7 +128,7 @@ _ROWS = [
 
 
 def test_select_months_near_and_next() -> None:
-    got = select_months(_ROWS, count=2, now=datetime(2026, 9, 3, 10, 0))
+    got = select_months(_ROWS, time(15, 45), count=2, now=datetime(2026, 9, 3, 10, 0))
     assert got[Underlying.SAMSUNG] == [("A1169000", 202609), ("A116C000", 202612)]
     assert got[Underlying.SK_HYNIX] == [("A5069000", 202609)]  # 차근 없음 → 1개
 
@@ -136,6 +136,6 @@ def test_select_months_near_and_next() -> None:
 def test_select_months_skips_rolled_contract() -> None:
     # 9월물 최종거래일(둘째 목요일 2026-09-10) 15:45 이후엔 9월물을 버리고 12월물이 근이 된다 —
     # 기존 select_near_month는 이 필터가 없어 만기일 저녁 재시동 시 만기월물을 잡았다(§5.11).
-    got = select_months(_ROWS, count=2, now=datetime(2026, 9, 10, 16, 0))
+    got = select_months(_ROWS, time(15, 45), count=2, now=datetime(2026, 9, 10, 16, 0))
     assert got[Underlying.SAMSUNG] == [("A116C000", 202612), ("A116F000", 202703)]
     assert Underlying.SK_HYNIX not in got  # 남은 월물 없음

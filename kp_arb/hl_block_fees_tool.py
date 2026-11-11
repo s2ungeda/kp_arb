@@ -27,12 +27,14 @@ from .hl_block_fees import (
     asset_id,
     find_block_at,
     format_block_line,
+    format_fill,
     format_summary,
     format_users,
     kst,
     merge_summaries,
     merge_users,
     summarize_block,
+    summarize_fills,
     top_paid_assets,
 )
 
@@ -103,6 +105,17 @@ def asset_names() -> dict[int, str]:
     return names
 
 
+def my_fills(me: str, t0: int, t1: int) -> dict[str, Any]:
+    """내 체결(공개 info userFillsByTime, 읽기 전용) → tx 해시별 요약. 실패하면 빈 dict."""
+    try:
+        fills = _post(INFO_URL, {"type": "userFillsByTime", "user": me,
+                                 "startTime": t0, "endTime": t1})
+    except Exception as exc:  # noqa: BLE001 - 체결 없이도 나머지는 보여 준다
+        print(f"  (체결 조회 실패: {type(exc).__name__}: {exc})", flush=True)
+        return {}
+    return summarize_fills(fills if isinstance(fills, list) else [])
+
+
 def default_me() -> str | None:
     try:
         from .config import default_secrets
@@ -169,18 +182,21 @@ def run(start: datetime, seconds: float, me: str | None, out: TextIO,
             f"테이커형 = IOC 80%↑) ==")
         for line in format_users(users, me):
             say("  " + line)
-    mine = [(s, i, a) for s in summaries for i, a in s.mine]
+    mine = [(s, i, a, txh) for s in summaries for i, a, txh in s.mine]
     if mine:
         say()
-        say("== 내 주문 ==")
-        for s, i, a in mine:
+        say("== 내 주문 (체결 = 체인 기록 userFills를 tx 해시로 이음; 구간 끝 +60초까지) ==")
+        fills = my_fills(me or "", summaries[0].time_ms - 1000, summaries[-1].time_ms + 60_000)
+        for s, i, a, txh in mine:
             orders = a.get("orders") or []
             desc = ", ".join(
                 f"{names.get(o.get('a'), o.get('a'))} {'매수' if o.get('b') else '매도'} "
                 f"{o.get('s')} @ {o.get('p')} "
                 f"{(o.get('t') or {}).get('limit', {}).get('tif', '?')}" for o in orders)
             say(f"  블록 {s.height} {kst(s.time_ms)} 위치 {i}/{s.n_tx} grouping={a.get('grouping')}"
-                f" {desc}")
+                f" {desc} tx {txh[:12]}…")
+            fs = fills.get(txh)
+            say(f"      {format_fill(fs)}" if fs else "      체결 없음(구간 안)")
     elif me:
         say()
         say("(이 구간에 내 주문 없음)")

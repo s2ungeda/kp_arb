@@ -260,6 +260,42 @@ def test_settings_global_command_and_persistence(tmp_path: Path) -> None:
     assert state.settings.fx_futures_code == ""
 
 
+def test_settings_global_auto_shutdown(tmp_path: Path) -> None:
+    # DESIGN-settings §2b(사용자 2026-11-10) — 켬+시각 저장·복원, 켬인데 형식 틀리면 거부,
+    # 키 없으면 유지
+    state = CoreState()
+    assert not state.settings.auto_shutdown.enabled
+    ok = apply_command(state, {"cmd": "settings_global",
+                               "auto_shutdown": {"enabled": True, "time": " 15:40:00 "}})
+    assert ok["ok"]
+    assert (state.settings.auto_shutdown.enabled, state.settings.auto_shutdown.time) == (
+        True, "15:40:00")
+    bad = apply_command(state, {"cmd": "settings_global",
+                                "auto_shutdown": {"enabled": True, "time": "15:40"}})
+    assert not bad["ok"] and state.settings.auto_shutdown.time == "15:40:00"
+    bad2 = apply_command(state, {"cmd": "settings_global",
+                                 "auto_shutdown": {"enabled": True, "time": ""}})
+    assert not bad2["ok"] and state.settings.auto_shutdown.enabled
+    assert apply_command(state, {"cmd": "settings_global", "hl_daily_limit_usdc": 1})["ok"]
+    assert state.settings.auto_shutdown.enabled  # 키 없으면 유지
+    # 끔이면 시각은 비어 있어도 된다
+    assert apply_command(state, {"cmd": "settings_global",
+                                 "auto_shutdown": {"enabled": False, "time": ""}})["ok"]
+    assert not state.settings.auto_shutdown.enabled
+    assert apply_command(state, {"cmd": "settings_global",
+                                 "auto_shutdown": {"enabled": True, "time": "16:00:00"}})["ok"]
+    path = tmp_path / "core_state.json"
+    save_state(path, state)
+    restored = load_state(path)
+    assert (restored.settings.auto_shutdown.enabled, restored.settings.auto_shutdown.time) == (
+        True, "16:00:00")
+    # 저장본의 시각이 깨졌으면 그 항목만 기본값(끔)
+    broken = CoreState()
+    _global_settings_from_dict(broken.settings,
+                               {"auto_shutdown": {"enabled": True, "time": "x"}})
+    assert not broken.settings.auto_shutdown.enabled
+
+
 def test_load_state_missing_or_corrupt(tmp_path: Path) -> None:
     assert load_state(tmp_path / "none.json").fx_month == "near"
     bad = tmp_path / "bad.json"

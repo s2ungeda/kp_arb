@@ -252,6 +252,21 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         tk.Checkbutton(dc_frame, text=name, variable=dc_vars[key], anchor="w").pack(
             side="left", padx=(0, 10))
 
+    # 자동종료(DESIGN-settings §2b, 사용자 2026-11-10) — 설정 시각을 지나는 순간 메인이
+    # 화면·코어까지 확인창 없이 전부 종료. 판정·실행은 메인 창, 여기서는 켬/끔과 시각만.
+    as_row = dc_row + 1
+    tk.Label(form, text="자동종료").grid(row=as_row, column=0, sticky="w", pady=(6, 2))
+    as_frame = tk.Frame(form)
+    as_frame.grid(row=as_row, column=1, columnspan=3, sticky="w", padx=6, pady=(6, 2))
+    var_as = tk.BooleanVar(value=False)
+    tk.Checkbutton(as_frame, text="켬", variable=var_as, anchor="w").pack(
+        side="left", padx=(0, 10))
+    tk.Label(as_frame, text="시각").pack(side="left")
+    e_as_time = tk.Entry(as_frame, width=10)
+    e_as_time.pack(side="left", padx=(4, 0))
+    tk.Label(as_frame, text="HH:MM:SS · 지나면 메인·화면·코어 모두 종료(확인창 없음)",
+             fg=T.C_MUTED).pack(side="left", padx=(8, 0))
+
     btn = tk.Button(root, text="저장", width=12, font=T.FONT_STRONG)
     btn.pack(pady=(0, 8))
 
@@ -273,6 +288,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if (spot_s2 or spot_e2) and not (is_time_text(spot_s2) and is_time_text(spot_e2)):
             set_status("외환선물 우선시간 2구간은 HH:MM:SS 둘 다 넣거나 둘 다 비우세요", err=True)
             return
+        as_time = e_as_time.get().strip()
+        if var_as.get() and not is_time_text(as_time):
+            set_status("자동종료 시각은 HH:MM:SS 형식으로 입력하세요", err=True)
+            return
         payload: dict[str, Any] = {
             "cmd": "settings_global", "hl_daily_limit_usdc": limit,
             "hl_price_limit_pct": risk_pct, "hl_max_qty_per_order": risk_qty,
@@ -286,6 +305,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             payload[key] = {"enabled": bool(r["var"].get()),
                             "path": r["entry"].get().strip()}
         payload["ls_disconnect"] = {k: bool(v.get()) for k, v in dc_vars.items()}
+        payload["auto_shutdown"] = {"enabled": bool(var_as.get()), "time": as_time}
         payload["quote_symbols"] = {k: bool(v.get()) for k, v in qs_vars.items()}
         send(payload, "저장")
 
@@ -343,6 +363,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             dc = settings.get("ls_disconnect") or {}
             for key, v in dc_vars.items():
                 v.set(bool(dc.get(key, False)))
+            a_s = settings.get("auto_shutdown") or {}
+            var_as.set(bool(a_s.get("enabled", False)))
+            e_as_time.delete(0, "end")
+            e_as_time.insert(0, str(a_s.get("time", "") or ""))
         # 시세 구독 종목 — 코어가 자동으로 켠 것(다른 화면의 종목 선택)이 열린 창에도 보이게, 코어
         # 값이 지난번과 다르면 그 종목 체크만 따라간다(사용자가 손대 둔 다른 종목은 안 덮음).
         if isinstance(settings, dict):

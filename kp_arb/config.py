@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import date
 from enum import StrEnum
 from typing import Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .domain.enums import Account, Underlying
 
@@ -293,6 +294,38 @@ class FxFutWindow(BaseModel):
     end: str = "15:45:00"
 
 
+MARKET_KEYS: tuple[str, ...] = ("krx", "nxt_pre", "nxt_main", "nxt_after",
+                                "stock_futures", "fx_futures", "fx_night")
+
+
+class MarketHours(BaseModel):
+    """평소 시장 시간표 "HH:MM" [개장, 마감] — DESIGN-market-hours §1(사용자 2026-11-10
+    "하드코딩 시각 → config", "설정파일값으로 — 설정값은 사용자가 입력"). 일곱 시장 모두 **필수**
+    — 코드에 기본 시각을 두지 않는다. 마감 ≤ 개장이면 익일 마감(야간). null = 그 시장 없음."""
+
+    krx: tuple[str, str] | None
+    nxt_pre: tuple[str, str] | None
+    nxt_main: tuple[str, str] | None
+    nxt_after: tuple[str, str] | None
+    stock_futures: tuple[str, str] | None
+    fx_futures: tuple[str, str] | None
+    fx_night: tuple[str, str] | None
+
+
+class SpecialDay(BaseModel):
+    """특별 개장일 한 날(수능일 등) — 적은 시장만 평소 시간표를 덮고, null은 "그날 열지 않음".
+    적었는지는 model_fields_set으로 구분한다."""
+
+    name: str = ""
+    krx: tuple[str, str] | None = None
+    nxt_pre: tuple[str, str] | None = None
+    nxt_main: tuple[str, str] | None = None
+    nxt_after: tuple[str, str] | None = None
+    stock_futures: tuple[str, str] | None = None
+    fx_futures: tuple[str, str] | None = None
+    fx_night: tuple[str, str] | None = None
+
+
 class FeeRates(BaseModel):
     """왕복 수수료·세금 (명목 대비 비율) — 순진입 계산용 (DESIGN §6.1)."""
 
@@ -317,6 +350,13 @@ class AppConfig(BaseModel):
     fees: FeeRates = FeeRates()
     fx_fut_window: FxFutWindow = FxFutWindow()
     disparity: DisparityConfig = DisparityConfig()
+    # 시장 시간표(DESIGN-market-hours) — 평소 + 특별일 덮어쓰기 + 환율 계산 시작(exec 결정 47).
+    # market_hours·fx_calc_start는 필수(없으면 ConfigError) — 시각의 출처는 config.yaml 하나.
+    market_hours: MarketHours
+    special_days: dict[date | str, SpecialDay] = {}
+    fx_calc_start: str
+    # HL 주문을 WS로 보내기(DESIGN-hl-ws-post, 사용자 2026-11-11). false면 옛 HTTP만.
+    hl_ws_post: bool = True
 
     def etf_symbols(self) -> dict[Underlying, str]:
         return {u: s.etf for u, s in self.symbols.items() if s.etf is not None}
@@ -334,7 +374,16 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> AppConfig:
             raw = yaml.safe_load(f)
     except FileNotFoundError as exc:
         raise ConfigError(f"config file not found: {path}") from exc
-    config = AppConfig.model_validate(raw)
+    try:
+        config = AppConfig.model_validate(raw)
+    except ValidationError as exc:
+        raise ConfigError(f"config 형식 오류: {exc}") from exc
+    from .market_hours import MarketCalendar
+
+    try:
+        MarketCalendar.from_config(config)  # 시간표 형식 검증(시동 때 바로 알게)
+    except ValueError as exc:
+        raise ConfigError(f"market_hours/special_days: {exc}") from exc
     for underlying, symbol in config.symbols.items():
         if symbol.stock != underlying.krx_code:
             raise ConfigError(

@@ -43,6 +43,7 @@ from .fx_auction import FxAuctionController, FxAuctionSettings, HedgeAction
 from .gateways.base import HLGateway, PlaceResult
 from .gateways.hl import Mark
 from .gateways.hl_ws import HLWebSocketClient, OrderUpdate
+from .gateways.hl_ws_post import HLWsPostClient
 from .gateways.ls import LSApiGateway, OrderGoneError
 from .gateways.ls_tr import RestError
 from .gateways.ls_ws import (
@@ -60,6 +61,7 @@ from .limits import (
     qty_limit_error,
     would_exceed_daily_limit,
 )
+from .market_hours import MarketCalendar
 from .order_book import OrderBook, TrackedOrder
 from .quote_plan import FX_EXPECTED_TR, FX_NIGHT_TRADE_TR, FX_TRADE_TR, QuotePlanInput, plan
 from .risk import RiskManager, RiskState
@@ -146,13 +148,15 @@ def select_near_month_futures(rows: list[dict[str, object]]) -> dict[Underlying,
 
 
 def select_months(
-    rows: list[dict[str, object]], count: int = 2, now: datetime | None = None,
+    rows: list[dict[str, object]], close_time: time | None, count: int = 2,
+    now: datetime | None = None,
 ) -> dict[Underlying, list[tuple[str, int]]]:
     """t8401 마스터 행에서 underlying별 **근·차근 월물**(만기 오름차순 count개) — [(코드, YYYYMM)].
 
-    §5.11(2026-09-03): 롤 지난 월물(최종거래일 15:45 이후)은 제외한다 — 기존 select_near_month는
+    §5.11(2026-09-03): 롤 지난 월물(최종거래일 거래종료 이후)은 제외한다 — 기존 select_near_month는
     이 필터가 없어 만기일 저녁 재시동 시 만기월물을 "근"으로 잡았다. 원달러선물
-    select_usd_futures_months와 같은 모양. 순수 로직(now 주입).
+    select_usd_futures_months와 같은 모양. 순수 로직(now 주입). close_time = 주식선물 그날 마감
+    (config market_hours, DESIGN-market-hours §3) — 코드 기본값 없음.
     """
     moment = now if now is not None else datetime.now()
     base_to_underlying = {f"A{u.krx_code}": u for u in Underlying}
@@ -166,15 +170,15 @@ def select_months(
         if not (len(yyyymm) == 6 and yyyymm.isdigit()):
             continue
         ym = int(yyyymm)
-        if is_rolled(ym, "EQ", moment):
+        if is_rolled(ym, "EQ", moment, close_time):
             continue  # 만기 지난 월물
         found.setdefault(underlying, {}).setdefault(ym, str(row.get("shcode", "")))
     return {u: [(code, ym) for ym, code in sorted(months.items())][:count]
             for u, months in found.items()}
 
 
-# 환율 계산 시작 시각 — 이 전에는 판정용·정산용 환율을 만들지 않는다(exec 결정 47, 2026-09-28).
-FX_CALC_START = time(7, 30)
+# 환율 계산 시작 시각(exec 결정 47, 2026-09-28)은 config `fx_calc_start`(필수 항목) —
+# LiveSystem.calendar.fx_calc_start(DESIGN-market-hours §3, 옛 FX_CALC_START 상수 2026-11-10 이동).
 # 하나은행 고시환율(네이버 경유)은 시동 뒤 LS CUR를 받기 전까지만 현물환으로 쓴다(결정 70 —
 # 사용자 2026-10-16 정정: "LS CUR가 들어오면 9시 이전이라도 LS". 옛 09:00 경계 FX_HANA_UNTIL은
 # 오독이라 폐지)
@@ -322,6 +326,7 @@ class LiveSystem:
         deriv_ws: LSWebSocketClient | None = None,
         hl_gateway: HLGateway | None = None,
         hl_ws: HLWebSocketClient | None = None,
+        hl_ws_post: HLWsPostClient | None = None,
         futures_symbols: dict[Underlying, str] | None = None,
         etf_symbols: dict[Underlying, str] | None = None,
         futures_expiry: dict[tuple[Underlying, Instrument], int] | None = None,
@@ -332,8 +337,12 @@ class LiveSystem:
         fees: FeeRates | None = None,
         fx_fut_window: tuple[str, str] = ("08:45:00", "15:45:00"),
         board_ref_qty: int = 1,
+        calendar: MarketCalendar | None = None,
     ) -> None:
         self._gw = gateway
+        # 시장 시간표(config market_hours/special_days, DESIGN-market-hours) — 옛 하드코딩 대신.
+        # 안 주면 config.yaml에서 읽는다(코드 안에 기본 시각 없음 — 사용자 2026-11-10).
+        self.calendar = calendar if calendar is not None else MarketCalendar.load()
         # 취급 종목코드 (공개 — UI/도구가 상품 가용성 판단에 사용. 예: 현대차 ETF 없음)
         self.futures_symbols = dict(futures_symbols or {})            # 주식선물 근월물 코드
         self.next_futures_symbols = dict(next_futures_symbols or {})  # 차근월물 코드(§5.11)
@@ -377,6 +386,7 @@ class LiveSystem:
             (parse_hhmm(fx_fut_window[0]), parse_hhmm(fx_fut_window[1]))]
         self._hl = hl_gateway
         self._hl_ws = hl_ws
+        self._hl_ws_post = hl_ws_post  # 주문 전송용 WS(DESIGN-hl-ws-post) — run()은 _start_ws에서
         # HL cloid → 발주 의도(응답 대기 중). 응답보다 먼저 온 orderUpdates의 cloid로 oid를 식별해
         # 즉시 장부에 등록한다(DESIGN §HL cloid ①). 식별 시 (cloid, oid)를 아래 훅에 알린다.
         self._hl_pending: dict[str, OrderIntent] = {}
@@ -900,7 +910,7 @@ class LiveSystem:
         한 값: 외환선물 우선시간 **안** = 선물 역산현물가 → LS 현물환, **밖** = LS 현물환 → 선물
         역산현물가. 07:30 전은 계산하지 않음. 둘 다 없으면 None(그 체결은 환 없이 쌓임)."""
         moment = now if now is not None else datetime.now()
-        if moment.time() < FX_CALC_START:
+        if moment.time() < self.calendar.fx_calc_start:
             return None
         first, second = ((self.usdkrw_theory, self.usdkrw_spot)
                          if self.in_fx_fut_window(moment.time())
@@ -1778,6 +1788,10 @@ class LiveSystem:
         if self._hl_ws is not None:
             self._tasks.append(asyncio.create_task(
                 self._guarded_ws("HL", self._hl_ws.run, self._mark_ws_dead)))
+        if self._hl_ws_post is not None:
+            # 주문 WS가 영구 중단돼도 시동 실패 등급은 아니다 — HTTP로 계속 보내므로 on_dead 없음
+            self._tasks.append(asyncio.create_task(
+                self._guarded_ws("HL 주문", self._hl_ws_post.run)))
 
     def usdkrw_effective(self, now: datetime | None = None) -> tuple[float | None, str]:
         """판정용 환율(HL 환산·실시간 Sprd·역산가)과 출처 — exec 결정 47(사용자 확정 2026-09-28).
@@ -1786,7 +1800,7 @@ class LiveSystem:
         · **밖**: LS 현물환("현물") → 선물 역산현물가("선물역산") → 계산불가.
         계산불가면 자동M은 주문만 안 낸다(세트 중지 아님, exec §4 G0)."""
         moment = now if now is not None else datetime.now()
-        if moment.time() < FX_CALC_START:
+        if moment.time() < self.calendar.fx_calc_start:
             return None, "계산불가"
         in_window = self.in_fx_fut_window(moment.time())
         if not in_window and self.usdkrw_spot is not None:
@@ -1929,7 +1943,8 @@ class LiveSystem:
         # (하나고시 현물환은 _hana_spot_loop가 따로 — 결정 70, 2026-10-14.)
         while True:
             now = datetime.now()
-            if not 8 <= now.hour < 16:  # 세션 밖 — 마지막 값 유지
+            # 주간장 밖(시장 시간표 fx_futures, 특별일 덮어쓰기 포함) — 마지막 값 유지
+            if not self.calendar.is_open("fx_futures", now):
                 await asyncio.sleep(60.0)
                 continue
             try:
@@ -2085,7 +2100,7 @@ class LiveSystem:
         자리에 같은 객체가 들어가므로 **같은 객체는 한 줄만**(운영 PC 실측 2026-09-29: 'LS xing'이
         수신 건수까지 같은 채 두 줄로 보임).
         """
-        clients = [self._stock_ws, self._deriv_ws, self._hl_ws]
+        clients = [self._stock_ws, self._deriv_ws, self._hl_ws, self._hl_ws_post]
         seen: set[int] = set()
         out: list[WsStatus] = []
         for c in clients:
@@ -2500,6 +2515,12 @@ async def bootstrap_live(
     import logging as _logging
 
     _blog = _logging.getLogger("kp_arb.bootstrap")
+    # 시장 시간표(DESIGN-market-hours) — 특별 개장일이면 시동 로그에 한 줄(메인은 /state로 팝업)
+    calendar = MarketCalendar.from_config(config)
+    _today = date.today()
+    if calendar.special_name(_today):
+        _blog.warning("특별 개장일 %s — %s (사용자 입력 시각은 자동으로 안 바뀜)",
+                      calendar.special_name(_today), calendar.describe(_today))
     # LS 접근은 xingAPI 하나(DESIGN-ls-xing.md): COM 세션 하나(로그인은 여기서 1회, 끊기면
     # XingRealClient가 ensure_login으로 다시). OpenAPI REST/WS 경로·KP_LS_API 스위치는
     # 2026-11-09 제거(사용자 "REST 쓰는 곳 없으면 제거해").
@@ -2535,7 +2556,8 @@ async def bootstrap_live(
         # 조회 원본(진단) + 시동 계측: 토큰 발급 + 마스터 수신에 걸린 초, 프로세스 기준 초
         _blog.info("t8401 주식선물 마스터 %d행 수신 (%.1fs, 프로세스 시작 후 %.1fs)",
                    len(_fut_rows), _time.perf_counter() - _t_master, _since())
-        months = select_months(_fut_rows, count=2)
+        months = select_months(
+            _fut_rows, calendar.close_time("stock_futures", _today), count=2)
     except Exception:  # noqa: BLE001 - 조회 실패는 종목 로드 실패(팝업)로 이어진다
         _blog.warning("주식선물 월물(t8401) 조회 실패", exc_info=True)
         months = {}
@@ -2560,8 +2582,8 @@ async def bootstrap_live(
         from datetime import datetime
 
         fx_months = select_usd_futures_months(
-            await gateway.fetch_commodity_master(), datetime.now(), count=2
-        )
+            await gateway.fetch_commodity_master(), datetime.now(),
+            calendar.close_time("fx_futures", _today), count=2)
         fx_futures = fx_months[0] if fx_months else None
     except Exception:  # noqa: BLE001 - 환율이론가 없이 계속(HL 괴리만 빈값)이되, 실패는 남긴다
         _blog.warning("원달러선물 월물(commodity) 조회 실패 — 환율이론가 빈값", exc_info=True)
@@ -2579,12 +2601,21 @@ async def bootstrap_live(
     # HL 슬롯 — 비밀(HL_AGENT_KEY/HL_ACCOUNT_ADDRESS) 없으면 LS-only.
     hl_gateway = None
     hl_ws = None
+    hl_ws_post: HLWsPostClient | None = None
     try:
         hl_gateway = HLSdkGateway.from_secrets(symbols=config.hl_symbols())
         hl_ws = HLWebSocketClient(
             HLWebSocketConnector(), symbols=config.hl_symbols(),
             max_reconnects=1_000_000, reconnect_backoff_s=2.0,
         )
+        if config.hl_ws_post:  # 주문 전송 WS(DESIGN-hl-ws-post) — 별도 연결, 미접속이면 HTTP
+            from .gateways.hl_ws_post import HLWsPostConnector
+
+            hl_ws_post = HLWsPostClient(HLWsPostConnector(), reconnect_backoff_s=2.0)
+            if not hl_gateway.attach_ws_post(hl_ws_post):
+                hl_ws_post = None
+        else:
+            _blog.info("HL 주문 전송: HTTP(config hl_ws_post=false)")
         _hl_addr = str(default_secrets().get("HL_ACCOUNT_ADDRESS"))
         hl_ws.subscribe_user_fills(_hl_addr)
         hl_ws.subscribe_order_updates(_hl_addr)  # 취소·자동취소 실시간 → OrderBook 정합
@@ -2627,6 +2658,7 @@ async def bootstrap_live(
         deriv_ws=deriv_ws,
         hl_gateway=hl_gateway,
         hl_ws=hl_ws,
+        hl_ws_post=hl_ws_post,
         futures_symbols=futures_symbols,
         etf_symbols=etf_symbols,
         futures_expiry=futures_expiry,
@@ -2637,6 +2669,7 @@ async def bootstrap_live(
         fees=config.fees,
         fx_fut_window=(config.fx_fut_window.start, config.fx_fut_window.end),
         board_ref_qty=config.disparity.ref_qty,
+        calendar=calendar,
     )
     system.closers.append(xing_real.stop)      # 실시간 루프 정지
     system.closers.append(xing_session.close)  # COM 스레드 종료

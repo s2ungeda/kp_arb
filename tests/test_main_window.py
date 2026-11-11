@@ -6,10 +6,35 @@ import pytest
 
 from kp_arb.main_window import (
     _restart_step,
+    auto_shutdown_due,
+    hms_seconds,
     launch_command,
     layout_choices,
     screens_to_save,
 )
+
+
+def test_hms_seconds_parses_and_rejects() -> None:
+    assert hms_seconds("00:00:00") == 0
+    assert hms_seconds(" 15:40:05 ") == 15 * 3600 + 40 * 60 + 5
+    for bad in ("15:40", "24:00:00", "12:60:00", "abc", ""):
+        with pytest.raises(ValueError):
+            hms_seconds(bad)
+
+
+def test_auto_shutdown_due_only_when_crossing_target() -> None:
+    # DESIGN-settings §2b — 지난 틱 < 설정 시각 ≤ 이번 틱일 때만 참.
+    t = hms_seconds("15:40:00")
+    assert auto_shutdown_due(None, t + 10, t) is False        # 첫 틱(기준만) — 시각 뒤에 켜도 안 끔
+    assert auto_shutdown_due(t - 1, t, t) is True             # 정확히 도달
+    assert auto_shutdown_due(t - 1, t + 2, t) is True         # 틱이 건너뛰어도(2초) 잡음
+    assert auto_shutdown_due(t, t + 1, t) is False            # 이미 지난 뒤엔 다시 안 끔
+    assert auto_shutdown_due(t + 5, t + 6, t) is False        # 지난 시각으로 바꿔도 즉시 안 끔
+    assert auto_shutdown_due(t - 5, t - 4, t) is False        # 아직 전
+    # 자정 넘김: 23:59:59 → 00:00:01, 설정 00:00:00
+    assert auto_shutdown_due(86399, 1, 0) is True
+    assert auto_shutdown_due(86398, 0, 86399) is True         # 23:59:59도 자정 틱에서 잡음
+    assert auto_shutdown_due(86399, 1, 30) is False           # 00:00:30은 아직 전
 
 
 def test_layout_choices_lists_generations_with_names() -> None:

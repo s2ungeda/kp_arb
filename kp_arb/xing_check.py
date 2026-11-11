@@ -19,6 +19,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,7 @@ async def _main(seconds: float) -> int:  # noqa: PLR0915 - 점검 순서를 한 
     from .gateways.xing import XingGateway
     from .gateways.xing_com import Win32ComFactory, XingSession
     from .gateways.xing_ws import XingRealClient
+    from .market_hours import MarketCalendar
     from .theory import select_usd_futures_months
 
     results: list[CheckResult] = []
@@ -109,6 +111,14 @@ async def _main(seconds: float) -> int:  # noqa: PLR0915 - 점검 순서를 한 
         session.close()
         return 1
     results.append(CheckResult("계좌 설정", True, "주식·선물 계좌 키 있음"))
+    try:
+        # 월물 롤오버 시각은 config.yaml 시장 시간표(DESIGN-market-hours)
+        calendar = MarketCalendar.load()
+    except ConfigError as exc:
+        results.append(CheckResult("config.yaml 시장 시간표", False, str(exc)))
+        print(render_report(results))
+        session.close()
+        return 1
 
     # --- 조회 TR (코어와 같은 본문) — 마스터 → 월물 → 계좌·시세 ---
     gw = XingGateway.from_session(session, accounts, res_dir=res_dir)
@@ -124,15 +134,15 @@ async def _main(seconds: float) -> int:  # noqa: PLR0915 - 점검 순서를 한 
 
     async def _commodity() -> list[tuple[str, int]]:
         nonlocal fx_months
-        from datetime import datetime
-
         rows = await gw.fetch_commodity_master()
-        fx_months = select_usd_futures_months(rows, datetime.now(), count=2)
+        fx_months = select_usd_futures_months(
+            rows, datetime.now(), calendar.close_time("fx_futures", date.today()), count=2)
         return fx_months
 
     results.append(await _timed("t8401 주식선물 마스터", _master))
     if fut_rows:
-        months = select_months(fut_rows, count=2)
+        months = select_months(
+            fut_rows, calendar.close_time("stock_futures", date.today()), count=2)
         for u, picked in months.items():
             if picked:
                 futures_symbols[u] = picked[0][0]

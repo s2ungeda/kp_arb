@@ -65,12 +65,14 @@ def next_month_window(yyyymm: int, product: str, today: date,
                    f"지금 {left}영업일 남음")
 
 
-def is_rolled(yyyymm: int, product: str, now: datetime) -> bool:
-    """해당 월물이 롤오버 시점(최종거래일 15:45)을 지났는가."""
+def is_rolled(yyyymm: int, product: str, now: datetime, close_time: time | None) -> bool:
+    """해당 월물이 롤오버 시점(최종거래일 거래종료)을 지났는가. close_time은 시장 시간표(config
+    market_hours, DESIGN-market-hours §3)에서 그날 마감 — 코드 기본값 없음. None(그날 그 시장
+    없음)이면 날짜가 지나야 롤."""
     exp = expiry_date(yyyymm, product)
     if now.date() > exp:
         return True
-    return now.date() == exp and (now.hour * 60 + now.minute) >= 15 * 60 + 45
+    return close_time is not None and now.date() == exp and now.time() >= close_time
 
 
 def parse_hhmm(text: str) -> time:
@@ -150,12 +152,13 @@ def parse_ym(hname: str) -> int | None:
 
 
 def select_usd_futures_months(
-    rows: list[dict[str, object]], now: datetime, count: int = 2
+    rows: list[dict[str, object]], now: datetime, close_time: time | None, count: int = 2,
 ) -> list[tuple[str, int]]:
     """t8426(상품선물 마스터) 행에서 미국달러선물 **가까운 월물부터 count개** [(shcode, yyyymm)].
 
     "미국달러 ... F ..." 월물만(스프레드 SP 제외), 롤오버 지난 월물 제외, 만기 오름차순.
-    최근월물=[0], 차근월물=[1] (환헤지 월물 선택용 — DESIGN §9.1).
+    최근월물=[0], 차근월물=[1] (환헤지 월물 선택용 — DESIGN §9.1). close_time = 원달러선물
+    그날 마감(config market_hours, DESIGN-market-hours §3) — 코드 기본값 없음.
     """
     candidates: list[tuple[int, str]] = []
     for row in rows:
@@ -170,7 +173,7 @@ def select_usd_futures_months(
             candidates.append((ym, shcode))
     out: list[tuple[str, int]] = []
     for ym, shcode in sorted(candidates):
-        if not is_rolled(ym, "USD", now):
+        if not is_rolled(ym, "USD", now, close_time):
             out.append((shcode, ym))
             if len(out) >= count:
                 break
@@ -192,8 +195,8 @@ def pick_fx_futures(
 
 
 def select_usd_futures(
-    rows: list[dict[str, object]], now: datetime
+    rows: list[dict[str, object]], now: datetime, close_time: time | None
 ) -> tuple[str, int] | None:
     """미국달러선물 **최근월물** (shcode, yyyymm). = ``select_usd_futures_months(..)[0]``."""
-    months = select_usd_futures_months(rows, now, count=1)
+    months = select_usd_futures_months(rows, now, close_time, count=1)
     return months[0] if months else None

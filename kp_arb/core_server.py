@@ -53,6 +53,7 @@ from .strategy_core import (
     CoreState,
     ScreenKind,
     ScreenState,
+    apply_auto_shutdown,
     apply_disconnect_actions,
     parse_operating_hours,
     state_from_dict,
@@ -432,6 +433,8 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
                     snd.path = str(raw.get("path", snd.path))
             # LS 끊김 때 할 일(DESIGN-settings §2a, 2026-10-14) — 키 없으면 기존 값 유지
             apply_disconnect_actions(g.ls_disconnect, body.get("ls_disconnect"))
+            # 자동종료(§2b, 2026-11-10) — 켬인데 시각 형식이 틀리면 ValueError → 거부
+            apply_auto_shutdown(g.auto_shutdown, body.get("auto_shutdown"))
             return _ok()
         if cmd == "fx_month":  # 환율 표시용 원달러선물 월물 (§6.2-7)
             choice = str(body["choice"])
@@ -1611,6 +1614,11 @@ def make_app(
         # 시동 실패 — 코어 조립 실패(boot_errors) + 순차 로드 실패(종목/종목정보/잔고/포지션/
         # 주문) + WS 채널 죽음. 있으면 메인창이 "…재접속하세요" 팝업 후 종료.
         payload["pid"] = os.getpid()  # 메인이 코어를 Job Object에 묶는 데 씀(2겹, 2026-09-29)
+        # 오늘 시장 시간표·특별 개장일(DESIGN-market-hours §4) — 메인이 시동 때 팝업
+        from datetime import date as _date
+
+        payload["market_day"] = (system.calendar.snapshot(_date.today())
+                                 if system is not None else None)
         payload["load_errors"] = boot_errors + (
             [system.startup_load_error]
             if system is not None and system.startup_load_error else [])

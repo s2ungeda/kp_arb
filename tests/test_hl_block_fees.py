@@ -7,12 +7,14 @@ from kp_arb.hl_block_fees import (
     fee_bucket,
     find_block_at,
     format_block_line,
+    format_fill,
     format_summary,
     format_users,
     merge_summaries,
     merge_users,
     priority_of,
     summarize_block,
+    summarize_fills,
     tif_of,
     top_paid_assets,
 )
@@ -63,7 +65,7 @@ def test_summarize_block_counts_by_tif_and_finds_mine() -> None:
     assert s.by_tif["Alo"] == {"p 1~99(≈0, 줄서기)": 1}
     assert s.by_tif["Gtc"] == {"없음(na)": 1}
     assert s.max_p == {"Alo": 7, "Ioc": 80000}
-    assert [i for i, _ in s.mine] == [3]
+    assert [i for i, _a, _h in s.mine] == [3]
     line = format_block_line(s)
     assert "블록 1208130639" in line and "내 tx 위치 [3]" in line
     assert "주문     4(수수료 있음     3)" in line
@@ -144,3 +146,26 @@ def test_user_behaviour_classification() -> None:
     # 종목 필터 땐 취소를 주소별로 안 센다(자산을 몰라서)
     s2 = summarize_block(1, block, None, assets={110022})
     assert s2.by_user["0xlp"].cancels == 0 and s2.n_cancels == 2
+
+
+def test_summarize_fills_groups_pieces_by_tx_hash() -> None:
+    # 체인 체결(userFillsByTime)은 조각마다 원인 주문의 tx 해시가 붙는다 — 해시별로 수량 가중
+    # 평균가·조각 수·시각·수수료를 합친다(11-04 실측: 매도 100이 11조각 1083.727).
+    fills = [
+        {"hash": "0xaa", "oid": 1, "coin": "xyz:SKHX", "side": "A", "sz": "60", "px": "1084",
+         "time": 1000, "crossed": True, "fee": "5", "feeToken": "USDC"},
+        {"hash": "0xaa", "oid": 1, "coin": "xyz:SKHX", "side": "A", "sz": "40", "px": "1083",
+         "time": 1000, "crossed": True, "fee": "3.4", "feeToken": "USDC"},
+        {"hash": "0xbb", "oid": 2, "coin": "xyz:SKHX", "side": "B", "sz": "1", "px": "1082.6",
+         "time": 2000, "crossed": False, "fee": "0.08", "feeToken": "USDC"},
+        {"hash": "", "oid": 3, "sz": "1", "px": "1"},  # 해시 없는 조각은 뺀다
+    ]
+    out = summarize_fills(fills)
+    assert set(out) == {"0xaa", "0xbb"}
+    a = out["0xaa"]
+    assert (a.qty, a.pieces, a.crossed, a.fee) == (100.0, 2, True, 8.4)
+    assert round(a.avg_px, 3) == 1083.6
+    line = format_fill(a)
+    assert line.startswith("체결 매도 100 @평균 1,083.600 (2조각, ")
+    assert "테이커) 수수료 8.4000 USDC #1" in line
+    assert "메이커" in format_fill(out["0xbb"])
