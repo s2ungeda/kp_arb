@@ -167,6 +167,15 @@ class AutoShutdown:
 
 
 @dataclass
+class BalanceWatch:
+    """토탈잔고 감시(DESIGN-balance-watch.md, 사용자 2026-11-11) — 비교잔고배수 선을 넘으면
+    텔레그램. 판정·전송은 코어(balance_watch_loop), 기준값은 저장 안 함(시동 값)."""
+
+    enabled: bool = True  # 기본 켬(사용자 2026-11-11)
+    step: int = 150       # 비교잔고배수(주 단위) — 켬이면 양의 정수. 기본 150(사용자 2026-11-11)
+
+
+@dataclass
 class SoundSetting:
     """알람 사운드 1종 — 재생 여부 + wav 파일 경로 (DESIGN-settings §2)."""
 
@@ -212,6 +221,8 @@ class GlobalSettings:
     ls_disconnect: DisconnectActions = field(default_factory=DisconnectActions)
     # 자동종료(§2b, 2026-11-10) — 판정·실행은 메인 창
     auto_shutdown: AutoShutdown = field(default_factory=AutoShutdown)
+    # 토탈잔고 감시(DESIGN-balance-watch, 2026-11-11) — 판정·전송은 코어
+    balance_watch: BalanceWatch = field(default_factory=BalanceWatch)
 
 
 @dataclass
@@ -419,6 +430,26 @@ def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
         apply_auto_shutdown(s.auto_shutdown, raw.get("auto_shutdown"))
     except ValueError:  # 저장본의 시각이 깨졌으면 그 항목만 기본값(끔)
         s.auto_shutdown = AutoShutdown()
+    try:
+        apply_balance_watch(s.balance_watch, raw.get("balance_watch"))
+    except ValueError:  # 저장본의 배수가 깨졌으면 그 항목만 기본값(끔)
+        s.balance_watch = BalanceWatch()
+
+
+def apply_balance_watch(b: BalanceWatch, raw: object) -> None:
+    """`balance_watch` dict → 설정(DESIGN-balance-watch §3). 없거나 dict가 아니면 그대로.
+    켬인데 배수가 양의 정수가 아니면 ValueError(명령은 거부, 저장본 복원은 기본값)."""
+    if not isinstance(raw, dict):
+        return
+    enabled = raw.get("enabled", b.enabled)
+    step = raw.get("step", b.step)
+    if not isinstance(enabled, bool) or isinstance(step, bool) or not isinstance(step, int | float):
+        raise ValueError("잔고감시 값 오류")
+    if step != int(step) or step < 0:
+        raise ValueError("비교잔고배수는 0 이상의 정수")
+    if enabled and step <= 0:
+        raise ValueError("잔고감시를 켜려면 비교잔고배수를 1 이상으로")
+    b.enabled, b.step = enabled, int(step)
 
 
 def apply_auto_shutdown(a: AutoShutdown, raw: object) -> None:

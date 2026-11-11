@@ -40,6 +40,17 @@ _DISCONNECT_ACTIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+def parse_balance_step(text: str) -> int:
+    """비교잔고배수 입력(DESIGN-balance-watch §3) → 0 이상의 정수. 빈 칸 = 0. 소수·음수·글자는
+    ValueError."""
+    raw = text.replace(",", "").strip()
+    if not raw:
+        return 0
+    if not raw.isdigit():
+        raise ValueError("비교잔고배수는 0 이상의 정수")
+    return int(raw)
+
+
 def is_time_text(text: str) -> bool:
     """'HH:MM:SS'(또는 'HH:MM') 형식 검사(00~23시, 00~59분·초) — 외환선물 우선시간 입력용.
     순수 로직. (초 단위는 사용자 2026-09-28.)"""
@@ -267,6 +278,22 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(as_frame, text="HH:MM:SS · 지나면 메인·화면·코어 모두 종료(확인창 없음)",
              fg=T.C_MUTED).pack(side="left", padx=(8, 0))
 
+    # 잔고감시(DESIGN-balance-watch §3, 사용자 2026-11-11) — 입력만. 기준·현재 토탈잔고는 메인 창
+    # '기준 N  잔고 : M' 한 줄. 판정·텔레그램은 코어.
+    bw_row = as_row + 1
+    tk.Label(form, text="잔고감시").grid(row=bw_row, column=0, sticky="w", pady=(6, 2))
+    bw_frame = tk.Frame(form)
+    bw_frame.grid(row=bw_row, column=1, columnspan=3, sticky="w", padx=6, pady=(6, 2))
+    var_bw = tk.BooleanVar(value=True)  # 기본 켬·150(사용자 2026-11-11) — 코어 값이 오면 덮임
+    tk.Checkbutton(bw_frame, text="켬", variable=var_bw, anchor="w").pack(
+        side="left", padx=(0, 10))
+    tk.Label(bw_frame, text="비교잔고배수").pack(side="left")
+    e_bw_step = tk.Entry(bw_frame, width=8, justify="right")
+    e_bw_step.insert(0, "150")
+    e_bw_step.pack(side="left", padx=(4, 0))
+    tk.Label(bw_frame, text="주 · 토탈잔고가 배수만큼 오르내리면 텔레그램",
+             fg=T.C_MUTED).pack(side="left", padx=(8, 0))
+
     btn = tk.Button(root, text="저장", width=12, font=T.FONT_STRONG)
     btn.pack(pady=(0, 8))
 
@@ -292,6 +319,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         if var_as.get() and not is_time_text(as_time):
             set_status("자동종료 시각은 HH:MM:SS 형식으로 입력하세요", err=True)
             return
+        try:
+            bw_step = parse_balance_step(e_bw_step.get())
+        except ValueError as exc:
+            set_status(str(exc), err=True)
+            return
+        if var_bw.get() and bw_step <= 0:
+            set_status("잔고감시를 켜려면 비교잔고배수를 1 이상으로 입력하세요", err=True)
+            return
         payload: dict[str, Any] = {
             "cmd": "settings_global", "hl_daily_limit_usdc": limit,
             "hl_price_limit_pct": risk_pct, "hl_max_qty_per_order": risk_qty,
@@ -306,6 +341,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                             "path": r["entry"].get().strip()}
         payload["ls_disconnect"] = {k: bool(v.get()) for k, v in dc_vars.items()}
         payload["auto_shutdown"] = {"enabled": bool(var_as.get()), "time": as_time}
+        payload["balance_watch"] = {"enabled": bool(var_bw.get()), "step": bw_step}
         payload["quote_symbols"] = {k: bool(v.get()) for k, v in qs_vars.items()}
         send(payload, "저장")
 
@@ -367,6 +403,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             var_as.set(bool(a_s.get("enabled", False)))
             e_as_time.delete(0, "end")
             e_as_time.insert(0, str(a_s.get("time", "") or ""))
+            b_w = settings.get("balance_watch") or {}
+            var_bw.set(bool(b_w.get("enabled", True)))
+            e_bw_step.delete(0, "end")
+            e_bw_step.insert(0, str(b_w.get("step", 150)))
         # 시세 구독 종목 — 코어가 자동으로 켠 것(다른 화면의 종목 선택)이 열린 창에도 보이게, 코어
         # 값이 지난번과 다르면 그 종목 체크만 따라간다(사용자가 손대 둔 다른 종목은 안 덮음).
         if isinstance(settings, dict):

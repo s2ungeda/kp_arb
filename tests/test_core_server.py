@@ -296,6 +296,36 @@ def test_settings_global_auto_shutdown(tmp_path: Path) -> None:
     assert not broken.settings.auto_shutdown.enabled
 
 
+def test_settings_global_balance_watch() -> None:
+    # DESIGN-balance-watch §3(사용자 2026-11-11) — 켬+배수 저장, 켬인데 배수 ≤ 0·소수·음수 거부,
+    # 끔이면 배수 0 허용, 키 없으면 유지, 저장본 복원도 같은 규칙
+    state = CoreState()
+    bw = state.settings.balance_watch
+    assert (bw.enabled, bw.step) == (True, 150)  # 기본 켬·150(사용자 2026-11-11)
+    assert apply_command(state, {"cmd": "settings_global",
+                                 "balance_watch": {"enabled": True, "step": 200}})["ok"]
+    assert (bw.enabled, bw.step) == (True, 200)
+    assert apply_command(state, {"cmd": "settings_global",
+                                 "balance_watch": {"enabled": True, "step": 150}})["ok"]
+    for bad in ({"enabled": True, "step": 0}, {"enabled": True, "step": -1},
+                {"enabled": True, "step": 1.5}, {"enabled": "yes", "step": 1}):
+        assert not apply_command(state, {"cmd": "settings_global", "balance_watch": bad})["ok"]
+        assert (bw.enabled, bw.step) == (True, 150)
+    assert apply_command(state, {"cmd": "settings_global",
+                                 "balance_watch": {"enabled": False, "step": 0}})["ok"]
+    assert (bw.enabled, bw.step) == (False, 0)
+    assert apply_command(state, {"cmd": "settings_global", "hl_daily_limit_usdc": 1})["ok"]
+    assert (bw.enabled, bw.step) == (False, 0)  # 키 없으면 유지
+    restored = CoreState()
+    _global_settings_from_dict(restored.settings, {"balance_watch": {"enabled": True, "step": 300}})
+    assert (restored.settings.balance_watch.enabled, restored.settings.balance_watch.step) == (
+        True, 300)
+    broken = CoreState()
+    _global_settings_from_dict(broken.settings, {"balance_watch": {"enabled": True, "step": 0}})
+    assert (broken.settings.balance_watch.enabled, broken.settings.balance_watch.step) == (
+        True, 150)
+
+
 def test_load_state_missing_or_corrupt(tmp_path: Path) -> None:
     assert load_state(tmp_path / "none.json").fx_month == "near"
     bad = tmp_path / "bad.json"

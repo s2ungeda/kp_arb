@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 from pydantic import ValidationError
 
+from .balance_watch import BalanceWatcher, balance_watch_loop
 from .domain.enums import Account, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import OrderIntent, Quote
 from .fx_auction import FxAuctionSettings
@@ -54,6 +55,7 @@ from .strategy_core import (
     ScreenKind,
     ScreenState,
     apply_auto_shutdown,
+    apply_balance_watch,
     apply_disconnect_actions,
     parse_operating_hours,
     state_from_dict,
@@ -435,6 +437,8 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
             apply_disconnect_actions(g.ls_disconnect, body.get("ls_disconnect"))
             # 자동종료(§2b, 2026-11-10) — 켬인데 시각 형식이 틀리면 ValueError → 거부
             apply_auto_shutdown(g.auto_shutdown, body.get("auto_shutdown"))
+            # 토탈잔고 감시(DESIGN-balance-watch §3) — 켬인데 배수 ≤ 0이면 ValueError → 거부
+            apply_balance_watch(g.balance_watch, body.get("balance_watch"))
             return _ok()
         if cmd == "fx_month":  # 환율 표시용 원달러선물 월물 (§6.2-7)
             choice = str(body["choice"])
@@ -1573,6 +1577,7 @@ def make_app(
     autom_hl_first: AutoMEngine | None = None,  # 주식선물 HL선 엔진(exec §7D 시험, 2026-09-22)
     nxt_open: NxtOpenEngine | None = None,  # 오전 NXT 개장 매매 엔진(DESIGN-nxt-open, 2026-10-20)
     auction: AuctionOrderEngine | None = None,  # 동시호가 주문 엔진(DESIGN-auction-order, 10-26)
+    balance: BalanceWatcher | None = None,  # 토탈잔고 감시(DESIGN-balance-watch, 11-11) — 기준·현재
 ) -> web.Application:
     """API 앱 조립 — 화면이 붙는 유일한 창구. on_shutdown = 종료 훅, save = 저장 훅.
 
@@ -1631,6 +1636,9 @@ def make_app(
         payload["nxt_open_live"] = nxt_open.live_snapshot() if nxt_open is not None else {}
         # 동시호가 주문 실시간(예상주문가·발주 결과·환·HL 행) — 설정은 payload["auction"]
         payload["auction_live"] = auction.live_snapshot() if auction is not None else {}
+        # 토탈잔고(DESIGN-balance-watch §3) — 메인 창 '기준 N  잔고 : M'. 시동 전·실패면 None
+        payload["balance"] = {"baseline": balance.baseline if balance is not None else None,
+                              "total": balance.total if balance is not None else None}
         return payload
 
     if hub is not None and hub.state_provider is None:
@@ -1871,6 +1879,7 @@ async def _serve() -> None:
         autom_engine_hl_first = None
         nxt_open_engine = None
         auction_engine = None
+        balance_watcher: BalanceWatcher | None = None
         tasks: list[asyncio.Task[None]] = []
         boot_errors: list[str] = []  # 코어 조립 실패 사유 → /state load_errors → 메인창 팝업
         try:
@@ -1936,6 +1945,15 @@ async def _serve() -> None:
 
             tasks.append(asyncio.create_task(pair_check_loop(
                 system.order_book.positions, lambda: state.autom.books)))
+            # 토탈잔고 감시(DESIGN-balance-watch, 사용자 2026-11-11): 1초마다 장부로 재고 배수
+            # 선을 넘으면 텔레그램(종류 balance). 종목 = config symbols(= 주식선물 코드가 있는
+            # 종목 전부).
+            balance_watcher = BalanceWatcher()
+            tasks.append(asyncio.create_task(balance_watch_loop(
+                system.order_book.positions, list(system.futures_symbols),
+                lambda: (state.settings.balance_watch.enabled,
+                         float(state.settings.balance_watch.step)),
+                balance_watcher, partial(_tg.notify, category="balance"))))
             # 텔레그램 수신(2026-09-21, 수신만) — 봇에 온 글을 로그에 남기고 "수신: …" 답장.
             # 명령 실행은 아직 없다. 토큰·chat_id 미설정이면 바로 끝난다.
             from .telegram_rx import TelegramReceiver, log_and_ack
@@ -1956,7 +1974,7 @@ async def _serve() -> None:
             system=system, engine=engine, fx_service=fx_service,
             boot_errors=boot_errors, hub=hub, autom=autom_engine,
             autom_stock=autom_engine_stock, autom_hl_first=autom_engine_hl_first,
-            nxt_open=nxt_open_engine, auction=auction_engine),
+            nxt_open=nxt_open_engine, auction=auction_engine, balance=balance_watcher),
             access_log=None)
         await runner.setup()
         if system is not None:  # LS 구독 계획(§9) — 저장된 설정(종목 체크·월물)대로 등록

@@ -262,6 +262,9 @@ def hms_seconds(text: str) -> int:
     return h * 3600 + m * 60 + s
 
 
+CORE_DOWN_TEXT = "코어 미접속 — 자동 재시동 대기(안 오르면 메인을 다시 시작)"  # 상태줄(2026-11-11)
+
+
 def auto_shutdown_due(prev_s: int | None, now_s: int, target_s: int) -> bool:
     """자동종료 시각을 '지나는 순간'인가(순수, DESIGN-settings §2b). 값은 하루 중 초.
 
@@ -628,6 +631,7 @@ def main() -> None:
                 # 자동종료 설정(DESIGN-settings §2b) — 화면 루프(시계 틱)가 읽어 판정
                 alive_box["auto_shutdown"] = ((data or {}).get("settings") or {}).get(
                     "auto_shutdown")
+                alive_box["balance"] = (data or {}).get("balance") or {}  # 토탈잔고 기준·현재
                 # 특별 개장일(수능일 등, config special_days) — 처음 한 번 팝업 + 로그. 사용자
                 # 입력 시각은 코드가 안 바꾸므로(사용자 2026-11-10) 직접 확인하라고 알린다.
                 md = (data or {}).get("market_day") or {}
@@ -765,22 +769,29 @@ def main() -> None:
         except (AttributeError, OSError, tk.TclError):
             pass
 
-    # width=1: 글 길이가 창 폭을 정하지 않게(크기 조절 허용 뒤, 2026-10-15) — 남는 폭은 fill로
-    lbl_core = tk.Label(root, text="코어: 확인 중 ...", anchor="w", width=1)
-    lbl_core.pack(fill="x", padx=8, pady=(8, 2))
-    # LS 처리 지연 띠 — 지연 동안만 맨 위(사용자 2026-10-26; 표의 "멈춤" 글만으론 못 보고 지나감)
-    from .ui_status import StallBanner, ls_stalled
-
-    banner = StallBanner(root, ("Malgun Gothic", 10, "bold"),
-                         lambda wd: wd.pack(fill="x", before=lbl_core))
+    # '코어: 연결됨 …' 줄은 2026-11-11 사용자 지시로 없앰(WS 표 '메인 채널'·상태줄과 겹침). 미접속
+    # 안내는 아래 상태줄에 빨간 글로.
     bottom = tk.Frame(root)
-    bottom.pack(fill="x", padx=8, pady=(2, 8))
+    bottom.pack(fill="x", padx=8, pady=(8, 2))
+    # width=1: 글 길이가 창 폭을 정하지 않게(크기 조절 허용 뒤, 2026-10-15) — 남는 폭은 fill로
     status = tk.Label(bottom, text="-", anchor="w", relief="groove", width=1)
     status.pack(side="left", fill="x", expand=True)
     # 현재 시각(사용자 2026-10-15) — 체결쏴 주문가능시간 구간이 시각으로 바뀌니 한눈에 보게
     lbl_clock = tk.Label(bottom, text="00:00:00", anchor="e", relief="groove", width=8)
     lbl_clock.pack(side="right", padx=(4, 0))
+    # 토탈잔고(DESIGN-balance-watch §3, 사용자 2026-11-11 "기준 300  잔고 : 500 이렇게만", 상태줄
+    # 아래) — 코어 /state의 balance(기준·현재)를 2초 폴링 값으로 보여 준다. 판정·텔레그램은 코어.
+    from .balance_watch import format_main_line
 
+    lbl_balance = tk.Label(root, text=format_main_line(None, None), anchor="w", width=1)
+    lbl_balance.pack(fill="x", padx=8, pady=(0, 6))
+    # LS 처리 지연 띠 — 지연 동안만 맨 위(사용자 2026-10-26; 표의 "멈춤" 글만으론 못 보고 지나감)
+    from .ui_status import StallBanner, ls_stalled
+
+    banner = StallBanner(root, ("Malgun Gothic", 10, "bold"),
+                         lambda wd: wd.pack(fill="x", before=bottom))
+
+    status_fg = status.cget("fg")  # 미접속 빨간 글 뒤 되돌릴 기본 글자색
     auto_box: dict[str, Any] = {"prev": None, "logged": None}
 
     def check_auto_shutdown() -> None:
@@ -969,12 +980,14 @@ def main() -> None:
 
                 show_message(root, popup[0], popup[1])
             if alive_box["alive"]:
-                lbl_core.config(text="코어: 연결됨 (127.0.0.1:8787)", fg="dark green")
-                if status.cget("text") == "코어 시작 중 ...":  # 시작 요청 → 실제 연결 확인
-                    status.config(text="코어 시작 완료")
+                # 시작 요청·미접속 안내 → 실제 연결 확인(다른 글은 그대로)
+                if status.cget("text") in ("코어 시작 중 ...", CORE_DOWN_TEXT):
+                    status.config(text="코어 시작 완료", fg=status_fg)
+                bal = alive_box.get("balance") or {}
+                lbl_balance.config(text=format_main_line(bal.get("baseline"), bal.get("total")))
             else:
-                lbl_core.config(text="코어: 미접속 — 자동 재시동 대기(안 오르면 메인을 다시 시작)",
-                                fg="#8b0000")
+                status.config(text=CORE_DOWN_TEXT, fg="#8b0000")
+                lbl_balance.config(text=format_main_line(None, None))
             render_ws()
         finally:
             try:

@@ -3,6 +3,7 @@ from kp_arb.settings_window import (
     _fmt_amount,
     fx_month_code,
     fx_month_label,
+    parse_balance_step,
     quote_symbol_changes,
 )
 
@@ -36,3 +37,14 @@ def test_quote_symbol_checks_follow_core_changes_only() -> None:
         "sk_hynix": True}
     assert quote_symbol_changes(seen, dict(seen)) == {}
     assert quote_symbol_changes(seen, None) == {} and quote_symbol_changes(seen, "x") == {}
+
+
+def test_parse_balance_step_integer_only() -> None:
+    # DESIGN-balance-watch §3 — 빈 칸 0, 천 단위 쉼표 허용, 소수·음수·글자 거부
+    import pytest
+
+    assert parse_balance_step("") == 0 and parse_balance_step(" 150 ") == 150
+    assert parse_balance_step("1,500") == 1500
+    for bad in ("1.5", "-1", "abc", "+3"):
+        with pytest.raises(ValueError):
+            parse_balance_step(bad)
