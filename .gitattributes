@@ -1,0 +1,4 @@
+# 줄바꿈 고정(2026-11-12): core.autocrlf=true인 PC에서 새로 받으면 .sh가 CRLF가 돼 bash 훅·check.sh가
+# 깨진다('\r' 명령 오류). .bat는 cmd용이라 CRLF(CLAUDE.md §7).
+*.sh  text eol=lf
+*.bat text eol=crlf
