@@ -1,5 +1,5 @@
 {
-  "_comment": "예시. PostToolUse 훅 스키마는 Claude Code 버전마다 다를 수 있으니 공식 문서에서 현재 문법을 확인할 것.",
+  "_comment": "Claude Code 프로젝트 설정(공유). 2026-11-12 공식 문서(code.claude.com/docs permissions·hooks) 문법으로 확인·개편. 되돌리기: 훅 커밋을 git revert, 급하면 여기에 \"disableAllHooks\": true 한 줄(훅만 끔, deny는 유지).",
   "_deny_comment": "permissions.deny(2026-11-12): .env 읽기 / 배포판 exe / 실접속 배치와 그 속 모듈(-m kp_arb.*) / HL 실주문 프로브 / NXT 개장 실측 프로브. CLAUDE.md §7 중 명령 패턴으로 막을 수 있는 것만. deny는 allow·모드·훅보다 우선하고 승인으로도 못 푼다.",
   "permissions": {
     "deny": [
@@ -37,12 +37,22 @@
       "PowerShell(*probe_nxt_open*)"
     ]
   },
+  "_hooks_comment": "2026-11-12: 편집 직후엔 고친 .py만 ruff(ruff_file.sh, 위반이면 exit 2로 Claude에게), 전체 검증(check.sh)은 Stop 훅(stop_check.sh)이 끝낼 때 한 번 — 마지막 green 뒤 코드가 바뀐 경우에만.",
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit",
+        "matcher": "Edit|Write",
         "hooks": [
-          { "type": "command", "command": "./.claude/hooks/check.sh" }
+          { "type": "command", "timeout": 30,
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/ruff_file.sh\"" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "timeout": 300,
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/stop_check.sh\"" }
         ]
       }
     ]

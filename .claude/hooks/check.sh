@@ -20,3 +20,4 @@ echo "▶ ruff";   "$PY" -m ruff check kp_arb tests
 echo "▶ mypy";   "$PY" -m mypy kp_arb
 echo "▶ pytest"; "$PY" -m pytest -q
 echo "✅ all green"
+touch "$(dirname "$0")/.last_green"   # Stop 훅(stop_check.sh)이 "이 뒤로 바뀐 코드 있나" 기준으로 쓴다
