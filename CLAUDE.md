@@ -26,19 +26,39 @@
   - 좋은 예: "LSGateway 토큰 매니저 구현, tests/test_ls_auth.py 전부 통과"
 - 여러 파일을 건드리는 변경은 먼저 plan을 세우고 시작한다.
 
-## 4. 아키텍처 맵 (DESIGN.md §4-5)
+## 4. 아키텍처 맵 (2026-11-12, kp_arb/ 실제 파일 기준)
+- **프로세스 둘.** 메인(`main_window.py`, 배포판 meme.exe)은 관리 화면이고, 코어(`core_server.py`, meme-core.exe)가
+  LS·HL 접속·판정·발주를 혼자 맡는다. 메인이 코어를 띄우고 HTTP(127.0.0.1:8787 `/state`·명령)로 보며, 읽은 상태를
+  공유메모리(`state_share`)에 써서 다른 화면들이 읽는다. 화면마다 별도 프로세스, 전부 코어의 얇은 클라이언트. `app.py`가
+  exe 인자로 무엇을 띄울지 가른다.
+- **32비트 venv(.venv32)가 기준.** LS 접속이 xingAPI COM(32비트 DLL)이라 코어가 32비트여야 하고, 배포판도 32비트로
+  얼리므로 검증(check.sh)도 같은 비트로 돈다.
 ```
 kp_arb/
-  domain/enums.py     # Underlying, Venue, Account, Instrument, Side, OrderType, SessionPhase
-  domain/models.py    # OrderIntent, Position, Quote, InstrumentStatus, MarketState (pydantic)
-  routing.py          # instrument -> LS 계좌
-  session.py          # 장운영 단계 -> instrument별 상태 맵
-  spread.py           # 프리미엄 계산
-  fx.py               # USD 노출 계산 (외부 #2로 보고할 값)
-  gateways/base.py    # LSGateway / HLGateway 추상 계약  <- 여기를 구현
-  gateways/mock_*.py  # 테스트용 목 (라이브 금지)
-  strategy/base.py    # Strategy 인터페이스 (전략 미정)
-  strategy/noop.py    # 플레이스홀더
+  domain/enums.py, models.py          # Underlying·Account·Instrument… / Quote·Position·OrderIntent(pydantic)
+  config.py, market_hours.py          # config.yaml·keyring 비밀 / 시장 시간표(시간 하드코딩 금지)
+  routing.py, session.py, ticks.py    # 계좌 라우팅 / 장운영→상태 / 호가단위
+  theory.py, disparity.py, spread.py  # 이론가·괴리·스프레드(순수)
+  gateways/
+    base.py, mock_ls.py, mock_hl.py   # LSGateway·HLGateway 계약(라이브·목이 전부 상속) / 테스트용 목(라이브 금지)
+    xing_com.py, xing.py, xing_ws.py  # LS = xingAPI COM 한 스레드(세션·TR·실시간) — ls.py/ls_ws.py의 전송 단
+    ls.py, ls_ws.py, ls_tr.py         # LS 주문·조회 게이트웨이 / 실시간 파서(UH1·JH0…) / TR 공통
+    hl_live.py, hl_ws.py, hl_ws_post.py # HL SDK 주문·조회 / 실시간 WS / 주문 WS 전송
+  bootstrap.py (LiveSystem)           # 코어 시동 절차·시세/포지션 저장소·장부 재동기
+  core_server.py, core_engine.py      # 코어 HTTP API·엔진 생성·주기 태스크 / 리허설 판정
+  order_book.py, strategy_core.py     # 주문·포지션 장부(순수) / 설정·검증·한도(순수)
+  auto_m.py + auto_m_engine.py        # 체결쏴(자동M): 순수 상태변화 + 코어 결합(주식선물·주식·HL선)
+  auction_order.py + _engine.py       # 동시호가 주문: 순수 + 엔진
+  nxt_open.py + _engine.py, _screen.py # NXT 개장 매매(11-04 원복, 코드만 남음)
+  balance_watch.py, pair_check.py, alert.py, telegram_rx.py # 잔고 감시 / 쌍 대조 / 텔레그램 송·수신
+  fx.py, fx_service.py, signallink.py, fx_auction*.py # USD 노출 계산(§5)·외부 #2 보고 / 원달러선물 동시호가 대응주문
+  main_window.py, settings_window.py, order_autom*.py, order_hl.py, order_list.py, monitor.py,
+    auction_order_screen.py           # 화면(tk) — 전부 코어 클라이언트
+  core_client.py, ui_*.py, win_state.py # 화면 공통: 코어 호출 / 팝업(부모 중앙)·스타일·상태줄 / 창 상태 저장
+  quote_plan.py, report_*.py, logs.py # LS 구독 계획 / 지연·Sprd 리포트 / 파일 로그
+  engine.py, runner.py, risk.py, strategy/, peg_order.py+pegging.py # 6월 골격·옛 도구(ArbEngine·전략 플러그인·호가추적 창) — 운영 판정 아님
+tools/                                # 측정·분석 스크립트. 실주문(hl_*_order_probe)·실접속(probe_nxt_open·probe_auction·
+                                      # hl_region_probe)은 Claude가 실행하지 않는다(deny) — 나머지는 로그 분석·공개 조회
 ```
 
 ## 5. 도메인 불변식 (깨면 안 됨)

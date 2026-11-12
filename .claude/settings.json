@@ -34,7 +34,12 @@
       "PowerShell(*hl_ws_order_probe*)",
 
       "Bash(*probe_nxt_open*)",
-      "PowerShell(*probe_nxt_open*)"
+      "PowerShell(*probe_nxt_open*)",
+
+      "Bash(*probe_auction*)",
+      "Bash(*hl_region_probe*)",
+      "PowerShell(*probe_auction*)",
+      "PowerShell(*hl_region_probe*)"
     ]
   },
   "_hooks_comment": "2026-11-12: 편집 직후엔 고친 .py만 ruff(ruff_file.sh, 위반이면 exit 2로 Claude에게), 전체 검증(check.sh)은 Stop 훅(stop_check.sh)이 끝낼 때 한 번 — 마지막 green 뒤 코드가 바뀐 경우에만.",
