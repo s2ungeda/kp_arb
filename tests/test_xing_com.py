@@ -383,18 +383,25 @@ async def test_realtime_advise_and_event_to_asyncio(res_dir: Path) -> None:
         s.close()
 
 
-def test_read_unified_quote_stops_when_both_exchanges_found() -> None:
-    # DESIGN-ls-xing §9(2026-10-27 오후): UH1은 단계별 8칸을 KRX·NXT 매도·매수 1호가가 다 나올
-    # 때까지만 읽는다(COM 호출 절감). 1단계에 KRX 매수·NXT 매도만 있으면 2단계까지, 둘 다 있으면
-    # 1단계에서 끝. 빈 단계(가격 0)면 끝. Res에 없는 칸은 안 읽는다.
-    data = {"ex_shcode": "U005930   ", "shcode": "005930", "hotime": "100000",
-            "offerho1": "70200", "bidho1": "70100", "krx_offerrem1": "0", "nxt_offerrem1": "30",
-            "unt_offerrem1": "30", "krx_bidrem1": "50", "nxt_bidrem1": "0", "unt_bidrem1": "50",
-            "offerho2": "70300", "bidho2": "70000", "krx_offerrem2": "80", "nxt_offerrem2": "10",
-            "unt_offerrem2": "90", "krx_bidrem2": "20", "nxt_bidrem2": "40", "unt_bidrem2": "60",
-            "offerho3": "70400", "bidho3": "69900", "krx_offerrem3": "1", "nxt_offerrem3": "1",
-            "unt_offerrem3": "2", "krx_bidrem3": "1", "nxt_bidrem3": "1", "unt_bidrem3": "2",
-            "volume": "123"}
+def _uh1_levels(n: int, **override: str) -> dict[str, str]:
+    """UH1 칸 n단계 — 1단계는 KRX 매수·NXT 매도만, 2단계부터 넷 다 있음."""
+    data = {"ex_shcode": "U005930   ", "shcode": "005930", "hotime": "100000", "volume": "123"}
+    for i in range(1, n + 1):
+        data.update({f"offerho{i}": str(70_200 + 100 * (i - 1)),
+                     f"bidho{i}": str(70_100 - 100 * (i - 1)),
+                     f"krx_offerrem{i}": "0" if i == 1 else "80", f"nxt_offerrem{i}": "30",
+                     f"unt_offerrem{i}": "30" if i == 1 else "110",
+                     f"krx_bidrem{i}": "50", f"nxt_bidrem{i}": "0" if i == 1 else "40",
+                     f"unt_bidrem{i}": "50" if i == 1 else "90"})
+    data.update(override)
+    return data
+
+
+def test_read_unified_quote_reads_five_levels_then_stops_when_both_exchanges_found() -> None:
+    # DESIGN-ls-xing §9: UH1은 단계별 8칸을 **5단계까지 늘** 읽고(사용자 2026-11-12 "5호가로 —
+    # 주식만", 호가창용), 그 뒤로는 KRX·NXT 매도·매수 1호가가 다 나올 때까지만(최대 10단계, COM
+    # 호출 절감). 빈 단계(가격 0)면 끝. Res에 없는 칸은 안 읽는다.
+    data = _uh1_levels(8)
     calls: list[str] = []
 
     def get(f: str) -> str:
@@ -402,21 +409,28 @@ def test_read_unified_quote_stops_when_both_exchanges_found() -> None:
         return data[f]
 
     got = read_unified_quote(get, data.keys())
-    assert got["offerho2"] == "70300" and "offerho3" not in got and "volume" not in got
-    assert len(calls) == 3 + 8 * 2                      # 머리 셋 + 두 단계
-    # 1단계에 넷 다 있으면 한 단계만
+    assert got["offerho5"] == "70600" and "offerho6" not in got and "volume" not in got
+    assert len(calls) == 3 + 8 * 5                      # 머리 셋 + 다섯 단계 = 43칸
+    # 5단계 안에 KRX 매수 1호가가 없으면(6단계부터) 나올 때까지 더 읽는다
     calls.clear()
-    one = dict(data, krx_offerrem1="5", nxt_bidrem1="7")
-    got1 = read_unified_quote(lambda f: one[f], one.keys())
-    assert "offerho2" not in got1 and set(got1) >= {"hotime", "offerho1", "unt_bidrem1"}
+    late = _uh1_levels(8, **{f"krx_bidrem{i}": "0" for i in range(1, 6)})
+    got1 = read_unified_quote(lambda f: late[f], late.keys())
+    assert got1["krx_bidrem6"] == "50" and "offerho7" not in got1
+    # 옛 규칙(min_levels=1, 10-27)은 넷 다 나온 2단계에서 끝
+    got_old = read_unified_quote(lambda f: data[f], data.keys(), min_levels=1)
+    assert "offerho2" in got_old and "offerho3" not in got_old
     # 빈 단계(가격 둘 다 0)면 거기서 끝 — 마감 뒤 KRX처럼 한쪽이 끝까지 없어도 멈춘다
-    empty = dict(data, offerho2="0", bidho2="0")
+    empty = _uh1_levels(8, offerho3="0", bidho3="0")
     got2 = read_unified_quote(lambda f: empty[f], empty.keys())
-    assert "offerho3" not in got2 and got2["offerho2"] == "0"
+    assert "offerho4" not in got2 and got2["offerho3"] == "0"
+    # 단계가 3개뿐(Res가 짧음)이면 3단계에서 끝
+    three = _uh1_levels(3)
+    got3 = read_unified_quote(lambda f: three[f], three.keys())
+    assert got3["offerho3"] == "70400" and "offerho4" not in got3
     # Res에 없는 칸(모의 등)은 건너뛴다
     few = {k: v for k, v in data.items() if not k.startswith(("krx_", "nxt_"))}
-    got3 = read_unified_quote(lambda f: few[f], few.keys(), levels=2)
-    assert "krx_offerrem1" not in got3 and got3["unt_offerrem2"] == "90"
+    got4 = read_unified_quote(lambda f: few[f], few.keys(), levels=2)
+    assert "krx_offerrem1" not in got4 and got4["unt_offerrem2"] == "110"
 
 
 async def test_unadvise_one_key_and_jh0_reads_only_first_level(res_dir: Path) -> None:

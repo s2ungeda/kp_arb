@@ -1,5 +1,42 @@
 {
   "_comment": "예시. PostToolUse 훅 스키마는 Claude Code 버전마다 다를 수 있으니 공식 문서에서 현재 문법을 확인할 것.",
+  "_deny_comment": "permissions.deny(2026-11-12): .env 읽기 / 배포판 exe / 실접속 배치와 그 속 모듈(-m kp_arb.*) / HL 실주문 프로브 / NXT 개장 실측 프로브. CLAUDE.md §7 중 명령 패턴으로 막을 수 있는 것만. deny는 allow·모드·훅보다 우선하고 승인으로도 못 푼다.",
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+
+      "Bash(*meme.exe*)",
+      "Bash(*meme-core.exe*)",
+      "PowerShell(*meme.exe*)",
+      "PowerShell(*meme-core.exe*)",
+
+      "Bash(*main.bat*)",
+      "Bash(*core_server.bat*)",
+      "Bash(*peg_order.bat*)",
+      "Bash(*monitor.bat*)",
+      "PowerShell(*main.bat*)",
+      "PowerShell(*core_server.bat*)",
+      "PowerShell(*peg_order.bat*)",
+      "PowerShell(*monitor.bat*)",
+
+      "Bash(*-m kp_arb.main_window*)",
+      "Bash(*-m kp_arb.core_server*)",
+      "Bash(*-m kp_arb.peg_order*)",
+      "Bash(*-m kp_arb.monitor*)",
+      "PowerShell(*-m kp_arb.main_window*)",
+      "PowerShell(*-m kp_arb.core_server*)",
+      "PowerShell(*-m kp_arb.peg_order*)",
+      "PowerShell(*-m kp_arb.monitor*)",
+
+      "Bash(*hl_region_order_probe*)",
+      "Bash(*hl_ws_order_probe*)",
+      "PowerShell(*hl_region_order_probe*)",
+      "PowerShell(*hl_ws_order_probe*)",
+
+      "Bash(*probe_nxt_open*)",
+      "PowerShell(*probe_nxt_open*)"
+    ]
+  },
   "hooks": {
     "PostToolUse": [
       {

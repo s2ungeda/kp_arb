@@ -47,13 +47,15 @@ _LEVEL1 = frozenset({"shcode", "ex_shcode", "futcode", "hotime", "offerho1", "bi
                      "offerrem1", "bidrem1"})
 REAL_FIELD_LIMIT: dict[str, frozenset[str]] = {"H1_": _LEVEL1, "NH1": _LEVEL1, "JH0": _LEVEL1}
 # 통합 호가 UH1(2026-10-27 오후, §9 "주식 호가는 UH1 하나"): 단계마다 가격 둘 + 잔량 여섯
-# (KRX·NXT·통합 × 매도·매수)을 KRX·NXT 매도·매수 1호가가 다 나올 때까지만 읽는다(최대 10단계,
-# 가격 0이면 끝).
+# (KRX·NXT·통합 × 매도·매수). **5단계까지는 항상** 읽고(사용자 2026-11-12 "5호가로 — 주식만",
+# 머리 3 + 8×5 = 43칸), KRX·NXT 매도·매수 1호가가 그 안에 다 안 나왔으면 나올 때까지 더(최대
+# 10단계). 가격이 둘 다 0인 빈 단계면 끝. 주식선물 JH0는 1호가 그대로(REAL_FIELD_LIMIT).
 UNIFIED_QUOTE_TR = "UH1"
 UNIFIED_HEAD_FIELDS = ("ex_shcode", "shcode", "hotime")
 UNIFIED_LEVEL_FIELDS = ("offerho{i}", "bidho{i}", "krx_offerrem{i}", "nxt_offerrem{i}",
                         "unt_offerrem{i}", "krx_bidrem{i}", "nxt_bidrem{i}", "unt_bidrem{i}")
 UNIFIED_MAX_LEVELS = 10
+UNIFIED_MIN_LEVELS = 5  # 늘 읽는 단계 수(호가창 5호가, 2026-11-12)
 
 
 def _positive(raw: str | None) -> bool:
@@ -64,11 +66,13 @@ def _positive(raw: str | None) -> bool:
 
 
 def read_unified_quote(get: Callable[[str], str], have: Collection[str],
-                       *, levels: int = UNIFIED_MAX_LEVELS) -> dict[str, str]:
+                       *, levels: int = UNIFIED_MAX_LEVELS,
+                       min_levels: int = UNIFIED_MIN_LEVELS) -> dict[str, str]:
     """UH1 칸을 필요한 만큼만 읽는다(순수 — get은 칸 하나 읽기, have는 Res의 칸 이름들).
 
-    머리 칸(코드·시각) 뒤 단계별 8칸을 읽다가 KRX·NXT의 매도·매수 1호가(그 거래소 잔량 > 0인 첫
-    단계)가 넷 다 나오면 멈춘다. 가격이 둘 다 0인 단계(빈 단계)면 끝. 보통 1~2단계 = 11~19칸."""
+    머리 칸(코드·시각) 뒤 단계별 8칸을 ``min_levels``(5)단계까지는 늘 읽고(호가창 5호가, 사용자
+    2026-11-12), 그 뒤로는 KRX·NXT의 매도·매수 1호가(그 거래소 잔량 > 0인 첫 단계)가 넷 다 나올
+    때까지만(최대 ``levels``). 가격이 둘 다 0인 단계(빈 단계)면 끝. 보통 5단계 = 43칸."""
     out: dict[str, str] = {}
     for f in UNIFIED_HEAD_FIELDS:
         if f in have:
@@ -83,7 +87,7 @@ def read_unified_quote(get: Callable[[str], str], have: Collection[str],
         for key in list(need):
             if _positive(vals.get(f"{key}{i}")):
                 need.discard(key)
-        if not need:
+        if not need and i >= min_levels:
             break
     return out
 SLOW_ITER_S = 1.0        # 한 바퀴가 이보다 길면 경고
