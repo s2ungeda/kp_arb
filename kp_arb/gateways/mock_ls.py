@@ -32,6 +32,7 @@ class MockLSGateway(LSGateway):
             Account.KR_DERIV: [],
         }
         self._balances: dict[Account, float] = {Account.KR_STOCK: 0.0, Account.KR_DERIV: 0.0}
+        self._credit: list[Position] = []  # 신용 잔고로 심은 것(get_positions_detail이 가름)
 
     async def connect(self) -> None:
         self.connected = True
@@ -60,6 +61,11 @@ class MockLSGateway(LSGateway):
     async def get_positions(self, account: Account) -> Sequence[Position]:
         return list(self._positions[account])
 
+    async def get_positions_detail(self, account: Account) -> Sequence[tuple[Position, bool]]:
+        """(포지션, 신용 여부) — seed_credit_position으로 심은 것만 신용(잔고 조회 화면용)."""
+        # 같은 객체인지로 가름(pydantic ==는 필드 비교라 값이 같은 현금 행까지 신용으로 셈)
+        return [(p, any(p is c for c in self._credit)) for p in self._positions[account]]
+
     async def get_balance(self, account: Account) -> float:
         return self._balances[account]
 
@@ -71,6 +77,11 @@ class MockLSGateway(LSGateway):
         if position.account is None:
             raise ValueError("position needs an account")
         self._positions[position.account].append(position)
+
+    def seed_credit_position(self, position: Position) -> None:
+        """신용 잔고 행 심기 — get_positions엔 보통 포지션처럼, get_positions_detail엔 신용으로."""
+        self.seed_position(position)
+        self._credit.append(position)
 
     def seed_last_price(self, underlying: object, instrument: object, price: float) -> None:
         """시동 초기값(구독 전 현재가 조회) 테스트용 — get_price_snapshots가 돌려줄 값."""

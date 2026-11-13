@@ -94,6 +94,7 @@ def _base_dir() -> Path:
 STATE_PATH = _base_dir() / "core_state.json"
 # 화면 스냅샷(/manual_state·메인 채널)에 싣는 체결·취소·거부 행 수 = 한 화면 분량(사용자 2026-09-29:
 # "한 화면 개수를 정하고 '이전' 버튼으로 이전 데이터를 가져오는 방식"). 그 이전은 GET /history.
+BALANCE_QUERY_TIMEOUT_S = 30.0  # 잔고 조회 실조회 상한(DESIGN-balance-query §2), 화면은 40초 대기
 SNAPSHOT_PAGE = 200
 HISTORY_LIMIT_MAX = 1000
 
@@ -1653,6 +1654,8 @@ def make_app(
     if hub is not None and hub.state_provider is None:
         hub.state_provider = state_payload
 
+    balance_query_lock = asyncio.Lock()  # 잔고 조회 화면(DESIGN-balance-query): 겹침 조회 방지
+
     async def get_state(_request: web.Request) -> web.Response:
         return web.json_response(state_payload(), dumps=_dumps)
 
@@ -1673,6 +1676,23 @@ def make_app(
                 save()
             await sync_quote_plan(state, system)  # 차이 없으면 아무것도 안 함
 
+        if cmd == "balance_query":  # 잔고 조회 화면(DESIGN-balance-query §2) — 보기 전용 실조회
+            if system is None:
+                return web.json_response(_fail(["코어 미접속"]), dumps=_dumps)
+            if balance_query_lock.locked():
+                return web.json_response(_fail(["조회 중 — 잠시 뒤 다시"]), dumps=_dumps)
+            async with balance_query_lock:
+                try:  # 상한 — LS 느림·한도 재시도가 겹쳐도 잠금을 오래 쥐지 않게(조회라 끊어도 됨)
+                    result = await asyncio.wait_for(system.balance_query(),
+                                                    BALANCE_QUERY_TIMEOUT_S)
+                except TimeoutError:
+                    logging.getLogger("kp_arb.core").warning("잔고 조회 시간 초과(%.0f초)",
+                                                             BALANCE_QUERY_TIMEOUT_S)
+                    result = _fail([f"조회 시간 초과({BALANCE_QUERY_TIMEOUT_S:.0f}초)"])
+                except Exception as exc:  # noqa: BLE001 - 조회 실패는 사유로만(장부 무관)
+                    logging.getLogger("kp_arb.core").warning("잔고 조회 실패", exc_info=True)
+                    result = _fail([f"{type(exc).__name__}: {exc}"[:200]])
+            return web.json_response(result, dumps=_dumps)
         # fx_auction_* 는 fx_* 보다 **먼저** 검사(둘 다 "fx_"로 시작 — 순서 중요).
         if isinstance(cmd, str) and (cmd.startswith("manual_")
                                      or cmd.startswith("fx_auction_")):

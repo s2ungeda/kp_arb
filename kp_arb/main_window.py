@@ -402,6 +402,8 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "meme.exe"), "order_hl"]
     if module == "kp_arb.order_list":
         return [str(exe_dir / "meme.exe"), "order_list"]
+    if module == "kp_arb.balance_query_screen":
+        return [str(exe_dir / "meme.exe"), "balance"]
     if module == "kp_arb.fx_auction_order":
         return [str(exe_dir / "meme.exe"), "fx_auction_order"]
     if module == "kp_arb.settings_window":
@@ -938,6 +940,8 @@ def main() -> None:
                         command=lambda: open_screen("kp_arb.order_hl"))
     m_order.add_command(label="주문 리스트 (미체결·취소·정정)",
                         command=lambda: open_screen("kp_arb.order_list"))
+    m_order.add_command(label="잔고 조회 (LS·HL 실조회)",  # DESIGN-balance-query(2026-11-13)
+                        command=lambda: open_screen("kp_arb.balance_query_screen"))
     # '원달러선물 동시호가 주문' 항목은 메뉴에서 뺌(사용자 2026-11-13 — 개발 목록에서도 제외; 환
     # 대응은 '동시호가 주문 (주식선물+환)'이 맡는다). 화면 모듈·코어 엔진은 남아 있다(DESIGN 부록).
     m_order.add_command(label="FX 노출 감시",

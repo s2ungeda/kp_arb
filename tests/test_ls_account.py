@@ -443,3 +443,25 @@ async def test_deriv_open_orders_rest_stops_at_first_page_with_warning(caplog: A
         assert any("다음 페이지 미조회" in r.getMessage() for r in caplog.records)
     finally:
         FIXTURES["t0434"]["t0434OutBlock"]["cts_ordno"] = ""
+
+
+async def test_positions_detail_splits_credit_rows_by_loan_date() -> None:
+    # 잔고 조회 화면(DESIGN-balance-query §1): CSPAQ12300 행 중 LoanDt가 있는 행은 신용 — 합치지
+    # 않고 (포지션, 신용 여부)로 따로. get_positions는 종전대로 합친 수량(장부용).
+    rows = FIXTURES["CSPAQ12300"]["CSPAQ12300OutBlock3"]
+    rows.append({"IsuNo": "005930", "BalQty": 40, "BnsBaseBalQty": 40, "AvrUprc": "71000.00",
+                 "LoanDt": "20261001"})
+    try:
+        transport = AccountTransport()
+        gw = _gateway(transport)
+        detail = await gw.get_positions_detail(Account.KR_STOCK)
+        samsung = [(p.qty, credit) for p, credit in detail if p.underlying is Underlying.SAMSUNG]
+        assert samsung == [(100, False), (40, True)]
+        assert transport.seen_trs == ["CSPAQ12300"]  # 조회 1회
+        merged = next(p for p in await gw.get_positions(Account.KR_STOCK)
+                      if p.underlying is Underlying.SAMSUNG)
+        assert merged.qty == 140  # 장부용 합산은 그대로
+        deriv = await gw.get_positions_detail(Account.KR_DERIV)
+        assert [credit for _p, credit in deriv] == [False]  # 선물은 신용 없음
+    finally:
+        rows.pop()

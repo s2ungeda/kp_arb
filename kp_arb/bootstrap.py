@@ -487,6 +487,13 @@ class LiveSystem:
         self._bg: set[asyncio.Task[None]] = set()  # 재연결 재동기 등 백그라운드 작업(GC 방지)
         self._hl_refresh_pending = False  # 체결 후 HL 재조회 예약 여부(디바운스 코얼레싱)
 
+    async def balance_query(self) -> dict[str, Any]:
+        """잔고 조회 화면(DESIGN-balance-query) — 게이트웨이 실조회를 문자열 표로만. 장부·
+        hl_detail·재동기 경로는 건드리지 않는다(보기 전용)."""
+        from .balance_query import query_balance
+
+        return await query_balance(self._gw, self._hl)
+
     # --- 스냅샷 (최초 실행 + 온디맨드/UI 조회 버튼) ---
 
     async def refresh_snapshot(self, scope: set[Account | None] | None = None, *,

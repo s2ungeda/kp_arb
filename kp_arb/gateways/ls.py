@@ -303,6 +303,23 @@ class LSApiGateway(LSGateway):
         rows = list(raw_rows) if isinstance(raw_rows, list) else []
         return [p for r in rows if (p := self._deriv_position(r)) is not None]
 
+    async def get_positions_detail(self, account: Account) -> Sequence[tuple[Position, bool]]:
+        """잔고 조회 화면용 — 주식 계좌는 CSPAQ12300 행을 합치지 않고 (포지션, 신용 여부)로.
+        신용 = 대출일(LoanDt)이 있는 행(get_credit_loans와 같은 기준, 2026-09-18 실측). 선물 계좌는
+        get_positions 그대로(신용 없음)."""
+        if account is not Account.KR_STOCK:
+            return [(p, False) for p in await self.get_positions(account)]
+        # 재동기·get_credit_loans가 같은 초에 같은 TR을 쓰면 초당 한도 — 조회라 잠깐 뒤 재시도
+        resp = await self._request_paced(
+            account, self.STOCK_POSITIONS_TR, self._account_fields(account), self.STOCK_ACC_PATH
+        )
+        out: list[tuple[Position, bool]] = []
+        for row in self._rows(resp, self.STOCK_POSITIONS_TR):
+            p = self._stock_position(row)
+            if p is not None:
+                out.append((p, bool(str(row.get("LoanDt") or "").strip())))
+        return out
+
     async def get_balance(self, account: Account) -> float:
         """계좌별 가용자금(현금주문가능). 주식 CSPAQ22200 / 선물 CFOBQ10500."""
         if account is Account.KR_STOCK:

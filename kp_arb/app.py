@@ -74,6 +74,9 @@ def main() -> None:
     elif arg == "order_list":
         from kp_arb.order_list import main as run
         run()
+    elif arg == "balance":  # 잔고 조회 화면(DESIGN-balance-query, 2026-11-13)
+        from kp_arb.balance_query_screen import main as run
+        run()
     elif arg == "fx_auction_order":
         from kp_arb.fx_auction_order import main as run
         run()

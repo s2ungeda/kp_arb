@@ -811,3 +811,52 @@ async def test_manual_fx_futures_command_places_one_order_or_reports_rejection()
                                       "qty": 2, "price": 1320.0})
     assert not bad["ok"] and "해당 계좌가 없습니다" in bad["errors"][0]
     assert not (await _manual_command(sys_, {"cmd": "manual_fx_futures", "qty": 0}))["ok"]  # type: ignore[arg-type]
+
+
+async def test_balance_query_command_returns_strings_and_rejects_overlap() -> None:
+    # 잔고 조회 화면(DESIGN-balance-query §2): 코어는 system.balance_query()의 문자열 표를 그대로
+    # 응답에 싣고, 조회가 진행 중이면 "조회 중"으로 거절. 장부는 건드리지 않는다(여기선 가짜
+    # 시스템에 장부가 없어도 됨). system 없으면 "코어 미접속".
+    import asyncio
+
+    gate = asyncio.Event()
+
+    class _Sys:
+        calls = 0
+
+        async def balance_query(self) -> dict[str, Any]:
+            self.calls += 1
+            await gate.wait()
+            return {"ok": True, "ts": "14:05:12", "errors": {},
+                    "cells": {"samsung": {"hl": "-20", "stock": "+200", "credit": "0",
+                                          "sf_near": "0", "sf_next": "0"}}}
+
+        def set_hl_daily_limit(self, usdc: float) -> None: ...
+        def set_carry_rates(self, fx: float, eq: float) -> None: ...
+        def set_fx_fut_window(self, start: str, end: str, start2: str = "",
+                              end2: str = "") -> None: ...
+        def set_fx_futures_code(self, code: str) -> None: ...
+
+    sys_ = _Sys()
+    client = TestClient(TestServer(make_app(CoreState(), system=sys_)))  # type: ignore[arg-type]
+    await client.start_server()
+    try:
+        first = asyncio.ensure_future(client.post("/command", json={"cmd": "balance_query"}))
+        await asyncio.sleep(0.05)  # 첫 조회가 게이트웨이를 기다리는 중
+        second = await (await client.post("/command", json={"cmd": "balance_query"})).json()
+        assert not second["ok"] and second["errors"] == ["조회 중 — 잠시 뒤 다시"]
+        gate.set()
+        body = await (await first).json()
+        assert body["ok"] and body["ts"] == "14:05:12"
+        assert body["cells"]["samsung"]["stock"] == "+200"
+        assert sys_.calls == 1  # 겹친 요청은 조회를 안 냈다
+    finally:
+        await client.close()
+
+    client = TestClient(TestServer(make_app(CoreState())))  # system 없음
+    await client.start_server()
+    try:
+        body = await (await client.post("/command", json={"cmd": "balance_query"})).json()
+        assert not body["ok"] and body["errors"] == ["코어 미접속"]
+    finally:
+        await client.close()
