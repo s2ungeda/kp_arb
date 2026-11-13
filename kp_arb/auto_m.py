@@ -208,6 +208,9 @@ class Signals:
     ls_feed_ok: bool = True
     # HL 채널도 같은 관문(사용자 2026-10-01 결정 60: 어느 한쪽이라도 끊기면 선주문 취소 후 대기)
     hl_feed_ok: bool = True
+    # 주식선물 월물 배당율 q(소수, 공통설정 dividend — 사용자 2026-11-13, exec §6.1): 역산가의
+    # 기준값에 더한다(진입SF·청산SF, 정·역방향). 주식·HL선은 0.
+    dividend: float = 0.0
     # 주식시장 동시호가 중(결정 57, 사용자 2026-09-30) — 현물이 예상체결가로 움직여 S괴리가
     # 이상하므로 주식선물·HL선의 G5 S괴리 필터를 건너뛴다(정·역방향). 기준값은 여전히 있어야 한다
     stock_auction: bool = False
@@ -995,10 +998,13 @@ def evaluate(
     else:
         if sig.sf_theory is None or hl_disp is None or thr is None or not tick:
             return hold(f"G6 입력 없음 (이론가 {sig.sf_theory} HL괴리 {pct(hl_disp)} 틱 {tick})")
-        price = pre_order_price(side, sig.sf_theory, hl_disp, thr, tick, s.price_offset)
+        # 기준값 + 월물 배당율 q(exec §6.1, 2026-11-13) — 화면 입력·모니터 수치는 그대로, 역산만
+        thr_eff = thr + sig.dividend
+        price = pre_order_price(side, sig.sf_theory, hl_disp, thr_eff, tick, s.price_offset)
         mkt_inst = Instrument.KR_STOCK_FUTURE
+        thr_text = f"{pct(thr)}+배당 {pct(sig.dividend)}" if sig.dividend else pct(thr)
         formula = (f"역산가 {price:,.0f} = 이론가 {sig.sf_theory:,.0f}"
-                   f"×(1+{pct(hl_disp)}−{pct(thr)})")
+                   f"×(1+{pct(hl_disp)}−({thr_text}))")
     # 상대 N호가 = 1호가 ± (N−1)×시세 호가단위(§6.3 개정 2026-10-23 — LS 호가는 1호가만 받는다)
     rel = (rel_quote_by_tick(sig.sf_asks[0][0] if sig.sf_asks else None, settings.rel_buy,
                              mkt_inst, Side.BUY) if side is Side.BUY

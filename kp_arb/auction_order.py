@@ -135,15 +135,16 @@ def hl_mid(bid: float | None, ask: float | None) -> float | None:
 
 def expected_order_price(sf_theory: float | None, fx_expected: float | None,
                          hl_px: float | None, s: float | None, spread: float | None,
-                         side: Side) -> float | None:
+                         side: Side, dividend: float = 0.0) -> float | None:
     """역산 예상주문가(§2, 사용자 10-22 답 2 "체결쏴 역산가 방식") = SF이론가 × (1 + (환×HL − S)/S
-    − s), 주식선물 호가단위에 **매수 내림·매도 올림**(그 가격에 잡히면 스프레드가 보장되는 쪽).
+    − (s + q)), 주식선물 호가단위에 **매수 내림·매도 올림**(그 가격에 잡히면 스프레드가 보장되는
+    쪽). q = 윗줄 월물의 주식선물 배당율(공통설정, 사용자 2026-11-13) — 매수·매도 행 모두 더한다.
     재료가 하나라도 없으면 None(두 예상체결가가 다 들어온 뒤에만 계산 — §0a-1)."""
     if (sf_theory is None or fx_expected is None or hl_px is None or s is None
             or spread is None or sf_theory <= 0 or s <= 0 or fx_expected <= 0 or hl_px <= 0):
         return None
     hl_disp = (fx_expected * hl_px - s) / s
-    raw = sf_theory * (1.0 + hl_disp - spread)
+    raw = sf_theory * (1.0 + hl_disp - (spread + dividend))
     if raw <= 0:
         return None
     tick = tick_for(Instrument.KR_STOCK_FUTURE, raw)

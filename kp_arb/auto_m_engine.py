@@ -62,6 +62,7 @@ from .hl_merge import merge_active_dict, merge_tick_options
 from .hl_price import hl_price_step, hl_round_price
 from .logs import attach_daily_file
 from .routing import account_for
+from .strategy_core import dividend_rate
 from .ticks import tick_for
 
 if TYPE_CHECKING:
@@ -620,6 +621,9 @@ class AutoMEngine:
             sf_theory=self._system.stock_futures_theory(u, inst), stock_last=stock,
             sf_asks=asks, sf_bids=bids, s_spread_exit=s_exit, market_halted=halted,
             resumed_mono=self._resumed_for(u), fx=fx, product=book.product,
+            # 주식선물 월물 배당율(공통설정, 2026-11-13) — 주식선물 정·역방향만, 주식·HL선은 0
+            dividend=(dividend_rate(self._state.settings.dividend, u.value, book.future_month)
+                      if book.product == "sf" else 0.0),
             stock_market=book.market if book.product == "stock" else "",
             hl_bid1=hl.bid if hl is not None else None,
             hl_ask1=hl.ask if hl is not None else None,

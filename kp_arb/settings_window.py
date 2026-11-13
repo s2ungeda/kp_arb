@@ -180,12 +180,30 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     e_eq_rate = tk.Entry(form, width=8, justify="right", font=T.FONT_NUM)
     e_eq_rate.grid(row=5, column=1, sticky="w", padx=6, pady=2)
     tk.Label(form, text="주식선물 이론가", fg=T.C_MUTED).grid(row=5, column=2, sticky="w")
+    # 주식선물 배당율(DESIGN-settings §2, 사용자 2026-11-13) — 종목 × 월물(최근·차근) 6칸, 화면은 %,
+    # 저장은 소수. 이론가엔 안 쓰고 체결쏴 주식선물 역산가·리스크방지, 동시호가 행 가격에 더한다.
+    tk.Label(form, text="주식선물 배당율(%)").grid(row=6, column=0, sticky="w", pady=2)
+    div_row = tk.Frame(form)
+    div_row.grid(row=6, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    # 표 꼴(사용자 2026-11-13 첨부 표): 열 = 종목, 행 = 최근월물·차근월물
+    e_div: dict[tuple[str, str], tk.Entry] = {}
+    div_names = {"samsung": "삼성전자", "sk_hynix": "SK하이닉스", "hyundai": "현대차"}
+    for col, (key, _name) in enumerate(QUOTE_SYMBOLS, start=1):
+        tk.Label(div_row, text=div_names.get(key, _name), fg=T.C_MUTED).grid(
+            row=0, column=col, padx=(0, 6))
+    for r, (month, label) in enumerate((("near", "최근월물"), ("next", "차근월물")), start=1):
+        tk.Label(div_row, text=label).grid(row=r, column=0, sticky="w", padx=(0, 6))
+        for col, (key, _name) in enumerate(QUOTE_SYMBOLS, start=1):
+            ent = tk.Entry(div_row, width=8, justify="right", font=T.FONT_NUM)
+            ent.insert(0, "0")
+            ent.grid(row=r, column=col, sticky="w", padx=(0, 6), pady=1)
+            e_div[(key, month)] = ent
 
     # 외환선물 우선시간(exec 결정 47, 2026-09-28) — 이 안은 원달러선물 역산현물가만, 밖은 LS 현물환
     # → 역산현물가. (옛 "현물환율 사용시간"은 뜻이 반대라 키까지 바꿨다.)
-    tk.Label(form, text="외환선물 우선시간").grid(row=6, column=0, sticky="w", pady=2)
+    tk.Label(form, text="외환선물 우선시간").grid(row=7, column=0, sticky="w", pady=2)
     spot_row = tk.Frame(form)
-    spot_row.grid(row=6, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    spot_row.grid(row=7, column=1, columnspan=3, sticky="w", padx=6, pady=2)
     e_spot_s = tk.Entry(spot_row, width=9, justify="center", font=T.FONT_NUM)
     e_spot_s.pack(side="left")
     tk.Label(spot_row, text="~").pack(side="left", padx=4)
@@ -194,9 +212,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     tk.Label(spot_row, text="HH:MM:SS · 안=선물역산, 밖=현물→선물역산",
              fg=T.C_MUTED).pack(side="left", padx=(8, 0))
     # 2구간 — 바로 아랫줄(옆에 붙이면 창 폭이 늘어남). 비우면 미사용, 어느 구간이든 안이면 "안".
-    tk.Label(form, text="  2구간").grid(row=7, column=0, sticky="w", pady=2)
+    tk.Label(form, text="  2구간").grid(row=8, column=0, sticky="w", pady=2)
     spot_row2 = tk.Frame(form)
-    spot_row2.grid(row=7, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    spot_row2.grid(row=8, column=1, columnspan=3, sticky="w", padx=6, pady=2)
     e_spot_s2 = tk.Entry(spot_row2, width=9, justify="center", font=T.FONT_NUM)
     e_spot_s2.pack(side="left")
     tk.Label(spot_row2, text="~").pack(side="left", padx=4)
@@ -208,25 +226,25 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 체결 TR 원문을 logs\probe\quote_trade_날짜.jsonl에 남긴다(하루 수백 MB, 5일 지나면 삭제).
     var_probe = tk.BooleanVar(value=False)
     tk.Checkbutton(form, text="시세 원문 기록", variable=var_probe, anchor="w").grid(
-        row=8, column=0, sticky="w", pady=(10, 2))
+        row=9, column=0, sticky="w", pady=(10, 2))
     tk.Label(form, text="호가·체결 TR 원문 → logs\\probe (분석용, 하루 수백 MB)",
-             fg=T.C_MUTED).grid(row=8, column=1, columnspan=3, sticky="w", padx=6,
+             fg=T.C_MUTED).grid(row=9, column=1, columnspan=3, sticky="w", padx=6,
                                 pady=(10, 2))
     # 시세 구독 종목(DESIGN-ls-xing §9, DESIGN-settings §3 — 사용자 2026-10-23): 체크된 종목만 LS
     # 실시간 등록, 끄면 바로 해제. 자동M·NXT 개장 화면에서 종목을 다루면(적·설정·실행) 코어가
     # 자동으로 켜는데, 이 창이 열려 있어도 보이게 코어 값이 바뀌면 체크를 따라간다(refresh).
-    tk.Label(form, text="시세 구독 종목").grid(row=9, column=0, sticky="w", pady=2)
+    tk.Label(form, text="시세 구독 종목").grid(row=10, column=0, sticky="w", pady=2)
     qs_frame = tk.Frame(form)
-    qs_frame.grid(row=9, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+    qs_frame.grid(row=10, column=1, columnspan=3, sticky="w", padx=6, pady=2)
     qs_vars: dict[str, tk.BooleanVar] = {}
     for key, name in QUOTE_SYMBOLS:
         qs_vars[key] = tk.BooleanVar(value=False)
         tk.Checkbutton(qs_frame, text=name, variable=qs_vars[key], anchor="w").pack(
             side="left", padx=(0, 10))
     # 알람 3줄 — [체크박스] 이벤트명  [wav 경로]  [찾아보기] [듣기]
-    tk.Label(form, text="알람 (wav)").grid(row=10, column=0, sticky="w", pady=(10, 2))
+    tk.Label(form, text="알람 (wav)").grid(row=11, column=0, sticky="w", pady=(10, 2))
     rows: dict[str, dict[str, Any]] = {}
-    for i, (key, name) in enumerate(_ALARMS, start=10):
+    for i, (key, name) in enumerate(_ALARMS, start=11):  # 배당율 줄 삽입으로 +1(2026-11-13)
         var = tk.BooleanVar(value=False)
         tk.Checkbutton(form, text=name, variable=var, width=10, anchor="w").grid(
             row=i, column=0, sticky="w", pady=1)
@@ -253,7 +271,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # LS(xing) 접속 끊김 때 할 일 — 체크박스 3개(DESIGN-settings §2a, 사용자 2026-10-14).
     # 판정·행동은
     # 메인 창(코어가 죽어도 알리려고), 여기서는 켬/끔만 고른다. 사운드는 위 'WS 끊김' 줄의 wav.
-    dc_row = 11 + len(_ALARMS)
+    dc_row = 12 + len(_ALARMS)
     tk.Label(form, text="LS 끊김 때").grid(row=dc_row, column=0, sticky="w", pady=(10, 2))
     dc_frame = tk.Frame(form)
     dc_frame.grid(row=dc_row, column=1, columnspan=3, sticky="w", padx=6, pady=(10, 2))
@@ -304,8 +322,13 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             risk_qty = float(e_risk_qty.get().replace(",", "").strip() or "0")
             fx_rate = float(e_fx_rate.get().strip() or "0") / 100.0   # % → 비율
             eq_rate = float(e_eq_rate.get().strip() or "0") / 100.0
+            dividend = {key: {month: float(e_div[(key, month)].get().strip() or "0") / 100.0
+                              for month in ("near", "next")} for key, _n in QUOTE_SYMBOLS}
         except ValueError:
-            set_status("한도·이자율은 숫자로 입력하세요", err=True)
+            set_status("한도·이자율·배당율은 숫자로 입력하세요", err=True)
+            return
+        if any(q < 0 or q >= 1 for months in dividend.values() for q in months.values()):
+            set_status("배당율은 0 이상 100 미만(%)으로 입력하세요", err=True)
             return
         spot_s, spot_e = e_spot_s.get().strip(), e_spot_e.get().strip()
         spot_s2, spot_e2 = e_spot_s2.get().strip(), e_spot_e2.get().strip()
@@ -333,7 +356,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             "fx_carry_rate": fx_rate, "eq_carry_rate": eq_rate,
             "fx_fut_start": spot_s, "fx_fut_end": spot_e,
             "fx_fut_start2": spot_s2, "fx_fut_end2": spot_e2,
-            "quote_probe": bool(var_probe.get())}
+            "quote_probe": bool(var_probe.get()), "dividend": dividend}
         if cb_fx.get():  # 콤보가 비었으면(코어 시세 미접속) 월물 설정은 건드리지 않는다
             payload["fx_futures_code"] = fx_month_code(cb_fx.get())
         for key, r in rows.items():
@@ -384,6 +407,14 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             e_fx_rate.insert(0, f"{float(settings.get('fx_carry_rate', 0.010) or 0) * 100:g}")
             e_eq_rate.delete(0, "end")
             e_eq_rate.insert(0, f"{float(settings.get('eq_carry_rate', 0.030) or 0) * 100:g}")
+            div = settings.get("dividend") or {}
+            for (key, month), ent in e_div.items():
+                try:
+                    q = float((div.get(key) or {}).get(month, 0.0) or 0.0) * 100
+                except (TypeError, ValueError):
+                    q = 0.0
+                ent.delete(0, "end")
+                ent.insert(0, f"{q:g}")
             for entry, key, default in ((e_spot_s, "fx_fut_start", "08:45:00"),
                                         (e_spot_e, "fx_fut_end", "15:45:00"),
                                         (e_spot_s2, "fx_fut_start2", ""),

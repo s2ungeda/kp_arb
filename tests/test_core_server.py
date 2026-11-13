@@ -326,6 +326,36 @@ def test_settings_global_balance_watch() -> None:
         True, 150)
 
 
+def test_settings_global_dividend() -> None:
+    # DESIGN-settings §2(사용자 2026-11-13): 종목 × 월물(최근·차근) 배당율, 기본 0, 소수 저장.
+    # 음수·100% 이상·숫자 아님은 거부(전체 거부), 모르는 종목·월물 키는 무시, 빠진 키는 유지.
+    from kp_arb.strategy_core import dividend_rate
+
+    state = CoreState()
+    d = state.settings.dividend
+    assert d == {"samsung": {"near": 0.0, "next": 0.0}, "sk_hynix": {"near": 0.0, "next": 0.0},
+                 "hyundai": {"near": 0.0, "next": 0.0}}
+    assert apply_command(state, {"cmd": "settings_global", "dividend": {
+        "sk_hynix": {"near": 0.012, "next": 0.0}, "samsung": {"next": 0.005},
+        "unknown": {"near": 0.5}, "hyundai": {"far": 0.3}}})["ok"]
+    assert d["sk_hynix"] == {"near": 0.012, "next": 0.0}
+    assert d["samsung"] == {"near": 0.0, "next": 0.005}      # 빠진 키(near) 유지
+    assert d["hyundai"] == {"near": 0.0, "next": 0.0} and "unknown" not in d
+    assert dividend_rate(d, "sk_hynix", "near") == 0.012 and dividend_rate(d, "x", "near") == 0
+    for bad in ({"sk_hynix": {"near": -0.01}}, {"sk_hynix": {"near": 1.2}},
+                {"sk_hynix": {"near": "1.2"}}, {"sk_hynix": {"near": True}}):
+        assert not apply_command(state, {"cmd": "settings_global", "dividend": bad})["ok"]
+        assert d["sk_hynix"] == {"near": 0.012, "next": 0.0}
+    assert apply_command(state, {"cmd": "settings_global", "hl_daily_limit_usdc": 1})["ok"]
+    assert d["sk_hynix"]["near"] == 0.012                      # 키 없으면 유지
+    restored = CoreState()
+    _global_settings_from_dict(restored.settings, {"dividend": {"samsung": {"near": 0.02}}})
+    assert restored.settings.dividend["samsung"] == {"near": 0.02, "next": 0.0}
+    broken = CoreState()
+    _global_settings_from_dict(broken.settings, {"dividend": {"samsung": {"near": -1}}})
+    assert broken.settings.dividend["samsung"] == {"near": 0.0, "next": 0.0}
+
+
 def test_load_state_missing_or_corrupt(tmp_path: Path) -> None:
     assert load_state(tmp_path / "none.json").fx_month == "near"
     bad = tmp_path / "bad.json"
@@ -674,8 +704,24 @@ def test_quote_symbols_setting_and_plan_input() -> None:
     # NXT 개장·동시호가 화면의 실행·예약 상태, 체결쏴 주식의 거래소는 계획과 무관(주식 호가는 통합
     # UH1 하나, 주식 체결은 안 받음 — 2026-10-28)
     state.nxt_open.of(Underlying.SAMSUNG).run_exit = True
-    state.auction.book("sk_hynix").buy[0].on = True
-    assert quote_plan_input(state, _Sys()) == inp
+    state.auction.book("sk_hynix").buy[0].on = True  # 종목 상태가 생기면 그 월물(기본 near)은 든다
+    inp2 = quote_plan_input(state, _Sys())
+    assert (inp2.symbols_on, inp2.futures_codes, inp2.fx_code) == (
+        inp.symbols_on, inp.futures_codes, inp.fx_code)
+    assert inp2.futures_months == {**inp.futures_months, Underlying.SK_HYNIX: frozenset({"near"})}
+    # 동시호가 화면의 **월물**은 계획에 들어간다(2026-11-13 수정 — 동시호가만 차근을 고르면 차근
+    # 시세가 등록되지 않던 빈 자리). 체결쏴와 다른 월물이면 둘 다(합집합).
+    # (CoreState 기본값: 체결쏴 주식선물 종목 상태가 세 종목 모두 '최근'으로 있다)
+    state.auction.book("sk_hynix").month = "next"
+    assert quote_plan_input(state, _Sys()).futures_months[Underlying.SK_HYNIX] == frozenset(
+        {"near", "next"})                                     # 체결쏴 최근 + 동시호가 차근
+    state.autom.book(Underlying.SK_HYNIX, "sf").future_month = "next"
+    assert quote_plan_input(state, _Sys()).futures_months[Underlying.SK_HYNIX] == frozenset(
+        {"next"})                                             # 둘 다 차근이면 차근만
+    state.auction.book("sk_hynix").month = "near"
+    state.autom.book(Underlying.SK_HYNIX, "sf").future_month = "near"
+    assert quote_plan_input(state, _Sys()).futures_months[Underlying.SK_HYNIX] == frozenset(
+        {"near"})
     state.nxt_open.of(Underlying.SAMSUNG).run_exit = False
     state.auction.book("sk_hynix").buy[0].on = False
     # 실행 켜기 → 체크 안 된 종목은 자동으로 켠다(거부 아님), 이미 켜져 있으면 변화 없음

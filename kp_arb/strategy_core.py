@@ -166,6 +166,45 @@ class AutoShutdown:
     time: str = ""  # "HH:MM:SS"
 
 
+DIVIDEND_MONTHS = ("near", "next")  # 주식선물 월물 키(최근·차근)
+
+
+def default_dividend() -> dict[str, dict[str, float]]:
+    """배당율 기본값 — 설정 종목 전부 최근·차근 0."""
+    return {key: dict.fromkeys(DIVIDEND_MONTHS, 0.0) for key in QUOTE_SYMBOL_KEYS}
+
+
+def apply_dividend(d: dict[str, dict[str, float]], raw: object) -> None:
+    """`dividend` dict → 설정(DESIGN-settings §2, 2026-11-13). 없거나 dict가 아니면 그대로. 모르는
+    종목·월물 키는 무시, 값은 0 이상의 수(소수; 1 이상이면 %를 그대로 보낸 것이라 거부)."""
+    if not isinstance(raw, dict):
+        return
+    checked: list[tuple[str, str, float]] = []  # 전부 검사한 뒤 넣는다(반쯤 바뀐 채 거부 방지)
+    for key in QUOTE_SYMBOL_KEYS:
+        months = raw.get(key)
+        if not isinstance(months, dict):
+            continue
+        for month in DIVIDEND_MONTHS:
+            if month not in months:
+                continue
+            val = months[month]
+            if isinstance(val, bool) or not isinstance(val, int | float):
+                raise ValueError("배당율 값 오류")
+            if val < 0 or val >= 1:
+                raise ValueError("배당율은 0 이상 100% 미만")
+            checked.append((key, month, float(val)))
+    for key, month, q in checked:
+        d.setdefault(key, dict.fromkeys(DIVIDEND_MONTHS, 0.0))[month] = q
+
+
+def dividend_rate(d: dict[str, dict[str, float]], symbol_key: str, month: str) -> float:
+    """종목키·월물("near"|"next")의 배당율(소수). 없으면 0."""
+    try:
+        return float(d.get(symbol_key, {}).get(month, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @dataclass
 class BalanceWatch:
     """토탈잔고 감시(DESIGN-balance-watch.md, 사용자 2026-11-11) — 비교잔고배수 선을 넘으면
@@ -223,6 +262,10 @@ class GlobalSettings:
     auto_shutdown: AutoShutdown = field(default_factory=AutoShutdown)
     # 토탈잔고 감시(DESIGN-balance-watch, 2026-11-11) — 판정·전송은 코어
     balance_watch: BalanceWatch = field(default_factory=BalanceWatch)
+    # 주식선물 배당율(DESIGN-settings §2, 사용자 2026-11-13) — {종목키: {near: q, next: q}}, 소수
+    # (0.012 = 1.2%). 이론가에는 안 쓰고 체결쏴 주식선물 역산가·리스크방지, 동시호가 행 가격의
+    # 기준값에 더한다. 월물 교체·배당락 뒤 값 변경은 사용자가 직접.
+    dividend: dict[str, dict[str, float]] = field(default_factory=default_dividend)
 
 
 @dataclass
@@ -434,6 +477,10 @@ def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
         apply_balance_watch(s.balance_watch, raw.get("balance_watch"))
     except ValueError:  # 저장본의 배수가 깨졌으면 그 항목만 기본값(끔)
         s.balance_watch = BalanceWatch()
+    try:
+        apply_dividend(s.dividend, raw.get("dividend"))
+    except ValueError:  # 저장본의 배당율이 깨졌으면 전부 0
+        s.dividend = default_dividend()
 
 
 def apply_balance_watch(b: BalanceWatch, raw: object) -> None:

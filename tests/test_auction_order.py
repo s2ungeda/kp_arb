@@ -40,6 +40,14 @@ def test_expected_order_price_reverses_spread_and_snaps_to_futures_tick() -> Non
     assert buy == 1_767_000 and sell == 1_768_000
     assert expected_order_price(theory, None, hl, s, 0.003, Side.BUY) is None
     assert expected_order_price(theory, fx, hl, s, None, Side.BUY) is None
+    # 배당율 q(사용자 2026-11-13, §2): 행 스프레드에 q를 더한 것과 같다 — 매수·매도 행 모두,
+    # 결과는 q만큼 낮은 가격(배당만큼 SF 적정가가 낮아지는 것과 일치)
+    for side in (Side.BUY, Side.SELL):
+        with_q = expected_order_price(theory, fx, hl, s, 0.003, side, dividend=0.012)
+        assert with_q == expected_order_price(theory, fx, hl, s, 0.015, side)
+        assert with_q is not None and with_q < (buy if side is Side.BUY else sell)
+    assert expected_order_price(theory, fx, hl, s, -0.003, Side.SELL, dividend=0.0) == (
+        expected_order_price(theory, fx, hl, s, -0.003, Side.SELL))
     assert expected_order_price(theory, fx, hl, 0.0, 0.003, Side.BUY) is None
     assert hl_mid(1332.0, 1333.0) == 1332.5 and hl_mid(None, 1.0) is None
 

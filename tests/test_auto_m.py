@@ -80,6 +80,27 @@ def test_pure_pieces_match_exec_example() -> None:
         parse_hms("9")
 
 
+def test_g6_adds_month_dividend_to_threshold_for_futures_only() -> None:
+    # exec §6.1(사용자 2026-11-13): 역산가 = 이론가 × (1 + HL괴리 − (기준값 + q)). 주문단위 500,
+    # q 0.1% → 200,000 × (1 + 0.01 − 0.006) = 200,800 → 내림 200,500 (q 없으면 201,000). 한계
+    # ≈ 200,196 안이라 발주. 입력 기준값(en_sf)은 그대로, 역산에만 더한다.
+    s = _set(pre_tick=500)
+    set_running(s, Block.ENTRY, True)
+    assert [(a.kind, a.price) for a in evaluate(s, Block.ENTRY, _sig(), SETTINGS, U)] == [
+        ("place_pre", 201_000.0)]
+    s2 = _set(pre_tick=500)
+    set_running(s2, Block.ENTRY, True)
+    acts = evaluate(s2, Block.ENTRY, _sig(dividend=0.001), SETTINGS, U)
+    assert [(a.kind, a.price) for a in acts] == [("place_pre", 200_500.0)]
+    assert s2.en_sf == 0.005
+    # q가 커서 역산가가 허용범위 아래로 내려가면(1.2% → 198,000 < 한계 200,196) 안 낸다 — 기존 G6
+    s3 = _set()
+    set_running(s3, Block.ENTRY, True)
+    assert evaluate(s3, Block.ENTRY, _sig(dividend=0.012), SETTINGS, U) == []
+    # 매도 선주문(역방향 진입·정방향 청산) 쪽 순수 식: 기준값 + q 올림
+    assert pre_order_price(Side.SELL, 200_000, 0.01, 0.005 + 0.012, 500) == 199_000
+
+
 def test_entry_round_trip_partial_fill_and_rt() -> None:
     # 감시 → 선주문 10계약 @201,000 → 4계약 체결 → HL 40 즉시 → 후주문 체결 → RT 4 (exec 실예)
     s = _set()

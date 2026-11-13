@@ -938,8 +938,8 @@ def main() -> None:
                         command=lambda: open_screen("kp_arb.order_hl"))
     m_order.add_command(label="주문 리스트 (미체결·취소·정정)",
                         command=lambda: open_screen("kp_arb.order_list"))
-    m_order.add_command(label="원달러선물 동시호가 주문",
-                        command=lambda: open_screen("kp_arb.fx_auction_order"))
+    # '원달러선물 동시호가 주문' 항목은 메뉴에서 뺌(사용자 2026-11-13 — 개발 목록에서도 제외; 환
+    # 대응은 '동시호가 주문 (주식선물+환)'이 맡는다). 화면 모듈·코어 엔진은 남아 있다(DESIGN 부록).
     m_order.add_command(label="FX 노출 감시",
                         command=lambda: open_screen("kp_arb.fx_monitor"))
     menubar.add_cascade(label="주문", menu=m_order)

@@ -57,6 +57,8 @@ from .strategy_core import (
     apply_auto_shutdown,
     apply_balance_watch,
     apply_disconnect_actions,
+    apply_dividend,
+    dividend_rate,
     parse_operating_hours,
     state_from_dict,
     validate_run,
@@ -110,6 +112,11 @@ def quote_plan_input(state: CoreState, system: Any) -> QuotePlanInput:
     for u in Underlying:
         used = {bk.future_month for product in ("sf", "sf_hl_first")
                 if (bk := state.autom.books.get(book_key(u, product))) is not None}
+        # 동시호가 주문 화면의 월물도 합친다(2026-11-13 수정 — 10-26 동시호가를 만들 때 빠뜨려
+        # 동시호가만 차근을 고르면 차근 시세가 등록되지 않았다; 사용자 "큰일날 뻔")
+        auction_book = state.auction.books.get(u.value)
+        if auction_book is not None:
+            used.add(auction_book.month)
         if used:
             months[u] = frozenset(used)
     codes: dict[tuple[Underlying, str], str] = {}
@@ -439,6 +446,8 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
             apply_auto_shutdown(g.auto_shutdown, body.get("auto_shutdown"))
             # 토탈잔고 감시(DESIGN-balance-watch §3) — 켬인데 배수 ≤ 0이면 ValueError → 거부
             apply_balance_watch(g.balance_watch, body.get("balance_watch"))
+            # 주식선물 배당율(DESIGN-settings §2, 2026-11-13) — 음수·100% 이상이면 ValueError → 거부
+            apply_dividend(g.dividend, body.get("dividend"))
             return _ok()
         if cmd == "fx_month":  # 환율 표시용 원달러선물 월물 (§6.2-7)
             choice = str(body["choice"])
@@ -1677,6 +1686,8 @@ def make_app(
         if isinstance(cmd, str) and cmd.startswith("auction_"):
             await _auto_check_symbol(payload, "동시호가")
             result = await _auction_command(auction, state, payload)
+            if result.get("ok") and cmd == "auction_settings" and "month" in payload:
+                await sync_quote_plan(state, system)  # 월물 바뀜 → 차근 등록·해제(§9, 2026-11-13)
             if result.get("ok") and save:
                 save()  # 행·설정·HL 행↔주문번호 저장(예약실행은 저장 안 함)
             return web.json_response(result, dumps=_dumps)
@@ -1932,7 +1943,9 @@ async def _serve() -> None:
             from .auction_order_engine import AuctionOrderEngine as _AuctionEngine
 
             auction_engine = _AuctionEngine(
-                state.auction, system, save=lambda: save_state(STATE_PATH, state))
+                state.auction, system, save=lambda: save_state(STATE_PATH, state),
+                # 행 스프레드에 더할 월물 배당율(DESIGN-auction-order §2, 2026-11-13)
+                dividend_of=lambda u, month: dividend_rate(state.settings.dividend, u.value, month))
             tasks.append(asyncio.create_task(auction_engine.run()))
             tasks.append(asyncio.create_task(engine.run()))
             tasks.append(asyncio.create_task(fx_service.run()))

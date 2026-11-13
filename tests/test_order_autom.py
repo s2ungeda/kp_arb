@@ -26,6 +26,29 @@ def test_fwd_exit_not_below_half() -> None:
     assert any("청산" in e for e in errs)
 
 
+def test_dividend_is_added_to_inputs_and_limits_alike() -> None:
+    # exec §11.9 배당율(사용자 2026-11-13, 정정 "설정에 입력된 수치에도 배당율 더해서"): 진입SF·청산
+    # 입력값과 설정 한도 **양쪽**에 q(%)를 더해 비교 → 판정은 배당 없는 달과 같고, 경고 글에만
+    # 더한 값이 보인다. gap은 그대로.
+    assert check_risk("fwd", 0.5, -0.1, EN, EX, GAP, dividend=0.0) == []
+    # q=0이면 경고 글도 옛 그대로
+    assert check_risk("fwd", 0.0, -0.5, EN, EX, GAP) == ["정방향 진입SF는 0 초과여야 합니다"]
+    # 정방향 청산 0.3(< 0.5 통과)은 q 0.3을 더해도 통과(0.6 < 0.8) — 한도도 같이 오르므로
+    assert check_risk("fwd", 0.5, 0.3, EN, EX, GAP, dividend=0.3) == []
+    # 정방향 청산 0.5(위반)는 q를 더해도 위반(0.8 ≥ 0.8) — 글에 양쪽 더한 값
+    errs = check_risk("fwd", 0.9, 0.5, EN, EX, GAP, dividend=0.3)
+    assert errs == ["정방향 청산(0.5+배당 0.3=0.8)은 0.8(0.5+배당 0.3) 미만이어야 합니다"]
+    # 정방향 진입 −0.2(위반)는 q를 더해도 위반(0.1 ≤ 0.3)
+    errs = check_risk("fwd", -0.2, -0.5, EN, EX, GAP, dividend=0.3)
+    assert errs == ["정방향 진입SF(-0.2+배당 0.3=0.1)는 0.3(0+배당 0.3) 초과여야 합니다"]
+    # 역방향(진입 < 0.5, 청산 > 0): 진입 0.3·청산 0.5는 q를 더해도 통과, 진입 0.5는 위반
+    assert check_risk("rev", 0.3, 0.5, 0.5, 0.0, GAP, dividend=0.3) == []
+    errs = check_risk("rev", 0.5, 0.7, 0.5, 0.0, GAP, dividend=0.3)
+    assert errs == ["역방향 진입SF(0.5+배당 0.3=0.8)는 0.8(0.5+배당 0.3) 미만이어야 합니다"]
+    # 미입력(None)은 q가 있어도 건너뛴다
+    assert check_risk("fwd", None, None, EN, EX, GAP, dividend=0.3) == []
+
+
 def test_fwd_gap_too_small() -> None:
     # 진입 0.15, 청산 0.1 → 차이 0.05 ≤ 0.1
     errs = check_risk("fwd", 0.15, 0.1, EN, EX, GAP)

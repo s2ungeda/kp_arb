@@ -338,11 +338,15 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     w["month"] = ttk.Combobox(top, values=["최근", "차근"], width=4, state="readonly")
     w["month"].set("최근")
     w["month"].pack(side="left", padx=(0, 4))
+    # 적용 중인 주식선물 배당율(공통설정 dividend, 사용자 2026-11-13) — 행 스프레드에 더해져 예상
+    # 주문가·실주문가에만 반영(§2). 행 입력칸·모니터 수치는 그대로.
+    w["div"] = tk.Label(top, text="배당 0%", fg=T.C_MUTED)
     # HL 호가단위 — 코어 공용 값을 글자로만(바꾸는 콤보는 일반주문창 한 곳뿐, 사용자 2026-10-30)
     w["agg"] = tk.Label(top, text="-", fg="black", bg="white", relief="solid", bd=1, width=5)
     w["agg"].pack(side="left", padx=(0, 4))
     w["apply"] = ttk.Button(top, text="적", width=3)
     w["apply"].pack(side="left", padx=(0, 8))
+    w["div"].pack(side="left", padx=(0, 6))  # '적' 버튼 옆(사용자 2026-11-13)
     # 시험 모드(§7a, 사용자 2026-10-26): 장중엔 예상체결가가 없어 주식선물 1호가 중간값·원달러선물
     # 현재가로 대신 — 동시호가 단계에 들어가면 코어가 무시한다. 저장 안 함(매번 켠다).
     w["test_var"] = tk.BooleanVar(value=False)
@@ -850,6 +854,18 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                     w["res_on"][(side_k, i)] = on
                     paint_res((side_k, i))
 
+    def refresh_dividend(data: dict[str, Any]) -> None:
+        # 윗줄 월물의 주식선물 배당율(공통설정 dividend, 2026-11-13) — 바뀔 때만 set
+        div = (data.get("settings") or {}).get("dividend") or {}
+        month = "next" if w["month"].get() == "차근" else "near"
+        try:
+            q = float((div.get(cur["u"].value) or {}).get(month, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            q = 0.0
+        text = f"배당 {q * 100:g}%"
+        if w["div"].cget("text") != text:
+            w["div"].config(text=text)
+
     def refresh_agg(live: dict[str, Any]) -> None:
         # 코어가 지금 적용 중인 HL 호가단위(hl_merge_active의 틱 글)를 글자로 — 바뀔 때만
         active = live.get("hl_merge_active")
@@ -896,6 +912,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 sync_rows_on(book)
             live = (data.get("auction_live") or {}).get(u.value) or {}
             refresh_agg(live)
+            refresh_dividend(data)
             sf, fx = live.get("sf_expected"), live.get("fx_expected")
             tag = " (현재가 대용)" if live.get("testing") else ""
             w["sf_exp"].config(text=f"{px_text(sf)}{tag}")

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -144,10 +145,13 @@ class AuctionOrderEngine:
     """동시호가 주문 엔진 — run()이 20ms 틱으로 주문시각을 지키고, 체결 통보로 HL을 낸다."""
 
     def __init__(self, screen: AuctionScreen, system: _System, *, save: Any = None,
-                 wall: Any = None) -> None:
+                 wall: Any = None,
+                 dividend_of: Callable[[Underlying, str], float] | None = None) -> None:
         self._screen = screen
         self._system = system
         self._save = save
+        # 윗줄 월물의 주식선물 배당율(공통설정 dividend, 2026-11-13) — 행 스프레드에 더한다(§2)
+        self._dividend_of = dividend_of
         self._wall = wall or time.time
         self._log = logging.getLogger("kp_arb.auction")
         self._days: dict[Underlying, DayState] = {}
@@ -257,10 +261,16 @@ class AuctionOrderEngine:
             "theory": self._system.stock_futures_theory(u, inst),
         }
 
+    def dividend(self, u: Underlying) -> float:
+        """윗줄 월물의 주식선물 배당율(소수) — 공통설정 dividend(2026-11-13). 없으면 0."""
+        if self._dividend_of is None:
+            return 0.0
+        return float(self._dividend_of(u, self.book(u).month) or 0.0)
+
     def _row_price(self, u: Underlying, inp: dict[str, float | None], side: Side,
                    spread: float | None) -> float | None:
         return expected_order_price(inp["theory"], inp["fx_expected"], inp["hl_mid"], inp["s"],
-                                    spread, side)
+                                    spread, side, dividend=self.dividend(u))
 
     def _refresh_prices(self, u: Underlying, d: DayState) -> dict[str, float | None]:
         """표시용 예상주문가(두 예상체결가가 다 있어야 계산 — §2)."""

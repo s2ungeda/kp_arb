@@ -451,7 +451,8 @@ def rt_manual_errors(dtag: str, text: str) -> list[str]:
 
 
 def check_risk(dtag: str, en_sf: float | None, ex_sf: float | None,
-               risk_en: float, risk_ex: float, risk_gap: float) -> list[str]:
+               risk_en: float, risk_ex: float, risk_gap: float,
+               dividend: float = 0.0) -> list[str]:
     """자동M 리스크방지 입력 검증 (exec §11.9). 위반 메시지 목록(빈 목록=통과).
 
     검사 시점은 실행 버튼을 켤 때와 세트설정 저장 때뿐(사용자 2026-09-09). 진입S는 검사하지
@@ -459,20 +460,36 @@ def check_risk(dtag: str, en_sf: float | None, ex_sf: float | None,
     진입SF·청산 둘 다 있을 때만.
     정방향: 진입SF > 기준, 청산 < 기준, 진입SF−청산 > gap.
     역방향: 진입SF < 기준, 청산 > 기준, 청산−진입SF > gap.
+    dividend = 이 화면 월물의 주식선물 배당율 q(%, 사용자 2026-11-13): 진입SF·청산 **입력값에도,
+    설정의 한도에도** q를 더해 비교한다(사용자 정정 "설정에 입력된 수치에도 배당율 더해서 체크").
+    양쪽에 더하므로 판정은 배당 없는 달과 같고, 경고 글에 더한 값을 보인다. 주식 화면은 0.
     """
     errs: list[str] = []
+    en_q = None if en_sf is None else en_sf + dividend
+    ex_q = None if ex_sf is None else ex_sf + dividend
+    lim_en, lim_ex = risk_en + dividend, risk_ex + dividend
+
+    def shown(raw: float, total: float) -> str:
+        """q가 있을 때만 '(0.3+배당 0.3=0.6)'을 덧붙인다 — q=0이면 옛 글 그대로."""
+        return f"({raw:g}+배당 {dividend:g}={total:g})" if dividend else ""
+
+    def lim(raw: float, total: float) -> str:
+        return f"{total:g}({raw:g}+배당 {dividend:g})" if dividend else f"{raw:g}"
+
+    en_txt = f"진입SF{shown(en_sf or 0.0, en_q or 0.0)}" if en_sf is not None else ""
+    ex_txt = f"청산{shown(ex_sf or 0.0, ex_q or 0.0)}" if ex_sf is not None else ""
     if dtag == "fwd":
-        if en_sf is not None and en_sf <= risk_en:
-            errs.append(f"정방향 진입SF는 {risk_en:g} 초과여야 합니다")
-        if ex_sf is not None and ex_sf >= risk_ex:
-            errs.append(f"정방향 청산은 {risk_ex:g} 미만이어야 합니다")
+        if en_q is not None and en_sf is not None and en_q <= lim_en:
+            errs.append(f"정방향 {en_txt}는 {lim(risk_en, lim_en)} 초과여야 합니다")
+        if ex_q is not None and ex_sf is not None and ex_q >= lim_ex:
+            errs.append(f"정방향 {ex_txt}은 {lim(risk_ex, lim_ex)} 미만이어야 합니다")
         if en_sf is not None and ex_sf is not None and en_sf - ex_sf <= risk_gap:
             errs.append(f"정방향 진입SF−청산은 {risk_gap:g} 초과여야 합니다")
     else:
-        if en_sf is not None and en_sf >= risk_en:
-            errs.append(f"역방향 진입SF는 {risk_en:g} 미만이어야 합니다")
-        if ex_sf is not None and ex_sf <= risk_ex:
-            errs.append(f"역방향 청산은 {risk_ex:g} 초과여야 합니다")
+        if en_q is not None and en_sf is not None and en_q >= lim_en:
+            errs.append(f"역방향 {en_txt}는 {lim(risk_en, lim_en)} 미만이어야 합니다")
+        if ex_q is not None and ex_sf is not None and ex_q <= lim_ex:
+            errs.append(f"역방향 {ex_txt}은 {lim(risk_ex, lim_ex)} 초과여야 합니다")
         if en_sf is not None and ex_sf is not None and ex_sf - en_sf <= risk_gap:
             errs.append(f"역방향 청산−진입SF는 {risk_gap:g} 초과여야 합니다")
     return errs
@@ -608,8 +625,12 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     # 목업 layout_1.png에는 없는 항목 — 호가단위 콤보 오른쪽. '적'으로 코어에 보낸다.
     cb_month = ttk.Combobox(top, values=list(MONTH_MAP), width=4, state="readonly")
     cb_month.set("최근")
+    # 적용 중인 주식선물 배당율(공통설정, 사용자 2026-11-13 "화면 상단에 적용된 배당율") — 월물 콤보
+    # 오른쪽. 입력칸·모니터 수치는 그대로이고 역산가·리스크방지에만 더해진다.
+    lbl_div = tk.Label(top, text="배당 0%", fg=T.C_MUTED)
     if spec.has_month:  # 주식 화면엔 월물이 없다(콤보는 만들되 안 붙임 — 아래 코드 공용)
         cb_month.pack(side="left", padx=(0, 4))
+    # lbl_div는 기준수량 입력 오른쪽에 붙인다(아래, 사용자 2026-11-13) — 주식선물 화면만
 
     def _guard_next_month() -> bool:
         """차근을 골랐는데 구간 밖(최근월물 만기 5영업일 전, 결정 75)이면 알림 + 최근으로 되돌림.
@@ -709,6 +730,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     # 모니터 수치가 숨겨졌다(실측 2026-09-22 HL선 첫 '적').
     ent_refqty.insert(0, "1")
     ent_refqty.pack(side="left", padx=(0, 6))
+    if spec.product == "sf":  # 배당율 표시 — 기준수량 옆(사용자 2026-11-13). HL선·주식은 적용 안 함
+        lbl_div.pack(side="left", padx=(0, 6))
     ref_sent["bg"] = ent_refqty.cget("bg")  # 깜빡임 뒤 되돌릴 평소 배경(중첩 호출에도 안전)
     ent_refqty.bind("<Return>", lambda _e: send_ref_qty())
     ent_refqty.bind("<FocusOut>", lambda _e: revert_ref_qty())  # Enter 없이 나가면 수정 취소
@@ -1124,7 +1147,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 if ex_sf is None:
                     errs.append("청산을 입력하세요")
             # 리스크방지의 진입 기준값 — SF 화면은 진입SF, 주식 화면은 진입S(결정 대기, 화면 골격)
-            errs += check_risk(dtag, en_sf if spec.has_en_sf else en_s, ex_sf, *_risk_of(dtag))
+            errs += check_risk(dtag, en_sf if spec.has_en_sf else en_s, ex_sf, *_risk_of(dtag),
+                               dividend=_dividend())
             rt_override, rt_errs = rt_override_on_run(dtag, i)  # RT 칸 고친 값(결정 74)
             errs += rt_errs
             if errs:  # 필수 미입력·위반 — 경고, 실행 시작 안 함(버튼 상태 유지)
@@ -1185,6 +1209,27 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     def _risk_of(dtag: str) -> tuple[float, float, float]:
         r = common["risk"]
         return r[f"{dtag}_en"], r[f"{dtag}_ex"], r[f"{dtag}_gap"]
+
+    def _dividend() -> float:
+        """이 화면 월물(콤보 최근/차근)의 주식선물 배당율(**% 단위** — 화면의 기준값·리스크값과
+        같은 단위) — 코어 공통설정 dividend(소수)에서. 리스크방지 검사에 더하고 윗줄에 보인다
+        (사용자 2026-11-13). 주식 화면(월물 없음)·HL선 화면(적용 대상 아님)은 0."""
+        if spec.product != "sf":
+            return 0.0
+        data = state_box.get("data") or {}
+        div = (data.get("settings") or {}).get("dividend") or {}
+        month = MONTH_MAP.get(cb_month.get(), "near")
+        try:
+            return float((div.get(cur_under()) or {}).get(month, 0.0) or 0.0) * 100.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _refresh_dividend_label() -> None:
+        if spec.product != "sf":
+            return
+        text = f"배당 {_dividend():g}%"
+        if lbl_div.cget("text") != text:
+            lbl_div.config(text=text)
 
     def warn_center(msg: str, parent: tk.Toplevel | None = None) -> None:
         # 경고 — **띄운 창(부모)** 중앙에 모달로(닫을 때까지 대기). 세트설정·공통설정 창에서 띄우면
@@ -1367,7 +1412,8 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 errs.append("진입S를 입력하세요")
             if ex_sf is None:
                 errs.append("청산을 입력하세요")
-            errs += check_risk(dtag, en_sf if spec.has_en_sf else en_s, ex_sf, *_risk_of(dtag))
+            errs += check_risk(dtag, en_sf if spec.has_en_sf else en_s, ex_sf, *_risk_of(dtag),
+                               dividend=_dividend())
             unit = offset = 0
             hl_unit = hl_offset = 0.0
             if spec.hl_unit_usd:
@@ -2140,6 +2186,7 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     def apply_live() -> None:
         data = state_box.get("data") or {}
         _load_common_from_core(data)  # 체결쏴 설정은 코어 값(공통) — 다른 창의 변경도 반영
+        _refresh_dividend_label()     # 윗줄 '배당 x%' — 공통설정·월물 콤보가 바뀌면 따라온다
         if state_box.get("_loaded_under") != cur_under() and data.get("autom"):
             state_box["_loaded_under"] = cur_under()  # 종목이 바뀌면 그 종목 상태으로 다시 채움
             _load_inputs_from_core(data)
