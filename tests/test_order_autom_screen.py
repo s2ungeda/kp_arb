@@ -102,10 +102,11 @@ def test_set_inputs_sig_includes_reverse_sets() -> None:
 def test_fx_caption() -> None:
     from kp_arb.order_autom import fx_caption
 
-    assert fx_caption(1349.6, "현물") == "환율 1,349.60 (현물)"
-    assert fx_caption(1352.25, "선물이론") == "환율 1,352.25 (선물이론)"
-    assert fx_caption(None, "현물") == "환율 -" and fx_caption(0, "") == "환율 -"
-    assert fx_caption(1349.6, "") == "환율 1,349.60"
+    # 2026-11-13 사용자 "최대 줄이기": 값 + 출처 한 글자(현/선/하), 값 없으면 '-'
+    assert fx_caption(1349.6, "현물") == "1,349.60(현)"
+    assert fx_caption(1352.25, "선물이론") == "1,352.25(선물이론)"  # 모르는 출처는 그대로
+    assert fx_caption(None, "현물") == "-" and fx_caption(0, "") == "-"
+    assert fx_caption(1349.6, "") == "1,349.60"
 
 
 def test_sum_acc_weights_by_hl_qty() -> None:

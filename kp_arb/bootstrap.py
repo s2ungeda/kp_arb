@@ -83,6 +83,9 @@ from .theory import (
 from .ticks import ceil_to_tick, floor_to_tick, maker_cap, tick_for
 from .ws_status import WsStatus
 
+# 차근월물 선택 제한(결정 75) 임시 해제 스위치 — 사용자 2026-11-13 배당율 시험 때 True로 풀었다가
+# 같은 날 원복. 평소엔 False(시험이 필요할 때만 켜고, 켠 채 커밋·빌드하지 않는다).
+NEXT_MONTH_OPEN_TEMP = False
 # 원달러선물 채널로 가는 계획 TR(야간 DC0 포함 — 2026-11-04 복원)
 FX_PLAN_TRS = frozenset({FX_TRADE_TR, FX_NIGHT_TRADE_TR, FX_EXPECTED_TR})
 
@@ -827,6 +830,8 @@ class LiveSystem:
             ym = self.futures_expiry.get((u, Instrument.KR_STOCK_FUTURE)) if u else None
         if not ym:
             return True, "최근월물 만기 정보 없음 — 제한 못 함"
+        if NEXT_MONTH_OPEN_TEMP:  # 임시 해제(사용자 2026-11-13 배당율 시험) — 완료되면 False로 원복
+            return True, "차근 선택 제한 임시 해제(시험)"
         return next_month_window(int(ym), product, today or date.today())
 
     def fx_futures_months(self) -> list[tuple[str, int]]:

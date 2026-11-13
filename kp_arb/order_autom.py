@@ -289,18 +289,30 @@ def s_auction_bg(phase: object) -> str:
     return C_AUCTION if str(phase or "") == "pre_open" else C_S_NORMAL
 
 
+def rt_sum(rows: Sequence[Mapping[str, Any]]) -> float | None:
+    """세트들의 RT선진입 합(순수, 사용자 2026-11-13 "RT선진입 바로 위에 합산 값" — 정·역 따로).
+    숫자인 RT만 더하고, 하나도 없으면 None. 역방향은 음수 그대로 더해진다."""
+    vals = [float(r["rt"]) for r in rows
+            if isinstance(r.get("rt"), int | float) and not isinstance(r.get("rt"), bool)]
+    return sum(vals) if vals else None
+
+
+# 환율 출처 한 글자: 선 = 원달러선물 역산현물가, 현 = LS 현물환(CUR), 하 = 하나은행 고시
+FX_SOURCE_SHORT = {"선물역산": "선", "하나고시": "하", "LS": "현", "현물": "현"}
+
+
 def fx_caption(used: object, src: object, spot_src: object = None) -> str:
-    """정방향 모니터 옆 환율 표시 — '환율 1,349.60 (LS)' / '(하나고시)' / '(선물역산)'. 값이 없으면
-    '환율 -'. 순수 로직. 현물이면 '현물' 대신 그 원천(LS CUR / 하나고시, 결정 70)을 쓴다 — 괴리
-    모니터의 '현물CUR(하나고시)'와 맞춤(사용자 2026-10-16: 두 화면이 달라 보여 CUR 미수신으로 오해;
-    '현물·하나고시'는 길어서 원천만). 선물역산은 종전 그대로."""
+    """정방향 모니터 옆 환율 표시 — '1,331.51(선)' / '(현)' / '(하)'. 값이 없으면 '-'. 순수 로직.
+    출처 한 글자(사용자 2026-11-13 "최대 줄이기" — RT선진입 머리 위에 합산 값을 둘 자리). 옛 꼴
+    '환율 1,349.60 (하나고시)'(2026-10-16 결정 70 맞춤)은 폐기. 모르는 출처는 그대로 괄호에."""
     if not isinstance(used, int | float) or used <= 0:
-        return "환율 -"
+        return "-"
     label = str(src) if src else ""
     if label == "현물" and spot_src:
         label = str(spot_src)
-    tail = f" ({label})" if label else ""
-    return f"환율 {float(used):,.2f}{tail}"
+    short = FX_SOURCE_SHORT.get(label, label)
+    tail = f"({short})" if short else ""
+    return f"{float(used):,.2f}{tail}"
 
 
 ACC_CLEAR_WAIT_S = 3.0  # 누적 clear 뒤 코어 스냅샷이 지워진 값을 실어 올 때까지 "-" 유지 상한
@@ -901,11 +913,17 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                             font=T.FONT_NUM_LG)
             mlbl.grid(row=rbase, column=col[skey], padx=1, pady=(0, 2), sticky="nsew")
             mon[f"{dtag}_{skey}"] = mlbl
+        # RT선진입 합산(이 방향 세트 전부, 부호 그대로) — RT선진입 머리 바로 위(사용자 2026-11-13;
+        # 환율 글을 줄여 자리를 냄). 정·역 따로.
+        lbl_rt_sum = tk.Label(grid, text="-", font=T.FONT_LABEL, anchor="e", bg="white",
+                              relief="solid", bd=1)  # 글자 크기는 환율 글과 같게(합은 커진다)
+        lbl_rt_sum.grid(row=rbase, column=col["rt"], padx=1, pady=(0, 2), sticky="nsew")
+        mon[f"{dtag}_rt_sum"] = lbl_rt_sum
         if dtag == "fwd":
-            # 지금 HL 환산에 쓰는 환율(값·출처) — 정방향 모니터 수치 옆 빈 자리(RT선진입~초 칸 위,
-            # 사용자 2026-09-11). 코어 스냅샷 fx.used/src, 출처는 현물|선물이론.
-            mon["fx"] = tk.Label(grid, text="환율 -", font=T.FONT_LABEL, fg="gray25", anchor="e")
-            mon["fx"].grid(row=rbase, column=col["rt"], columnspan=3, sticky="e", padx=(0, 2))
+            # 지금 HL 환산에 쓰는 환율(값·출처 한 글자) — 체결차·초 칸 위(2026-11-13 줄임, 전엔
+            # RT선진입~초 세 칸). 코어 스냅샷 fx.used/src/spot_src.
+            mon["fx"] = tk.Label(grid, text="-", font=T.FONT_LABEL, fg="gray25", anchor="e")
+            mon["fx"].grid(row=rbase, column=col["diff"], columnspan=2, sticky="e", padx=(0, 2))
         ttk.Separator(grid, orient="vertical").grid(
             row=rbase, column=nset, rowspan=section_height(rows_by[dtag]), sticky="ns", padx=3)
         acc_cols: dict[str, tuple[int, int, tuple[str, ...]]] = {}
@@ -1940,7 +1958,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
     # 목업 대조용 모니터 샘플 (정 -0.82/-0.82/-0.52, 역 0.12/0.12/0.23)
     preview_mon = {"fwd_en_sf": "-0.82", "fwd_en_s": "-0.82", "fwd_ex_sf": "-0.52",
                    "rev_en_sf": "0.12", "rev_en_s": "0.12", "rev_ex_sf": "0.23",
-                   "fx": fx_caption(1349.6, "현물", "하나고시")}
+                   "fx": fx_caption(1349.6, "현물", "하나고시"),
+                   # RT선진입 합산 칸 표본(최대 폭) — 실제는 코어 세트 RT 합(rt_sum)
+                   "fwd_rt_sum": f"{9999 * rows_by['fwd']:,}",
+                   "rev_rt_sum": f"{-9999 * rows_by.get('rev', 0):,}"}
 
     def _fmt_num(v: Any, d: int = 0) -> str:
         return f"{float(v):,.{d}f}" if isinstance(v, int | float) else "-"
@@ -2215,6 +2236,10 @@ def main(spec: ScreenSpec = SF_SPEC) -> None:  # noqa: PLR0915 - 화면 조립�
                 # 체결차는 HL 소수 계약 그대로(0.612 등) — 정수로 반올림하면 "1"로 보여 한도(1)에
                 # 걸린 줄 안다(실측 2026-09-17 주식 1회 1주, HL 0.388 부분 체결)
                 w["diff"].config(text=_fmt_diff(row.get("fill_diff")))
+            # 이 방향 세트들의 RT선진입 합(사용자 2026-11-13) — 머리줄 RT선진입 위(미리보기는 표본)
+            if not preview:
+                mon[f"{dtag}_rt_sum"].config(
+                    text=_fmt_num(rt_sum(_live_sets(dtag)[:rows_by[dtag]])))
         # 상단 모니터 3칸 — 코어가 기준수량으로 계산한 est 괴리(%), 정/역 각각.
         # '적'을 누른 뒤부터 표시(종목·호가단위·기준수량이 코어에 적용된 값이라야 뜻이 있음).
         monitor = _live_book().get("monitor") or {}

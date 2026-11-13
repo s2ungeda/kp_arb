@@ -122,18 +122,31 @@ def test_slot_bar_text_shows_current_or_next_slot_only() -> None:
         "08:30:10~08:46:20 (1/2)", "1: 08:30:10~08:46:20\n2: 15:35:30~15:46:55")
 
 
+def test_rt_sum_per_direction_keeps_sign_and_skips_missing() -> None:
+    # 사용자 2026-11-13: RT선진입 머리 위에 그 방향 세트들의 RT 합 — 역방향은 음수 그대로,
+    # 값 없는 행은 건너뛰고, 하나도 없으면 None("-")
+    from kp_arb.order_autom import rt_sum
+
+    assert rt_sum([{"rt": 5}, {"rt": 3.0}, {"rt": None}, {}]) == 8
+    assert rt_sum([{"rt": -4}, {"rt": -1}]) == -5
+    assert rt_sum([{"rt": None}, {}]) is None and rt_sum([]) is None
+    assert rt_sum([{"rt": True}]) is None                     # bool은 숫자로 안 센다
+
+
 def test_fx_caption_shows_spot_source() -> None:
     # 사용자 2026-10-16: 괴리 모니터는 '현물CUR(하나고시)'인데 체결쏴는 '(현물)'뿐이라 CUR
     # 미수신으로 오해 → 현물이면 원천(하나고시/LS, 결정 70)까지. 선물역산·값 없음은 종전 그대로.
     from kp_arb.order_autom import fx_caption
 
-    assert fx_caption(None, "현물", "LS") == "환율 -"
-    assert fx_caption(0, "현물") == "환율 -"
-    assert fx_caption(1340.0, "현물", "하나고시") == "환율 1,340.00 (하나고시)"  # '현물·' 없이
-    assert fx_caption(1339.5, "현물", "LS") == "환율 1,339.50 (LS)"
-    assert fx_caption(1339.5, "현물") == "환율 1,339.50 (현물)"           # 출처 미상(옛 코어)
-    assert fx_caption(1338.29, "선물역산", "LS") == "환율 1,338.29 (선물역산)"
-    assert fx_caption(1338.29, None) == "환율 1,338.29"
+    # 2026-11-13 사용자 "최대 줄이기" — 값 + 출처 한 글자(현/선/하), 값 없으면 '-'
+    assert fx_caption(None, "현물", "LS") == "-"
+    assert fx_caption(0, "현물") == "-"
+    assert fx_caption(1340.0, "현물", "하나고시") == "1,340.00(하)"
+    assert fx_caption(1339.5, "현물", "LS") == "1,339.50(현)"
+    assert fx_caption(1339.5, "현물") == "1,339.50(현)"               # 출처 미상(옛 코어)
+    assert fx_caption(1338.29, "선물역산", "LS") == "1,338.29(선)"
+    assert fx_caption(1338.29, None) == "1,338.29"
+    assert fx_caption(1338.29, "기타") == "1,338.29(기타)"              # 모르는 출처는 그대로
 
 
 
