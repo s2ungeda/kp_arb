@@ -1,6 +1,7 @@
-"""잔고 조회(LS·HL 실조회) — 결과를 문자열 표로. 계약 = DESIGN-balance-query.md(사용자 2026-11-13).
+"""잔고 조회(LS·HL 실조회) — 결과를 문자열 표로. 계약 = DESIGN-balance-query.md(사용자 2026-11-13,
+표 개정 2026-11-16).
 
-장부(OrderBook)와 섞이지 않게, 게이트웨이 조회 결과를 **문자열 칸**으로만 만든다(``build_cells``·
+장부(OrderBook)와 섞이지 않게, 게이트웨이 조회 결과를 **문자열 칸**으로만 만든다(``build_table``·
 ``fmt_qty``는 순수). ``query_balance``는 게이트웨이 세 출처(LS 주식·LS 선물·HL)를 부르기만 하고
 장부·재동기 경로는 전혀 타지 않는다.
 """
@@ -10,27 +11,28 @@ import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from .auto_m import HL_PER_SF
 from .domain.enums import Account, Instrument, Underlying
 from .domain.models import Position
 
-# 열 키(화면 순서) — HL 퍼프 | LS 주식(현금) | 신용 | 주선(최근) | 주선(차선)
-COLUMNS: tuple[str, ...] = ("hl", "stock", "credit", "sf_near", "sf_next")
-COLUMN_TITLES: dict[str, str] = {"hl": "퍼프", "stock": "주식", "credit": "신용",
-                                 "sf_near": "주선(최근)", "sf_next": "주선(차선)"}
-# 행 순서는 목업대로(하이닉스 → 삼성 → 현대)
+# 응답 칸 키 — hl 퍼프 / stock 주식(현금+신용 합) / credit 신용 / sf 주선(최근+차근 합) /
+# sf_next 차근 / diff 체결차
+COLUMNS: tuple[str, ...] = ("hl", "stock", "credit", "sf", "sf_next", "diff")
+# 행 순서는 사용자 표대로(하이닉스 → 삼성 → 현대)
 ROW_ORDER: tuple[Underlying, ...] = (Underlying.SK_HYNIX, Underlying.SAMSUNG, Underlying.HYUNDAI)
 ROW_NAMES: dict[str, str] = {"sk_hynix": "하이닉스", "samsung": "삼성", "hyundai": "현대"}
-# 출처 → 그 출처가 채우는 열(실패하면 이 열만 '오류')
+# 출처 → 그 출처가 채우는 칸(실패하면 이 칸과 체결차가 '오류')
 SOURCE_COLUMNS: dict[str, tuple[str, ...]] = {
-    "hl": ("hl",), "ls_stock": ("stock", "credit"), "ls_deriv": ("sf_near", "sf_next")}
+    "hl": ("hl",), "ls_stock": ("stock", "credit"), "ls_deriv": ("sf", "sf_next")}
 SOURCE_NAMES: dict[str, str] = {"hl": "HL", "ls_stock": "LS 주식", "ls_deriv": "LS 선물"}
 NOT_QUERIED = "-"
 ERROR_TEXT = "오류"
-AUTO_INTERVALS_S: tuple[int, ...] = (10, 30, 60)  # 자동조회 주기 콤보(사용자 2026-11-13)
+# 자동조회 주기 콤보(사용자 2026-11-13; 10초는 같은 날 뺌 — 조회 차선을 종일 쓰는 첫 기능이라 여유)
+AUTO_INTERVALS_S: tuple[int, ...] = (30, 60)
 
 
 def auto_interval_s(choice: object) -> int:
-    """콤보 글 → 주기(초). 목록에 없는 값·빈 값은 첫 항목(10초)."""
+    """콤보 글 → 주기(초). 목록에 없는 값·빈 값은 첫 항목(30초)."""
     try:
         sec = int(str(choice).strip())
     except ValueError:
@@ -48,11 +50,15 @@ def fmt_qty(qty: float) -> str:
     return f"{q:+,.4f}".rstrip("0").rstrip(".")
 
 
-def _column_of(p: Position, credit: bool) -> str | None:
+# 원시 칸(게이트웨이 상품 → 칸) — 합치기 전
+_RAW = ("hl", "stock_cash", "credit", "sf_near", "sf_next")
+
+
+def _raw_column(p: Position, credit: bool) -> str | None:
     if p.instrument is Instrument.HL_PERP:
         return "hl"
     if p.instrument in (Instrument.KR_STOCK, Instrument.KR_ETF):
-        return "credit" if credit else "stock"
+        return "credit" if credit else "stock_cash"
     if p.instrument is Instrument.KR_STOCK_FUTURE:
         return "sf_near"
     if p.instrument is Instrument.KR_STOCK_FUTURE_NEXT:
@@ -60,31 +66,59 @@ def _column_of(p: Position, credit: bool) -> str | None:
     return None  # 원달러선물 등 — 이 표에 없음
 
 
-def build_cells(lots: Iterable[tuple[Position, bool]], *,
-                failed: Iterable[str] = ()) -> dict[str, dict[str, str]]:
-    """(포지션, 신용 여부) 목록 → {종목키: {열: 글}}. 같은 칸은 부호 수량을 합친다.
+def balance_numbers(lots: Iterable[tuple[Position, bool]]) -> dict[str, dict[str, float]]:
+    """(포지션, 신용 여부) → {종목키: {hl, stock(현금+신용), credit, sf(최근+차근), sf_next, diff}}.
 
-    failed: 조회 실패한 출처 키("hl"·"ls_stock"·"ls_deriv") — 그 출처의 열은 '오류'로 둔다.
+    diff(체결차) = stock + sf × HL_PER_SF + hl — 부호 그대로(exec §8 체결차 식과 같음, 사용자
+    2026-11-16 "1 ok").
     """
-    sums: dict[tuple[str, str], float] = {}
+    raw: dict[str, dict[str, float]] = {u.value: dict.fromkeys(_RAW, 0.0) for u in ROW_ORDER}
     for p, credit in lots:
-        col = _column_of(p, credit)
-        if col is None:
+        col = _raw_column(p, credit)
+        row = raw.get(p.underlying.value)
+        if col is None or row is None:
             continue
-        key = (p.underlying.value, col)
-        sums[key] = sums.get(key, 0.0) + p.signed_qty
-    cells = {u.value: {c: fmt_qty(sums.get((u.value, c), 0.0)) for c in COLUMNS}
-             for u in ROW_ORDER}
+        row[col] += p.signed_qty
+    out: dict[str, dict[str, float]] = {}
+    for key, r in raw.items():
+        stock = r["stock_cash"] + r["credit"]
+        sf = r["sf_near"] + r["sf_next"]
+        out[key] = {"hl": r["hl"], "stock": stock, "credit": r["credit"], "sf": sf,
+                    "sf_next": r["sf_next"], "diff": stock + sf * HL_PER_SF + r["hl"]}
+    return out
+
+
+def sum_numbers(rows: dict[str, dict[str, float]]) -> dict[str, float]:
+    """'합' 행 — 토탈잔고 구성(종목·상품별 절대값 합, DESIGN-balance-watch §0). 체결차만 부호 합."""
+    total = dict.fromkeys(COLUMNS, 0.0)
+    for r in rows.values():
+        for col in COLUMNS:
+            total[col] += r[col] if col == "diff" else abs(r[col])
+    return total
+
+
+def build_table(lots: Iterable[tuple[Position, bool]], *,
+                failed: Iterable[str] = ()) -> dict[str, Any]:
+    """(포지션, 신용 여부) 목록 → {"rows": {종목키: {칸: 글}}, "sum": {칸: 글}} — 전부 문자열.
+
+    failed: 조회 실패한 출처 키("hl"·"ls_stock"·"ls_deriv") — 그 출처의 칸과 체결차는 '오류'.
+    """
+    nums = balance_numbers(lots)
+    bad: set[str] = set()
     for src in failed:
-        for col in SOURCE_COLUMNS.get(src, ()):
-            for row in cells.values():
-                row[col] = ERROR_TEXT
-    return cells
+        bad.update(SOURCE_COLUMNS.get(src, ()))
+    if bad:
+        bad.add("diff")  # 세 출처가 다 있어야 계산되는 칸
+    rows = {key: {c: (ERROR_TEXT if c in bad else fmt_qty(v)) for c, v in r.items()}
+            for key, r in nums.items()}
+    total = {c: (ERROR_TEXT if c in bad else fmt_qty(v)) for c, v in sum_numbers(nums).items()}
+    return {"rows": rows, "sum": total}
 
 
-def empty_cells() -> dict[str, dict[str, str]]:
+def empty_table() -> dict[str, Any]:
     """조회 전 표 — 전부 '-'."""
-    return {u.value: dict.fromkeys(COLUMNS, NOT_QUERIED) for u in ROW_ORDER}
+    return {"rows": {u.value: dict.fromkeys(COLUMNS, NOT_QUERIED) for u in ROW_ORDER},
+            "sum": dict.fromkeys(COLUMNS, NOT_QUERIED)}
 
 
 def status_text(result: dict[str, Any] | None) -> str:
@@ -102,11 +136,12 @@ def status_text(result: dict[str, Any] | None) -> str:
     return f"{ts} 일부 실패 — {bad}"
 
 
-async def query_balance(ls: Any, hl: Any | None, *,
-                        now: float | None = None) -> dict[str, Any]:
+async def query_balance(ls: Any, hl: Any | None, *, now: float | None = None,
+                        baseline: dict[str, Any] | None = None) -> dict[str, Any]:
     """세 출처를 각각 조회해 문자열 표로. 출처마다 독립 — 하나가 실패해도 나머지는 채운다.
 
     장부·재동기 경로를 타지 않는다(DESIGN-balance-query §0). 돌려주는 값은 전부 문자열·사유.
+    baseline: 코어가 시동 때 떠 둔 같은 표(문자열) — 응답에 그대로 싣는다(없으면 None).
     """
     lots: list[tuple[Position, bool]] = []
     errors: dict[str, str] = {}
@@ -128,4 +163,6 @@ async def query_balance(ls: Any, hl: Any | None, *,
         except Exception as exc:  # noqa: BLE001
             errors["hl"] = f"{type(exc).__name__}: {exc}"[:200]
     ts = time.strftime("%H:%M:%S", time.localtime(now if now is not None else time.time()))
-    return {"ok": True, "ts": ts, "cells": build_cells(lots, failed=errors), "errors": errors}
+    table = build_table(lots, failed=errors)
+    return {"ok": True, "ts": ts, "rows": table["rows"], "sum": table["sum"],
+            "baseline": baseline, "errors": errors}

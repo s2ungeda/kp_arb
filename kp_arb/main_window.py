@@ -781,12 +781,8 @@ def main() -> None:
     # 현재 시각(사용자 2026-10-15) — 체결쏴 주문가능시간 구간이 시각으로 바뀌니 한눈에 보게
     lbl_clock = tk.Label(bottom, text="00:00:00", anchor="e", relief="groove", width=8)
     lbl_clock.pack(side="right", padx=(4, 0))
-    # 토탈잔고(DESIGN-balance-watch §3, 사용자 2026-11-11 "기준 300  잔고 : 500 이렇게만", 상태줄
-    # 아래) — 코어 /state의 balance(기준·현재)를 2초 폴링 값으로 보여 준다. 판정·텔레그램은 코어.
-    from .balance_watch import format_main_line
-
-    lbl_balance = tk.Label(root, text=format_main_line(None, None), anchor="w", width=1)
-    lbl_balance.pack(fill="x", padx=8, pady=(0, 6))
+    # 토탈잔고 한 줄('기준 300  잔고 : 500')은 2026-11-16 잔고 조회 창(balance_query_screen)으로
+    # 옮김(사용자 지시) — 메인은 /state의 balance를 읽어 두기만 한다.
     # LS 처리 지연 띠 — 지연 동안만 맨 위(사용자 2026-10-26; 표의 "멈춤" 글만으론 못 보고 지나감)
     from .ui_status import StallBanner, ls_stalled
 
@@ -987,11 +983,8 @@ def main() -> None:
                 # 시작 요청·미접속 안내 → 실제 연결 확인(다른 글은 그대로)
                 if status.cget("text") in ("코어 시작 중 ...", CORE_DOWN_TEXT):
                     status.config(text="코어 시작 완료", fg=status_fg)
-                bal = alive_box.get("balance") or {}
-                lbl_balance.config(text=format_main_line(bal.get("baseline"), bal.get("total")))
             else:
                 status.config(text=CORE_DOWN_TEXT, fg="#8b0000")
-                lbl_balance.config(text=format_main_line(None, None))
             render_ws()
         finally:
             try:

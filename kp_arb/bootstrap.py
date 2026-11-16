@@ -424,6 +424,9 @@ class LiveSystem:
         self.closers: list[Callable[[], None]] = []
         # HL 포지션 상세(마진·누적펀딩·청산가·레버리지) — clearinghouseState에서 refresh 때 채움.
         self.hl_detail: dict[Underlying, dict[str, Any]] = {}
+        # 잔고 조회 창 '기준' 행 — 시동 로드 뒤 실조회 1회의 문자열 복사본(DESIGN-balance-query §2).
+        # 장부 아님·판정에 안 씀. 실패면 None.
+        self.balance_baseline: dict[str, Any] | None = None
         # 종목정보(틱·승수·szDecimals·maxLeverage·만기) — 시동 시 1회 조회·보관 (§5.10).
         self.instruments: dict[tuple[Underlying, Instrument], InstrumentInfo] = {}
         # 시동 초기화(종목→잔고→포지션→주문) 중 실패한 작업명 — 있으면 /state로 알려
@@ -489,10 +492,30 @@ class LiveSystem:
 
     async def balance_query(self) -> dict[str, Any]:
         """잔고 조회 화면(DESIGN-balance-query) — 게이트웨이 실조회를 문자열 표로만. 장부·
-        hl_detail·재동기 경로는 건드리지 않는다(보기 전용)."""
+        hl_detail·재동기 경로는 건드리지 않는다(보기 전용). 기준 행(시동 복사본)을 같이 싣는다."""
         from .balance_query import query_balance
 
-        return await query_balance(self._gw, self._hl)
+        return await query_balance(self._gw, self._hl, baseline=self.balance_baseline)
+
+    async def load_balance_baseline(self) -> None:
+        """잔고 조회 '기준' 행(DESIGN-balance-query §1·§2) — 시동 로드 뒤 같은 실조회 1회를 문자열
+        표로 떠 둔다. 장부가 아니라 복사본이고 판정에 안 쓴다. 실패·일부 실패면 로그 + 없음(재시도
+        없음, 다음 시동 때)."""
+        import logging
+
+        from .balance_query import query_balance
+
+        log = logging.getLogger("kp_arb.bootstrap")
+        try:
+            got = await query_balance(self._gw, self._hl)
+        except Exception:  # noqa: BLE001 - 기준 행은 보기용, 시동을 막지 않는다
+            log.warning("잔고 조회 기준 행 실패 — 이번 시동엔 기준 없음", exc_info=True)
+            return
+        if got.get("errors"):
+            log.warning("잔고 조회 기준 행 일부 실패 %s — 이번 시동엔 기준 없음", got["errors"])
+            return
+        self.balance_baseline = {"rows": got["rows"], "sum": got["sum"]}
+        log.info("잔고 조회 기준 행 적재(시동 실조회) %s", got["ts"])
 
     # --- 스냅샷 (최초 실행 + 온디맨드/UI 조회 버튼) ---
 
@@ -2408,6 +2431,8 @@ class LiveSystem:
         미확보 ETF 재시도는 병행 루프로.
         """
         complete = await self._load_etf_refs()
+        # 잔고 조회 '기준' 행 — 시동 실조회 1회(LS 2건·HL 1건, 같은 순차 줄에서). 보기용 복사본.
+        await self.load_balance_baseline()
         # 현재가 초기값은 start()가 구독 전에 이미 채웠다(_seed_initial_prices).
         if complete:
             await self._fx_loop()

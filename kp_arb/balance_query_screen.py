@@ -3,14 +3,16 @@
     python -m kp_arb.balance_query_screen [--preview]   (운영은 메인 메뉴 "잔고 조회")
 
 - [조회]를 누르면 뒷단 스레드가 코어 명령 ``balance_query``를 보내고(최대 40초 대기) 응답의
-  문자열 표(``cells``)를 상자에 둔다. 화면은 after()로 그 상자만 읽어 그린다(CLAUDE.md L5 —
-  화면 스레드에서 네트워크 금지). 장부(OrderBook)와는 무관 — 코어가 문자열만 돌려준다.
+  문자열 표를 상자에 둔다. 화면은 after()로 그 상자만 읽어 그린다(CLAUDE.md L5 — 화면 스레드에서
+  네트워크 금지). 장부(OrderBook)와는 무관 — 코어가 문자열만 돌려준다.
 - 버튼은 누르는 즉시 잠기고 **1초 뒤** 풀린다(사용자 2026-11-13). 조회가 그보다 늦으면 다시
   눌러도 화면이 "조회 중"으로 막는다.
-- 자동조회(체크박스 + 주기 10·30·60초): 켜면 바로 한 번, 그 뒤 주기마다 조회. 켜 있는 동안
+- 자동조회(체크박스 + 주기 30·60초): 켜면 바로 한 번, 그 뒤 주기마다 조회. 켜 있는 동안
   [조회] 버튼은 잠긴다. 앞 조회가 안 끝났으면 그 차례는 건너뛴다. 저장 안 함(열면 꺼짐).
-- 표: 행 하이닉스·삼성·현대(목업 순서), 열 HL 퍼프 | LS 주식·신용·주선(최근)·주선(차선).
-  값 색은 부호(+빨강 −파랑 0검정), 조회 전 '-', 실패한 출처 열은 '오류'.
+- 표(사용자 2026-11-16): 열 HL 퍼프 | LS 주식(신용)·주선(차근) | 체결차, 행 하이닉스·삼성·현대·합
+  ('기준' 행은 같은 날 뺌 — 코어의 시동 복사본·응답 baseline은 남김). 포지션 칸은 부호 없이
+  ``100(50)``, 방향은 색(롱 빨강·숏 파랑·0 검정). 체결차는 부호를 보이고 0이 아니면 바탕 강조.
+  조회 전 '-', 실패한 출처는 '오류'.
 """
 from __future__ import annotations
 
@@ -22,27 +24,33 @@ from . import ui_theme as T
 from . import win_state
 from .balance_query import (
     AUTO_INTERVALS_S,
-    COLUMN_TITLES,
-    COLUMNS,
     ERROR_TEXT,
+    NOT_QUERIED,
     ROW_NAMES,
     ROW_ORDER,
     auto_interval_s,
-    empty_cells,
+    empty_table,
     status_text,
 )
 from .core_client import core_request_err, screen_log, watch_parent_exit
 
 LOCK_MS = 1000           # 조회 버튼 잠김 시간(사용자 지시 1초)
 REQUEST_TIMEOUT_S = 40.0  # LS 두 TR(10초 상한×재시도) + HL 한 번을 기다릴 여유
-_PREVIEW_RESULT: dict[str, Any] = {  # --preview 표본(코어 없이 화면 확인용)
-    "ok": True, "ts": "14:05:12", "errors": {},
-    "cells": {"sk_hynix": {"hl": "+100", "stock": "0", "credit": "+50", "sf_near": "-10",
-                           "sf_next": "0"},
-              "samsung": {"hl": "-200", "stock": "+200", "credit": "0", "sf_near": "0",
-                          "sf_next": "+5"},
-              "hyundai": {"hl": "0", "stock": "0", "credit": "0", "sf_near": "0",
-                          "sf_next": "0"}}}
+# 화면 열: (머리글, 바깥 값 키, 괄호 값 키 또는 None)
+SCREEN_COLUMNS: tuple[tuple[str, str, str | None], ...] = (
+    ("퍼프", "hl", None), ("주식(신용)", "stock", "credit"), ("주선(차근)", "sf", "sf_next"),
+    ("체결차", "diff", None))
+_PREVIEW_ROWS = {  # --preview 표본(코어 없이 화면 확인용)
+    "sk_hynix": {"hl": "-310", "stock": "+100", "credit": "+50", "sf": "+20", "sf_next": "+10",
+                 "diff": "-10"},
+    "samsung": {"hl": "+200", "stock": "0", "credit": "0", "sf": "-20", "sf_next": "0",
+                "diff": "0"},
+    "hyundai": {"hl": "0", "stock": "0", "credit": "0", "sf": "0", "sf_next": "0", "diff": "0"}}
+_PREVIEW_SUM = {"hl": "+510", "stock": "+100", "credit": "+50", "sf": "+40", "sf_next": "+10",
+                "diff": "-10"}
+_PREVIEW_RESULT: dict[str, Any] = {
+    "ok": True, "ts": "14:05:12", "errors": {}, "rows": _PREVIEW_ROWS, "sum": _PREVIEW_SUM,
+    "baseline": {"rows": _PREVIEW_ROWS, "sum": _PREVIEW_SUM}}
 
 
 def cell_color(text: str) -> str:
@@ -53,6 +61,40 @@ def cell_color(text: str) -> str:
         return T.sign_color(float(text.replace(",", "")))
     except ValueError:
         return T.C_MUTED
+
+
+def _unsigned(text: str) -> str:
+    return text if text in (ERROR_TEXT, NOT_QUERIED) else text.lstrip("+-")
+
+
+def display_cell(outer: str, inner: str | None, *, signed: bool = False) -> str:
+    """칸에 보일 글 — 포지션은 부호 없이 ``100(50)``(사용자 2026-11-16 "부호 표시는 안 해도 됨"),
+    체결차(signed)는 부호 그대로. '-'·'오류'는 그대로(순수)."""
+    if signed:
+        return outer
+    text = _unsigned(outer)
+    if inner is None or outer in (ERROR_TEXT, NOT_QUERIED):
+        return text
+    return f"{text}({_unsigned(inner)})"
+
+
+def diff_bg(text: str) -> str:
+    """체결차 칸 바탕 — 0이 아닌 수량이면 강조색, 그 밖(0·'-'·'오류')은 흰색(순수)."""
+    try:
+        return T.C_HILITE_BG if float(text.replace(",", "")) != 0 else "white"
+    except ValueError:
+        return "white"
+
+
+def table_rows(result: dict[str, Any] | None) -> dict[str, dict[str, str]]:
+    """응답 → 화면 행(종목 3 + '합')의 칸 문자열. 조회 전·실패 응답이면 전부 '-'(순수).
+    응답의 baseline(시동 복사본)은 화면에 안 그린다(사용자 2026-11-16 "기준 행은 빼자")."""
+    if not result or not result.get("ok"):
+        empty = empty_table()
+        return {**empty["rows"], "sum": empty["sum"]}
+    rows = {k: dict(v) for k, v in (result.get("rows") or {}).items()}
+    rows["sum"] = dict(result.get("sum") or {})
+    return rows
 
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
@@ -91,8 +133,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     chk_auto = tk.Checkbutton(top, text="자동조회", variable=auto_var)
     chk_auto.pack(side="left")
     tk.Label(top, text="주기").pack(side="left", padx=(8, 2))
-    cmb_interval = ttk.Combobox(top, values=[str(s) for s in AUTO_INTERVALS_S], width=4,
-                                state="readonly", font=T.FONT_NUM)
+    cmb_interval = ttk.Combobox(top, values=[str(s) for s in AUTO_INTERVALS_S], width=3,
+                                state="readonly", font=T.FONT_NUM)  # 두 자리 숫자만큼(사용자)
     cmb_interval.set(str(AUTO_INTERVALS_S[0]))
     cmb_interval.pack(side="left")
     tk.Label(top, text="초").pack(side="left", padx=(2, 0))
@@ -101,36 +143,43 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     grid.pack(padx=8, pady=4)
     head_bg = "#f0f0f0"
     opts: dict[str, Any] = {"padx": (0, 1), "pady": (0, 1), "sticky": "nsew"}
-    # 머리 두 줄: HL | LS(4열 합침) / 퍼프 | 주식 | 신용 | 주선(최근) | 주선(차선)
+    # 머리 두 줄: HL | LS(2열 합침) | 체결차(2줄 합침) / 퍼프 | 주식(신용) | 주선(차근)
     tk.Label(grid, text="", width=9, bg=head_bg).grid(row=0, column=0, rowspan=2, **opts)
     tk.Label(grid, text="HL", bg=head_bg, font=T.FONT_LABEL).grid(row=0, column=1, **opts)
     tk.Label(grid, text="LS", bg=head_bg, font=T.FONT_LABEL).grid(
-        row=0, column=2, columnspan=4, **opts)
-    for col, key in enumerate(COLUMNS, start=1):
-        tk.Label(grid, text=COLUMN_TITLES[key], width=10, bg=head_bg,
-                 font=T.FONT_LABEL).grid(row=1, column=col, **opts)
+        row=0, column=2, columnspan=2, **opts)
+    tk.Label(grid, text="체결차", bg=head_bg, font=T.FONT_LABEL).grid(
+        row=0, column=4, rowspan=2, **opts)
+    for col, (head, _k, _i) in enumerate(SCREEN_COLUMNS[:3], start=1):
+        tk.Label(grid, text=head, width=11, bg=head_bg, font=T.FONT_LABEL).grid(
+            row=1, column=col, **opts)
     cells: dict[tuple[str, str], tk.Label] = {}
-    for r, u in enumerate(ROW_ORDER, start=2):
-        tk.Label(grid, text=ROW_NAMES[u.value], width=9, bg=head_bg, anchor="e",
+    row_keys = [*(u.value for u in ROW_ORDER), "sum"]
+    row_names = {**ROW_NAMES, "sum": "합"}
+    for r, rk in enumerate(row_keys, start=2):
+        tk.Label(grid, text=row_names[rk], width=9, bg=head_bg, anchor="e",
                  font=T.FONT_LABEL).grid(row=r, column=0, **opts)
-        for col, key in enumerate(COLUMNS, start=1):
-            lbl = tk.Label(grid, text="-", width=10, bg="white", anchor="e", font=T.FONT_NUM,
-                           fg=T.C_MUTED)
+        for col, (_head, key, _inner) in enumerate(SCREEN_COLUMNS, start=1):
+            lbl = tk.Label(grid, text=NOT_QUERIED, width=11, bg="white", anchor="e",
+                           font=T.FONT_NUM, fg=T.C_MUTED)
             lbl.grid(row=r, column=col, **opts)
-            cells[(u.value, key)] = lbl
+            cells[(rk, key)] = lbl
 
     status = tk.Label(root, text=status_text(None), anchor="w", fg=T.C_MUTED,
                       font=T.FONT_LABEL)
     status.pack(fill="x", padx=8, pady=(2, 8))
 
     def show(result: dict[str, Any] | None) -> None:
-        table = (result or {}).get("cells") if result and result.get("ok") else None
-        if not isinstance(table, dict):
-            table = empty_cells() if result is None else None
-        if table is not None:  # 실패 응답(ok=False)은 표를 그대로 두고 상태줄만 바꾼다
-            for (u, key), lbl in cells.items():
-                text = str((table.get(u) or {}).get(key, "-"))
-                lbl.config(text=text, fg=cell_color(text))
+        if result is None or result.get("ok"):  # 실패 응답(ok=False)은 표를 그대로 두고 상태줄만
+            rows = table_rows(result)
+            for (rk, key), lbl in cells.items():
+                row = rows.get(rk) or {}
+                outer = str(row.get(key, NOT_QUERIED))
+                inner_key = next(i for _h, k, i in SCREEN_COLUMNS if k == key)
+                inner = str(row.get(inner_key, NOT_QUERIED)) if inner_key else None
+                signed = key == "diff"
+                lbl.config(text=display_cell(outer, inner, signed=signed), fg=cell_color(outer),
+                           bg=diff_bg(outer) if signed else "white")
         status.config(text=status_text(result),
                       fg=T.C_ERR if result and (not result.get("ok") or result.get("errors"))
                       else T.C_MUTED)

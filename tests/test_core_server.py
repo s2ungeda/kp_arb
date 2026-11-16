@@ -828,8 +828,9 @@ async def test_balance_query_command_returns_strings_and_rejects_overlap() -> No
             self.calls += 1
             await gate.wait()
             return {"ok": True, "ts": "14:05:12", "errors": {},
-                    "cells": {"samsung": {"hl": "-20", "stock": "+200", "credit": "0",
-                                          "sf_near": "0", "sf_next": "0"}}}
+                    "rows": {"samsung": {"hl": "-20", "stock": "+200", "credit": "0",
+                                         "sf": "0", "sf_next": "0", "diff": "+180"}},
+                    "sum": {}, "baseline": None}
 
         def set_hl_daily_limit(self, usdc: float) -> None: ...
         def set_carry_rates(self, fx: float, eq: float) -> None: ...
@@ -848,7 +849,7 @@ async def test_balance_query_command_returns_strings_and_rejects_overlap() -> No
         gate.set()
         body = await (await first).json()
         assert body["ok"] and body["ts"] == "14:05:12"
-        assert body["cells"]["samsung"]["stock"] == "+200"
+        assert body["rows"]["samsung"]["stock"] == "+200" and body["baseline"] is None
         assert sys_.calls == 1  # 겹친 요청은 조회를 안 냈다
     finally:
         await client.close()

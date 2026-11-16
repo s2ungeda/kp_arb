@@ -1,17 +1,18 @@
-"""토탈잔고 감시 — 배수 선을 넘으면 텔레그램. 계약 = DESIGN-balance-watch.md(사용자 2026-11-11).
+"""잔고 감시 — HL 잔고 합이 배수 선을 넘으면 텔레그램. 계약 = DESIGN-balance-watch.md
+(사용자 2026-11-11, 개정 2026-11-16).
 
-토탈잔고 = Σ(설정 종목) |주식·ETF 잔고(주)| + |주식선물 계약(근+차근)| × 10 + |HL 포지션|.
-원달러선물은 종목이 아니라 자연히 빠진다. 값의 출처는 장부(OrderBook) 포지션 — 실조회 없음.
-
-기준값 = 코어 시동 직후 값(저장 안 함). 비교잔고배수 S를 넘으면(T ≥ B+S 또는 T ≤ B−S) 보내고,
-새 기준은 **마지막으로 넘은 선**(B ± n·S). 계산(``balance_rows``·``BalanceWatcher``)·글
-(``format_*``)은 순수, ``balance_watch_loop``만 I/O(로그·텔레그램).
+판정값 = |Σ(설정 종목) HL 포지션|(부호대로 더한 뒤 절대값, 2026-11-16 — 전엔 토탈잔고
+Σ|주식|+|주식선물|×10+|HL|). 값의 출처는 장부(OrderBook) 포지션 — 실조회 없음. 기준값 = 코어 시동
+직후 값(저장 안 함). 비교잔고배수 S를 넘으면(T ≥ B+S 또는 T ≤ B−S) 보내고, 새 기준은 **마지막으로
+넘은 선**(B ± n·S). 시동 때도 한 번 보낸다. 글은 종목마다 이름 줄 +
+``LS 주식(S) 잔고 LS선물(SF) 잔고*10 HP 잔고``(변화량은 같은 날 뺌).
+계산(``balance_rows``·``BalanceWatcher``)·글(``format_report``)은 순수, ``balance_watch_loop``만
+I/O.
 """
 from __future__ import annotations
 
 import logging
 import math
-import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
@@ -23,7 +24,9 @@ log = logging.getLogger("kp_arb.balance")
 
 BALANCE_WATCH_INTERVAL_S = 1.0  # 장부 재계산 주기(순수 계산, I/O 없음)
 
-_NAMES = {Underlying.SAMSUNG: "삼성", Underlying.SK_HYNIX: "하이닉스", Underlying.HYUNDAI: "현대차"}
+# 종목 이름 줄(사용자 예시 2026-11-16 "sk하이닉스") — 다른 화면과 같은 전체 이름
+_NAMES = {Underlying.SAMSUNG: "삼성전자", Underlying.SK_HYNIX: "SK하이닉스",
+          Underlying.HYUNDAI: "현대차"}
 
 
 @dataclass(frozen=True)
@@ -66,7 +69,13 @@ def balance_rows(positions: Iterable[Position],
 
 
 def total_balance(rows: Iterable[BalanceRow]) -> float:
+    """토탈잔고(옛 판정값·잔고 조회 창 '합' 행과 같은 정의) — 종목·상품별 절대값 합."""
     return sum(r.total for r in rows)
+
+
+def hl_total(rows: Iterable[BalanceRow]) -> float:
+    """판정값(2026-11-16) = |Σ 종목 HL 포지션| — 부호대로 더한 뒤 절대값("전 종목 HL 합 하나")."""
+    return abs(sum(r.hl for r in rows))
 
 
 @dataclass(frozen=True)
@@ -114,26 +123,17 @@ def _q(x: float, *, signed: bool = False) -> str:
     return "0" if text in ("+0", "-0") else text
 
 
-def format_telegram(c: Crossing, rows: Iterable[BalanceRow], when: str) -> str:
-    """텔레그램 본문(상세) — 현재값·변화·시각 / 기준 변화·배수·다음 선 / 종목별 부호 있는 포지션."""
-    lines = [f"토탈잔고 {_q(c.total)} ({_q(c.change, signed=True)})  {when}",
-             f"기준 {_q(c.old_baseline)} → {_q(c.new_baseline)}, 배수 {_q(c.step)}, "
-             f"다음 알림 {_q(c.new_baseline + c.step)}↑ / "
-             f"{_q(max(c.new_baseline - c.step, 0.0))}↓"]
+def format_report(rows: Iterable[BalanceRow]) -> str:
+    """텔레그램 본문(사용자 2026-11-16) — 종목마다 이름 줄 +
+    ``LS 주식(S) 잔고 LS선물(SF) 잔고*10 HP 잔고``. 잔고는 음수만 부호. 변화량(증감)은 같은 날
+    "없어도 된다"로 뺌. 전부 0인 종목은 뺀다."""
+    lines: list[str] = []
     for r in rows:
         if r.is_empty:
             continue
-        name = _NAMES.get(r.underlying, r.underlying.value)
-        lines.append(f"{name} 주식 {_q(r.stock, signed=True)} / 선물 {_q(r.sf, signed=True)}"
-                     f"×{HL_PER_SF} / HL {_q(r.hl, signed=True)}")
+        lines.append(_NAMES.get(r.underlying, r.underlying.value))
+        lines.append(f"LS 주식(S) {_q(r.stock)} LS선물(SF) {_q(r.sf)}*{HL_PER_SF} HP {_q(r.hl)}")
     return "\n".join(lines)
-
-
-def format_main_line(baseline: float | None, total: float | None) -> str:
-    """메인 창 한 줄(사용자 2026-11-11 "이렇게만"): ``기준 300  잔고 : 500``. 값 없으면 '-'."""
-    b = "-" if baseline is None else _q(baseline)
-    t = "-" if total is None else _q(total)
-    return f"기준 {b}  잔고 : {t}"
 
 
 async def balance_watch_loop(
@@ -144,25 +144,30 @@ async def balance_watch_loop(
     notify: Callable[[str], bool],
     *,
     interval_s: float = BALANCE_WATCH_INTERVAL_S,
-    clock: Callable[[], str] = lambda: time.strftime("%Y-%m-%d %H:%M:%S"),
 ) -> None:
-    """코어 태스크 — interval_s마다 장부로 토탈잔고를 재고, 첫 값을 기준으로 잡고(시동 값),
-    켜져 있으면 선 넘김을 판정해 로그 + 텔레그램(``notify``는 블로킹이라 스레드로)."""
+    """코어 태스크 — interval_s마다 장부로 HL 잔고 합을 재고, 첫 값을 기준으로 잡아(시동 값) 켜져
+    있으면 시동 글을 한 번 보내고, 그 뒤 선 넘김마다 로그 + 텔레그램(``notify``는 블로킹이라
+    스레드로)."""
     import asyncio
 
     while True:
         try:
             rows = balance_rows(positions_of(), underlyings)
-            total = total_balance(rows)
+            total = hl_total(rows)
+            enabled, step = settings_of()
+            send = False
             if watcher.baseline is None:
                 watcher.baseline = total
                 watcher.total = total
-                log.info("잔고 감시 기준값 %s (시동 토탈잔고)", _q(total))
-            enabled, step = settings_of()
-            crossing = watcher.check(total, step if enabled else 0.0)
-            if crossing is not None:
-                text = format_telegram(crossing, rows, clock())
-                log.info("잔고 감시 선 넘김 — %s", text.replace("\n", " | "))
+                log.info("잔고 감시 기준값 %s (시동 HL 잔고 합)", _q(total))
+                send = enabled  # 시동 글
+            elif (crossing := watcher.check(total, step if enabled else 0.0)) is not None:
+                send = True
+                log.info("잔고 감시 선 넘김 HL %s → 기준 %s → %s", _q(total),
+                         _q(crossing.old_baseline), _q(crossing.new_baseline))
+            text = format_report(rows) if send else ""
+            if text:
+                log.info("잔고 감시 — %s", text.replace("\n", " | "))
                 sent = await asyncio.to_thread(notify, text)
                 if not sent:
                     log.warning("잔고 감시 텔레그램 안 보냄(미설정·실패)")
