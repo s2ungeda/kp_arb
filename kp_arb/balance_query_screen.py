@@ -8,7 +8,9 @@
 - 버튼은 누르는 즉시 잠기고 **1초 뒤** 풀린다(사용자 2026-11-13). 조회가 그보다 늦으면 다시
   눌러도 화면이 "조회 중"으로 막는다.
 - 자동조회(체크박스 + 주기 30·60초): 켜면 바로 한 번, 그 뒤 주기마다 조회. 켜 있는 동안
-  [조회] 버튼은 잠긴다. 앞 조회가 안 끝났으면 그 차례는 건너뛴다. 저장 안 함(열면 꺼짐).
+  [조회] 버튼은 잠긴다. 앞 조회가 안 끝났으면 그 차례는 건너뛴다. 체크·주기는 창 상태(win_state
+  fields)에 저장해 다시 열 때 그대로(사용자 2026-11-16 "화면저장이 안 된다") — 켜진 채 저장됐으면
+  열자마자 자동조회가 돈다.
 - 표(사용자 2026-11-16): 열 HL 퍼프 | LS 주식(신용)·주선(차근) | 체결차, 행 하이닉스·삼성·현대·합
   ('기준' 행은 같은 날 뺌 — 코어의 시동 복사본·응답 baseline은 남김). 포지션 칸은 부호 없이
   ``100(50)``, 방향은 색(롱 빨강·숏 파랑·0 검정). 체결차는 부호를 보이고 0이 아니면 바탕 강조.
@@ -65,6 +67,13 @@ def cell_color(text: str) -> str:
 
 def _unsigned(text: str) -> str:
     return text if text in (ERROR_TEXT, NOT_QUERIED) else text.lstrip("+-")
+
+
+def saved_auto(fields: dict[str, Any]) -> tuple[bool, str]:
+    """저장된 창 필드 → (자동조회 켬, 주기 글). 없거나 이상하면 (False, 첫 주기)(순수)."""
+    auto = bool(fields.get("auto", False))
+    interval = str(auto_interval_s(fields.get("interval", "")))
+    return auto, interval
 
 
 def display_cell(outer: str, inner: str | None, *, signed: bool = False) -> str:
@@ -129,7 +138,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     top.pack(fill="x", padx=8, pady=(8, 2))
     btn = tk.Button(top, text="조회", width=8)
     btn.pack(side="right")
-    auto_var = tk.BooleanVar(value=False)  # 저장 안 함 — 창을 열면 꺼짐
+    auto_var = tk.BooleanVar(value=False)  # 저장값은 아래 restore_saved가 핸들러 연결 뒤 되살림
     chk_auto = tk.Checkbutton(top, text="자동조회", variable=auto_var)
     chk_auto.pack(side="left")
     tk.Label(top, text="주기").pack(side="left", padx=(8, 2))
@@ -230,6 +239,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         start_query()  # 앞 조회가 안 끝났으면 이번 차례는 건너뜀(겹침 없음)
         auto_job["id"] = root.after(auto_interval_s(cmb_interval.get()) * 1000, auto_tick)
 
+    def persist_fields() -> None:  # 체크·주기 저장(사용자 2026-11-16 "화면저장이 안 된다")
+        if not preview:
+            win_state.save_fields("balance_query",
+                                  {"auto": auto_var.get(), "interval": cmb_interval.get()})
+
     def on_auto_toggle() -> None:
         cancel_auto_job()
         if auto_var.get():
@@ -237,14 +251,26 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             auto_tick()                   # 켜면 바로 한 번, 그 뒤 주기마다
         else:
             btn.config(state="normal")
+        persist_fields()
 
     def on_interval_change(_event: object) -> None:
         if auto_var.get():  # 다음 조회부터 새 주기
             cancel_auto_job()
             auto_job["id"] = root.after(auto_interval_s(cmb_interval.get()) * 1000, auto_tick)
+        persist_fields()
 
     chk_auto.config(command=on_auto_toggle)
     cmb_interval.bind("<<ComboboxSelected>>", on_interval_change)
+
+    def restore_saved() -> None:
+        auto, interval = saved_auto(win_state.saved_fields("balance_query"))
+        cmb_interval.set(interval)
+        if auto:
+            auto_var.set(True)
+            on_auto_toggle()  # 켜진 채 저장됐으면 열자마자 돈다(버튼 잠김·바로 1회)
+
+    if not preview:
+        restore_saved()
     shown = {"seq": 0}
 
     def poll() -> None:

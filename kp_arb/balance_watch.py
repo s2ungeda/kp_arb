@@ -4,7 +4,7 @@
 판정값 = |Σ(설정 종목) HL 포지션|(부호대로 더한 뒤 절대값, 2026-11-16 — 전엔 토탈잔고
 Σ|주식|+|주식선물|×10+|HL|). 값의 출처는 장부(OrderBook) 포지션 — 실조회 없음. 기준값 = 코어 시동
 직후 값(저장 안 함). 비교잔고배수 S를 넘으면(T ≥ B+S 또는 T ≤ B−S) 보내고, 새 기준은 **마지막으로
-넘은 선**(B ± n·S). 시동 때도 한 번 보낸다. 글은 종목마다 이름 줄 +
+넘은 선**(B ± n·S). 시동 때는 기준만 잡고 보내지 않는다. 글은 종목마다 이름 줄 +
 ``LS 주식(S) 잔고 LS선물(SF) 잔고*10 HP 잔고``(변화량은 같은 날 뺌).
 계산(``balance_rows``·``BalanceWatcher``)·글(``format_report``)은 순수, ``balance_watch_loop``만
 I/O.
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
@@ -123,17 +124,17 @@ def _q(x: float, *, signed: bool = False) -> str:
     return "0" if text in ("+0", "-0") else text
 
 
-def format_report(rows: Iterable[BalanceRow]) -> str:
-    """텔레그램 본문(사용자 2026-11-16) — 종목마다 이름 줄 +
+def format_report(rows: Iterable[BalanceRow], when: str) -> str:
+    """텔레그램 본문(사용자 2026-11-16) — 제목 ``[잔고] 날짜 시간`` 한 줄 + 종목마다 이름 줄 +
     ``LS 주식(S) 잔고 LS선물(SF) 잔고*10 HP 잔고``. 잔고는 음수만 부호. 변화량(증감)은 같은 날
-    "없어도 된다"로 뺌. 전부 0인 종목은 뺀다."""
+    "없어도 된다"로 뺌. 전부 0인 종목은 뺀다(종목이 하나도 없으면 빈 글 — 안 보냄)."""
     lines: list[str] = []
     for r in rows:
         if r.is_empty:
             continue
         lines.append(_NAMES.get(r.underlying, r.underlying.value))
         lines.append(f"LS 주식(S) {_q(r.stock)} LS선물(SF) {_q(r.sf)}*{HL_PER_SF} HP {_q(r.hl)}")
-    return "\n".join(lines)
+    return "\n".join([f"[잔고] {when}", *lines]) if lines else ""
 
 
 async def balance_watch_loop(
@@ -144,9 +145,10 @@ async def balance_watch_loop(
     notify: Callable[[str], bool],
     *,
     interval_s: float = BALANCE_WATCH_INTERVAL_S,
+    clock: Callable[[], str] = lambda: time.strftime("%Y-%m-%d %H:%M:%S"),
 ) -> None:
     """코어 태스크 — interval_s마다 장부로 HL 잔고 합을 재고, 첫 값을 기준으로 잡아(시동 값) 켜져
-    있으면 시동 글을 한 번 보내고, 그 뒤 선 넘김마다 로그 + 텔레그램(``notify``는 블로킹이라
+    있으면 선 넘김마다 로그 + 텔레그램(시동 글은 없음 — 사용자 2026-11-16)(``notify``는 블로킹이라
     스레드로)."""
     import asyncio
 
@@ -155,17 +157,15 @@ async def balance_watch_loop(
             rows = balance_rows(positions_of(), underlyings)
             total = hl_total(rows)
             enabled, step = settings_of()
-            send = False
-            if watcher.baseline is None:
+            text = ""
+            if watcher.baseline is None:  # 시동 — 기준만 잡고 보내지 않는다(사용자 2026-11-16 "빼")
                 watcher.baseline = total
                 watcher.total = total
                 log.info("잔고 감시 기준값 %s (시동 HL 잔고 합)", _q(total))
-                send = enabled  # 시동 글
             elif (crossing := watcher.check(total, step if enabled else 0.0)) is not None:
-                send = True
+                text = format_report(rows, clock())
                 log.info("잔고 감시 선 넘김 HL %s → 기준 %s → %s", _q(total),
                          _q(crossing.old_baseline), _q(crossing.new_baseline))
-            text = format_report(rows) if send else ""
             if text:
                 log.info("잔고 감시 — %s", text.replace("\n", " | "))
                 sent = await asyncio.to_thread(notify, text)

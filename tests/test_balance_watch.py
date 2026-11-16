@@ -84,18 +84,20 @@ def test_format_report_follows_user_example() -> None:
     first = balance_rows([_pos(H, Instrument.KR_STOCK, 200, Account.KR_STOCK),
                           _pos(H, Instrument.KR_STOCK_FUTURE, 20, Account.KR_DERIV),
                           _pos(H, Instrument.HL_PERP, -400)], [H, S])
-    assert format_report(first) == "SK하이닉스\nLS 주식(S) 200 LS선물(SF) 20*10 HP -400"
+    assert format_report(first, "2026-11-16 14:05:12") == (
+        "[잔고] 2026-11-16 14:05:12\nSK하이닉스\nLS 주식(S) 200 LS선물(SF) 20*10 HP -400")
     down = balance_rows([_pos(H, Instrument.KR_STOCK, 160, Account.KR_STOCK),
                          _pos(H, Instrument.KR_STOCK_FUTURE, -24, Account.KR_DERIV),
                          _pos(H, Instrument.HL_PERP, -400)], [H, S])
-    assert format_report(down) == "SK하이닉스\nLS 주식(S) 160 LS선물(SF) -24*10 HP -400"
-    # 전부 0인 종목은 뺀다
-    assert format_report(balance_rows([], [H, S])) == ""
+    assert format_report(down, "T") == (
+        "[잔고] T\nSK하이닉스\nLS 주식(S) 160 LS선물(SF) -24*10 HP -400")
+    # 전부 0인 종목은 뺀다 — 종목이 하나도 없으면 빈 글(제목도 없음 → 안 보냄)
+    assert format_report(balance_rows([], [H, S]), "T") == ""
     # 두 종목이면 종목마다 두 줄
     both = balance_rows([_pos(H, Instrument.HL_PERP, -100), _pos(S, Instrument.HL_PERP, 70)],
                         [H, S])
-    assert format_report(both) == (
-        "SK하이닉스\nLS 주식(S) 0 LS선물(SF) 0*10 HP -100\n"
+    assert format_report(both, "T") == (
+        "[잔고] T\nSK하이닉스\nLS 주식(S) 0 LS선물(SF) 0*10 HP -100\n"
         "삼성전자\nLS 주식(S) 0 LS선물(SF) 0*10 HP 70")
 
 
@@ -113,7 +115,7 @@ def test_loop_sends_startup_report_then_on_hl_sum_crossing_only_when_enabled() -
     async def run() -> None:
         task = asyncio.create_task(balance_watch_loop(
             lambda: positions, [S], lambda: (enabled["on"], 100.0), w, notify,
-            interval_s=0.01))
+            interval_s=0.01, clock=lambda: "T"))
         await asyncio.sleep(0.05)
         assert (w.baseline, w.total) == (150, 150) and sent == []   # 꺼진 채 시동 → 시동 글 없음
         positions.append(_pos(S, Instrument.HL_PERP, -200))          # |HL| 350 — 꺼져서 안 보냄
@@ -122,14 +124,14 @@ def test_loop_sends_startup_report_then_on_hl_sum_crossing_only_when_enabled() -
         enabled["on"] = True                                         # 켜면 150→350: 기준 350
         await asyncio.sleep(0.05)
         assert w.baseline == 350 and len(sent) == 1
-        assert sent[0] == "삼성전자\nLS 주식(S) 150 LS선물(SF) 0*10 HP -350"
+        assert sent[0] == "[잔고] T\n삼성전자\nLS 주식(S) 150 LS선물(SF) 0*10 HP -350"
         positions.append(_pos(S, Instrument.KR_STOCK, 50, Account.KR_STOCK))  # 주식만 → 안 보냄
         await asyncio.sleep(0.05)
         assert len(sent) == 1
         positions.append(_pos(S, Instrument.HL_PERP, 120))           # |HL| 230 ≤ 350−100 → 보냄
         await asyncio.sleep(0.05)
         assert w.baseline == 250 and len(sent) == 2
-        assert sent[1] == "삼성전자\nLS 주식(S) 200 LS선물(SF) 0*10 HP -230"  # 잔고만, 변화량 없음
+        assert sent[1] == "[잔고] T\n삼성전자\nLS 주식(S) 200 LS선물(SF) 0*10 HP -230"  # 잔고만
         task.cancel()
         try:
             await task
@@ -139,7 +141,8 @@ def test_loop_sends_startup_report_then_on_hl_sum_crossing_only_when_enabled() -
     asyncio.run(run())
 
 
-def test_loop_sends_startup_report_when_enabled_at_start() -> None:
+def test_loop_does_not_send_at_startup_even_when_enabled() -> None:
+    # 사용자 2026-11-16 "시동 때 텔레그램은 빼" — 켜진 채 시동해도 기준만 잡고 글은 없다
     positions = [_pos(H, Instrument.HL_PERP, -400),
                  _pos(H, Instrument.KR_STOCK, 200, Account.KR_STOCK)]
     sent: list[str] = []
@@ -153,8 +156,7 @@ def test_loop_sends_startup_report_when_enabled_at_start() -> None:
         task = asyncio.create_task(balance_watch_loop(
             lambda: positions, [H], lambda: (True, 100.0), w, notify, interval_s=0.01))
         await asyncio.sleep(0.05)
-        assert w.baseline == 400
-        assert sent == ["SK하이닉스\nLS 주식(S) 200 LS선물(SF) 0*10 HP -400"]
+        assert w.baseline == 400 and sent == []
         task.cancel()
         try:
             await task

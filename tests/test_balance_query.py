@@ -59,6 +59,16 @@ def test_screen_cells_drop_sign_show_inner_and_keep_diff_sign() -> None:
     assert rows["samsung"]["hl"] == "+1" and rows["sum"]["hl"] == "+1" and "baseline" not in rows
 
 
+def test_saved_auto_restores_check_and_interval_with_fallbacks() -> None:
+    # 사용자 2026-11-16 "자동조회 체크박스 화면저장이 안 된다" — 창 필드에 저장·복원, 이상값은 기본
+    from kp_arb.balance_query_screen import saved_auto
+
+    assert saved_auto({}) == (False, "30")
+    assert saved_auto({"auto": True, "interval": "60"}) == (True, "60")
+    assert saved_auto({"auto": 1, "interval": "10"}) == (True, "30")   # 뺀 주기 → 첫 항목
+    assert saved_auto({"auto": False, "interval": None}) == (False, "30")
+
+
 def test_fmt_qty_signed_with_sparse_decimals() -> None:
     assert fmt_qty(0) == "0" and fmt_qty(1e-12) == "0" and fmt_qty(1e-5) == "0"
     assert fmt_qty(1200) == "+1,200" and fmt_qty(-20) == "-20"
