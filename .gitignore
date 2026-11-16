@@ -25,3 +25,5 @@ real_log/
 docs/review-*.md
 docs/*.pdf
 .venv32/
+# 사용자 엑셀 초안(동시호가·개장 요청서) — 로컬 전용(사용자 2026-11-16)
+docs/동시호가/
