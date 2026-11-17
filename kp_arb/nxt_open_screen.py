@@ -82,24 +82,28 @@ def row_complete(spread: str, qty: str, price: str) -> bool:
 
 
 def tiers_payload(rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
-    """표 입력 3행 → 코어 설정 dict 목록. 행 = (스프레드 %, 수량, 주문가격 %[, 청산가 %, 자동청산
-    bool]) — 뒤 둘은 2026-10-29 추가 칸(§2, 저장만)."""
+    """표 입력 3행 → 코어 설정 dict 목록. 행 = (스프레드 %, 수량, 주문가격 %[, 목표수익률 %,
+    자동청산 bool]) — 목표수익률은 2026-11-17부터(옛 청산가 칸 자리, 양수 %; 0·빈칸은 없음)."""
     out: list[dict[str, Any]] = []
     for row in rows:
         spread, qty, price = row[0], row[1], row[2]
-        exit_px = frac_of(str(row[3])) if len(row) > 3 else None
+        target = frac_of(str(row[3])) if len(row) > 3 else None
+        if target is not None and target <= 0:
+            target = None
         auto = bool(row[4]) if len(row) > 4 else False
         out.append({"spread": frac_of(spread), "qty": qty_of(qty), "price_spread": frac_of(price),
-                    "exit_price_spread": exit_px, "auto_exit": auto})
+                    "target_profit": target, "auto_exit": auto})
     return out
 
 
 def settings_payload(u: Underlying, open_hms: str, start: str, end: str,
                      entries: list[tuple[Any, ...]],
                      exits: list[tuple[Any, ...]], hl_base_hms: str = "",
-                     range_limit: str = "") -> dict[str, Any]:
+                     range_limit: str = "", sum5_qty: str = "", exclude_qty: str = "",
+                     min_spread: str = "") -> dict[str, Any]:
     """입력 → nxt_open_settings 명령 본문. HL 호가단위는 코어 공용 값(일반주문창에서만 바꿈).
-    hl_base_hms·range_limit = 2026-10-29 추가 칸(빈 글 = 기본값 07:59:55·3%)."""
+    hl_base_hms·range_limit = 2026-10-29 추가 칸(빈 글 = 기본값 07:59:55·3%). sum5_qty·
+    exclude_qty·min_spread = 2026-11-17 호가 필터 칸(§1a; 빈 글 = 0·0·없음)."""
 
     def _f(text: str, default: float) -> float:
         try:
@@ -113,7 +117,9 @@ def settings_payload(u: Underlying, open_hms: str, start: str, end: str,
             "entries": tiers_payload(entries), "exits": tiers_payload(exits),
             "hl_base_hms": hl_base_hms.strip() or DEFAULT_HL_BASE_HMS,
             "range_limit": (frac_of(range_limit) if frac_of(range_limit) is not None
-                            else DEFAULT_RANGE_LIMIT)}
+                            else DEFAULT_RANGE_LIMIT),
+            "sum5_qty": qty_of(sum5_qty), "exclude_qty": qty_of(exclude_qty),
+            "min_spread": frac_of(min_spread)}
 
 
 def results_summary(results: list[dict[str, Any]]) -> str:
@@ -182,7 +188,8 @@ def top_states(locked: bool) -> dict[str, str]:
     normal. 순수 — 화면은 이 표대로 config(state=…)만 한다."""
     plain = "disabled" if locked else "normal"
     return {"apply": plain, "ref": plain, "open": plain, "start": plain,
-            "end": plain, "hl_base": plain, "range": plain}
+            "end": plain, "hl_base": plain, "range": plain,
+            "sum5": plain, "excl": plain, "min_sprd": plain}  # 11-17 호가 필터 줄도 같이
 
 
 def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽다
@@ -291,14 +298,36 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     w["range"].pack(side="left")
     tk.Label(top, text="%").pack(side="left", padx=(1, 0))
 
+    # ===== 호가 필터 줄(사용자 2026-11-17 "종목콤보 아래에 한 라인 추가") — §1a =====
+    # 5호가합(잔량 합 하한)·호가제외수량(이 이하 잔량의 호가는 최우선호가에서 뺌)·최소호가스프레드
+    # (%). 화면·저장만 먼저 — 판정에 쓰는 것은 [OPEN] 문답 뒤. 윗줄과 같이 잠긴다(top_states).
+    flt = tk.Frame(root)
+    flt.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 2))
+    tk.Label(flt, text="5호가합", fg="gray25", font=T.FONT_LABEL).pack(side="left", padx=(0, 2))
+    w["sum5"] = tk.Entry(flt, width=7, justify="right", validate="key",
+                         validatecommand=vcmd_qty, font=T.FONT_NUM_LG)
+    w["sum5"].pack(side="left", padx=(0, 8))
+    tk.Label(flt, text="호가제외수량", fg="gray25", font=T.FONT_LABEL).pack(side="left",
+                                                                       padx=(0, 2))
+    w["excl"] = tk.Entry(flt, width=7, justify="right", validate="key",
+                         validatecommand=vcmd_qty, font=T.FONT_NUM_LG)
+    w["excl"].pack(side="left", padx=(0, 8))
+    tk.Label(flt, text="최소호가스프레드", fg="gray25", font=T.FONT_LABEL).pack(side="left",
+                                                                         padx=(0, 2))
+    w["min_sprd"] = tk.Entry(flt, width=5, justify="right", validate="key",
+                             validatecommand=vcmd_qty, font=T.FONT_NUM_LG)
+    w["min_sprd"].pack(side="left")
+    tk.Label(flt, text="%").pack(side="left", padx=(1, 0))
+
     # ===== 표(사용자 2026-10-20): 진입 세트 | 청산 세트를 좌우로, 구분 열 없음 =====
     # 0행 = 모니터 수치(각 Sprd 헤더 위)·환율, 1행 = 헤더(Sprd 수량 주문가 역산가 실행),
     # 2~4행 = 3단. 실행은 3행 병합 버튼(HL매도/HL매수). 역산가는 주문가 옆 표시 열(사용자
     # 2026-10-22 — 숨은 패널 대신), 결과 열은 없다.
     tbl = tk.Frame(root)
-    tbl.grid(row=2, column=0, sticky="ew", padx=6, pady=(4, 0))
-    # 청산가(주문가 옆 입력)·자동(자동청산 체크, 실행 버튼 왼쪽)은 2026-10-29 추가 칸(§2, 저장만)
-    heads = ("Sprd", "수량", "주문가", "청산가", "역산가", "자동청산", "실행")  # Sprd = 체결쏴 표기
+    tbl.grid(row=3, column=0, sticky="ew", padx=6, pady=(4, 0))
+    # 목수률 = 목표수익률(주문가 옆 입력, 양수 % — 2026-11-17, 옛 청산가 자리; 헤더는 사용자 "줄여서
+    # 다른 칸과 폭을 맞추자")·자동청산(체크, 실행 버튼 왼쪽, 2026-10-29)
+    heads = ("Sprd", "수량", "주문가", "목수률", "역산가", "자동청산", "실행")  # Sprd = 체결쏴 표기
     widths = (5, 6, 5, 5, 8, 3, 7)   # 입력칸 폭은 체결쏴 세트 행과 같게(5·6·5), 역산가 8(1,303.50)
     head_w = (7, 7, 7, 7, 8, 8, 7)   # 헤더 폭이 곧 칸 폭(입력칸은 nsew로 채움 — 체결쏴와 같음)
     col_px, col_auto, col_run = 4, 5, 6
@@ -333,8 +362,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         for i in range(TIERS):
             r = 2 + i
             cells: dict[str, Any] = {}
+            # 목표수익률(exit_price 칸)은 양수만(사용자 2026-11-17) — 부호 없는 소수 검사
             for c, key, vc in ((0, "spread", vcmd_dec), (1, "qty", vcmd_qty),
-                               (2, "price", vcmd_dec), (3, "exit_price", vcmd_dec)):
+                               (2, "price", vcmd_dec), (3, "exit_price", vcmd_qty)):
                 e = tk.Entry(tbl, width=widths[c], justify="right", validate="key",
                              validatecommand=vc, font=T.FONT_NUM_LG,
                              disabledforeground="black", disabledbackground="#f0f0f0")
@@ -371,7 +401,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 상태줄 = 읽기 전용 콤보(사용자 2026-10-23): 최신 글을 보여 주고 펼치면 지난 글 50건. width=1 +
     # 가로 채움 — 긴 글이 창을 넓히지 않게. 펼친 목록은 넓혀서 긴 글도 보이게(postcommand).
     status_box = StatusCombo(root, T.FONT_LABEL)  # 체결쏴와 공용(ui_status)
-    status_box.widget.grid(row=3, column=0, sticky="ew", padx=6, pady=(4, 6))
+    status_box.widget.grid(row=4, column=0, sticky="ew", padx=6, pady=(4, 6))
     # LS 처리 지연 띠 — 지연 동안만 맨 위(사용자 2026-10-26)
     banner = StallBanner(root, (T.FAMILY, 10, "bold"),
                          lambda wd: wd.grid(row=0, column=0, sticky="ew"))
@@ -392,7 +422,9 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     def payload_of(u: Underlying) -> dict[str, Any]:
         return settings_payload(u, w["open"].get(), w["start"].get(), w["end"].get(),
                                 rows_of("entry"), rows_of("exit"),
-                                hl_base_hms=w["hl_base"].get(), range_limit=w["range"].get())
+                                hl_base_hms=w["hl_base"].get(), range_limit=w["range"].get(),
+                                sum5_qty=w["sum5"].get(), exclude_qty=w["excl"].get(),
+                                min_spread=w["min_sprd"].get())
 
     ref_sent = {"qty": -1}
 
@@ -508,7 +540,10 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                          ("start", f"{float(st.get('start_s', DEFAULT_START_S)):g}"),
                          ("end", f"{float(st.get('end_s', DEFAULT_END_S)):g}"),
                          ("hl_base", st.get("hl_base_hms") or DEFAULT_HL_BASE_HMS),
-                         ("range", f"{float(st.get('range_limit', DEFAULT_RANGE_LIMIT)) * 100:g}")):
+                         ("range", f"{float(st.get('range_limit', DEFAULT_RANGE_LIMIT)) * 100:g}"),
+                         ("sum5", qty_text(st.get("sum5_qty"))),      # 11-17 호가 필터 줄
+                         ("excl", qty_text(st.get("exclude_qty"))),
+                         ("min_sprd", pct_text(st.get("min_spread")))):
             set_entry(w[key], str(val))
         for block, key in (("entry", "entries"), ("exit", "exits")):
             tiers = list(st.get(key) or [])
@@ -518,7 +553,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 for ck, val in (("spread", pct_text(t.get("spread"))),
                                 ("qty", qty_text(t.get("qty"))),
                                 ("price", pct_text(t.get("price_spread"))),
-                                ("exit_price", pct_text(t.get("exit_price_spread")))):
+                                ("exit_price", pct_text(t.get("target_profit")))):
                     set_entry(cells[ck], val)
                 cells["auto"].set(t.get("auto_exit") is True)
         cur["loaded"] = True

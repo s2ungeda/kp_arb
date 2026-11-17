@@ -75,7 +75,8 @@ class _System(Protocol):
     def new_hl_cloid(self) -> str | None: ...
     async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str: ...
     async def place_many(self, intents: Any, cloids: Any = None) -> Any: ...
-    async def cancel(self, order_id: str, account: Account | None = None) -> None: ...
+    async def cancel(self, order_id: str, account: Account | None = None,
+                     venue: Venue | None = None) -> None: ...
     async def place_fx_futures(self, code: str, side: Side, qty: int, price: float,
                                src: str = "") -> str: ...
 
@@ -413,7 +414,7 @@ class AuctionOrderEngine:
         self._log.warning("[동시호가] %s %s %d계약 가상 체결 #%s(실주문 없음) → 3단계 HL 헤지",
                           u.value, name, qty, oid)
         self._on_fill(Fill(fill_id=oid, order_id=oid, qty=float(qty), price=px,
-                           ts=self._wall(), account=Account.KR_DERIV))
+                           ts=self._wall(), venue=Venue.LS, account=Account.KR_DERIV))
         return oid
 
     async def _place_row(self, u: Underlying, d: DayState, inst: Instrument, side: Side,
@@ -487,8 +488,10 @@ class AuctionOrderEngine:
         """주식선물 체결 통보 — 우리 행의 주문이면 모아 두고, 잠깐 뒤 HL 발주(예약실행 켜져 있을
         때)."""
         oid = str(getattr(fill, "order_id", ""))
-        account = getattr(fill, "account", None)
-        if account not in (None, Account.KR_DERIV):
+        # 우리 행 주문은 LS 선물옵션 계좌 — 통보의 (거래소, 계좌)가 다르면 같은 번호라도 남의 것
+        # (결정 92)
+        if (getattr(fill, "venue", None) is not Venue.LS
+                or getattr(fill, "account", None) is not Account.KR_DERIV):
             return
         for u, d in self._days.items():
             for s, r in [*((s, r) for (s, _i), r in d.rows.items()),
@@ -582,7 +585,7 @@ class AuctionOrderEngine:
         oid = book.hl_orders.get(name)
         if not oid:
             return f"{name} 행에 HL 주문이 없습니다"
-        tracked = self._system.order_book.order(oid)
+        tracked = self._system.order_book.order(oid, venue=Venue.HYPERLIQUID)
         if tracked is None or not tracked.is_open:
             return f"{name} 행 주문 #{oid}이(가) 열려 있지 않습니다"
         pt = book.settings.hl_pt.get(name, 0.0)
@@ -597,7 +600,7 @@ class AuctionOrderEngine:
         self._log.info("[동시호가] %s HL %s 정정 — #%s 잔량 %s %s → %s", u.value, name, oid,
                        remaining, tracked.intent.price, new_px)
         try:
-            await self._system.cancel(oid)
+            await self._system.cancel(oid, venue=Venue.HYPERLIQUID)
         except Exception as exc:  # noqa: BLE001 - 취소 요청 실패 = 정정 안 함(원주문 유지)
             row.status = "접수"
             return f"취소 요청 실패 — {exc}"[:160]
@@ -641,7 +644,7 @@ class AuctionOrderEngine:
         if not oid:
             return f"{name} 행에 HL 주문이 없습니다"
         try:
-            await self._system.cancel(oid)
+            await self._system.cancel(oid, venue=Venue.HYPERLIQUID)
         except Exception as exc:  # noqa: BLE001 - 응답 없음도 재전송 금지(CLAUDE.md §7)
             return f"취소 요청 실패 — {exc}"[:160]
         row = d.hl.setdefault(name, HlRow(order_id=oid))
@@ -665,7 +668,8 @@ class AuctionOrderEngine:
             for name in HL_ROWS:
                 row = d.hl.get(name)
                 oid = self.book(u).hl_orders.get(name)
-                tracked = self._system.order_book.order(oid) if oid else None
+                tracked = (self._system.order_book.order(oid, venue=Venue.HYPERLIQUID)
+                           if oid else None)
                 hl_rows[name] = {
                     "order_id": oid, "side": row.side if row else "",
                     "price": row.price if row else None, "qty": row.qty if row else 0.0,
@@ -676,7 +680,8 @@ class AuctionOrderEngine:
             per_order: list[tuple[float, float]] = []
             for row in d.hl.values():
                 for oid2 in [*row.past_ids, row.order_id]:
-                    t = self._system.order_book.order(oid2) if oid2 else None
+                    t = (self._system.order_book.order(oid2, venue=Venue.HYPERLIQUID)
+                         if oid2 else None)
                     if t is not None:
                         per_order.append((float(t.filled_qty), float(t.avg_fill_price)))
             filled_qty, avg_px = hl_fill_summary(per_order)

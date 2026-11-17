@@ -215,8 +215,8 @@ meme-core.exe (32bit, asyncio 메인 스레드)
   정상 확정 H01은 TTRODP11301·rejcode 0000·qty 1(당일 1,352건 중 1,352건). **H01 `qty` = 실정정취소수량, `qty2` =
 - **계좌 통보는 로그인 계정의 전 계좌가 한 채널로 온다 — 주문번호는 계좌마다 따로**(운영 실측 2026-10-14: 주식
   계좌 …001 #4545와 선물 계좌 …002 #4545가 같은 날 공존). 통보 본문 `accno`로 계좌를 풀어(`LSWebSocketClient`
-  `account_numbers`: 계좌번호 → Account, `LSAccounts.numbers()`) 체결·주문 이벤트에 싣고, 장부는 (계좌, 번호)로
-  찾는다(exec 결정 73). `accno`가 없거나 모르는 번호면 TR 종류로(SC* = 주식, O01/C01/H01 = 선물옵션 — 원달러선물
+  `account_numbers`: 계좌번호 → Account, `LSAccounts.numbers()`) 체결·주문 이벤트에 거래소(LS)와 같이 싣고, 장부는
+  (거래소, 계좌, 번호)로 찾는다(exec 결정 73 → 92, 2026-11-17). `accno`가 없거나 모르는 번호면 TR 종류로(SC* = 주식, O01/C01/H01 = 선물옵션 — 원달러선물
   계좌는 accno로만 가려진다). 종목코드(`Isuno`/`expcode`)는 장부 주문과 대조.
   호가수량(Res H01) / SC3 `canccnfqty` = 취소확인수량(Res SC3)** — 장부는 이 확정 수량과 남은 수량을 대조해 주문을 닫는다
   (exec 결정 69, 2026-10-13; 옛 120초 늦은 체결 타이머 폐기).

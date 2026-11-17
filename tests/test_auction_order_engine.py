@@ -93,9 +93,10 @@ class FakeSystem:
             outs.append(PlaceResult(await self.place(it)))
         return outs
 
-    async def cancel(self, order_id: str, account: Account | None = None) -> None:
+    async def cancel(self, order_id: str, account: Account | None = None,
+                     venue: Venue | None = None) -> None:
         self.cancelled.append(order_id)
-        o = self.order_book.order(order_id)
+        o = self.order_book.order(order_id, account, venue)
         assert o is not None
         o.cancelled_qty = o.remaining_qty  # 취소 확정 — 장부가 닫힘(HL 통보 대신)
         from kp_arb.order_book import OrderStatus
@@ -245,7 +246,11 @@ async def test_process3_fills_to_four_hl_orders_then_amend_and_cancel() -> None:
     # 15:45 체결 통보 두 건으로 나뉘어 옴(2 + 1 계약)
     for n, q in enumerate((2.0, 1.0), start=1):
         sys_.on_fill[0](Fill(fill_id=f"x{n}", order_id="O1", qty=q, price=1_767_000.0, ts=0,
-                             account=Account.KR_DERIV))
+                             account=Account.KR_DERIV, venue=Venue.LS))
+    assert eng._day(U).fills == {"O1": ("buy", 3.0)}
+    # 같은 번호의 HL 체결(거래소 HL, 계좌 없음)은 우리 행의 체결이 아니다(결정 92)
+    sys_.on_fill[0](Fill(fill_id="hx", order_id="O1", qty=5.0, price=1330.0, ts=0,
+                         venue=Venue.HYPERLIQUID))
     assert eng._day(U).fills == {"O1": ("buy", 3.0)}
     await asyncio.sleep(FILL_DEBOUNCE_S + 0.05)
     d = eng._day(U)
@@ -277,21 +282,23 @@ async def test_process3_fills_to_four_hl_orders_then_amend_and_cancel() -> None:
     # (정정 전 원주문 O2의 체결도 a 몫으로 합친다 — 여기선 0)
     assert eng.live_snapshot()[U.value]["hl_fill"] == {"side": "sell", "qty": 0.0,
                                                        "total": 30.0, "avg": None}
-    sys_.order_book.on_fill(Fill(fill_id="h1", order_id="O3", qty=7.5, price=1332.5, ts=0))
-    sys_.order_book.on_fill(Fill(fill_id="h2", order_id="O6", qty=2.5, price=1331.3, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="h1", order_id="O3", qty=7.5, price=1332.5, ts=0,
+                                 venue=Venue.HYPERLIQUID))
+    sys_.order_book.on_fill(Fill(fill_id="h2", order_id="O6", qty=2.5, price=1331.3, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     fill = eng.live_snapshot()[U.value]["hl_fill"]
     assert (fill["side"], fill["qty"], fill["total"]) == ("sell", 10.0, 30.0)
     assert abs(fill["avg"] - 1332.2) < 1e-9
     # 늦게 온 체결은 다시 HL을 내지 않는다(하루 한 번)
     sys_.on_fill[0](Fill(fill_id="x3", order_id="O1", qty=1.0, price=1_767_000.0, ts=0,
-                         account=Account.KR_DERIV))
+                         account=Account.KR_DERIV, venue=Venue.LS))
     await asyncio.sleep(FILL_DEBOUNCE_S + 0.05)
     assert len([i for i in sys_.placed if i.venue is Venue.HYPERLIQUID]) == 6  # 4건 + 정정 a·d
     # HL 예약실행을 다시 켜면 새 바퀴(사용자 2026-10-28) — 전 체결 집계는 버리고 그 뒤 체결(2계약)만
     eng.set_run(U, "hl", True)
     assert not d.hl_done and d.fills == {}
     sys_.on_fill[0](Fill(fill_id="x4", order_id="O1", qty=2.0, price=1_767_000.0, ts=0,
-                         account=Account.KR_DERIV))
+                         account=Account.KR_DERIV, venue=Venue.LS))
     await asyncio.sleep(FILL_DEBOUNCE_S + 0.05)
     again = [i for i in sys_.placed if i.venue is Venue.HYPERLIQUID][6:]
     assert len(again) == 4 and sum(i.qty for i in again) == 20.0 and d.hl_done and not d.hl_run
@@ -307,7 +314,7 @@ async def test_hl_not_fired_when_run_off_and_net_zero() -> None:
     eng._tick(U)
     await _settle()
     sys_.on_fill[0](Fill(fill_id="x1", order_id="O1", qty=2.0, price=1_767_000.0, ts=0,
-                         account=Account.KR_DERIV))
+                         account=Account.KR_DERIV, venue=Venue.LS))
     await asyncio.sleep(FILL_DEBOUNCE_S + 0.05)
     assert len(sys_.placed) == 1              # 예약실행 꺼짐 → HL 없음
     assert eng._day(U).fills == {"O1": ("buy", 2.0)}
@@ -417,7 +424,7 @@ async def test_moving_order_time_later_reruns_process1_same_day() -> None:
     assert [i.tag for i in sys_.placed] == ["매수1", "매수1", "매수2"] and d.ls_done
     # 전 바퀴 주문의 체결 통보도 여전히 우리 것으로 잡힌다
     sys_.on_fill[0](Fill(fill_id="xr", order_id=first_oid, qty=1.0, price=1_767_000.0, ts=0,
-                         account=Account.KR_DERIV))
+                         account=Account.KR_DERIV, venue=Venue.LS))
     assert d.fills[first_oid] == ("buy", 1.0)
     # 지난 시각으로 바꾸는 건 되돌리지 않는다
     b.settings.ls_hms = "14:00:00"

@@ -6,7 +6,7 @@ from typing import Any
 from kp_arb.auto_m import LegStatus
 from kp_arb.auto_m_engine import AutoMEngine, _OrderRef
 from kp_arb.core_server import _autom_command
-from kp_arb.domain.enums import Block, Instrument, OrderType, Side, Underlying, Venue
+from kp_arb.domain.enums import Account, Block, Instrument, OrderType, Side, Underlying, Venue
 from kp_arb.domain.models import OrderIntent, Quote
 from kp_arb.gateways.ls_ws import Fill
 from kp_arb.order_book import OrderBook, OrderStatus
@@ -142,14 +142,15 @@ class FakeSystem:
             from kp_arb.gateways.ls_ws import Fill
 
             self.order_book.on_fill(Fill(fill_id=f"imm-{oid}", order_id=oid,
-                                         qty=imm, price=intent.price or 0.0, ts=0))
+                                         qty=imm, price=intent.price or 0.0, ts=0,
+                                         venue=Venue.HYPERLIQUID))
             # 거래소가 잔량을 버리고 끝낸 통보(orderUpdates filled, sz>0)가 발주 응답보다 먼저
             # 와서 replay로 장부 상태가 place() 안에서 이미 취소로 바뀌는 경우 흉내(실측 09-11)
             if getattr(self, "drop_remainder_before_return", False):
                 self.order_book.on_cancel(oid)
         return oid
 
-    async def cancel(self, order_id: str, account: Any = None) -> None:
+    async def cancel(self, order_id: str, account: Any = None, venue: Any = None) -> None:
         self.cancel_calls = getattr(self, "cancel_calls", 0) + 1
         if getattr(self, "cancel_gone", False):  # 체결과 교차 — LS 03416/01433(OrderGoneError)
             from kp_arb.gateways.ls import OrderGoneError
@@ -206,7 +207,8 @@ class FakeSystem:
             out.append(PlaceResult(oid))
         return out
 
-    async def cancel_many(self, order_ids: Any) -> list[tuple[str, str | None]]:
+    async def cancel_many(self, order_ids: Any, accounts: Any = None,
+                          venues: Any = None) -> list[tuple[str, str | None]]:
         """묶음 취소 흉내 — 요청 하나로 기록, cancel_errors: {주문번호: 실패 문구}."""
         self.cancel_batches: list[list[str]] = getattr(self, "cancel_batches", [])
         self.cancel_batches.append(list(order_ids))
@@ -223,6 +225,16 @@ class FakeSystem:
 
 
 RUN = {"cmd": "autom_run", "underlying": U.value}  # 종목별 명령(2026-09-08) — 세트·진입/청산은 매번
+
+
+def _hl(oid: str) -> tuple[Venue, Account | None, str]:
+    """엔진 추적 키(결정 92) — HL 주문 (HL, None, 번호)."""
+    return (Venue.HYPERLIQUID, None, oid)
+
+
+def _ls(oid: str, acct: Account = Account.KR_DERIV) -> tuple[Venue, Account | None, str]:
+    """엔진 추적 키(결정 92) — LS 주문 (LS, 계좌, 번호). 기본 상품은 주식선물(선물옵션 계좌)."""
+    return (Venue.LS, acct, oid)
 
 
 def _engine(log_dir: Any = None) -> tuple[AutoMEngine, FakeSystem, CoreState]:
@@ -251,7 +263,8 @@ async def test_immediate_partial_fill_is_applied_and_remainder_is_fractional() -
                                       "value": True})
     eng.tick(now, mono)
     await _settle()
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     s = state.autom.book(U).sets[0]
     assert s.hl_net == -0.588 and abs(s.entry.post_pending - 9.412) < 1e-9
@@ -274,13 +287,14 @@ async def test_remainder_dropped_before_place_returns_finishes_round() -> None:
     await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert abs(s.hl_net + 5.963) < 1e-9 and s.entry.post_pending == 0  # 대기 안 남음
     assert abs(s.fill_diff - 4.037) < 1e-9                              # 체결차 누적
     assert s.entry.status is not LegStatus.POST_PENDING                 # 판 종료
     assert s.entry.status is not LegStatus.HALTED and s.entry.running   # 4.037 < 한도 10 → 계속
-    assert "O2" not in eng._orders                                      # 후주문 추적 정리
+    assert _hl("O2") not in eng._orders                                      # 후주문 추적 정리
 
 
 async def test_post_order_linked_by_cloid_before_place_returns() -> None:
@@ -295,12 +309,13 @@ async def test_post_order_linked_by_cloid_before_place_returns() -> None:
     await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert abs(s.hl_net + 5.963) < 1e-9 and s.entry.post_pending == 0
     assert abs(s.fill_diff - 4.037) < 1e-9 and s.entry.running
     assert s.entry.status is not LegStatus.POST_PENDING
-    assert eng._pending_refs == {} and "O2" not in eng._orders and eng._orphan_fills == {}
+    assert eng._pending_refs == {} and _hl("O2") not in eng._orders and eng._orphan_fills == {}
     # 검토 2026-10-13 ★3: 선식별이 등록·종료 처리까지 마친 뒤 발주 응답 경로가 _register를 또 불러도
     # 같은 종료를 다시 처리하지 않는다(전엔 판 마무리 2회 → 마지막 판 매매결과가 빈 판으로 덮임)
     assert s.entry.last_round is not None and abs(s.entry.last_round.hl_qty - 5.963) < 1e-9
@@ -318,7 +333,8 @@ async def test_failed_post_order_relinked_when_identified_late() -> None:
     await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert s.fill_diff == 10 and s.entry.post_pending == 0          # 거부 처리 — 판 끝, 계속
     assert s.entry.status is not LegStatus.HALTED and sys_.last_cloid == sys_.cloid
@@ -328,8 +344,9 @@ async def test_failed_post_order_relinked_when_identified_late() -> None:
     sys_.order_book.track("O9", post_intent)
     for cb in sys_.on_hl_identified:
         cb(sys_.cloid, "O9")
-    assert s.entry.post_pending == 10 and "O9" in eng._orders and eng._failed_refs == {}
-    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O9", qty=10, price=1184.0, ts=0))
+    assert s.entry.post_pending == 10 and _hl("O9") in eng._orders and eng._failed_refs == {}
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O9", qty=10, price=1184.0, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     assert s.hl_net == -10 and s.fill_diff == 0 and s.entry.post_pending == 0  # 장부 보정
     assert s.entry.status is not LegStatus.HALTED and s.entry.running
@@ -352,12 +369,14 @@ async def test_engine_reverse_round_sells_sf_then_buys_hl() -> None:
     # HL 매도호가 1184.5×1356 = 1,606,182 → 괴리 +0.386% → P = 1,605,000×(1+0.00386−0.005)
     # = 1,603,170 → 3,000 올림 1,605,000 ≤ 한계 (1,598,000+1,000)×1.004 = 1,605,396
     assert sys_.placed[0].price == 1_605_000
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_605_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_605_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert len(sys_.placed) == 2 and sys_.placed[1].side is Side.BUY    # 후주문 HL 매수 100
     assert [i.tag for i in sys_.placed] == ["선역1진", "선역1진"]  # 주문 리스트 '세트'(09-17 형식)
     assert sys_.placed[1].qty == 100 and r.rt == -10 and r.sf_net == -10
-    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=100, price=1184.5, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=100, price=1184.5, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     assert r.hl_net == 100 and r.fill_diff == 0 and r.entry.status is LegStatus.SETTLE_DELAY
     snap = eng.live_snapshot()[U.value]
@@ -387,7 +406,8 @@ async def test_engine_saves_state_after_fills_and_halt() -> None:
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
     before = len(saves)
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=2, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=2, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert len(saves) > before  # 선주문 체결 → 저장
     before = len(saves)
@@ -418,7 +438,8 @@ async def test_state_save_runs_after_post_order_is_sent() -> None:
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
     order.clear()
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert order[:2] == ["place:hl_perp", "save"]  # 후주문 전송이 저장보다 먼저
 
@@ -551,7 +572,8 @@ async def test_late_pre_fill_after_stop_still_hedges() -> None:
     eng.set_running(U, 0, Block.ENTRY, False)
     await _settle()
     assert sys_.cancelled == [] and sys_.order_book.order("O1") is not None
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert [p.instrument for p in sys_.placed] == [SF, Instrument.HL_PERP]
     assert sys_.placed[1].qty == 100 and s.entry.post_pending == 100  # 10계약 × 10
@@ -604,7 +626,8 @@ async def test_cancel_crossed_by_fill_is_not_retried() -> None:
     await asyncio.sleep(1.5)                      # 재시도 간격(0.6초×2)보다 길게 기다려도
     assert sys_.cancel_calls == 1                 # 한 번만 보냈고 재시도 없음
     assert s.entry.cancel_tries == 1 and not s.entry.cancel_alarmed
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()                               # 체결 통보가 정리 → 후주문(헤지)
     assert [p.instrument for p in sys_.placed] == [SF, Instrument.HL_PERP]
     for task in list(eng._bg):
@@ -631,7 +654,8 @@ async def test_partial_cancel_confirmation_waits_for_pending_fill_then_closes() 
     await _settle()
     assert len(sys_.placed) == 1
     # 기다리던 체결 1 → 보통 선주문 체결로 헤지 후주문 10, 셈이 맞아 장부가 취소로 닫음 → 정리
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=1, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert len(sys_.placed) == 2
     post = sys_.placed[1]
@@ -639,7 +663,8 @@ async def test_partial_cancel_confirmation_waits_for_pending_fill_then_closes() 
     assert s.sf_net == 1 and s.rt == 1 and abs(s.fill_diff - 10) < 1e-9  # 장부 반영, HL 대기 10
     assert sys_.order_book.order("O1").status is OrderStatus.CANCELLED
     assert s.entry.pre_order_id is None             # 취소 확정으로 정리(딜레이 → 다음 판)
-    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=10, price=1184.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=10, price=1184.0, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     assert s.fill_diff == 0 and abs(s.hl_net + 10) < 1e-9                # 헤지 완성
 
@@ -913,9 +938,11 @@ async def test_pump_runs_timers_for_delay_and_window_edges() -> None:
     s = state.autom.book(U).sets[0]
     assert s.entry.pre_order_id == "O1"
     # 한 판을 끝낸다(선주문 10 체결 → 후주문 O2 100 체결) → 선주문 딜레이 1초
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
-    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=100, price=1184.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=100, price=1184.0, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     assert s.entry.status is LegStatus.SETTLE_DELAY and s.entry.delay_until is not None
     due = s.entry.delay_until
@@ -1026,10 +1053,12 @@ async def test_release_keeps_ledger_and_logs_fill_before_action(tmp_path: Any) -
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
     s = state.autom.book(U).sets[0]
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()                                       # 후주문 O2(100) 발주됨
-    assert s.entry.post_pending == 100 and "O2" in eng._orders
-    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1184.0, ts=0))
+    assert s.entry.post_pending == 100 and _hl("O2") in eng._orders
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1184.0, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     assert s.fill_diff == 60                              # 칸 = 장부 실시간(SF 10, HL −40)
     s.per_qty = 5                                         # 한도 50 → 잔량 60은 한도 이상
@@ -1061,13 +1090,14 @@ async def test_vanished_pre_order_is_cleared_and_vanished_post_order_halts() -> 
         del sys_.order_book._orders[o]
     eng._on_book_change()
     assert s.entry.pre_order_id is None and s.entry.status is LegStatus.ARMED  # 다시 감시
-    assert "O1" not in eng._orders
+    assert _ls("O1") not in eng._orders
     # 후주문이 사라지면: 미체결분만큼 체결차 → 세트 중지
     eng2, sys2, state2 = _engine()
     eng2.set_running(U, 0, Block.ENTRY, True)
     eng2.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
-    sys2.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0))
+    sys2.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     s2 = state2.autom.book(U).sets[0]
     assert s2.entry.status is LegStatus.POST_PENDING and s2.entry.post_pending == 100
@@ -1093,7 +1123,8 @@ async def test_engine_round_trip_pre_fill_post_fill() -> None:
     s = state.autom.book(U).sets[0]
     assert s.entry.status is LegStatus.PRE_RESTING and s.entry.pre_order_id == "O1"
 
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     post = sys_.placed[1]
     # 후주문도 지정가(Gtc)만 — HL 매도 = 매수1호가 1184 × (1 − 1%) = 1172.16 (사용자 확정)
@@ -1103,7 +1134,8 @@ async def test_engine_round_trip_pre_fill_post_fill() -> None:
     assert post.price == 1172.1
     assert s.entry.status is LegStatus.PRE_PARTIAL and s.entry.post_pending == 40
 
-    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1184.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1184.0, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     assert s.rt == 4 and s.entry.post_pending == 0 and s.entry.acc.fx_avg() == 1356.0
     snap = eng.live_snapshot()[U.value]  # 종목별 스냅샷(2026-09-08)
@@ -1138,9 +1170,11 @@ async def test_engine_writes_per_underlying_log(tmp_path: Any) -> None:
     eng.tick(now, 100.0)
     eng.tick(now, 100.1)  # 같은 판정 → 로그 추가 없음
     await _settle()
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
-    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1183.5, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=40, price=1183.5, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     for h in logging.getLogger("kp_arb.autom.sk_hynix").handlers:
         h.flush()
@@ -1179,7 +1213,8 @@ async def test_engine_cancel_on_signal_loss_and_halt_on_post_reject() -> None:
     state.autom.settings.windows = (("09:00:00", "15:20:00"),)  # 다시 시간 안
     eng.tick(now, 102.0)
     await _settle()
-    sys_.order_book.on_fill(Fill(fill_id="f3", order_id="O2", qty=10, price=1_602_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f3", order_id="O2", qty=10, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert sys_.placed[-1].instrument is Instrument.HL_PERP
     # 후주문은 취소하지 않는다(사용자 확정 2026-09-07) — 시간이 아무리 지나도 후주문대기 유지
@@ -1413,13 +1448,15 @@ async def test_stock_engine_round_one_share_one_contract() -> None:
     assert pre.instrument is Instrument.KR_STOCK and pre.side is Side.BUY
     assert pre.qty == 10 and pre.price == 100_000.0 and pre.tag == "주정1진"
     assert pre.credit_code == "000" and pre.market == "krx"  # 일반 세트·KRX
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=100_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=4, price=100_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     post = sys_.placed[1]
     assert post.instrument is Instrument.HL_PERP and post.side is Side.SELL and post.qty == 4
     s = state.autom.book(U, "stock").sets[0]
     assert s.entry.post_pending == 4 and s.fill_diff == 4
-    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=4, price=74.3, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=4, price=74.3, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     assert s.rt == 4 and s.fill_diff == 0 and s.entry.post_pending == 0
     assert state.autom.book(U).sets[0].rt == 0  # 주식선물 종목 상태는 무관
@@ -1494,7 +1531,8 @@ async def test_stock_credit_repay_carries_loan_date() -> None:
     assert pre.loan_date == "20260915" and pre.qty == 2 and s.exit.pre_qty == 2
     assert sys_.loan_queries == 1
     assert eng._repay_inflight == {}                      # 응답이 왔으니 예약은 풀림(장부가 듦)
-    sys_.order_book.on_fill(Fill(fill_id="r1", order_id="O1", qty=2, price=100_400.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="r1", order_id="O1", qty=2, price=100_400.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert s.exit.status is LegStatus.POST_PENDING  # 줄인 수량 전량 체결 = 선주문 끝(취소 없음)
     assert sys_.cancelled == []
@@ -1603,11 +1641,13 @@ async def test_hl_first_engine_round_hl_alo_pre_then_ls_post() -> None:
     assert pre.post_only and pre.tag == "H정1진"  # ALO + 꼬리표
     s = state.autom.book(U, "sf_hl_first").sets[0]
     assert s.entry.status is LegStatus.PRE_RESTING and s.entry.pre_order_id == "O1"
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=3.4, price=1185.9, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=3.4, price=1185.9, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     assert len(sys_.placed) == 1 and abs(s.hl_net + 3.4) < 1e-9  # 조각 — LS 아직
     assert s.entry.status is LegStatus.PRE_PARTIAL and abs(s.fill_diff + 3.4) < 1e-9
-    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O1", qty=6.6, price=1185.9, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O1", qty=6.6, price=1185.9, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     assert len(sys_.placed) == 2
     post = sys_.placed[1]
@@ -1616,7 +1656,8 @@ async def test_hl_first_engine_round_hl_alo_pre_then_ls_post() -> None:
     assert not post.post_only
     assert s.entry.status is LegStatus.POST_PENDING and s.entry.post_pending == 1
     assert s.rt == 0 and abs(s.fill_diff + 10) < 1e-9
-    sys_.order_book.on_fill(Fill(fill_id="f3", order_id="O2", qty=1, price=1_605_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f3", order_id="O2", qty=1, price=1_605_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert s.rt == 1 and s.sf_net == 1 and abs(s.hl_net + 10) < 1e-9 and s.fill_diff == 0
     assert s.entry.status is LegStatus.SETTLE_DELAY and s.entry.running
@@ -1660,13 +1701,15 @@ async def test_hl_first_engine_reverse_round_entry_then_exit() -> None:
     assert pre.venue is Venue.HYPERLIQUID and pre.side is Side.BUY and pre.qty == 10
     assert pre.price == 1183.6 and pre.post_only and pre.tag == "H역1진"
     assert state.autom.book(U, "sf_hl_first").sets[0].entry.status is LegStatus.IDLE  # 정방향 무관
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1183.6, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1183.6, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     post = sys_.placed[1]
     assert post.venue is Venue.LS and post.instrument is SF and post.side is Side.SELL
     assert post.qty == 1 and post.price == 1_598_000.0 and post.tag == "H역1진"
     assert s.rt == 0 and abs(s.fill_diff - 10) < 1e-9  # HL +10만 잡힌 상태
-    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=1, price=1_598_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f2", order_id="O2", qty=1, price=1_598_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert s.rt == -1 and s.sf_net == -1 and abs(s.hl_net - 10) < 1e-9 and s.fill_diff == 0
     assert s.entry.status is LegStatus.SETTLE_DELAY
@@ -1683,12 +1726,14 @@ async def test_hl_first_engine_reverse_round_entry_then_exit() -> None:
     pre_x = sys_.placed[2]
     assert pre_x.venue is Venue.HYPERLIQUID and pre_x.side is Side.SELL and pre_x.qty == 10
     assert pre_x.price == 1185.9 and pre_x.post_only and pre_x.tag == "H역1청"
-    sys_.order_book.on_fill(Fill(fill_id="f3", order_id="O3", qty=10, price=1185.9, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f3", order_id="O3", qty=10, price=1185.9, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     post_x = sys_.placed[3]
     assert post_x.venue is Venue.LS and post_x.side is Side.BUY and post_x.qty == 1
     assert post_x.price == 1_605_000.0
-    sys_.order_book.on_fill(Fill(fill_id="f4", order_id="O4", qty=1, price=1_605_000.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f4", order_id="O4", qty=1, price=1_605_000.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert s.rt == 0 and s.sf_net == 0 and abs(s.hl_net) < 1e-9 and s.fill_diff == 0
     snap = eng.live_snapshot()[f"{U.value}|sf_hl_first"]
@@ -1915,7 +1960,8 @@ async def test_hl_first_engine_ls_post_timeout_halts_and_alo_cross_reject_retrie
     assert len(sys_.placed) == 1 and s.entry.status is LegStatus.PRE_RESTING
     # LS 후주문 응답 없음
     sys_.timeout_pre = True  # FakeSystem: SF 주문에 RestTimeoutError
-    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1185.9, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1185.9, ts=0,
+                                 venue=Venue.HYPERLIQUID))
     await _settle()
     assert s.entry.status is LegStatus.HALTED and s.exit.status is LegStatus.HALTED
     assert "응답 없음" in s.entry.halt_reason and "재전송 없이" in s.entry.halt_reason
@@ -1938,7 +1984,7 @@ async def test_reject_notice_before_ack_does_not_reinject_dead_number() -> None:
     assert s.entry.pre_order_id is None                      # 죽은 번호가 남지 않음
     assert s.entry.reject_streak == 1 and s.entry.status is LegStatus.SETTLE_DELAY
     assert not s.entry.replace_pending and not s.entry.cancel_sent
-    assert sys_.cancelled == [] and "O1" not in eng._orders
+    assert sys_.cancelled == [] and _ls("O1") not in eng._orders
 
 
 async def test_old_pre_order_notice_does_not_touch_current_pre_order() -> None:
@@ -1950,14 +1996,14 @@ async def test_old_pre_order_notice_does_not_touch_current_pre_order() -> None:
     eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
     await _settle()
     s = state.autom.book(U).sets[0]
-    assert s.entry.pre_order_id == "O1" and "O1" in eng._orders
+    assert s.entry.pre_order_id == "O1" and _ls("O1") in eng._orders
     s.entry.pre_order_id = "O9"                              # 다리는 새 선주문으로 넘어간 상태 흉내
     status_before = s.entry.status
     sys_.order_book.on_cancel("O1")                          # 옛 번호의 취소 확정
     await _settle()
     assert s.entry.pre_order_id == "O9"                      # 지금 번호 유지
     assert s.entry.status is status_before
-    assert "O1" not in eng._orders                           # 추적만 종료
+    assert _ls("O1") not in eng._orders                           # 추적만 종료
 
 
 async def test_cancel_communication_error_is_not_retried(monkeypatch: Any) -> None:
@@ -2077,7 +2123,8 @@ async def test_stock_credit_entry_fill_learns_loan_date_with_one_query() -> None
     assert sys_.placed[0].credit_code == "003"
     loan = (_date.today() + timedelta(days=4)).strftime("%Y%m%d")   # LS가 매긴 대출일(오늘보다 뒤)
     sys_.loans = [(loan, 10.0)]                             # 조회하면 이 체결까지 품은 잔고가 온다
-    sys_.order_book.on_fill(Fill(fill_id="e1", order_id="O1", qty=10, price=100_100.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="e1", order_id="O1", qty=10, price=100_100.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert sys_.loan_queries == 2                           # 첫 신용매수 → 1회 조회
     assert eng._today_loan[U][1] == loan and eng._loans[U] == [(loan, 10.0)]
@@ -2087,7 +2134,8 @@ async def test_stock_credit_entry_fill_learns_loan_date_with_one_query() -> None
         venue=Venue.LS, underlying=U, instrument=Instrument.KR_STOCK, side=Side.BUY, qty=5,
         order_type=OrderType.LIMIT, price=100_100.0, credit_code="003"))
     eng._register("O9", _OrderRef(U, 0, Block.ENTRY, "pre"))
-    sys_.order_book.on_fill(Fill(fill_id="e2", order_id="O9", qty=5, price=100_100.0, ts=0))
+    sys_.order_book.on_fill(Fill(fill_id="e2", order_id="O9", qty=5, price=100_100.0, ts=0,
+                                 venue=Venue.LS))
     await _settle()
     assert sys_.loan_queries == 2 and eng._loans[U] == [(loan, 15.0)]
 
@@ -2130,7 +2178,6 @@ def test_orphan_fill_from_other_account_is_not_kept_or_applied() -> None:
     # 그 세트의 선주문 체결(20계약!)로 반영 → HL 200 반대 헤지 + 실제 선물 주문은 미추적 잔류.
     # 다른 계좌의 번호는 보관하지 않고, 등록 때도 계좌가 다르면 버린다.
     from kp_arb.auto_m_engine import SOURCE
-    from kp_arb.domain.enums import Account
     from kp_arb.order_book import TrackedOrder
 
     eng, sys_, state = _engine()
@@ -2139,24 +2186,24 @@ def test_orphan_fill_from_other_account_is_not_kept_or_applied() -> None:
         price=1_184_000.0, account=Account.KR_STOCK, source=SOURCE))
     eng._on_fill_applied(stock_order, 20, 1_184_000.0, "f-stock")   # 등록 전 — 보관 대상 아님
     assert eng._orphan_fills == {}
-    # 설령 보관돼 있었더라도(옛 코드 경로) 등록 때 계좌가 다르면 버린다
-    eng._orphan_fills["1871"] = [(stock_order, 20, 1_184_000.0)]
+    # 설령 보관돼 있었더라도 키가 (거래소, 계좌, 번호)(결정 92)라 주식 계좌 보관분은 선물 계좌
+    # 선주문 등록 때 꺼내지지 않는다
+    eng._orphan_fills[_ls("1871", Account.KR_STOCK)] = [(stock_order, 20, 1_184_000.0)]
     eng._register("1871", _OrderRef(U, 0, Block.EXIT, "pre"))
     leg = state.autom.book(U).sets[0].exit
     assert leg.pre_filled == 0 and sys_.placed == []
+    assert _ls("1871", Account.KR_STOCK) in eng._orphan_fills  # 남의 것은 그대로 남음
     # 같은 계좌(선물옵션)의 우리 주문 체결은 지금처럼 보관된다
     fut_order = TrackedOrder("1872", OrderIntent(
         venue=Venue.LS, underlying=U, instrument=SF, side=Side.SELL, qty=2,
         price=1_212_000.0, account=Account.KR_DERIV, source=SOURCE))
     eng._on_fill_applied(fut_order, 2, 1_212_000.0, "f-fut")
-    assert "1872" in eng._orphan_fills
+    assert _ls("1872") in eng._orphan_fills
 
 
 async def test_pre_fill_over_order_qty_is_rejected_and_set_halted() -> None:
     # 결정 85(사용자 2026-10-19 "거부+중지"): 선주문 체결 수량이 주문 잔량을 넘으면(10-19 사고
     # "누적 20/2") 반영하지 않고 세트 중지. 결정 84(계좌 대조) 뒤에 남는 마지막 안전장치.
-    from kp_arb.domain.enums import Account
-
     eng, sys_, state = _engine()
     s = state.autom.book(U).sets[0]
     await _autom_command(eng, state, {**RUN, "set": 0, "block": "entry", "value": True})
@@ -2183,3 +2230,25 @@ async def test_pre_fill_over_order_qty_is_rejected_and_set_halted() -> None:
     assert s2.entry.pre_filled == 4 and s2.entry.status is not LegStatus.HALTED
 
 
+
+
+async def test_hl_fill_with_same_number_as_ls_pre_order_is_not_the_pre_fill() -> None:
+    # 결정 92: 엔진 추적 키가 (거래소, 계좌, 번호) — LS 선주문 #O1이 걸려 있을 때 같은 번호의
+    # HL 체결(다른 거래소)은 선주문 체결로 세지 않는다(옛 번호만 키이던 때는 선주문 다리에 들어갔다)
+    from kp_arb.order_book import TrackedOrder
+
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    eng.tick(datetime(2026, 9, 4, 10, 0, 0), 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1" and _ls("O1") in eng._orders
+    hl_order = TrackedOrder("O1", OrderIntent(
+        venue=Venue.HYPERLIQUID, underlying=U, instrument=Instrument.HL_PERP, side=Side.SELL,
+        qty=10, order_type=OrderType.LIMIT, price=1184.0, source="수동"))
+    eng._on_fill_applied(hl_order, 10, 1184.0, "h1")            # 같은 번호, 거래소 HL
+    assert s.entry.pre_filled == 0 and eng._orphan_fills == {}   # 선주문 다리에 안 들어감
+    sys_.order_book.on_fill(Fill(fill_id="f1", order_id="O1", qty=10, price=1_602_000.0, ts=0,
+                                 venue=Venue.LS))                # 진짜 선주문 체결
+    await _settle()
+    assert s.entry.pre_filled == 10

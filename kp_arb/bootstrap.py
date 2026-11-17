@@ -62,7 +62,7 @@ from .limits import (
     would_exceed_daily_limit,
 )
 from .market_hours import MarketCalendar
-from .order_book import OrderBook, TrackedOrder
+from .order_book import OrderBook, OrderKey, TrackedOrder
 from .quote_plan import FX_EXPECTED_TR, FX_NIGHT_TRADE_TR, FX_TRADE_TR, QuotePlanInput, plan
 from .risk import RiskManager, RiskState
 from .routing import account_for
@@ -452,7 +452,8 @@ class LiveSystem:
         # 옛 최근 200건·화면 50건 상한으로 09:08 이전 체결이 안 보였음). 날짜가 바뀌면 비운다.
         self.fills: deque[dict[str, Any]] = deque()
         self.cancels: deque[dict[str, Any]] = deque()
-        self._cancel_recorded: set[str] = set()  # 취소내역에 이미 넣은 주문번호(통보 중복 방지)
+        # 취소내역에 이미 넣은 주문 키 (거래소, 계좌, 번호)(통보 중복 방지, 결정 92)
+        self._cancel_recorded: set[OrderKey] = set()
         # 거부내역(주문리스트 '거부' 행, 사용자 2026-09-18) — 발주 거부(LS REST·HL)·취소 거부·
         # 응답 없음. 당일치 전부(fills·cancels와 같이 날짜 바뀌면 비움)
         self.rejects: deque[dict[str, Any]] = deque()
@@ -651,7 +652,7 @@ class LiveSystem:
         ③ 종목이 풀렸는데 다르면 거부 + 에러."""
         if not fill.symbol or fill.account is None:
             return True
-        order = self.order_book.order(fill.order_id, fill.account)
+        order = self.order_book.order(fill.order_id, fill.account, fill.venue)
         if order is None:
             return True
         intent = order.intent
@@ -691,18 +692,19 @@ class LiveSystem:
         정정으로 소멸한 원주문은 장부에서 먼저 취소된 뒤 통보가 또 오므로 통보 쪽 1회로 남긴다."""
         import time as _t
 
-        seen: set[str] | None = getattr(self, "_cancel_recorded", None)
+        seen: set[OrderKey] | None = getattr(self, "_cancel_recorded", None)
         if seen is None:
             seen = set()
             self._cancel_recorded = seen
-        if order.order_id in seen:
+        key = OrderBook.key_of(order.intent, order.order_id)  # (거래소, 계좌, 번호) — 결정 92
+        if key in seen:
             return
         it = order.intent
         if roll_daily_logs(getattr(self, "_daylog_state", {}), _t.strftime("%Y-%m-%d"),
                            getattr(self, "fills", deque()), self.cancels,
                            getattr(self, "rejects", deque())):
             seen.clear()  # 날짜가 바뀌어 보관분을 비웠으면 중복 방지 기록도 같이
-        seen.add(order.order_id)
+        seen.add(key)
         self.cancels.appendleft({
             "seq": _bump_row_seq(self),             # 행 일련번호('이전 N건' 조회 기준)
             "time": _t.strftime("%H:%M:%S"),        # 취소시각(현재 열엔 미표시)
@@ -1092,8 +1094,8 @@ class LiveSystem:
         # 성공이면 취소 통보를 보고 판단").
         # 통보의 sz = 취소 시점 남은 수량(취소 직전 체결은 이미 빠져 있음) → 장부 남은 수량과 대조해
         # 닫는다(결정 69). 장부가 더 많으면 그 차이의 체결 통보(userFills)가 뒤따르는 중 — 기다린다
-        order = (self.order_book.on_reject(upd.oid) if upd.is_rejected
-                 else self.order_book.on_cancel(upd.oid, qty=upd.sz))
+        order = (self.order_book.on_reject(upd.oid, venue=Venue.HYPERLIQUID) if upd.is_rejected
+                 else self.order_book.on_cancel(upd.oid, qty=upd.sz, venue=Venue.HYPERLIQUID))
         log = order_log.logger_for(Venue.HYPERLIQUID)
         if order is not None:
             if upd.ended_with_remainder:  # 거래소가 잔량을 버리고 끝냄(증거금 한도 등, 실측 09-07)
@@ -1156,7 +1158,7 @@ class LiveSystem:
             log.info("HL 주문 식별(응답 전) #%s ← cloid %s (%s)", oid, cloid, how)
         for cb in self.on_hl_identified:
             cb(cloid, oid)
-        self.order_book.replay_pending(oid)
+        self.order_book.replay_pending(oid, venue=Venue.HYPERLIQUID)
 
     def _hold_failed_hl(self, cloid: str, intent: OrderIntent) -> None:
         """발주 실패(통신 오류·조회 실패)한 cloid를 유예 목록에 두고, 유예 끝에 다시 조회한다."""
@@ -1254,9 +1256,9 @@ class LiveSystem:
             if intent.account is None:  # 장부 키 (계좌, 번호) — 라우팅 계좌를 채워 둔다(결정 73)
                 intent = intent.model_copy(update={"account": account_for(intent.instrument)})
             self.order_book.track(order_id, intent)
-            # track 전에 온 이벤트 반영(역전 대비) — **계좌를 넘긴다**(검토 2026-10-19 §A): 같은
-            # 번호가 다른 계좌에 열려 있으면 장부가 계좌를 못 골라 보관 체결이 유실된다
-            self.order_book.replay_pending(order_id, account=intent.account)
+            # track 전에 온 이벤트 반영(역전 대비) — **거래소·계좌를 넘긴다**(검토 2026-10-19 §A,
+            # 결정 92): 같은 번호가 다른 계좌에 열려 있으면 장부가 계좌를 못 골라 보관 체결이 유실됨
+            self.order_book.replay_pending(order_id, account=intent.account, venue=Venue.LS)
             return order_id
         if self._hl is None:
             raise RuntimeError("HL gateway not configured")
@@ -1306,7 +1308,7 @@ class LiveSystem:
             delta = sz - order.filled_qty
             if delta > 1e-9:
                 fill = Fill(fill_id=f"place-{order_id}", order_id=order_id,
-                            qty=delta, price=px, ts=0.0)
+                            qty=delta, price=px, ts=0.0, venue=Venue.HYPERLIQUID)
                 # 주문 체결처리 + 포지션만 반영(미체결 잔류 방지). apply_place_fill은 선반영
                 # 수량을 기록해 뒤이어 오는 userFills 재통보를 그 수량만큼 흡수한다(부분 즉시
                 # 체결도 이중 반영 안 됨). 체결내역 기록·엔진 통지는 userFills가 전담.
@@ -1314,7 +1316,7 @@ class LiveSystem:
             self._schedule_hl_refresh()
         # apply_place_fill **뒤**에 replay — track 전에 온 이벤트(체결·취소 등) 반영. 겹친
         # 체결은 provisional_filled가 흡수해 이중 반영 없음(주문 역전 대비, LS·HL 공용).
-        self.order_book.replay_pending(order_id)
+        self.order_book.replay_pending(order_id, venue=Venue.HYPERLIQUID)
 
     async def place_many(self, intents: Sequence[OrderIntent],
                          cloids: Sequence[str | None] | None = None) -> list[PlaceResult]:
@@ -1376,9 +1378,10 @@ class LiveSystem:
     async def amend_price(
         self, order_id: str, price: float, *,
         reduce_only: bool = False, post_only: bool = False,
-        account: Account | None = None,
+        account: Account | None = None, venue: Venue | None = None,
     ) -> str:
-        """가격 정정 (LS 전용) — 새 주문번호를 등록하고 원주문은 취소 처리.
+        """가격 정정 (LS 전용) — 새 주문번호를 등록하고 원주문은 취소 처리. venue·account = 주문
+        키(결정 92) — 아는 쪽은 넘긴다.
 
         **HL은 어떤 경우에도 정정 금지**(원자적 modify가 크로싱 시 원주문 소실) —
         HL 주문이 오면 HLAmendForbidden으로 거부한다. HL은 취소 후 신규로 대체한다
@@ -1386,7 +1389,7 @@ class LiveSystem:
         지점이라 여기서 막으면 어느 경로로 와도 HL modify가 나가지 않는다.
         LS는 CSPAT00701/CFOAT00200. 수량은 **잔량 기준** — 부분체결 후 원수량 정정 거부(01442).
         """
-        order = self.order_book.order(order_id, account)
+        order = self.order_book.order(order_id, account, venue)
         if order is None:
             raise ValueError(f"unknown order {order_id}")
         if order.intent.venue is not Venue.LS:  # HL 등 — 정정 금지, 취소 후 신규로
@@ -1406,16 +1409,19 @@ class LiveSystem:
             update={"price": price, "qty": qty,
                     "reduce_only": reduce_only, "post_only": post_only})
         self.order_book.track(new_id, new_intent)
-        # 새 주문번호로 track 전에 온 이벤트 반영 — 계좌 명시(검토 2026-10-19 §A)
-        self.order_book.replay_pending(new_id, account=new_intent.account)
+        # 새 주문번호로 track 전에 온 이벤트 반영 — 거래소·계좌 명시(검토 2026-10-19 §A, 결정 92)
+        self.order_book.replay_pending(new_id, account=new_intent.account, venue=Venue.LS)
         if new_id != order_id:
-            self.order_book.on_cancel(order_id, account=order.intent.account)  # 원주문 소멸
+            self.order_book.on_cancel(order_id, account=order.intent.account,
+                                      venue=Venue.LS)  # 원주문 소멸
         return new_id
 
-    async def cancel(self, order_id: str, account: Account | None = None) -> None:
-        """venue 라우팅 취소. account = LS 계좌(결정 73 — 번호가 계좌마다 겹치므로 아는 쪽은
-        넘긴다; None이면 번호가 한 계좌에만 있을 때만 찾는다). HL 장부는 취소 통보가 닫는다."""
-        order = self.order_book.order(order_id, account)
+    async def cancel(self, order_id: str, account: Account | None = None,
+                     venue: Venue | None = None) -> None:
+        """venue 라우팅 취소. (venue, account) = 주문 키(결정 73·92 — 번호가 계좌·거래소마다 겹치니
+        아는 쪽은 넘긴다; 둘 다 None이면 찾기: HL 먼저 → 번호가 한 LS 계좌뿐일 때만). HL 장부는 취소
+        통보가 닫는다."""
+        order = self.order_book.order(order_id, account, venue)
         if order is None:
             raise ValueError(f"unknown order {order_id}")
         if order.intent.venue is Venue.LS:
@@ -1445,6 +1451,7 @@ class LiveSystem:
 
     async def cancel_many(
         self, order_ids: Sequence[str], accounts: Sequence[Account | None] | None = None,
+        venues: Sequence[Venue | None] | None = None,
     ) -> list[tuple[str, str | None]]:
         """여러 건 취소 → (주문번호, 실패 사유|None) 목록(입력 순서). HL은 게이트웨이
         cancel_orders로 **한 요청**에 묶고(요청 한도, 사용자 2026-09-28), LS는 한 건씩(cancel).
@@ -1454,17 +1461,21 @@ class LiveSystem:
         HTS 주문과 선물 선주문이 같은 번호로 함께 열려 있으면 둘 다 "unknown"으로 건너뛰던 길)."""
         if accounts is not None and len(accounts) != len(order_ids):
             raise ValueError("cancel_many: accounts 길이가 order_ids와 다름")
+        if venues is not None and len(venues) != len(order_ids):
+            raise ValueError("cancel_many: venues 길이가 order_ids와 다름")
         errs: list[str | None] = [None] * len(order_ids)
         hl_ids: list[str] = []
         hl_pos: dict[str, int] = {}
         for i, oid in enumerate(order_ids):
             acct = accounts[i] if accounts is not None else None
-            order = self.order_book.order(oid, acct)
+            venue = venues[i] if venues is not None else None  # 주문 키의 거래소(결정 92)
+            order = self.order_book.order(oid, acct, venue)
             if order is None:
                 errs[i] = f"unknown order {oid}"
             elif order.intent.venue is Venue.LS:
                 try:
-                    await self.cancel(oid, account=self.order_book.account_of(order.intent))
+                    await self.cancel(oid, account=self.order_book.account_of(order.intent),
+                                      venue=Venue.LS)
                 except Exception as exc:  # noqa: BLE001 - 건별 사유
                     errs[i] = str(exc)
             else:

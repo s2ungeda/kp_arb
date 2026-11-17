@@ -31,9 +31,11 @@ class Tier:
     spread: float | None = None
     qty: float = 0.0
     price_spread: float | None = None
-    # 자동청산(§4a, 2026-10-29): 체크된 단은 전략주문이 전량 체결되면 청산가 스프레드로 반대 주문.
-    exit_price_spread: float | None = None  # 청산가(주문가 옆 입력, % → 소수)
-    auto_exit: bool = False                 # 자동청산 체크
+    # 자동청산(§4a): 체크된 단은 전략주문이 전량 체결되면 반대 방향 주문. 2026-11-17부터 가격은
+    # 체결평균가 × (1 ∓ 목표수익률) — ~~청산가 스프레드(exit_price_spread, 10-29)~~는 뜻이 달라
+    # 복원하지 않는다(옛 저장값 버림).
+    target_profit: float | None = None  # 목표수익률(주문가 옆 입력, 양수 % → 소수)
+    auto_exit: bool = False             # 자동청산 체크
 
     def valid(self) -> bool:
         return self.spread is not None and self.qty > 0 and self.price_spread is not None
@@ -57,11 +59,12 @@ def run_block_error(tiers: list[Tier], label: str) -> str | None:
     그때부터 판정에 들어간다(judge가 valid()만 본다)."""
     if not any(t.valid() for t in tiers):
         return f"{label} 단 없음"
-    # 자동청산을 체크한 단은 청산가도 있어야 켠다(§4a-5, 사용자 2026-10-29 확인 4)
+    # 자동청산을 체크한 단은 목표수익률도 있어야 켠다(§4a-5, 사용자 2026-10-29 확인 4 — 11-17부터
+    # 청산가 대신 목표수익률)
     bad = [i + 1 for i, t in enumerate(tiers) if t.valid() and t.auto_exit
-           and t.exit_price_spread is None]
+           and t.target_profit is None]
     if bad:
-        return f"{label}{bad[0]} 자동청산 단 청산가 없음"
+        return f"{label}{bad[0]} 자동청산 단 목표수익률 없음"
     return None
 
 
@@ -72,24 +75,52 @@ def opposite(side: Side) -> Side:
 
 @dataclass
 class AutoExit:
-    """자동청산 대기 한 건(§4a) — 전략주문 주문번호에 걸어 두고 전량 체결되면 낸다."""
+    """자동청산 대기 한 건(§4a) — 전략주문 주문번호에 걸어 두고 전량 체결되면 낸다. 가격은 전량
+    체결된 뒤 체결평균가 × (1 ∓ 목표수익률)(사용자 2026-11-17) — 발주 때는 모른다."""
 
     order_id: str
     block: str
     index: int
-    side: Side        # 자동청산 주문 방향(전략주문의 반대)
-    qty: float        # 전략주문 수량 = 자동청산 수량
-    price: float      # 발주 시점에 청산가 스프레드로 푼 HL 가격(§4a-2)
+    side: Side            # 자동청산 주문 방향(전략주문의 반대)
+    qty: float            # 전략주문 수량 = 자동청산 수량
+    target_profit: float  # 목표수익률(소수)
     filled: float = 0.0
+    priced: float = 0.0    # 가격이 실린 체결 수량(평균가 분모)
+    notional: float = 0.0  # Σ 체결수량 × 체결가 — 평균가용
     fill_ids: set[str] = field(default_factory=set)
 
-    def add_fill(self, fill_id: str, qty: float) -> bool:
-        """체결 누적(같은 체결번호는 한 번). 전량(수량 − 1e-9 이상)이 되면 True."""
+    def add_fill(self, fill_id: str, qty: float, price: float = 0.0) -> bool:
+        """체결 누적(같은 체결번호는 한 번). 전량(수량 − 1e-9 이상)이 되면 True. 가격이 안 실린
+        체결(0)은 전량 판정엔 넣고 평균가엔 안 넣는다."""
         if fill_id in self.fill_ids:
             return False
         self.fill_ids.add(fill_id)
-        self.filled += max(0.0, qty)
+        q = max(0.0, qty)
+        self.filled += q
+        if price > 0:
+            self.priced += q
+            self.notional += q * price
         return self.filled >= self.qty - 1e-9
+
+    def avg_price(self) -> float | None:
+        """체결평균가(수량가중, 가격이 실린 체결만). 하나도 없으면 None."""
+        if self.priced <= 0:
+            return None
+        return self.notional / self.priced
+
+
+def auto_exit_price(avg: float, target_profit: float, side: Side,
+                    sz_decimals: int | None) -> float | None:
+    """자동청산 주문가(§4a-2, 사용자 2026-11-17): 진입(HL매도) 단의 청산은 **매수** —
+    `체결평균가 × (1 − 목표수익률)`을 아래 호가로 내림, 청산(HL매수) 단의 청산은 **매도** —
+    `체결평균가 × (1 + 목표수익률)`을 위 호가로 올림. side = 자동청산 주문 방향. 평균가·수익률이
+    0 이하면 None."""
+    if avg <= 0 or target_profit <= 0:
+        return None
+    raw = avg * (1.0 - target_profit) if side is Side.BUY else avg * (1.0 + target_profit)
+    if raw <= 0:
+        return None
+    return hl_round_price(raw, side, sz_decimals, maker=True)
 
 
 def _tiers() -> list[Tier]:
@@ -110,6 +141,12 @@ class NxtOpenSettings:
     # 리스크 방지(§4b, 2026-10-29). 비우면 기본값(개장 시각과 같은 규칙).
     hl_base_hms: str = DEFAULT_HL_BASE_HMS   # HL기준시간(HH:MM:SS) — 그 시각의 HL 현재가를 기준가로
     range_limit: float = DEFAULT_RANGE_LIMIT  # 주문범위제한(% → 소수)
+    # 호가 필터(§1a, 사용자 2026-11-17 — 화면·저장만 먼저, 판정은 [OPEN] 문답 뒤): 5호가합(잔량 합
+    # 하한) · 호가제외수량(이 이하 잔량의 호가는 최우선호가에서 제외) · 최소호가스프레드(% → 소수,
+    # 비우면 None)
+    sum5_qty: float = 0.0
+    exclude_qty: float = 0.0
+    min_spread: float | None = None
     entries: list[Tier] = field(default_factory=_tiers)
     exits: list[Tier] = field(default_factory=_tiers)
     run_entry: bool = False   # 진입(HL매도) 실행 — 화면 표의 병합 버튼(사용자 2026-10-20 목업)
@@ -136,7 +173,7 @@ class Plan:
     side: Side        # entry → SELL, exit → BUY
     qty: float
     price_spread: float
-    exit_spread: float | None = None  # 자동청산(§4a) 청산가 스프레드 — 체크된 단만, 아니면 None
+    target_profit: float | None = None  # 자동청산(§4a) 목표수익률 — 체크된 단만, 아니면 None
 
 
 # --- 계산 ---
@@ -316,8 +353,8 @@ def judge(entry_disp: float | None, exit_disp: float | None, settings: NxtOpenSe
 
 
 def _auto_spread(t: Tier) -> float | None:
-    """자동청산 체크 + 청산가가 있는 단만 청산가 스프레드(§4a)."""
-    return t.exit_price_spread if t.auto_exit and t.exit_price_spread is not None else None
+    """자동청산 체크 + 목표수익률이 있는 단만 목표수익률(§4a)."""
+    return t.target_profit if t.auto_exit and t.target_profit is not None else None
 
 
 # --- 저장·복원(core_state.json) ---
@@ -326,10 +363,13 @@ def _tier_from(raw: object) -> Tier:
     if not isinstance(raw, dict):
         return Tier()
     out = Tier()
-    for key in ("spread", "price_spread", "exit_price_spread"):
+    for key in ("spread", "price_spread"):
         v = raw.get(key)
         if isinstance(v, int | float) and not isinstance(v, bool):
             setattr(out, key, float(v))
+    tp = raw.get("target_profit")  # 양수만(0·음수·옛 청산가 키는 없음으로)
+    if isinstance(tp, int | float) and not isinstance(tp, bool) and tp > 0:
+        out.target_profit = float(tp)
     q = raw.get("qty")
     if isinstance(q, int | float) and not isinstance(q, bool) and q >= 0:
         out.qty = float(q)
@@ -371,6 +411,13 @@ def settings_from_dict(raw: object) -> NxtOpenSettings:
     lim = raw.get("range_limit")
     if isinstance(lim, int | float) and not isinstance(lim, bool) and lim >= 0:
         st.range_limit = float(lim)
+    for key in ("sum5_qty", "exclude_qty"):  # 호가 필터(§1a) — 0 이상, 틀리면 기본 0
+        v = raw.get(key)
+        if isinstance(v, int | float) and not isinstance(v, bool) and v >= 0:
+            setattr(st, key, float(v))
+    ms = raw.get("min_spread")
+    if isinstance(ms, int | float) and not isinstance(ms, bool) and ms > 0:
+        st.min_spread = float(ms)
     for key in ("entries", "exits"):
         rows = raw.get(key)
         if isinstance(rows, list):
@@ -411,12 +458,23 @@ def apply_settings(st: NxtOpenSettings, body: dict[str, Any],
         errors.append("개장 시각은 HH:MM:SS")
     if "hl_base_hms" in body and new.hl_base_hms != body["hl_base_hms"]:
         errors.append("HL기준시간은 HH:MM:SS")
+    # 목표수익률은 양수만(사용자 2026-11-17) — 음수는 거부(0·빈칸은 없음)
+    for key in ("entries", "exits"):
+        rows = body.get(key)
+        if isinstance(rows, list) and any(
+                isinstance(r, dict) and isinstance(r.get("target_profit"), int | float)
+                and not isinstance(r.get("target_profit"), bool) and r["target_profit"] < 0
+                for r in rows):
+            errors.append("목표수익률은 양수만")
+            break
     if errors:
         return errors
     st.start_s, st.end_s = new.start_s, new.end_s
     st.open_hms, st.entries, st.exits = new.open_hms, new.entries, new.exits
     st.ref_qty = new.ref_qty
     st.hl_base_hms, st.range_limit = new.hl_base_hms, new.range_limit  # 10-29 추가 칸
+    st.sum5_qty, st.exclude_qty, st.min_spread = (  # 11-17 호가 필터 칸(저장만)
+        new.sum5_qty, new.exclude_qty, new.min_spread)
     return []
 
 

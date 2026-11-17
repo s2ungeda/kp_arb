@@ -61,12 +61,12 @@ from .gateways.ls_tr import RestTimeoutError
 from .hl_merge import merge_active_dict, merge_tick_options
 from .hl_price import hl_price_step, hl_round_price
 from .logs import attach_daily_file
+from .order_book import OrderBook, OrderKey, TrackedOrder
 from .routing import account_for
 from .strategy_core import dividend_rate
 from .ticks import tick_for
 
 if TYPE_CHECKING:
-    from .order_book import OrderBook, TrackedOrder
     from .strategy_core import CoreState
 
 
@@ -144,12 +144,14 @@ class _SystemLike(Protocol):
     def ls_feed_ok(self) -> bool: ...  # LS 채널 연결(끊김·COM 정지면 False) — G0-1
     def hl_feed_ok(self) -> bool: ...  # HL 채널 연결 — G0-1(결정 60)
     async def place(self, intent: OrderIntent, *, cloid: str | None = None) -> str: ...
-    async def cancel(self, order_id: str, account: Account | None = None) -> None: ...
+    async def cancel(self, order_id: str, account: Account | None = None,
+                     venue: Venue | None = None) -> None: ...
     # 묶음 전송(exec §7D, 사용자 2026-09-30) — HL 주문 여러 건을 한 요청으로, 결과는 건별
     async def place_many(self, intents: Sequence[OrderIntent],
                          cloids: Sequence[str | None] | None = None) -> list[PlaceResult]: ...
     async def cancel_many(
-        self, order_ids: Sequence[str]) -> list[tuple[str, str | None]]: ...
+        self, order_ids: Sequence[str], accounts: Sequence[Account | None] | None = None,
+        venues: Sequence[Venue | None] | None = None) -> list[tuple[str, str | None]]: ...
     async def query_credit_loans(self, underlying: Underlying) -> Sequence[tuple[str, float]]: ...
     def new_hl_cloid(self) -> str | None: ...
     on_hl_identified: list[Callable[[str, str], None]]  # (cloid, oid) — 응답 전 식별 통지
@@ -190,16 +192,18 @@ class AutoMEngine:
         self._save = save
         self._log = logging.getLogger("kp_arb.autom")  # 굵직한 줄 → 코어 로그
         self._log_dir = log_dir
-        self._orders: dict[str, _OrderRef] = {}
-        # 등록 전에 온 우리 주문 체결(발주 응답 즉시체결) — oid → [(주문, 수량, 가격)], 등록 때 반영
-        self._orphan_fills: dict[str, list[tuple[TrackedOrder, float, float]]] = {}
+        # 추적 주문 — 키는 장부와 같은 (거래소, 계좌, 번호)(결정 92): LS 번호는 계좌마다 겹치고
+        # HL 번호도 LS와 겹칠 수 있어 번호만으로는 "내 주문"을 가릴 수 없다
+        self._orders: dict[OrderKey, _OrderRef] = {}
+        # 등록 전에 온 우리 주문 체결(발주 응답 즉시체결) — 키 → [(주문, 수량, 가격)], 등록 때 반영
+        self._orphan_fills: dict[OrderKey, list[tuple[TrackedOrder, float, float]]] = {}
         # 후주문 cloid → 세트(발주 응답 대기 중). 코어가 통보로 oid를 식별하면 그 oid로 등록
         # (결정 27)
         self._pending_refs: dict[str, _OrderRef] = {}
         # 발주 실패로 처리한 후주문 cloid → (세트, 수량, 시각). 코어가 유예 안에 살아 있는 주문으로
         # 식별하면 재연결(결정 30). 코어 유예(30초)보다 길게 두고 지나면 버린다.
         self._failed_refs: dict[str, tuple[_OrderRef, float, float]] = {}
-        self._seen_status: dict[str, str] = {}
+        self._seen_status: dict[OrderKey, str] = {}
         self._mono = 0.0  # 마지막 tick의 단조 시계(테스트 주입 가능)
         # 종목별 상세 로그(logs/autom_<종목>_날짜.log) — 판정 근거·상태 전이·체결 반영
         # (사용자 2026-09-04). 판정·상태는 바뀔 때만 한 줄.
@@ -263,8 +267,16 @@ class AutoMEngine:
 
     def tracked_order_ids(self) -> set[str]:
         """엔진이 아직 세트에 묶어 보는 주문번호 — 장부의 닫힌 주문 정리에서 보호(검토 2026-11-03
-        §5B)."""
-        return set(self._orders)
+        §5B). 번호만 돌려준다(보호는 넓어도 안전)."""
+        return {k[2] for k in self._orders}
+
+    def _key(self, ref: _OrderRef, oid: str) -> OrderKey:
+        """이 참조 주문의 장부 키 (거래소, 계좌, 번호)(결정 92) — 선주문은 LS(HL선이면 HL), 후주문은
+        HL(HL선이면 LS)."""
+        acct = self._ls_account(ref)
+        if acct is None:
+            return (Venue.HYPERLIQUID, None, oid)
+        return (Venue.LS, acct, oid)
 
     def _log_restored_halts(self) -> None:
         """재시동 복원 뒤 체결차가 남은 세트를 로그에 남긴다 — 중지는 대기로 복원되므로(사용자
@@ -474,7 +486,8 @@ class AutoMEngine:
                             and mono - leg.cancel_sent_mono >= CANCEL_WAIT_ALARM_S):
                         leg.cancel_wait_alarmed = True
                         order = self._system.order_book.order(
-                            leg.pre_order_id, None if s.hl_first else self._ls_account_pre())
+                            leg.pre_order_id, None if s.hl_first else self._ls_account_pre(),
+                            Venue.HYPERLIQUID if s.hl_first else Venue.LS)
                         if order is not None and order.cancelled_qty > 0:
                             # 취소는 확정됐는데 셈이 안 맞아 체결 통보를 기다리는 중(결정 69)
                             what = (f"부분 취소 확정(취소 {order.cancelled_qty:g}) 뒤 체결 "
@@ -764,11 +777,12 @@ class AutoMEngine:
         # 보관)는 정리된 죽은 번호를 다리에 다시 넣어 그 취소가 "잔량 없음"으로 끝나고
         # replace_pending이 영원히 걸렸다(검토 2026-10-13 14번). 응답 전 식별(cloid)이 종료까지
         # 끝낸 번호는 넣지 않는다
-        if self._already_closed(oid, u, index, block, reverse):
+        ref = _OrderRef(u, index, block, "pre", reverse)  # 상품은 엔진 단위
+        if self._already_closed(self._key(ref, oid), u, index, block, reverse):
             return
         late = on_pre_ack(s, block, oid)  # 발주 중 꺼졌/중지됐으면 취소 행동
-        self._register(oid, _OrderRef(u, index, block, "pre", reverse))  # 상품은 엔진 단위
-        if late and oid in self._orders:  # 등록 중 종료된 주문이면 취소할 것이 없다
+        self._register(oid, ref)
+        if late and self._key(ref, oid) in self._orders:  # 등록 중 종료된 주문이면 취소할 것 없음
             self._log.warning("[자동M] %s 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → 즉시 취소",
                               u.value, self._tag(u, index, block, reverse), oid)
             self._apply(u, index, block, late, reverse)
@@ -818,11 +832,11 @@ class AutoMEngine:
             return
         if cloid:
             self._pending_refs.pop(cloid, None)
-        if self._already_closed(oid, u, index, block, reverse):  # 14번 — 위 LS 선주문과 같음
+        if self._already_closed(self._key(ref, oid), u, index, block, reverse):  # 14번
             return
         late = on_pre_ack(s, block, oid)
         self._register(oid, ref)
-        if late and oid in self._orders:
+        if late and self._key(ref, oid) in self._orders:
             self._log.warning("[자동M] %s HL 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → 즉시 "
                               "취소", u.value, self._tag(u, index, block, reverse), oid)
             self._apply(u, index, block, late, reverse)
@@ -899,11 +913,11 @@ class AutoMEngine:
                 s.leg(block).last_reject_at = time.strftime("%H:%M:%S")
                 self._trace(u, index, block, s.leg(block), reverse)
                 continue
-            if self._already_closed(res.order_id, u, index, block, reverse):  # 14번
-                continue
+            if self._already_closed(self._key(ref, res.order_id), u, index, block, reverse):
+                continue  # 14번
             late = on_pre_ack(s, block, res.order_id)
             self._register(res.order_id, ref)
-            if late and res.order_id in self._orders:
+            if late and self._key(ref, res.order_id) in self._orders:
                 self._log.warning("[자동M] %s HL 선주문 %s #%s — 발주 응답 전 실행 꺼짐/중지 → "
                                   "즉시 취소", u.value, tag, res.order_id)
                 self._apply(u, index, block, late, reverse)
@@ -920,7 +934,8 @@ class AutoMEngine:
                            u.value, self._tag(u, index, block, reverse), order_id, reason)
         ids = [it[3] for it in items]
         try:
-            results = await self._system.cancel_many(ids)
+            # 묶음 취소는 HL선(§7D) 선주문 전용 — 주문 키의 거래소를 같이 넘긴다(결정 92)
+            results = await self._system.cancel_many(ids, venues=[Venue.HYPERLIQUID] * len(ids))
         except Exception as exc:  # noqa: BLE001 - 요청 자체가 실패
             if _is_comm_error(exc):
                 # 통신 오류·응답 없음 = 결과 모름 — 한 건씩 다시 보내지 않고 통보를 기다린다
@@ -1193,9 +1208,11 @@ class AutoMEngine:
         # 다음 판정이 다시 보낸다(이미 체결/취소된 주문의 거부도 통보로 정리된다).
         for attempt in range(3):
             try:
+                hl_first = self._book(u).hl_first
                 await self._system.cancel(
                     order_id,
-                    account=None if self._book(u).hl_first else self._ls_account_pre())
+                    account=None if hl_first else self._ls_account_pre(),
+                    venue=Venue.HYPERLIQUID if hl_first else Venue.LS)  # 주문 키(결정 92)
                 return
             except RestTimeoutError as exc:
                 # 응답 없음 = 결과 모름(첫 요청이 접수됐을 수 있다) — 다시 보내지 않고 통보를
@@ -1301,15 +1318,15 @@ class AutoMEngine:
                        price, oid)
 
     # ------------------------------------------------------------ 주문 통보 ---
-    def _already_closed(self, oid: str, u: Underlying, index: int, block: Block,
+    def _already_closed(self, key: OrderKey, u: Underlying, index: int, block: Block,
                         reverse: bool) -> bool:
-        """발주 응답이 왔는데 이 번호가 이미 **종료까지 처리된** 번호인가 — 응답 전 식별(cloid)로
+        """발주 응답이 왔는데 이 주문(키)이 이미 **종료까지 처리된** 것인가 — 응답 전 식별(cloid)로
         등록돼 거부·취소·체결 통보까지 끝나 추적에서 빠진 경우(★3·14번). 그 번호를 다리에 다시
         넣지 않도록 호출한 쪽이 발주 뒷처리를 건너뛴다."""
-        if oid in self._seen_status and oid not in self._orders:
+        if key in self._seen_status and key not in self._orders:
             self._log.info("[자동M] %s 선주문 %s #%s — 응답 전에 이미 종료 처리된 번호, 다시 넣지"
                            " 않음",
-                           u.value, self._tag(u, index, block, reverse), oid)
+                           u.value, self._tag(u, index, block, reverse), key[2])
             return True
         return False
 
@@ -1323,19 +1340,13 @@ class AutoMEngine:
         기록 때문에 같은 종료를 새 상태로 다시 처리했다(판 마무리 2회 → 마지막 판 매매결과가 빈
         판으로 덮임). 실패→복구 경로는 등록된 적이 없어 그대로 통과한다. 종료 처리로 _forget된
         번호도 _seen_status에 남아 있어(아래) 재등록을 거른다."""
-        if oid in self._orders or oid in self._seen_status:
+        key = self._key(ref, oid)
+        if key in self._orders or key in self._seen_status:
             return
-        self._orders[oid] = ref
-        for order, qty, price in self._orphan_fills.pop(oid, []):
-            # 보관 때 걸렀어도 한 번 더(결정 84) — 이 참조 주문의 계좌와 보관된 체결의 계좌가 달라선
-            # 안 된다(주식↔선물 같은 번호)
-            if order.intent.venue is Venue.LS:
-                expect = self._ls_account(ref)
-                actual = order.intent.account or account_for(order.intent.instrument)
-                if expect is None or actual != expect:
-                    self._log.warning("[자동M] 보관 체결 #%s는 계좌 %s 주문 — 이 세트의 주문(%s)"
-                                      " 아님, 무시", order.order_id, actual, expect)
-                    continue
+        self._orders[key] = ref
+        # 보관함도 같은 키(거래소, 계좌, 번호)라 다른 계좌·거래소의 같은 번호 체결은 여기 안 온다
+        # (결정 84·92 — 옛 번호만 키이던 때의 계좌 재검사는 키로 대체)
+        for order, qty, price in self._orphan_fills.pop(key, []):
             self._apply_fill(ref, order, qty, price)
         # 상태 통보(취소·잔량 버림 종료)도 발주 응답보다 먼저 올 수 있다 — 장부는 replay로 이미
         # 상태를 바꿨는데 그때는 주인을 몰라 _on_book_change가 지나쳤다(실측 2026-09-11 10:18:35:
@@ -1380,15 +1391,10 @@ class AutoMEngine:
 
     def _on_fill_applied(self, order: TrackedOrder, qty: float, price: float,
                          _fill_id: str) -> None:
-        ref = self._orders.get(order.order_id)
-        if ref is not None and order.intent.venue is Venue.LS:
-            # 같은 번호의 다른 계좌 주문(주식↔선물)의 체결이 아닌지(결정 73, 운영 사고 2026-10-14)
-            expect = self._ls_account(ref)
-            actual = order.intent.account or account_for(order.intent.instrument)
-            if expect is None or actual != expect:
-                self._log.warning("[자동M] 체결 #%s는 계좌 %s 주문 — 이 세트의 주문(%s) 아님, 무시",
-                                  order.order_id, actual, expect)
-                return
+        # 장부 키 (거래소, 계좌, 번호)로 찾는다(결정 92) — 같은 번호의 다른 계좌 주문(주식↔선물,
+        # 결정 73·운영 사고 2026-10-14)이나 다른 거래소 주문의 체결은 키가 달라 여기 안 걸린다
+        key = OrderBook.key_of(order.intent, order.order_id)
+        ref = self._orders.get(key)
         if ref is None:
             # 취소로 닫은 선주문의 체결은 이제 오지 않는다 — 장부가 취소 확정 수량으로 닫으므로
             # (결정 69) 셈이 안 끝난 체결은 선주문이 열린 채 보통 체결로 온다
@@ -1397,7 +1403,7 @@ class AutoMEngine:
                 # 않는다**(결정 84, 운영 사고 2026-10-19: 주식 엔진의 체결 #1871(주식 계좌)이 이
                 # 보관함에 번호만으로 남았다가 42분 뒤 선물 계좌 #1871이 등록되자 그 세트 체결로
                 # 반영 → 20계약 허위 체결·HL 200 반대 헤지·실제 선물 주문은 미추적으로 잔류)
-                self._orphan_fills.setdefault(order.order_id, []).append((order, qty, price))
+                self._orphan_fills.setdefault(key, []).append((order, qty, price))
             return
         self._apply_fill(ref, order, qty, price)
 
@@ -1640,18 +1646,19 @@ class AutoMEngine:
 
     def _on_book_change(self) -> None:
         """취소·거부는 상태 변화로 온다 — 추적 주문의 상태 전이를 한 번씩 처리."""
-        for oid, ref in list(self._orders.items()):
-            order = self._system.order_book.order(oid, self._ls_account(ref))
+        for key, ref in list(self._orders.items()):
+            venue, acct, oid = key
+            order = self._system.order_book.order(oid, acct, venue)
             if order is None:
                 # 장부에서 사라진 추적 주문(재동기 유령 정리 등) — 그대로 두면 "걸려 있다"고
                 # 믿고 없는 주문 취소를 되풀이한다(실측 2026-09-09 #20851). 선주문은 취소된 것으로
                 # 정리해 다음 판으로, 후주문은 밖에서 끝난 것으로 보고 체결차 → 중지(사람 확인).
-                self._recover_vanished(oid, ref)
+                self._recover_vanished(key, ref)
                 continue
             status = order.status.value
-            if self._seen_status.get(oid) == status:
+            if self._seen_status.get(key) == status:
                 continue
-            self._seen_status[oid] = status
+            self._seen_status[key] = status
             u = ref.underlying
             s = self._set(u, ref.index, ref.reverse)
             mono = time.monotonic()
@@ -1671,28 +1678,28 @@ class AutoMEngine:
                                          " 반영 안 함(추적만 종료)",
                                          self._tag(u, ref.index, ref.block, ref.reverse),
                                          oid, status, cur)
-                    self._forget(oid)
+                    self._forget(key)
                     continue
                 if status == "cancelled":
                     on_pre_cancelled(s, ref.block, mono, self._settings)
-                    self._forget(oid)
+                    self._forget(key)
                 elif status == "rejected":
-                    venue = "HL" if s.hl_first else "LS"
+                    venue_text = "HL" if s.hl_first else "LS"
                     self._apply(u, ref.index, ref.block,
                                 on_pre_reject(s, ref.block, mono, self._settings,
-                                              reason=f"{venue} 거부 통보(접수 뒤 거부)"),
+                                              reason=f"{venue_text} 거부 통보(접수 뒤 거부)"),
                                 ref.reverse)
                     s.leg(ref.block).last_reject_at = time.strftime("%H:%M:%S")
                     self._trace(u, ref.index, ref.block, s.leg(ref.block), ref.reverse)
-                    self._forget(oid)
+                    self._forget(key)
                 elif status == "filled":
-                    self._forget(oid)
+                    self._forget(key)
             elif s.hl_first and status in ("cancelled", "rejected"):
                 # HL선(§7D) 후주문(LS)이 밖에서 취소·거부됨 — 결정 B: 재전송 없이 세트 중지
                 self._apply(u, ref.index, ref.block, on_ls_post_reject(
                     s, ref.block, f"LS 후주문 #{oid} {status} (체결 {order.filled_qty:g}/"
                                   f"{order.intent.qty:g})"), ref.reverse)
-                self._forget(oid)
+                self._forget(key)
             elif status in ("cancelled", "rejected"):
                 # 후주문이 밖에서 취소(사람·거래소)되거나 거부됨 — 엔진은 후주문을 취소하지 않는다
                 # (사용자 확정 2026-09-07). 미체결분(소수 그대로)만큼 체결차 → 중지.
@@ -1701,16 +1708,17 @@ class AutoMEngine:
                     self._apply(u, ref.index, ref.block, on_post_partial_reject(
                         s, ref.block, unfilled, mono=mono, settings=self._settings),
                         ref.reverse)
-                self._forget(oid)
+                self._forget(key)
             elif status == "filled":
-                self._forget(oid)
+                self._forget(key)
             self._trace(u, ref.index, ref.block, s.leg(ref.block), ref.reverse)
             self._persist()  # 취소·거부로 바뀐 상태(체결차·중지) 저장
 
-    def _recover_vanished(self, oid: str, ref: _OrderRef) -> None:
+    def _recover_vanished(self, key: OrderKey, ref: _OrderRef) -> None:
         """장부에서 사라진 추적 주문 정리(실측 2026-09-09 — 재동기가 선물 선주문 #20851을 유령으로
         지워 체결 통보가 미아가 되고 자동M은 'unknown order' 취소를 되풀이). 선주문은 취소 확인과
         같게 다음 판으로, 후주문은 밖에서 끝난 것으로 보고 미체결분 체결차 → 중지(사람이 확인)."""
+        oid = key[2]
         u = ref.underlying
         s = self._set(u, ref.index, ref.reverse)
         leg = s.leg(ref.block)
@@ -1731,17 +1739,17 @@ class AutoMEngine:
             self._apply(u, ref.index, ref.block, on_post_partial_reject(
                 s, ref.block, leg.post_pending, mono=time.monotonic(),
                 settings=self._settings), ref.reverse)
-        self._forget(oid)
+        self._forget(key)
         self._trace(u, ref.index, ref.block, s.leg(ref.block), ref.reverse)
         self._persist()
 
     _SEEN_CAP = 5000  # 하루 주문 수천 건 — 오래된 것부터 버림
 
-    def _forget(self, oid: str) -> None:
+    def _forget(self, key: OrderKey) -> None:
         """추적 해제. 마지막으로 처리한 상태(_seen_status)는 **남긴다** — 종료 처리 뒤 발주 응답
         경로가 같은 번호를 다시 등록하려 할 때 거르고, 혹시 등록돼도 같은 종료를 또 처리하지 않게
         (검토 2026-10-13 ★3)."""
-        self._orders.pop(oid, None)
+        self._orders.pop(key, None)
         while len(self._seen_status) > self._SEEN_CAP:
             del self._seen_status[next(iter(self._seen_status))]
 
@@ -1798,7 +1806,7 @@ class AutoMEngine:
             await asyncio.wait(list(self._bg), timeout=timeout_s)
 
         def pending() -> list[str]:
-            return [oid for oid, ref in self._orders.items() if ref.leg == "pre"]
+            return [key[2] for key, ref in self._orders.items() if ref.leg == "pre"]
 
         # 취소 요청이 접수된 뒤 확정 통보가 오기까지도 기다린다(같은 시간 한도 안에서) — 통보는 요청
         # 응답보다 조금 늦게 온다(모의 실측 2026-10-01: 중앙 50ms). 안 기다리면 취소된 주문을 "확인

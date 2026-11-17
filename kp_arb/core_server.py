@@ -155,8 +155,9 @@ async def closed_order_prune_loop(system: Any, engines: Sequence[Any],
                 if eng is not None:
                     protect |= eng.tracked_order_ids()
             removed = system.order_book.prune_closed(time.monotonic(), protect=protect)
-            for account, oid in removed:
-                if account is not None and gw is not None and hasattr(gw, "forget_order"):
+            for venue, account, oid in removed:  # 장부 키 (거래소, 계좌, 번호) — 결정 92
+                if (venue is Venue.LS and account is not None and gw is not None
+                        and hasattr(gw, "forget_order")):
                     gw.forget_order(account, oid)
             if removed:
                 lg.debug("닫힌 주문 정리 %d건 (장부 %d건 남음)", len(removed),
@@ -873,22 +874,24 @@ def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
         errors = apply_settings(st, {k: v for k, v in body.items()
                                      if k in ("start_s", "end_s", "open_hms", "ref_qty",
                                               "entries", "exits", "hl_base_hms",
-                                              "range_limit")},
+                                              "range_limit", "sum5_qty", "exclude_qty",
+                                              "min_spread")},
                                 sz_decimals=engine.sz_decimals(u) if engine else None)
         if errors:
             return _fail(errors)
         if engine is not None and st.open_hms != open_before:
             engine.reset_day(u)  # 개장 시각이 바뀌면 오늘 상태 다시(사용자 2026-10-21)
-        # 단 = (스프레드, 수량, 주문가, 청산가, 자동청산) — 기준수량·HL기준·범위도 같이
-        # (2026-10-30, 운영 로그 역추적용)
+        # 단 = (스프레드, 수량, 주문가, 목표수익률, 자동청산) — 기준수량·HL기준·범위·호가 필터도
+        # 같이(2026-10-30, 운영 로그 역추적용)
         logging.getLogger("kp_arb.nxt_open").info(
             "[NXT개장] %s 설정 저장: 창 +%.1f~+%.1f초 개장 %s 기준수량 %g HL기준 %s 범위 %g%% "
-            "진입 %s 청산 %s",
+            "5호가합 %g 호가제외수량 %g 최소호가스프레드 %s 진입 %s 청산 %s",
             u.value, st.start_s, st.end_s, st.open_hms, st.ref_qty, st.hl_base_hms,
-            st.range_limit * 100,
-            [(t.spread, t.qty, t.price_spread, t.exit_price_spread, t.auto_exit)
+            st.range_limit * 100, st.sum5_qty, st.exclude_qty,
+            f"{st.min_spread * 100:g}%" if st.min_spread is not None else "-",
+            [(t.spread, t.qty, t.price_spread, t.target_profit, t.auto_exit)
              for t in st.entries],
-            [(t.spread, t.qty, t.price_spread, t.exit_price_spread, t.auto_exit)
+            [(t.spread, t.qty, t.price_spread, t.target_profit, t.auto_exit)
              for t in st.exits])
         return _ok()
     if cmd == "nxt_open_run":
@@ -1079,6 +1082,18 @@ def _account_from_body(body: dict[str, Any]) -> Account | None:
     return account_for(inst) if inst is not Instrument.HL_PERP else None
 
 
+def _venue_from_body(body: dict[str, Any]) -> Venue | None:
+    """화면이 보낸 상품(instrument) → 거래소(주문 키의 첫 칸, 결정 92). 없음·모르는 값이면 None
+    (장부 찾기)."""
+    inst_raw = body.get("instrument")
+    if not isinstance(inst_raw, str) or not inst_raw:
+        return None
+    try:
+        return Instrument(inst_raw).venue
+    except ValueError:
+        return None
+
+
 async def _manual_command(
     system: LiveSystem | None, body: dict[str, Any], state: CoreState | None = None
 ) -> dict[str, Any]:
@@ -1155,11 +1170,11 @@ async def _manual_command(
         order_id = body.get("order_id")
         if not order_id:
             return _fail(["order_id 필요"])
-        # 화면이 행의 상품(instrument)을 같이 보내면 계좌로 풀어 같은 번호의 다른 계좌 주문을
-        # 건드리지 않는다(결정 73). 안 보내면 번호가 한 계좌에만 있을 때만 취소된다
+        # 화면이 행의 상품(instrument)을 같이 보내면 거래소·계좌로 풀어 같은 번호의 다른 주문을
+        # 건드리지 않는다(결정 73·92). 안 보내면 찾기(HL 먼저 → 번호가 한 LS 계좌뿐일 때만)
         acct = _account_from_body(body)
         try:
-            await system.cancel(str(order_id), account=acct)
+            await system.cancel(str(order_id), account=acct, venue=_venue_from_body(body))
         except Exception as exc:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
             _olog.warning("수동주문 취소 실패: #%s — %s", order_id, exc)  # #3 실패 로그
             return _fail([f"취소 실패: {exc}"])
@@ -1182,9 +1197,10 @@ async def _manual_command(
         # 거른 주문의 계좌를 번호와 같이 넘긴다 — 같은 번호가 다른 계좌에도 열려 있으면 번호만으로는
         # 못 가려 건너뛰었다(검토 10-13 G2, 결정 73 마무리)
         accounts = [system.order_book.account_of(o.intent) for o in picked]
+        venues = [o.intent.venue for o in picked]  # 주문 키의 거래소(결정 92)
         # HL은 cancel 액션 하나에 묶어 한 요청(요청 한도 절약), LS는 한 건씩 — cancel_many가 가른다.
         # 하나가 실패해도 나머지는 계속(실패는 세어서 보고).
-        results = await system.cancel_many(targets, accounts) if targets else []
+        results = await system.cancel_many(targets, accounts, venues) if targets else []
         cancelled = sum(1 for _oid, err in results if err is None)
         failed = [f"#{oid}: {err}" for oid, err in results if err is not None]
         for item in failed:
@@ -1216,7 +1232,8 @@ async def _manual_command(
         # HL 정정 금지(DESIGN-manual-order 2026-08-11 — 크로싱 정정 시 주문 소실). 화면
         # 차단(order_list)에 더해 코어에서도 방어 — 다른 경로로 들어와도 modify가 안 나간다.
         acct = _account_from_body(body)  # 상품 → 계좌(결정 73, manual_cancel과 같음)
-        target = system.order_book.order(str(order_id), acct)
+        venue = _venue_from_body(body)   # 상품 → 거래소(결정 92)
+        target = system.order_book.order(str(order_id), acct, venue)
         if target is not None and target.intent.venue is Venue.HYPERLIQUID:
             return _fail(["HL은 정정 미지원 — 취소 후 신규 주문하세요"])
         reduce_only = bool(body.get("reduce_only", False))  # 정정 화면 체크(HL 전용)
@@ -1224,7 +1241,7 @@ async def _manual_command(
         try:
             new_id = await system.amend_price(
                 str(order_id), float(raw),
-                reduce_only=reduce_only, post_only=post_only, account=acct)
+                reduce_only=reduce_only, post_only=post_only, account=acct, venue=venue)
         except Exception as exc:  # noqa: BLE001 - 실패 사유를 화면에 그대로 전달
             _olog.warning("수동주문 정정 실패: #%s @ %s — %s", order_id, raw, exc)  # #3
             return _fail([f"정정 실패: {exc}"])

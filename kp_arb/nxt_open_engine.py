@@ -27,6 +27,7 @@ from .nxt_open import (
     NxtOpenSettings,
     Plan,
     Tier,
+    auto_exit_price,
     base_due,
     day_over,
     disparity,
@@ -68,8 +69,8 @@ class TierResult:
     price: float
     order_id: str | None = None
     error: str | None = None
-    auto: bool = False               # 자동청산 주문(§4a) — 상태줄 "진입1청산 …"
-    auto_price: float | None = None  # 전략주문이면 그 단에 걸어 둔 자동청산가(없으면 None)
+    auto: bool = False                # 자동청산 주문(§4a) — 상태줄 "진입1청산 …"
+    auto_target: float | None = None  # 전략주문이면 그 단에 걸어 둔 목표수익률(없으면 None)
 
 
 # 등록 전 체결 보관함 크기 — HL 테이커 즉시 체결은 통보가 발주 응답보다 먼저 올 수 있다(§4a-3)
@@ -115,8 +116,8 @@ class NxtOpenEngine:
         self._log = logging.getLogger("kp_arb.nxt_open")
         self._days: dict[Underlying, DayState] = {u: DayState() for u in Underlying}
         self._tasks: set[asyncio.Task[None]] = set()
-        # 등록 전 체결(§4a-3): 주문번호 → [(체결번호, 수량)] — 발주 응답보다 먼저 온 통보 보관
-        self._early_fills: dict[str, list[tuple[str, float]]] = {}
+        # 등록 전 체결(§4a-3): 주문번호 → [(체결번호, 수량, 체결가)] — 발주 응답보다 먼저 온 통보
+        self._early_fills: dict[str, list[tuple[str, float, float]]] = {}
         for name, handler in (("on_quote", self._on_quote), ("on_fx", self._on_fx),
                               ("on_fill", self._on_fill)):
             hooks = getattr(system, name, None)
@@ -348,13 +349,8 @@ class NxtOpenEngine:
             if px is None:
                 res.error = "주문가 계산 불가(S·환율 없음)"
                 continue
-            # 자동청산가(§4a-2): 발주 시점의 S·환으로 청산가 스프레드를 풀어 반대 방향 격자에 맞춤
-            if p.exit_spread is not None and s is not None and fx is not None:
-                res.auto_price = order_price(s, p.exit_spread, fx, opposite(p.side), sz_dec)
-                if res.auto_price is None:
-                    self._log.warning("[NXT개장] %s %s%d 자동청산가 계산 불가 — 자동청산 없음",
-                                      u.value, "진입" if p.block == "entry" else "청산",
-                                      p.index + 1)
+            # 자동청산(§4a-2, 2026-11-17): 가격은 전량 체결 뒤 체결평균가로 — 여기선 목표수익률만
+            res.auto_target = p.target_profit
             tag = f"{'진입' if p.block == 'entry' else '청산'}{p.index + 1}"
             intents.append(OrderIntent(
                 venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
@@ -384,7 +380,7 @@ class NxtOpenEngine:
             self._log.info("[NXT개장] %s %s%d %s %s @ %s → %s", u.value,
                            "진입" if r.block == "entry" else "청산", r.index + 1, r.side,
                            r.qty, r.price, r.order_id or f"실패 {r.error}")
-            if r.order_id and r.auto_price is not None:
+            if r.order_id and r.auto_target is not None:
                 self._arm_auto_exit(u, d, r)
         self._auto_off(u, d, self.settings(u))  # 발주했으니 오늘은 끝 — 실행 끔
 
@@ -394,33 +390,39 @@ class NxtOpenEngine:
         """전략주문 주문번호에 자동청산 대기를 걸고, 등록 전에 온 체결이 있으면 합친다."""
         oid = str(r.order_id)
         ae = AutoExit(order_id=oid, block=r.block, index=r.index, side=opposite(Side(r.side)),
-                      qty=float(r.qty), price=float(r.auto_price or 0.0))
+                      qty=float(r.qty), target_profit=float(r.auto_target or 0.0))
         d.auto_exits[oid] = ae
-        self._log.info("[NXT개장] %s %s 자동청산 대기 #%s — 전량 체결되면 %s %s @ %s", u.value,
-                       _tier_name(r.block, r.index), oid, ae.side.value, ae.qty, ae.price)
+        self._log.info("[NXT개장] %s %s 자동청산 대기 #%s — 전량 체결되면 %s %s @ 평균가 %s%g%%",
+                       u.value, _tier_name(r.block, r.index), oid, ae.side.value, ae.qty,
+                       "-" if ae.side is Side.BUY else "+", ae.target_profit * 100)
         done = False
-        for fid, qty in self._early_fills.pop(oid, []):
-            done = ae.add_fill(fid, qty) or done
+        for fid, qty, price in self._early_fills.pop(oid, []):
+            done = ae.add_fill(fid, qty, price) or done
         if done:
             self._fire_auto_exit(u, d, oid)
 
     def _on_fill(self, fill: Any) -> None:
         """체결 통보 — 자동청산 대기 중인 주문이면 누적, 전량이면 자동청산 발주. 아직 등록 안 된
-        주문번호면 잠시 보관(HL 즉시 체결은 통보가 발주 응답보다 먼저 온다)."""
+        주문번호면 잠시 보관(HL 즉시 체결은 통보가 발주 응답보다 먼저 온다).
+        같은 훅으로 LS 주식·선물 체결도 오고 LS 주문번호는 HL oid와 겹칠 수 있다(L12) — 주문 키는
+        (거래소, 계좌, 번호)(결정 92)이고 이 엔진 주문은 전부 (HL, None, oid)라 HL 통보만 본다."""
+        if getattr(fill, "venue", None) is not Venue.HYPERLIQUID:
+            return
         oid = str(getattr(fill, "order_id", "") or "")
         if not oid:
             return
         fid = str(getattr(fill, "fill_id", "") or "")
         qty = float(getattr(fill, "qty", 0.0) or 0.0)
+        price = float(getattr(fill, "price", 0.0) or 0.0)
         for u, d in self._days.items():
             ae = d.auto_exits.get(oid)
             if ae is None:
                 continue
-            if ae.add_fill(fid, qty):
+            if ae.add_fill(fid, qty, price):
                 self._fire_auto_exit(u, d, oid)
             return
         kept = self._early_fills.setdefault(oid, [])
-        kept.append((fid, qty))
+        kept.append((fid, qty, price))
         while len(self._early_fills) > EARLY_FILLS_KEEP:  # 오래된 주문번호부터 버림
             self._early_fills.pop(next(iter(self._early_fills)))
 
@@ -436,11 +438,24 @@ class NxtOpenEngine:
         task.add_done_callback(self._tasks.discard)
 
     async def _place_auto_exit(self, u: Underlying, d: DayState, ae: AutoExit) -> None:
-        """자동청산 주문(§4a-3): 전략주문 수량 전부를 발주 때 정한 가격에, 반대 방향 GTC 지정가.
-        자동청산 주문에는 다시 자동청산을 걸지 않는다."""
+        """자동청산 주문(§4a-3): 전략주문 수량 전부를 **체결평균가 × (1 ∓ 목표수익률)**(사용자
+        2026-11-17 — 매수 내림·매도 올림)에, 반대 방향 GTC 지정가. 자동청산 주문에는 다시 자동청산을
+        걸지 않는다."""
         name = _tier_name(ae.block, ae.index)
-        res = TierResult(ae.block, ae.index, ae.side.value, ae.qty, ae.price, auto=True)
+        info = self._system.instruments.get((u, Instrument.HL_PERP))
+        sz_dec = getattr(info, "sz_decimals", None) if info is not None else None
+        avg = ae.avg_price()
+        price = (auto_exit_price(avg, ae.target_profit, ae.side, sz_dec)
+                 if avg is not None else None)
+        res = TierResult(ae.block, ae.index, ae.side.value, ae.qty, price or 0.0, auto=True)
         d.results.append(res)
+        if price is None:
+            res.error = ("체결평균가 없음" if avg is None
+                         else f"자동청산가 계산 불가(평균 {avg:.4f} 목표 {ae.target_profit:g})")
+            d.fired, d.fired_wall = True, self._wall()
+            self._log.warning("[NXT개장] %s %s청산 안 냄 — %s(#%s 체결 %g)", u.value, name,
+                              res.error, ae.order_id, ae.filled)
+            return
         why = self._blocked(u, d, ae.side)  # §4b — 자동청산도 금지 검사, 걸리면 내지 않고 끝
         if why is not None:
             res.error = why
@@ -448,10 +463,11 @@ class NxtOpenEngine:
             self._log.warning("[NXT개장] %s %s청산 안 냄 — %s", u.value, name, why)
             return
         intent = OrderIntent(venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
-                             side=ae.side, qty=ae.qty, order_type=OrderType.LIMIT, price=ae.price,
+                             side=ae.side, qty=ae.qty, order_type=OrderType.LIMIT, price=price,
                              source=SOURCE, tag=f"{name}청산")
-        self._log.info("[NXT개장] %s %s청산 발주 — #%s 전량 체결 → %s %s @ %s", u.value, name,
-                       ae.order_id, ae.side.value, ae.qty, ae.price)
+        self._log.info("[NXT개장] %s %s청산 발주 — #%s 전량 체결 평균 %.4f → %s %s @ %s(목표 %g%%)",
+                       u.value, name, ae.order_id, avg, ae.side.value, ae.qty, price,
+                       ae.target_profit * 100)
         try:
             outs = await self._system.place_many([intent], [self._system.new_hl_cloid()])
         except Exception as exc:  # noqa: BLE001 - 실패는 기록만(재전송 없음, CLAUDE.md §7)
@@ -463,7 +479,7 @@ class NxtOpenEngine:
         res.error = getattr(out, "error", None)
         d.fired, d.fired_wall = True, self._wall()
         self._log.info("[NXT개장] %s %s청산 %s %s @ %s → %s", u.value, name, ae.side.value, ae.qty,
-                       ae.price, res.order_id or f"실패 {res.error}")
+                       price, res.order_id or f"실패 {res.error}")
 
     # --- 화면 ---
 
@@ -493,7 +509,8 @@ class NxtOpenEngine:
                 # 자동청산 대기(§4a) — 전량 체결을 기다리는 전략주문
                 "auto_pending": [{"order_id": a.order_id, "tag": _tier_name(a.block, a.index),
                                   "side": a.side.value, "qty": a.qty, "filled": a.filled,
-                                  "price": a.price} for a in d.auto_exits.values()],
+                                  "avg": a.avg_price(), "target_profit": a.target_profit}
+                                 for a in d.auto_exits.values()],
                 # 리스크 방지(§4b) — 기준가·한도·지금 HL 현재가
                 "hl_base": d.hl_base,
                 "hl_base_at": _hms(d.hl_base_wall) if d.hl_base_wall else None,

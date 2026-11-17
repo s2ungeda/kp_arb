@@ -71,9 +71,10 @@ def test_taker_immediate_fill_recorded_once_via_on_fill_applied() -> None:
         instrument=Instrument.HL_PERP, side=Side.SELL, qty=0.1,
         order_type=OrderType.LIMIT, price=163.0))
     ob.apply_place_fill(Fill(fill_id="place-O1", order_id="O1", qty=0.1,
-                             price=163.5, fee=0.0, ts=0.0))
+                             price=163.5, fee=0.0, ts=0.0, venue=Venue.HYPERLIQUID))
     assert len(sys.fills) == 1 and sys.fills[0]["qty"] == 0.1  # 즉시체결 기록됨
-    ob.on_fill(Fill(fill_id="tid-1", order_id="O1", qty=0.1, price=163.5, fee=0.0, ts=0.0))
+    ob.on_fill(Fill(fill_id="tid-1", order_id="O1", qty=0.1, price=163.5, fee=0.0, ts=0.0,
+                    venue=Venue.HYPERLIQUID))
     assert len(sys.fills) == 1  # 재통보 흡수 → 중복 없음
 
 
@@ -145,13 +146,17 @@ def test_ls_cancel_and_reject_events_record_cancels_once() -> None:
     ob.track("3326", intent)
     ob.track("3327", intent)
     ob.track("3328", intent)
-    apply_event(OrderEvent(kind="ack", order_id="3326"))
+    apply_event(OrderEvent(kind="ack", order_id="3326", venue=Venue.LS))
     assert not sys.cancels  # 접수 통보는 기록 안 함
-    apply_event(OrderEvent(kind="cancel", order_id="3400", org_order_id="3326"))  # 취소 통보
-    apply_event(OrderEvent(kind="reject", order_id="3327"))                         # 거부 통보
+    apply_event(OrderEvent(kind="cancel", order_id="3400", org_order_id="3326",
+                           venue=Venue.LS))  # 취소 통보
+    apply_event(OrderEvent(kind="reject", order_id="3327",
+                           venue=Venue.LS))                         # 거부 통보
     ob.on_cancel("3328")  # 정정 — 원주문을 장부에서 먼저 취소
-    apply_event(OrderEvent(kind="cancel", order_id="3401", org_order_id="3328"))  # 뒤따르는 통보
-    apply_event(OrderEvent(kind="cancel", order_id="3401", org_order_id="3328"))  # 같은 통보 재수신
+    apply_event(OrderEvent(kind="cancel", order_id="3401", org_order_id="3328",
+                           venue=Venue.LS))  # 뒤따르는 통보
+    apply_event(OrderEvent(kind="cancel", order_id="3401", org_order_id="3328",
+                           venue=Venue.LS))  # 같은 통보 재수신
     assert [c["order_id"] for c in sys.cancels] == ["3328", "3327", "3326"]  # 최신 우선, 중복 없음
     by_id = {c["order_id"]: c for c in sys.cancels}
     assert by_id["3326"]["status"] == "cancelled" and by_id["3327"]["status"] == "rejected"
@@ -420,7 +425,8 @@ async def test_cancel_with_no_remaining_qty_is_order_gone_without_sending() -> N
     ob.track("D1", OrderIntent(
         venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE, side=Side.BUY,
         qty=1, order_type=OrderType.LIMIT, price=1.0, account=Account.KR_DERIV))
-    ob.on_fill(Fill(fill_id="f1", order_id="D1", qty=1, price=1.0, ts=0))  # 전량 체결
+    ob.on_fill(Fill(fill_id="f1", order_id="D1", qty=1, price=1.0, ts=0,
+                    venue=Venue.LS))  # 전량 체결
     with pytest.raises(OrderGoneError):
         await system.cancel("D1")
     assert sent == []  # 거래소로 안 나감
@@ -1847,7 +1853,8 @@ async def test_fill_symbol_check_rejects_other_kind_and_passes_unknown_same_kind
         account=Account.KR_STOCK))
 
     def fill(oid: str, acct: Account, sym: str) -> Fill:
-        return Fill(fill_id="x", order_id=oid, qty=1, price=1.0, ts=0, account=acct, symbol=sym)
+        return Fill(fill_id="x", order_id=oid, qty=1, price=1.0, ts=0, account=acct, symbol=sym,
+                    venue=Venue.LS)
 
     ok = system._fill_symbol_ok
     assert ok(fill("9", Account.KR_DERIV, "KR7005930003")) is False   # 선물 주문 + 주식 ISIN → 거부
@@ -1905,7 +1912,7 @@ async def test_refresh_snapshot_requeries_once_when_fill_lands_during_round_trip
         calls[0] += 1
         if calls[0] == 1:  # 첫 조회 왕복 중 체결 통보 도착 흉내
             system.order_book.on_fill(Fill(fill_id="f1", order_id="77", qty=10, price=80_000.0,
-                                           ts=0, account=Account.KR_STOCK))
+                                           ts=0, account=Account.KR_STOCK, venue=Venue.LS))
         return await orig(account)
 
     gw.get_positions = _positions  # type: ignore[method-assign]
@@ -1918,18 +1925,19 @@ async def test_ls_place_replays_pending_with_account() -> None:
     # 검토 2026-10-19 §A: LS 발주 뒤 track 전 이벤트 되돌리기(replay_pending)는 라우팅 계좌를 넘겨야
     # 한다 — 같은 번호가 다른 계좌에 열려 있으면 장부가 계좌를 못 골라 선주문 체결이 유실된다.
     system, _, _ = _system([])
-    calls: list[tuple[str, object]] = []
+    calls: list[tuple[str, object, object]] = []
     orig = system.order_book.replay_pending
 
-    def _spy(order_id: str, account: object = None) -> None:
-        calls.append((order_id, account))
-        orig(order_id, account=account)  # type: ignore[arg-type]
+    def _spy(order_id: str, account: object = None, venue: object = None) -> None:
+        calls.append((order_id, account, venue))
+        orig(order_id, account=account, venue=venue)  # type: ignore[arg-type]
 
     system.order_book.replay_pending = _spy  # type: ignore[method-assign]
     oid = await system.place(OrderIntent(
         venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
         side=Side.SELL, qty=1, order_type=OrderType.LIMIT, price=1_212_000.0))
-    assert calls == [(oid, Account.KR_DERIV)]  # 계좌 없이 보낸 intent도 라우팅 계좌로 채워 넘김
+    # 계좌 없이 보낸 intent도 라우팅 계좌로 채워 넘기고, 거래소도 같이(결정 92)
+    assert calls == [(oid, Account.KR_DERIV, Venue.LS)]
 
 
 def test_ls_quote_lag_ms_from_hotime() -> None:

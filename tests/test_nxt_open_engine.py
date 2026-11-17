@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 from kp_arb.core_server import _nxt_open_command
-from kp_arb.domain.enums import Instrument, Side, Underlying, Venue
+from kp_arb.domain.enums import Account, Instrument, Side, Underlying, Venue
 from kp_arb.domain.models import InstrumentInfo, OrderIntent, Quote
 from kp_arb.gateways.base import PlaceResult
 from kp_arb.gateways.ls_ws import Fill
@@ -51,7 +51,7 @@ class FakeSystem:
             if q:
                 for h in self.on_fill:
                     h(Fill(fill_id=f"early-{out.order_id}", order_id=str(out.order_id), qty=q,
-                           price=float(it.price or 0.0), ts=0))
+                           price=float(it.price or 0.0), ts=0, venue=Venue.HYPERLIQUID))
         return outs
 
 
@@ -244,10 +244,13 @@ def test_core_command_saves_settings_and_guards_run() -> None:
     state = CoreState()
     body = {"cmd": "nxt_open_settings", "underlying": "sk_hynix",
             "start_s": 0.5, "end_s": 5.0,
-            "entries": [{"spread": 0.012, "qty": 100, "price_spread": 0.009}]}
+            "entries": [{"spread": 0.012, "qty": 100, "price_spread": 0.009,
+                         "target_profit": 0.002, "auto_exit": True}],
+            "sum5_qty": 1000, "exclude_qty": 30, "min_spread": 0.003}  # 11-17 칸도 명령으로
     assert _nxt_open_command(None, state, body)["ok"]
     st = state.nxt_open.of(U)
-    assert st.entries[0] == Tier(0.012, 100, 0.009)
+    assert st.entries[0] == Tier(0.012, 100, 0.009, 0.002, True)
+    assert (st.sum5_qty, st.exclude_qty, st.min_spread) == (1000.0, 30.0, 0.003)
     assert not _nxt_open_command(None, state, {**body, "start_s": 9.0, "end_s": 1.0})["ok"]
     # 실행: 엔진 없으면 거부, 단이 비어 있으면 거부
     run = {"cmd": "nxt_open_run", "underlying": "samsung", "block": "entry", "value": True}
@@ -308,11 +311,12 @@ async def test_each_tier_fires_once_and_rest_keep_running_until_window_end() -> 
 
 
 async def test_auto_exit_places_opposite_order_when_strategy_order_fully_filled() -> None:
-    # §4a(사용자 2026-10-29 확인 1~3): 체크한 단은 발주 시점 S·환으로 청산가 스프레드를 풀어 두고,
-    # 그 주문이 전량 체결되면 곧바로 반대 방향 GTC 지정가. 부분 체결엔 안 냄, 같은 체결번호는 한 번.
+    # §4a(사용자 2026-10-29 확인 1~3, 2026-11-17 개정): 체크한 단은 전략주문이 전량 체결되면 곧바로
+    # **체결평균가 × (1 − 목표수익률)**(진입 단의 청산 = 매수, 아래 호가로 내림)에 반대 방향 GTC
+    # 지정가. 부분 체결엔 안 냄, 같은 체결번호는 한 번.
     eng, sys_, clk, screen = _engine(_wall(8, 0, 1.2))
     st = screen.of(U)
-    st.entries[0] = Tier(0.012, 100, 0.009, 0.002, True)   # 진입1 자동청산(청산가 +0.2%)
+    st.entries[0] = Tier(0.012, 100, 0.009, 0.002, True)   # 진입1 자동청산(목표수익률 0.2%)
     st.entries[1] = Tier(0.010, 100, 0.007, 0.001, False)  # 체크 안 함
     eng._on_quote(_nxt(1_729_000.0))
     clk.advance(1.0)
@@ -320,28 +324,34 @@ async def test_auto_exit_places_opposite_order_when_strategy_order_fully_filled(
     await _settle()
     assert len(sys_.placed) == 1 and [o.tag for o in sys_.placed[0]] == ["진입1", "진입2", "진입3"]
     snap = eng.live_snapshot()[U.value]
-    # 1,729,000 × 1.002 / 1338.4 = 1294.43 → 매수는 내림 1294.4
-    assert snap["results"][0]["auto_price"] == 1294.4
-    assert snap["results"][1]["auto_price"] is None
+    assert snap["results"][0]["auto_target"] == 0.002
+    assert snap["results"][1]["auto_target"] is None
     assert [p["order_id"] for p in snap["auto_pending"]] == ["O1"]
-    sys_.on_fill[0](Fill(fill_id="f1", order_id="O1", qty=40.0, price=1303.5, ts=0))
-    sys_.on_fill[0](Fill(fill_id="f1", order_id="O1", qty=40.0, price=1303.5, ts=0))  # 중복 통보
-    sys_.on_fill[0](Fill(fill_id="f2", order_id="O2", qty=100.0, price=1301.5, ts=0))  # 체크 없음
+    sys_.on_fill[0](Fill(fill_id="f1", order_id="O1", qty=40.0, price=1303.5, ts=0,
+                         venue=Venue.HYPERLIQUID))
+    sys_.on_fill[0](Fill(fill_id="f1", order_id="O1", qty=40.0, price=1303.5, ts=0,
+                         venue=Venue.HYPERLIQUID))  # 중복 통보
+    sys_.on_fill[0](Fill(fill_id="f2", order_id="O2", qty=100.0, price=1301.5, ts=0,
+                         venue=Venue.HYPERLIQUID))  # 체크 없음
     await _settle()
     assert len(sys_.placed) == 1
-    assert eng.live_snapshot()[U.value]["auto_pending"][0]["filled"] == 40.0
-    sys_.on_fill[0](Fill(fill_id="f3", order_id="O1", qty=60.0, price=1303.5, ts=0))
+    pend = eng.live_snapshot()[U.value]["auto_pending"][0]
+    assert (pend["filled"], pend["avg"], pend["target_profit"]) == (40.0, 1303.5, 0.002)
+    sys_.on_fill[0](Fill(fill_id="f3", order_id="O1", qty=60.0, price=1305.0, ts=0,
+                         venue=Venue.HYPERLIQUID))
     await _settle()
     assert len(sys_.placed) == 2
     o = sys_.placed[1][0]
+    # 평균 (40×1303.5 + 60×1305)/100 = 1304.4 → × 0.998 = 1301.7912 → 매수 내림 1301.7
     assert (o.side, o.qty, o.price, o.tag, o.source) == (
-        Side.BUY, 100, 1294.4, "진입1청산", "NXT개장")
+        Side.BUY, 100, 1301.7, "진입1청산", "NXT개장")
     snap = eng.live_snapshot()[U.value]
     assert snap["auto_pending"] == []
     last = snap["results"][-1]
     assert last["auto"] and last["order_id"] == "O4" and last["side"] == "buy"
     # 늦은 중복 통보는 아무 일도 안 한다
-    sys_.on_fill[0](Fill(fill_id="f4", order_id="O1", qty=1.0, price=1303.5, ts=0))
+    sys_.on_fill[0](Fill(fill_id="f4", order_id="O1", qty=1.0, price=1303.5, ts=0,
+                         venue=Venue.HYPERLIQUID))
     await _settle()
     assert len(sys_.placed) == 2
 
@@ -358,6 +368,37 @@ async def test_auto_exit_handles_fill_notified_before_place_response() -> None:
     await _settle()
     assert [[o.tag for o in b] for b in sys_.placed] == [["진입1"], ["진입1청산"]]
     assert eng.live_snapshot()[U.value]["auto_pending"] == []
+    # 보관했던 체결의 가격(= 주문가 1303.5)으로 평균가 → × 0.998 = 1300.893 → 매수 내림 1300.8
+    assert (sys_.placed[1][0].side, sys_.placed[1][0].price) == (Side.BUY, 1300.8)
+
+
+async def test_auto_exit_of_exit_tier_sells_above_avg_and_ignores_ls_fills() -> None:
+    # §4a-2(사용자 2026-11-17): 청산 단(HL매수)의 자동청산 = 매도 `평균가 × (1 + 목표)` 위 호가로
+    # 올림. 같은 on_fill 훅으로 오는 LS 체결(계좌 있음)은 주문번호가 겹쳐도 안 본다(L12, 검토 11-17)
+    eng, sys_, clk, screen = _engine(_wall(8, 0, 1.2))
+    st = screen.of(U)
+    st.run_entry = False
+    st.exits = [Tier(-0.004, 10, -0.002, 0.001, True)]  # 청산1, 목표수익률 0.1%
+    sys_.trades[(U, Instrument.HL_PERP, "hl")] = 1310.0  # HL 현재가 — 기준 1310.25 범위 안(§4b)
+    eng._on_quote(_nxt(1_770_000.0))
+    clk.advance(1.0)
+    eng._on_quote(_nxt(1_770_000.0))   # 청산괴리 ≤ −0.4% → 청산1 HL 매수
+    await _settle()
+    assert [o.tag for o in sys_.placed[-1]] == ["청산1"]
+    oid = eng.live_snapshot()[U.value]["auto_pending"][0]["order_id"]
+    # LS 주식 체결(계좌 있음)이 같은 번호로 와도 무시 — 원화 가격이 평균가에 섞이면 안 된다
+    sys_.on_fill[0](Fill(fill_id="ls1", order_id=oid, qty=10.0, price=1_770_000.0, ts=0,
+                         account=Account.KR_STOCK, venue=Venue.LS))
+    await _settle()
+    assert eng.live_snapshot()[U.value]["auto_pending"][0]["filled"] == 0.0
+    sys_.on_fill[0](Fill(fill_id="h1", order_id=oid, qty=4.0, price=1300.0, ts=0,
+                         venue=Venue.HYPERLIQUID))
+    sys_.on_fill[0](Fill(fill_id="h2", order_id=oid, qty=6.0, price=1301.0, ts=0,
+                         venue=Venue.HYPERLIQUID))
+    await _settle()
+    o = sys_.placed[-1][0]
+    # 평균 (4×1300 + 6×1301)/10 = 1300.6 → × 1.001 = 1301.9006 → 매도 올림 1302.0
+    assert (o.side, o.qty, o.price, o.tag) == (Side.SELL, 10, 1302.0, "청산1청산")
 
 
 async def test_range_block_skips_tier_but_keeps_trying_until_window_end() -> None:
@@ -394,7 +435,7 @@ async def test_range_block_skips_tier_but_keeps_trying_until_window_end() -> Non
     # 자동청산도 금지 검사(§4a-4): 청산1(HL 매수)의 자동청산은 매도 — HL 1,300 ≤ 매도 한도 1,319.2면
     # 안 내고 실패 사유만
     st = screen.of(U)
-    st.exits = [Tier(-0.004, 10, -0.002, -0.001, True)]
+    st.exits = [Tier(-0.004, 10, -0.002, 0.001, True)]  # 목표수익률 0.1%(양수, 11-17)
     d.fired_tiers.clear()
     sys_.trades[(U, Instrument.HL_PERP, "hl")] = 1320.0
     eng._on_quote(_nxt(1_770_000.0))   # 청산괴리 −0.9% → 청산1(HL 매수) 발주
@@ -402,7 +443,8 @@ async def test_range_block_skips_tier_but_keeps_trying_until_window_end() -> Non
     assert [o.tag for o in sys_.placed[-1]] == ["청산1"]
     oid = eng.live_snapshot()[U.value]["auto_pending"][0]["order_id"]
     sys_.trades[(U, Instrument.HL_PERP, "hl")] = 1300.0
-    sys_.on_fill[0](Fill(fill_id="x", order_id=oid, qty=10.0, price=1300.0, ts=0))
+    sys_.on_fill[0](Fill(fill_id="x", order_id=oid, qty=10.0, price=1300.0, ts=0,
+                         venue=Venue.HYPERLIQUID))
     await _settle()
     last = eng.live_snapshot()[U.value]["results"][-1]
     assert last["auto"] and last["order_id"] is None and last["side"] == "sell"

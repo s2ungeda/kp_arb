@@ -11,6 +11,7 @@ from kp_arb.nxt_open import (
     Tier,
     accept_t0,
     apply_settings,
+    auto_exit_price,
     base_due,
     day_over,
     disparity,
@@ -150,13 +151,33 @@ def test_settings_roundtrip_and_validation() -> None:
     assert back.start_s == 1.0 and back.end_s == 4.0 and back.ref_qty == 100
     assert back.entries[0] == Tier(0.012, 100, 0.009) and back.exits[2] == Tier(-0.010, 100, -0.008)
     assert back.run_entry is False and back.run_exit is False  # 실행은 복원 안 함
-    # 2026-10-29 추가 칸(저장·복원만): HL기준시간·범위제한, 단의 청산가·자동청산
+    # 2026-10-29 추가 칸(저장·복원만): HL기준시간·범위제한, 단의 목표수익률(11-17, 옛 청산가 자리)·
+    # 자동청산
     st.hl_base_hms, st.range_limit = "07:59:55", 0.03
     st.entries[0] = Tier(0.012, 100, 0.009, 0.005, True)
     back2 = settings_from_dict(asdict(st))
     assert (back2.hl_base_hms, back2.range_limit) == ("07:59:55", 0.03)
     assert back2.entries[0] == Tier(0.012, 100, 0.009, 0.005, True)
     assert back2.entries[1] == Tier(0.010, 100, 0.007) and back2.entries[1].auto_exit is False
+    # 옛 청산가 키(exit_price_spread)·0 이하 목표수익률은 복원 안 함(뜻이 다름, 양수만)
+    old = settings_from_dict({"entries": [{"spread": 0.01, "qty": 1, "price_spread": 0.0,
+                                           "exit_price_spread": -0.002, "auto_exit": True},
+                                          {"target_profit": -0.001}, {"target_profit": 0}]})
+    assert [t.target_profit for t in old.entries] == [None, None, None]
+    # 11-17 호가 필터 칸(저장·복원만): 5호가합·호가제외수량(0 이상)·최소호가스프레드(양수, 비우면
+    # 없음)
+    st.sum5_qty, st.exclude_qty, st.min_spread = 1000.0, 30.0, 0.003
+    back3 = settings_from_dict(asdict(st))
+    assert (back3.sum5_qty, back3.exclude_qty, back3.min_spread) == (1000.0, 30.0, 0.003)
+    dflt = settings_from_dict({"sum5_qty": -1, "exclude_qty": "x", "min_spread": 0})
+    assert (dflt.sum5_qty, dflt.exclude_qty, dflt.min_spread) == (0.0, 0.0, None)
+    st4 = NxtOpenSettings()
+    assert apply_settings(st4, {"sum5_qty": 500, "exclude_qty": 10, "min_spread": 0.002}) == []
+    assert (st4.sum5_qty, st4.exclude_qty, st4.min_spread) == (500.0, 10.0, 0.002)
+    assert apply_settings(st4, {"entries": [{"spread": 0.01, "qty": 1, "price_spread": 0.0,
+                                            "target_profit": -0.001}]}) == ["목표수익률은 양수만"]
+    assert apply_settings(st4, {"exits": [{"target_profit": -1}]}) == ["목표수익률은 양수만"]
+    assert st4.entries[0] == Tier() and st4.exits[0] == Tier()  # 거부면 그대로
     # 기본값 07:59:55·3%(사용자 2026-10-29) — 틀린 값·없는 값은 기본값
     base = settings_from_dict({"hl_base_hms": "7:59", "range_limit": "x"})
     assert (base.hl_base_hms, base.range_limit) == ("07:59:55", 0.03)
@@ -204,25 +225,39 @@ def test_run_guard_needs_one_complete_tier_only() -> None:
         "청산 단 없음")
     assert Tier(0.002, 0, None).missing() == ["수량", "주문가"] and empty.missing() == [
         "Sprd", "수량", "주문가"]
-    # 자동청산 체크 단은 청산가도 있어야 켠다(§4a-5, 사용자 2026-10-29 확인 4)
+    # 자동청산 체크 단은 목표수익률도 있어야 켠다(§4a-5, 사용자 2026-10-29 확인 4; 11-17 청산가→
+    # 목표수익률)
     assert run_block_error([full, Tier(0.002, 1, -0.005, None, True)], "진입") == (
-        "진입2 자동청산 단 청산가 없음")
+        "진입2 자동청산 단 목표수익률 없음")
     assert run_block_error([Tier(0.002, 1, -0.005, 0.001, True)], "진입") is None
     assert run_block_error([Tier(0.002, 0, -0.005, None, True), full], "진입") is None  # 무효 단
 
 
 def test_auto_exit_and_range_block_pure() -> None:
-    # §4a: 판정 결과(Plan)에 체크+청산가 있는 단만 청산가 스프레드가 실린다; 반대 방향; 체결 누적
+    # §4a: 판정 결과(Plan)에 체크+목표수익률 있는 단만 목표수익률이 실린다; 반대 방향; 체결 누적
     st = NxtOpenSettings()
     st.run_entry = True
     st.entries = [Tier(0.010, 100, 0.009, 0.002, True), Tier(0.008, 50, 0.007, 0.001, False),
                   Tier(0.006, 10, 0.005, None, True)]
     plans = judge(0.012, None, st)
-    assert [p.exit_spread for p in plans] == [0.002, None, None]
+    assert [p.target_profit for p in plans] == [0.002, None, None]
     assert opposite(Side.SELL) is Side.BUY and opposite(Side.BUY) is Side.SELL
-    ae = AutoExit("O1", "entry", 0, Side.BUY, 100.0, 1294.4)
-    assert not ae.add_fill("f1", 40.0) and not ae.add_fill("f1", 40.0)  # 같은 체결번호 한 번
-    assert ae.filled == 40.0 and ae.add_fill("f2", 60.0)                  # 전량 → True
+    ae = AutoExit("O1", "entry", 0, Side.BUY, 100.0, 0.002)
+    assert ae.avg_price() is None
+    assert not ae.add_fill("f1", 40.0, 1300.0) and not ae.add_fill("f1", 40.0, 1300.0)  # 같은 번호
+    assert ae.filled == 40.0 and ae.add_fill("f2", 60.0, 1310.0)                  # 전량 → True
+    assert ae.avg_price() == 1306.0  # (40×1300 + 60×1310)/100
+    # 가격이 안 실린 체결은 전량 판정엔 들어가고 평균가엔 안 들어간다(검토 2026-11-17)
+    ae2 = AutoExit("O2", "exit", 0, Side.SELL, 10.0, 0.001)
+    assert not ae2.add_fill("g1", 4.0, 0.0) and ae2.avg_price() is None
+    assert ae2.add_fill("g2", 6.0, 800.0) and ae2.avg_price() == 800.0
+    # 자동청산가(사용자 2026-11-17): 진입(매도) 단의 청산 = 매수 → 평균가 × (1 − 목표) 내림,
+    # 청산(매수) 단의 청산 = 매도 → 평균가 × (1 + 목표) 올림
+    assert auto_exit_price(1306.0, 0.002, Side.BUY, None) == 1303.3   # 1303.388 → 내림
+    assert auto_exit_price(1306.0, 0.002, Side.SELL, None) == 1308.7  # 1308.612 → 올림
+    assert auto_exit_price(822.23, 0.004, Side.SELL, None) == 825.52  # 825.5189 → 올림
+    assert auto_exit_price(0.0, 0.002, Side.BUY, None) is None
+    assert auto_exit_price(1306.0, 0.0, Side.BUY, None) is None
     # §4b: HL 현재가 = 마지막 체결가, 없으면 중간값(확인 5); 기준시간 + 10초 안의 첫 시세만
     assert hl_current(1310.2, 1310.0, 1310.5) == 1310.2
     assert hl_current(None, 1310.0, 1310.5) == 1310.25 and hl_current(None, None, 1310.5) is None

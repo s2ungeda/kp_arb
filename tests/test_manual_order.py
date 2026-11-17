@@ -96,13 +96,13 @@ class _FakeSystem:
     def bump_error(self) -> None:
         self.errors = getattr(self, "errors", 0) + 1  # 발주 실패 알람 카운터(테스트용)
 
-    async def cancel(self, order_id: str, account: Any = None) -> None:
+    async def cancel(self, order_id: str, account: Any = None, venue: Any = None) -> None:
         if self._fail is not None:
             raise self._fail
         self.cancelled.append(order_id)
 
-    async def cancel_many(self, order_ids: list[str],
-                          accounts: list[Any] | None = None) -> list[tuple[str, str | None]]:
+    async def cancel_many(self, order_ids: list[str], accounts: list[Any] | None = None,
+                          venues: list[Any] | None = None) -> list[tuple[str, str | None]]:
         """일괄 취소(2026-09-28) — 실제 코어는 HL을 한 요청에 묶는다; 여기선 한 건씩 흉내."""
         self.cancel_accounts = list(accounts or [])
         out: list[tuple[str, str | None]] = []
@@ -116,7 +116,7 @@ class _FakeSystem:
 
     async def amend_price(self, order_id: str, price: float, *,
                           reduce_only: bool = False, post_only: bool = False,
-                          account: Any = None) -> str:
+                          account: Any = None, venue: Any = None) -> str:
         self.amended.append((order_id, price, reduce_only, post_only))
         self.amend_accounts.append(account)
         return "OID-2"

@@ -199,7 +199,10 @@ class Fill(BaseModel):
     price: float
     fee: float = 0.0
     ts: float
-    # 통보의 계좌(LS: accno → Account, 모르면 TR 종류로 주식/선물 계좌) · 종목코드(대조용).
+    # 통보를 낸 거래소 — 주문 키 (거래소, 계좌, 번호)의 첫 칸(결정 92, 사용자 2026-11-17 "일관성을
+    # 위해서는 거래소·계좌·주문번호 셋이 키"). 파서가 반드시 채운다(LS/HL).
+    venue: Venue
+    # 통보의 계좌(LS: accno → Account, 모르면 TR 종류로 주식/선물 계좌; HL은 None) · 종목코드(대조).
     # LS 주문번호는 계좌마다 따로 매겨져 주식·선물 번호가 겹친다(운영 사고 2026-10-14, 결정 73)
     account: Account | None = None
     symbol: str = ""
@@ -221,8 +224,9 @@ class OrderEvent(BaseModel):
 
     kind: str            # "ack" | "amend" | "cancel" | "reject" | "cancel_ack" | "cancel_reject"
     order_id: str        # ordno
+    venue: Venue         # 통보를 낸 거래소 — 주문 키 (거래소, 계좌, 번호)(결정 92)
     org_order_id: str | None = None  # 정정/취소 통보의 원주문(orgordno)
-    account: Account | None = None   # 통보의 계좌(결정 73) — 장부 키 (계좌, 주문번호)
+    account: Account | None = None   # 통보의 계좌(결정 73) — 장부 키의 둘째 칸
     symbol: str = ""                 # 종목코드(대조용)
     # 취소 **확정 수량**(exec 결정 69) — 선물 H01 `qty`(실정정취소수량) / 주식 SC3 `canccnfqty`
     # (취소확인수량). 장부는 이 수량과 남은 수량을 대조해 주문을 닫는다(적으면 차이만큼 체결 대기)
@@ -1023,7 +1027,7 @@ class LSWebSocketClient:
                 price=float(body["cheprice"]) * 100.0,
                 fee=0.0,
                 ts=float(body["chetime"]),
-                account=account, symbol=symbol,
+                venue=Venue.LS, account=account, symbol=symbol,
             )
         # 주식 SC1 실측 필드: ordno/execno/execqty/execprc/exectime(HHMMSSmmm).
         return Fill(
@@ -1033,7 +1037,7 @@ class LSWebSocketClient:
             price=float(body["execprc"]),
             fee=0.0,  # 수수료 필드(cmsnamtexecamt)는 모의에서 공백 — 라이브 확정 시 반영
             ts=float(body["exectime"]),
-            account=account, symbol=symbol,
+            venue=Venue.LS, account=account, symbol=symbol,
         )
 
     def _parse_order_event(self, tr_cd: str, msg: dict[str, Any]) -> OrderEvent:
@@ -1073,6 +1077,7 @@ class LSWebSocketClient:
         return OrderEvent(
             kind=kind,
             order_id=ordno,
+            venue=Venue.LS,
             org_order_id=org if org not in ("", "0") else None,
             qty=qty,
             account=account, symbol=self._symbol_of(body),

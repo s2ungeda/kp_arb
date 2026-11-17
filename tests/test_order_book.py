@@ -18,8 +18,16 @@ def intent(side: Side = Side.BUY, qty: float = 10,
 
 
 def fill(order_id: str, qty: float, price: float, *, fee: float = 0.0,
-         fill_id: str = "F1") -> Fill:
-    return Fill(fill_id=fill_id, order_id=order_id, qty=qty, price=price, fee=fee, ts=1.0)
+         fill_id: str = "F1", venue: Venue = Venue.LS) -> Fill:
+    """체결 통보 — 거래소는 키의 첫 칸(결정 92). 이 파일의 주문은 대개 LS(삼성 주식)."""
+    return Fill(fill_id=fill_id, order_id=order_id, qty=qty, price=price, fee=fee, ts=1.0,
+                venue=venue)
+
+
+def hl_fill(order_id: str, qty: float, price: float, *, fee: float = 0.0,
+            fill_id: str = "F1") -> Fill:
+    """HL 체결 통보 — 키 (HL, None, 번호)."""
+    return fill(order_id, qty, price, fee=fee, fill_id=fill_id, venue=Venue.HYPERLIQUID)
 
 
 # --- 스냅샷 (최초 실행/온디맨드) ---
@@ -144,10 +152,10 @@ def test_on_fill_ignores_duplicate_after_full_fill() -> None:
     ob.track("O1", OrderIntent(
         venue=Venue.HYPERLIQUID, underlying=SAMSUNG, instrument=Instrument.HL_PERP,
         side=Side.SELL, qty=0.1, order_type=OrderType.LIMIT, price=165.0))
-    ob.on_fill(fill("O1", 0.1, 168.0))  # 전량 체결
+    ob.on_fill(hl_fill("O1", 0.1, 168.0))  # 전량 체결
     assert ob.order("O1").status is OrderStatus.FILLED
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == -0.1
-    ob.on_fill(fill("O1", 0.1, 168.0, fill_id="F2"))  # 중복(같은 체결 재통보) → 무시
+    ob.on_fill(hl_fill("O1", 0.1, 168.0, fill_id="F2"))  # 중복(같은 체결 재통보) → 무시
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == -0.1  # 초과 안 됨
 
 
@@ -276,12 +284,12 @@ def test_fill_after_assumed_full_cancel_corrects_cancelled_qty(
     # 그대로, 에러 아님.
     ob = OrderBook()
     ob.track("H1", _hl_intent(Side.SELL, 1.0))
-    ob.on_fill(fill("H1", 0.3, 100.0, fill_id="t1"))
+    ob.on_fill(fill("H1", 0.3, 100.0, fill_id="t1", venue=Venue.HYPERLIQUID))
     ob.on_cancel("H1")                                  # 응답/통보 — 남은 0.7 취소로 가정
     o = ob.order("H1")
     assert o.status is OrderStatus.CANCELLED and o.cancelled_qty == 0.7 and o.cancel_assumed
     with caplog.at_level(logging.WARNING, logger="kp_arb.order"):
-        ob.on_fill(fill("H1", 0.2, 100.0, fill_id="t2"))   # 취소 직전 체결, 통보가 늦음
+        ob.on_fill(hl_fill("H1", 0.2, 100.0, fill_id="t2"))   # 취소 직전 체결, 통보가 늦음
     assert o.status is OrderStatus.CANCELLED and o.filled_qty == 0.5
     assert abs(o.cancelled_qty - 0.5) < 1e-9 and ob.open_orders() == []
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == -0.5
@@ -292,7 +300,7 @@ def test_fill_after_assumed_full_cancel_corrects_cancelled_qty(
 def test_cancel_before_track_replays_confirmed_qty() -> None:
     # 취소 확정이 track보다 먼저 와도 확정 수량이 보관됐다가 replay에 쓰인다(결정 69)
     ob = OrderBook()
-    ob.on_cancel("O1", qty=1)
+    ob.on_cancel("O1", qty=1, account=Account.KR_DERIV, venue=Venue.LS)  # LS 통보는 거래소·계좌
     ob.track("O1", OrderIntent(
         venue=Venue.LS, underlying=SAMSUNG, instrument=Instrument.KR_STOCK_FUTURE,
         side=Side.SELL, qty=3, order_type=OrderType.LIMIT, price=300_000.0,
@@ -320,7 +328,8 @@ def test_same_order_number_in_two_ls_accounts_is_kept_apart() -> None:
     assert ob.order("4545", Account.KR_DERIV) is fut
     assert ob.order("4545") is None                                 # 둘 다 열림 — 계좌 없인 못 가림
     ob.on_fill(Fill(fill_id="s1", order_id="4545", qty=8, price=1_464_000.0, ts=0,
-                    account=Account.KR_STOCK))                      # 주식 8주 체결(10-14 실제 통보)
+                    account=Account.KR_STOCK,
+                    venue=Venue.LS))                      # 주식 8주 체결(10-14 실제 통보)
     assert stock.filled_qty == 8 and fut.filled_qty == 0            # 선물 주문은 그대로
     ob.on_cancel("4545", qty=92, account=Account.KR_STOCK)          # 주식 남은 92 취소
     assert stock.status is OrderStatus.CANCELLED and fut.is_open
@@ -338,7 +347,7 @@ def test_pending_events_are_kept_per_account() -> None:
     # 초과 헤지). 이제 보관도 (계좌, 번호)라 선물 주문 등록 때 주식 통보는 재생되지 않는다.
     ob = OrderBook()
     ob.on_fill(Fill(fill_id="s1", order_id="4545", qty=8, price=1_464_000.0, ts=0,
-                    account=Account.KR_STOCK))
+                    account=Account.KR_STOCK, venue=Venue.LS))
     ob.on_cancel("4508", qty=100, account=Account.KR_STOCK)
     fut = ob.track("4545", OrderIntent(
         venue=Venue.LS, underlying=Underlying.SK_HYNIX, instrument=Instrument.KR_STOCK_FUTURE,
@@ -371,17 +380,17 @@ def test_place_fill_absorbs_duplicate_userfill_partial() -> None:
     # 부분 즉시체결: 발주응답 3/5 선반영 → 같은 3을 userFills가 재통보해도 이중 반영 안 됨.
     ob = OrderBook()
     ob.track("O1", _hl_intent(Side.BUY, 5))
-    ob.apply_place_fill(fill("O1", 3, 100.0, fill_id="place-O1"))  # 발주응답 선반영
+    ob.apply_place_fill(hl_fill("O1", 3, 100.0, fill_id="place-O1"))  # 발주응답 선반영
     assert ob.order("O1").filled_qty == 3
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == 3
     assert ob.order("O1").status is OrderStatus.PARTIAL
 
-    ob.on_fill(fill("O1", 3, 100.0, fill_id="hl1"))  # 같은 체결 userFills 재통보 → 흡수
+    ob.on_fill(hl_fill("O1", 3, 100.0, fill_id="hl1"))  # 같은 체결 userFills 재통보 → 흡수
     assert ob.order("O1").filled_qty == 3                            # 6 아님
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == 3   # 이중 반영 안 됨
     assert ob.order("O1").status is OrderStatus.PARTIAL
 
-    ob.on_fill(fill("O1", 2, 101.0, fill_id="hl2"))  # 잔여 2 진짜 체결
+    ob.on_fill(hl_fill("O1", 2, 101.0, fill_id="hl2"))  # 잔여 2 진짜 체결
     assert ob.order("O1").filled_qty == 5
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == 5
     assert ob.order("O1").status is OrderStatus.FILLED
@@ -391,9 +400,9 @@ def test_place_fill_absorb_across_split_userfills() -> None:
     # 선반영 3을 userFills가 2+1로 쪼개 재통보 → 각각 흡수(총 3), 이중 반영 없음.
     ob = OrderBook()
     ob.track("O1", _hl_intent(Side.BUY, 5))
-    ob.apply_place_fill(fill("O1", 3, 100.0, fill_id="place-O1"))
-    ob.on_fill(fill("O1", 2, 100.0, fill_id="hl1"))  # 2 흡수(잔여 선반영 1)
-    ob.on_fill(fill("O1", 1, 100.0, fill_id="hl2"))  # 1 흡수(선반영 0)
+    ob.apply_place_fill(hl_fill("O1", 3, 100.0, fill_id="place-O1"))
+    ob.on_fill(hl_fill("O1", 2, 100.0, fill_id="hl1"))  # 2 흡수(잔여 선반영 1)
+    ob.on_fill(hl_fill("O1", 1, 100.0, fill_id="hl2"))  # 1 흡수(선반영 0)
     assert ob.order("O1").filled_qty == 3
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == 3
 
@@ -402,8 +411,8 @@ def test_place_fill_absorb_partial_when_userfill_batches_more() -> None:
     # userFills 한 건이 즉시체결분(선반영 3)+잔여 1 = 4를 묶어 오면: 3 흡수, 1만 신규 반영.
     ob = OrderBook()
     ob.track("O1", _hl_intent(Side.BUY, 5))
-    ob.apply_place_fill(fill("O1", 3, 100.0, fill_id="place-O1"))
-    ob.on_fill(fill("O1", 4, 100.0, fill_id="hl1"))
+    ob.apply_place_fill(hl_fill("O1", 3, 100.0, fill_id="place-O1"))
+    ob.on_fill(hl_fill("O1", 4, 100.0, fill_id="hl1"))
     assert ob.order("O1").filled_qty == 4
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP, None) == 4
 
@@ -449,10 +458,11 @@ def test_ws_order_event_dispatch() -> None:
 
     ob = OrderBook()
     ob.track("9852", intent())
-    ob.on_order_event(OrderEvent(kind="ack", order_id="9852"))
+    ob.on_order_event(OrderEvent(kind="ack", order_id="9852", venue=Venue.LS))
     assert ob.order("9852").status is OrderStatus.ACCEPTED
 
-    ob.on_order_event(OrderEvent(kind="cancel", order_id="9901", org_order_id="9852"))
+    ob.on_order_event(OrderEvent(kind="cancel", order_id="9901", org_order_id="9852",
+                                 venue=Venue.LS))
     assert ob.order("9852").status is OrderStatus.CANCELLED
 
 
@@ -530,7 +540,7 @@ def test_hl_fill_skips_balance() -> None:
                      instrument=Instrument.HL_PERP, side=Side.SELL, qty=1,
                      order_type=OrderType.MARKET)
     ob.track("1", oi)
-    ob.on_fill(fill("1", qty=1, price=52.0))
+    ob.on_fill(hl_fill("1", qty=1, price=52.0))
     assert ob.position_qty(SAMSUNG, Instrument.HL_PERP) == -1
     assert ob.balance(Account.KR_STOCK) == 0.0
 
@@ -550,7 +560,7 @@ def test_fill_before_track_is_buffered_then_applied() -> None:
 
 def test_cancel_before_track_is_buffered_then_applied() -> None:
     ob = OrderBook()
-    ob.on_cancel("O2")                                  # 취소가 먼저 → 버퍼
+    ob.on_cancel("O2", venue=Venue.LS)                  # 취소가 먼저 → 버퍼
     ob.track("O2", intent())
     ob.replay_pending("O2")
     order = ob.order("O2")
@@ -559,7 +569,7 @@ def test_cancel_before_track_is_buffered_then_applied() -> None:
 
 def test_ack_before_track_is_buffered_then_applied() -> None:
     ob = OrderBook()
-    ob.on_ack("O3")                                     # 접수가 먼저 → 버퍼
+    ob.on_ack("O3", venue=Venue.LS)                     # 접수가 먼저 → 버퍼
     ob.track("O3", intent())
     ob.replay_pending("O3")
     order = ob.order("O3")
@@ -569,9 +579,9 @@ def test_ack_before_track_is_buffered_then_applied() -> None:
 def test_replay_absorbs_duplicate_with_provisional() -> None:
     # 즉시체결(apply_place_fill) 뒤 replay되는 같은 체결은 provisional로 흡수 — 이중 반영 없음.
     ob = OrderBook()
-    ob.on_fill(fill("O4", 0.1, 100.0))                  # WS 체결이 먼저 → 버퍼
+    ob.on_fill(hl_fill("O4", 0.1, 100.0))               # WS 체결이 먼저 → 버퍼
     ob.track("O4", _hl_intent(Side.SELL, 0.1))
-    ob.apply_place_fill(fill("O4", 0.1, 100.0, fill_id="place-O4"))  # 응답 즉시체결
+    ob.apply_place_fill(hl_fill("O4", 0.1, 100.0, fill_id="place-O4"))  # 응답 즉시체결
     ob.replay_pending("O4")                             # 버퍼된 WS 체결 → 흡수
     order = ob.order("O4")
     assert order is not None and order.filled_qty == 0.1   # 0.2 아님(이중 없음)
@@ -584,9 +594,9 @@ def test_replay_float_residue_is_not_a_fill() -> None:
     seen: list[float] = []
     ob.on_fill_applied.append(lambda _o, q, _p, _f: seen.append(q))
     for i, q in enumerate((0.521, 5.208, 0.234)):
-        ob.on_fill(fill("O5", q, 192.0, fill_id=f"ws{i}"))       # WS 체결이 먼저 → 버퍼
+        ob.on_fill(hl_fill("O5", q, 192.0, fill_id=f"ws{i}"))    # WS 체결이 먼저 → 버퍼
     ob.track("O5", _hl_intent(Side.SELL, 10.0))
-    ob.apply_place_fill(fill("O5", 5.963, 192.03, fill_id="place-O5"))
+    ob.apply_place_fill(hl_fill("O5", 5.963, 192.03, fill_id="place-O5"))
     ob.replay_pending("O5")
     order = ob.order("O5")
     assert order is not None and order.filled_qty == 5.963
@@ -649,7 +659,8 @@ def test_replay_pending_needs_account_when_same_number_open_on_both_accounts(
         side=Side.BUY, qty=20, order_type=OrderType.LIMIT, price=1_184_000.0,
         account=Account.KR_STOCK))
     ob.on_fill(Fill(fill_id="d1", order_id="1871", qty=2, price=1_212_000.0, ts=0,
-                    account=Account.KR_DERIV))                       # 선물 체결, 등록 전 → 보관
+                    account=Account.KR_DERIV,
+                    venue=Venue.LS))                       # 선물 체결, 등록 전 → 보관
     fut = ob.track("1871", OrderIntent(
         venue=Venue.LS, underlying=Underlying.SK_HYNIX, instrument=Instrument.KR_STOCK_FUTURE,
         side=Side.SELL, qty=2, order_type=OrderType.LIMIT, price=1_212_000.0,
@@ -678,7 +689,35 @@ def test_prune_closed_keeps_open_recent_and_protected() -> None:
     fresh.placed_ts = 1000.0
     ob.on_cancel("F1")                             # 닫혔지만 방금
     removed = ob.prune_closed(now=1100.0, keep_s=900.0, protect={"K1"})
-    assert [oid for _a, oid in removed] == ["D1"] and removed[0][0] is Account.KR_STOCK
+    assert removed == [(Venue.LS, Account.KR_STOCK, "D1")]  # 키 (거래소, 계좌, 번호) — 결정 92
     assert ob.order("O1") is not None and ob.order("K1") is not None
     assert ob.order("F1") is not None and ob.order("D1") is None
-    assert [oid for _a, oid in ob.prune_closed(now=2000.0, keep_s=900.0)] == ["K1", "F1"]
+    later = ob.prune_closed(now=2000.0, keep_s=900.0)
+    assert [k[2] for k in later] == ["K1", "F1"]
+
+
+def test_same_number_on_ls_and_hl_are_separate_orders() -> None:
+    # 결정 92(사용자 2026-11-17 "거래소, 계좌, 주문번호 이 3개가 키"): HL oid와 LS 주문번호가 같아도
+    # 다른 주문 — 체결·취소·보관 통보가 거래소로 갈린다
+    ob = OrderBook()
+    ls = ob.track("777", intent(qty=10))                               # (LS, 주식계좌, 777)
+    hl = ob.track("777", _hl_intent(Side.SELL, 0.5))                   # (HL, None, 777)
+    assert ob.order("777", venue=Venue.HYPERLIQUID) is hl
+    assert ob.order("777", Account.KR_STOCK, Venue.LS) is ls
+    assert ob.order("777") is hl                                       # 찾기: HL 먼저
+    ob.on_fill(hl_fill("777", 0.5, 100.0, fill_id="h1"))               # HL 체결 → HL 주문만
+    assert hl.filled_qty == 0.5 and ls.filled_qty == 0
+    ob.on_fill(fill("777", 4, 80_000.0, fill_id="s1"))                 # LS 체결(거래소 LS) → LS만
+    assert ls.filled_qty == 4 and hl.filled_qty == 0.5
+    ob.on_cancel("777", qty=6, account=Account.KR_STOCK, venue=Venue.LS)
+    assert ls.status is OrderStatus.CANCELLED and hl.status is OrderStatus.FILLED
+    # 등록 전 보관도 거래소별: HL 번호 888의 체결은 같은 번호의 LS 주문 등록 때 재생되지 않는다
+    ob.on_fill(hl_fill("888", 0.2, 100.0, fill_id="h2"))
+    ls2 = ob.track("888", intent(qty=10))
+    ob.replay_pending("888", account=Account.KR_STOCK, venue=Venue.LS)
+    assert ls2.filled_qty == 0
+    hl2 = ob.track("888", _hl_intent(Side.BUY, 0.2))
+    ob.replay_pending("888", venue=Venue.HYPERLIQUID)
+    assert hl2.filled_qty == 0.2
+    assert OrderBook.key_of(hl2.intent, "888") == (Venue.HYPERLIQUID, None, "888")
+    assert OrderBook.key_of(ls2.intent, "888") == (Venue.LS, Account.KR_STOCK, "888")

@@ -536,6 +536,7 @@ class HLWebSocketClient:
                     price=float(f["px"]),
                     fee=float(f.get("fee", 0.0) or 0.0),
                     ts=float(f.get("time", 0.0)),
+                    venue=Venue.HYPERLIQUID,  # 주문 키 (거래소, 계좌 None, oid) — 결정 92
                 )
             )
         return fills

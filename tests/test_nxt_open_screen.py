@@ -37,22 +37,29 @@ def test_settings_payload_from_inputs() -> None:
     assert body["cmd"] == "nxt_open_settings" and body["underlying"] == "sk_hynix"
     assert body["open_hms"] == "08:00:00" and (body["start_s"], body["end_s"]) == (0.5, 5.0)
     assert body["entries"][0] == {"spread": 0.012, "qty": 100, "price_spread": 0.009,
-                                  "exit_price_spread": None, "auto_exit": False}
+                                  "target_profit": None, "auto_exit": False}
     assert body["entries"][2] == {"spread": None, "qty": 0, "price_spread": None,
-                                  "exit_price_spread": None, "auto_exit": False}
+                                  "target_profit": None, "auto_exit": False}
+    # 11-17 호가 필터 줄: 빈 칸은 0·0·없음
+    assert (body["sum5_qty"], body["exclude_qty"], body["min_spread"]) == (0, 0, None)
     assert body["exits"][0]["spread"] == -0.004
     # 10-29 추가 칸: 빈 칸은 기본값 07:59:55·3%(사용자 2026-10-29)
     assert body["hl_base_hms"] == "07:59:55" and body["range_limit"] == 0.03
     body2 = settings_payload(Underlying.SAMSUNG, "", "", "", [], [])  # 빈 칸은 기본값
     assert body2["open_hms"] == "08:00:00" and (body2["start_s"], body2["end_s"]) == (0.5, 5.0)
     assert body2["entries"] == []
-    # 2026-10-29 추가 칸: 윗줄 HL기준시간·범위제한(%), 단의 청산가(%)·자동청산 체크 — 저장만
+    # 2026-10-29 추가 칸: 윗줄 HL기준시간·범위제한(%), 단의 목표수익률(%, 11-17 — 옛 청산가 자리)·
+    # 자동청산 체크. 11-17 호가 필터 줄(5호가합·호가제외수량·최소호가스프레드 %)
     body3 = settings_payload(Underlying.SAMSUNG, "08:00:00", "0.5", "5",
                              entries=[("1.2", "100", "0.9", "0.5", True)], exits=[],
-                             hl_base_hms=" 07:58:00 ", range_limit="2.5")
+                             hl_base_hms=" 07:58:00 ", range_limit="2.5",
+                             sum5_qty="1,000", exclude_qty="30", min_spread="0.3")
     assert body3["hl_base_hms"] == "07:58:00" and body3["range_limit"] == 0.025
-    assert body3["entries"][0]["exit_price_spread"] == 0.005
+    assert body3["entries"][0]["target_profit"] == 0.005
     assert body3["entries"][0]["auto_exit"] is True
+    assert (body3["sum5_qty"], body3["exclude_qty"], body3["min_spread"]) == (1000, 30, 0.003)
+    # 목표수익률은 양수만(사용자 2026-11-17) — 0은 없음
+    assert tiers_payload([("1.2", "100", "0.9", "0", True)])[0]["target_profit"] is None
     assert tiers_payload([("1,2", "1,000", "0.9")])[0]["qty"] == 1000
     # 수량 소수(사용자 2026-10-21 — HL 주문) — 칸 글은 뒤 0 없이
     assert tiers_payload([("1.2", "0.5", "0.9")])[0]["qty"] == 0.5
@@ -119,9 +126,11 @@ def test_top_row_locks_all_but_underlying_while_running() -> None:
     # 사용자 2026-10-21: 진입 or 청산 실행 중이면 종목 콤보 빼고 윗줄(호가단위·적·기준수량·시간)
     # 입력 불가
     locked = top_states(True)
-    # 종목 콤보 제외(hl_base·range는 10-29 추가 칸). 호가단위는 10-30부터 글자뿐이라 잠글 게 없다
-    assert set(locked) == {"apply", "ref", "open", "start", "end", "hl_base", "range"}
+    # 종목 콤보 제외(hl_base·range는 10-29 추가 칸, sum5·excl·min_sprd는 11-17 호가 필터 줄).
+    # 호가단위는 10-30부터 글자뿐이라 잠글 게 없다
+    assert set(locked) == {"apply", "ref", "open", "start", "end", "hl_base", "range",
+                           "sum5", "excl", "min_sprd"}
     assert all(v == "disabled" for v in locked.values())
     free = top_states(False)
     assert all(free[k] == "normal" for k in ("apply", "ref", "open", "start", "end",
-                                             "hl_base", "range"))
+                                             "hl_base", "range", "sum5", "excl", "min_sprd"))
