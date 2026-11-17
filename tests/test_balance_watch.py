@@ -7,6 +7,7 @@ from kp_arb.balance_watch import (
     BalanceWatcher,
     balance_rows,
     balance_watch_loop,
+    format_main_line,
     format_report,
     hl_total,
     total_balance,
@@ -76,6 +77,14 @@ def test_watcher_step_change_keeps_baseline_and_zero_step_disables() -> None:
     c = w.check(1000, 500)                                    # 배수 바꿔도 기준은 150에서
     assert c is not None and (c.old_baseline, c.new_baseline) == (150, 650)
     assert BalanceWatcher(None).check(999, 10) is None        # 시동 값 없음 → 판정 안 함
+
+
+def test_format_main_line_for_balance_query_window() -> None:
+    # 잔고 조회 창 한 줄(사용자 2026-11-11 "기준 300  잔고 : 500 이렇게만", 11-17 다시 넣음) — 값
+    # 없으면 '-'
+    assert format_main_line(300.0, 500.0) == "기준 300  잔고 : 500"
+    assert format_main_line(None, None) == "기준 -  잔고 : -"
+    assert format_main_line(1234.0, None) == "기준 1,234  잔고 : -"  # 천 단위 쉼표(_q)
 
 
 def test_format_report_follows_user_example() -> None:

@@ -121,6 +121,31 @@ def empty_table() -> dict[str, Any]:
             "sum": dict.fromkeys(COLUMNS, NOT_QUERIED)}
 
 
+def total_of(sum_row: dict[str, Any] | None) -> float | None:
+    """'합' 행(문자열) → 토탈잔고 = Σ|주식| + Σ|주식선물|×10 + Σ|HL|(DESIGN-balance-watch §0의 옛
+    정의, 실조회 값). 세 칸 중 하나라도 조회 전·오류면 None. 순수."""
+    if not sum_row:
+        return None
+    try:
+        stock = float(str(sum_row["stock"]).replace(",", ""))
+        sf = float(str(sum_row["sf"]).replace(",", ""))
+        hl = float(str(sum_row["hl"]).replace(",", ""))
+    except (KeyError, ValueError, TypeError):
+        return None
+    return abs(stock) + abs(sf) * HL_PER_SF + abs(hl)
+
+
+def balance_line(result: dict[str, Any] | None) -> str:
+    """상태줄 오른쪽 '기준 300  잔고 : 500'(사용자 2026-11-17): 기준 = 시동 때 실조회한 토탈잔고
+    (응답의 baseline), 잔고 = 이번 조회의 토탈잔고. 조회 전·실패면 '-'. 순수."""
+    from .balance_watch import format_main_line
+
+    if not result or not result.get("ok"):
+        return format_main_line(None, None)
+    base = result.get("baseline") or {}
+    return format_main_line(total_of(base.get("sum")), total_of(result.get("sum")))
+
+
 def status_text(result: dict[str, Any] | None) -> str:
     """상태줄 글 — 조회 전 / 완료 / 실패 출처."""
     if not result:

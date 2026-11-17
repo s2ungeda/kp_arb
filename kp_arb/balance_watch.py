@@ -124,6 +124,15 @@ def _q(x: float, *, signed: bool = False) -> str:
     return "0" if text in ("+0", "-0") else text
 
 
+def format_main_line(baseline: float | None, total: float | None) -> str:
+    """잔고 조회 창 한 줄(사용자 2026-11-11 "이렇게만", 11-16 메인에서 옮김·같은 날 뺌, 11-17 다시
+    넣음): ``기준 300  잔고 : 500``. 값 없으면 '-'. 기준 = 시동 때 잡은 토탈잔고, 잔고 = 지금 장부
+    토탈잔고."""
+    b = "-" if baseline is None else _q(baseline)
+    t = "-" if total is None else _q(total)
+    return f"기준 {b}  잔고 : {t}"
+
+
 def format_report(rows: Iterable[BalanceRow], when: str) -> str:
     """텔레그램 본문(사용자 2026-11-16) — 제목 ``[잔고] 날짜 시간`` 한 줄 + 종목마다 이름 줄 +
     ``LS 주식(S) 잔고 LS선물(SF) 잔고*10 HP 잔고``. 잔고는 음수만 부호. 변화량(증감)은 같은 날

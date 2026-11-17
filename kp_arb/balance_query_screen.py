@@ -31,6 +31,7 @@ from .balance_query import (
     ROW_NAMES,
     ROW_ORDER,
     auto_interval_s,
+    balance_line,
     empty_table,
     status_text,
 )
@@ -174,9 +175,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
             lbl.grid(row=r, column=col, **opts)
             cells[(rk, key)] = lbl
 
-    status = tk.Label(root, text=status_text(None), anchor="w", fg=T.C_MUTED,
-                      font=T.FONT_LABEL)
-    status.pack(fill="x", padx=8, pady=(2, 8))
+    # 상태줄 한 줄: 왼쪽 조회 시각·결과, 오른쪽 '기준 300  잔고 : 500'(사용자 2026-11-17 "조회완료
+    # 시간과 같은 라인에 두고 우측에") — 기준 = 시동 때 실조회한 토탈잔고(응답 baseline), 잔고 =
+    # 이번 조회의 토탈잔고(합 행: 주식 + 주선×10 + HL). 둘 다 실조회 값(장부 아님). 11-11 메인 창 →
+    # 11-16 이 창에서 뺌 → 11-17 다시.
+    bar = tk.Frame(root)
+    bar.pack(fill="x", padx=8, pady=(2, 8))
+    status = tk.Label(bar, text=status_text(None), anchor="w", fg=T.C_MUTED, font=T.FONT_LABEL)
+    status.pack(side="left")
+    lbl_balance = tk.Label(bar, text=balance_line(None), anchor="e", font=T.FONT_LABEL)
+    lbl_balance.pack(side="right")
 
     def show(result: dict[str, Any] | None) -> None:
         if result is None or result.get("ok"):  # 실패 응답(ok=False)은 표를 그대로 두고 상태줄만
@@ -192,6 +200,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
         status.config(text=status_text(result),
                       fg=T.C_ERR if result and (not result.get("ok") or result.get("errors"))
                       else T.C_MUTED)
+        if result is None or result.get("ok"):  # 실패 응답이면 앞 값 유지
+            lbl_balance.config(text=balance_line(result))
 
     def unlock() -> None:
         if auto_var.get():

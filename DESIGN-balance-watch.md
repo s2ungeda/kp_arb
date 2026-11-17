@@ -58,8 +58,10 @@
 - 설정 키 `balance_watch` {enabled: bool(**기본 켬**), step: int(**기본 150**)}(사용자 2026-11-11). 켬인데 step ≤ 0이면
   코어가 거부(저장 안 됨). 코어 저장본(core_state.json)에 enabled·step만 저장. 기준값은 저장하지 않는다(§1).
 - 공통설정 화면 '자동종료' 아랫줄, **입력만**: `잔고감시  [ ] 켬  비교잔고배수 [____]주`.
-- 화면 표시는 없다. 옛 메인 창 한 줄 `기준 300  잔고 : 500`은 2026-11-16 잔고 조회 창으로 옮겼다가 같은 날 없앰(그 창의
-  '합' 행이 대신함 — DESIGN-balance-query §1). 코어 `/state`의 `balance` {baseline, total}는 그대로 둔다(지금 total = T).
+- 화면 표시: 한 줄 `기준 300  잔고 : 500`(글 모양 `format_main_line`) — 2026-11-11 메인 창 → 11-16 잔고 조회 창으로 옮겼다가
+  같은 날 없앰 → **2026-11-17 사용자 지시로 잔고 조회 창 상태줄 오른쪽에 다시**. 값은 이 감시의 장부 판정값이 아니라 **잔고 조회
+  창의 실조회 토탈잔고**(기준 = 시동 복사본, 잔고 = 이번 조회 — DESIGN-balance-query §1). 코어 `/state`의 `balance`
+  {baseline, total}(장부·HL 합)는 그대로 두되 화면에선 안 쓴다.
 
 ## 4. 모듈·테스트
 - `kp_arb/balance_watch.py`(순수): `balance_rows(positions, symbols)`, `hl_total(rows)`(판정값), `total_balance(rows)`

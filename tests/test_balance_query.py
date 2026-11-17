@@ -9,11 +9,13 @@ from typing import Any
 
 from kp_arb.balance_query import (
     COLUMNS,
+    balance_line,
     build_table,
     empty_table,
     fmt_qty,
     query_balance,
     status_text,
+    total_of,
 )
 from kp_arb.domain.enums import Account, Instrument, Side, Underlying
 from kp_arb.domain.models import Position
@@ -197,3 +199,20 @@ async def test_query_balance_keeps_other_sources_when_one_fails() -> None:
     assert status_text(None).startswith("조회 전")
     assert status_text({"ok": True, "ts": "09:00:00", "errors": {}}) == "09:00:00 조회 완료"
     assert status_text({"ok": False, "errors": ["조회 중 — 잠시 뒤 다시"]}).startswith("조회 실패")
+
+
+def test_total_of_and_balance_line_from_query_result() -> None:
+    # 상태줄 오른쪽 '기준 N  잔고 : M'(사용자 2026-11-17): 기준 = 시동 때 실조회한 토탈잔고(응답
+    # baseline), 잔고 = 이번 조회의 토탈잔고 = 합 행 주식 + 주선×10 + HL(절대값, 실조회)
+    cur = {"hl": "+310", "stock": "+100", "credit": "+50", "sf": "+20", "sf_next": "+10",
+           "diff": "-10"}
+    base = {"hl": "+300", "stock": "+0", "credit": "+0", "sf": "+0", "sf_next": "+0", "diff": "0"}
+    assert total_of(cur) == 100 + 20 * 10 + 310 and total_of(base) == 300
+    assert total_of({"hl": "오류", "stock": "+1", "sf": "+0"}) is None  # 한 출처 실패 → 없음
+    assert total_of({"hl": "-", "stock": "-", "sf": "-"}) is None and total_of(None) is None
+    res = {"ok": True, "ts": "09:00:00", "errors": {}, "rows": {}, "sum": cur,
+           "baseline": {"rows": {}, "sum": base}}
+    assert balance_line(res) == "기준 300  잔고 : 610"
+    assert balance_line({**res, "baseline": None}) == "기준 -  잔고 : 610"  # 시동 복사본 실패
+    assert balance_line(None) == "기준 -  잔고 : -"
+    assert balance_line({"ok": False, "errors": ["조회 중"]}) == "기준 -  잔고 : -"
