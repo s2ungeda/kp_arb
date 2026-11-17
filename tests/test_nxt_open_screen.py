@@ -6,6 +6,8 @@ from kp_arb.nxt_open_screen import (
     base_text,
     frac_of,
     monitor_text,
+    opt_qty_of,
+    opt_qty_text,
     pct_text,
     qty_text,
     results_summary,
@@ -40,8 +42,8 @@ def test_settings_payload_from_inputs() -> None:
                                   "target_profit": None, "auto_exit": False}
     assert body["entries"][2] == {"spread": None, "qty": 0, "price_spread": None,
                                   "target_profit": None, "auto_exit": False}
-    # 11-17 호가 필터 줄: 빈 칸은 0·0·없음
-    assert (body["sum5_qty"], body["exclude_qty"], body["min_spread"]) == (0, 0, None)
+    # 11-17 호가 필터 줄: 빈 칸은 없음(None) — 셋 다 필수라 코어가 실행 켜기를 거부(답 6 "가")
+    assert (body["sum5_qty"], body["exclude_qty"], body["min_spread"]) == (None, None, None)
     assert body["exits"][0]["spread"] == -0.004
     # 10-29 추가 칸: 빈 칸은 기본값 07:59:55·3%(사용자 2026-10-29)
     assert body["hl_base_hms"] == "07:59:55" and body["range_limit"] == 0.03
@@ -58,6 +60,11 @@ def test_settings_payload_from_inputs() -> None:
     assert body3["entries"][0]["target_profit"] == 0.005
     assert body3["entries"][0]["auto_exit"] is True
     assert (body3["sum5_qty"], body3["exclude_qty"], body3["min_spread"]) == (1000, 30, 0.003)
+    # 필터 수량 칸은 0과 빈칸이 다르다 — 0은 0으로 보내고 "0"으로 되돌린다(호가제외수량 0 = 제외
+    # 없음)
+    assert opt_qty_of("0") == 0.0 and opt_qty_of("") is None and opt_qty_of("-1") is None
+    assert opt_qty_of(" 1,000 ") == 1000.0 and opt_qty_of("x") is None
+    assert opt_qty_text(0.0) == "0" and opt_qty_text(None) == "" and opt_qty_text(1000.0) == "1000"
     # 목표수익률은 양수만(사용자 2026-11-17) — 0은 없음
     assert tiers_payload([("1.2", "100", "0.9", "0", True)])[0]["target_profit"] is None
     assert tiers_payload([("1,2", "1,000", "0.9")])[0]["qty"] == 1000

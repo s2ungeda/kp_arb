@@ -861,7 +861,7 @@ def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
     """오전 NXT 개장 매매 명령(DESIGN-nxt-open.md §6) — nxt_open_settings(종목 설정 저장) ·
     nxt_open_run(실행 켜기/끄기 — block entry|exit). 설정은 엔진 없이도 저장되고, 실행은 엔진이
     있어야 한다."""
-    from .nxt_open import apply_settings, run_block_error
+    from .nxt_open import apply_settings, filter_settings_error, run_block_error
 
     cmd = body.get("cmd")
     try:
@@ -885,9 +885,11 @@ def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
         # 같이(2026-10-30, 운영 로그 역추적용)
         logging.getLogger("kp_arb.nxt_open").info(
             "[NXT개장] %s 설정 저장: 창 +%.1f~+%.1f초 개장 %s 기준수량 %g HL기준 %s 범위 %g%% "
-            "5호가합 %g 호가제외수량 %g 최소호가스프레드 %s 진입 %s 청산 %s",
+            "5호가합 %s 호가제외수량 %s 최소호가스프레드 %s 진입 %s 청산 %s",
             u.value, st.start_s, st.end_s, st.open_hms, st.ref_qty, st.hl_base_hms,
-            st.range_limit * 100, st.sum5_qty, st.exclude_qty,
+            st.range_limit * 100,  # 필터 3칸은 비면 None(§1a) — "-"로
+            f"{st.sum5_qty:g}" if st.sum5_qty is not None else "-",
+            f"{st.exclude_qty:g}" if st.exclude_qty is not None else "-",
             f"{st.min_spread * 100:g}%" if st.min_spread is not None else "-",
             [(t.spread, t.qty, t.price_spread, t.target_profit, t.auto_exit)
              for t in st.entries],
@@ -903,6 +905,9 @@ def _nxt_open_command(engine: NxtOpenEngine | None, state: CoreState,
             return _fail([f"block은 entry|exit: {block!r}"])
         tiers = st.entries if block == "entry" else st.exits
         why = run_block_error(tiers, "진입" if block == "entry" else "청산") if value else None
+        if why:
+            return _fail([why])
+        why = filter_settings_error(st) if value else None  # 호가 필터 3칸 필수(§1a, 답 6 "가")
         if why:
             return _fail([why])
         over = engine.chance_over(u) if value else None

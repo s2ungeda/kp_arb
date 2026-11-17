@@ -1,7 +1,8 @@
 """오전 NXT 개장 매매 — 순수 로직(I/O 없음). 계약: DESIGN-nxt-open.md.
 
-08:00 NXT 첫 체결 뒤 0.5~5초 창 안에서 `(환 × HL − S) / S` 괴리로 진입(HL 매도)·청산(HL 매수) 단을
+08:00 NXT 첫 호가 뒤 0.5~5초 창 안에서 `(환 × HL − S) / S` 괴리로 진입(HL 매도)·청산(HL 매수) 단을
 판정하고, 조건이 맞는 단을 한꺼번에 **딱 한 번** 낸다. 수량 단위는 HL 1:1(주식 1주 = HL 1).
+S = 호가 필터(§1a, filter_quote) 세 조건을 통과한 NXT 최우선 매도·매수호가의 중간값(2026-11-17).
 """
 from __future__ import annotations
 
@@ -141,11 +142,11 @@ class NxtOpenSettings:
     # 리스크 방지(§4b, 2026-10-29). 비우면 기본값(개장 시각과 같은 규칙).
     hl_base_hms: str = DEFAULT_HL_BASE_HMS   # HL기준시간(HH:MM:SS) — 그 시각의 HL 현재가를 기준가로
     range_limit: float = DEFAULT_RANGE_LIMIT  # 주문범위제한(% → 소수)
-    # 호가 필터(§1a, 사용자 2026-11-17 — 화면·저장만 먼저, 판정은 [OPEN] 문답 뒤): 5호가합(잔량 합
-    # 하한) · 호가제외수량(이 이하 잔량의 호가는 최우선호가에서 제외) · 최소호가스프레드(% → 소수,
-    # 비우면 None)
-    sum5_qty: float = 0.0
-    exclude_qty: float = 0.0
+    # 호가 필터(§1a, 사용자 2026-11-17 문답 확정): 5호가합(매도·매수 각 5단계 잔량 합 하한) ·
+    # 호가제외수량(이 이하 잔량의 호가는 최우선호가에서 제외) · 최소호가스프레드(% → 소수).
+    # 셋 다 필수 — 빈칸(None)이면 실행 켤 때 거부(답 6 "가"), filter_settings_error
+    sum5_qty: float | None = None
+    exclude_qty: float | None = None
     min_spread: float | None = None
     entries: list[Tier] = field(default_factory=_tiers)
     exits: list[Tier] = field(default_factory=_tiers)
@@ -190,6 +191,73 @@ def level_price(levels: list[tuple[float, float]] | None, n: int = 1) -> float |
     if not levels or n < 1 or n > len(levels):
         return None
     return float(levels[n - 1][0])
+
+
+# --- 호가 필터·현재가(§1a, 사용자 2026-11-17 문답 확정) ---
+
+FILTER_LEVELS = 5  # 조건 1 합산·조건 2 탐색 범위 = NXT 호가 상위 5단계(답 2)
+
+
+@dataclass(frozen=True)
+class QuoteFilter:
+    """호가 필터 결과 — 세 조건을 다 통과하면 현재가(price)와 최우선 매도·매수호가, 아니면
+    사유(why). 조건은 1 → 2 → 3 순서로 보고 처음 막힌 조건의 사유만 남긴다(답 6)."""
+
+    price: float | None = None
+    why: str | None = None
+    ask: float | None = None
+    bid: float | None = None
+
+
+def _levels_sum(levels: list[tuple[float, float]] | None, n: int) -> float:
+    return float(sum(q for _, q in (levels or [])[:n]))
+
+
+def _best_over(levels: list[tuple[float, float]] | None, exclude_qty: float,
+               n: int) -> float | None:
+    """상위 n단계 안에서 잔량이 exclude_qty**보다 큰** 첫(가장 좋은) 호가 가격 — 작거나 같으면
+    건너뜀."""
+    for px, qty in (levels or [])[:n]:
+        if qty > exclude_qty and px > 0:
+            return float(px)
+    return None
+
+
+def filter_quote(bids: list[tuple[float, float]] | None, asks: list[tuple[float, float]] | None,
+                 sum5_qty: float | None, exclude_qty: float | None, min_spread: float | None,
+                 levels: int = FILTER_LEVELS) -> QuoteFilter:
+    """NXT 주식 호가창(최우선부터, NXT 잔량 있는 단계만 — UH1의 NXT 쪽)에 §1a 세 조건을 순서대로.
+    - 조건 1: 매도·매수 각각 상위 5단계 잔량 합 ≥ 5호가합(제외수량과 무관하게 그대로 더함, 답 2)
+    - 조건 2: 5단계 안에서 잔량 > 호가제외수량인 가장 좋은 호가 — 매도·매수 둘 다 있어야
+    - 조건 3: (매도 − 매수) / 매도 < 최소호가스프레드(분모 = 매도호가, 답 3)
+    통과하면 현재가 = (매도 + 매수) × 0.5(답 4 — 이 화면의 S). 필터 값이 비면 판정 불가."""
+    if sum5_qty is None or exclude_qty is None or min_spread is None:
+        return QuoteFilter(why="호가 필터 값 없음")
+    if not bids or not asks:
+        return QuoteFilter(why="NXT 호가 없음")
+    ask_sum, bid_sum = _levels_sum(asks, levels), _levels_sum(bids, levels)
+    if ask_sum < sum5_qty or bid_sum < sum5_qty:
+        short, val = ("매도", ask_sum) if ask_sum < sum5_qty else ("매수", bid_sum)
+        return QuoteFilter(why=f"조건1 미달 — {short}5호가합 {val:,.0f} < {sum5_qty:,.0f}")
+    ask, bid = _best_over(asks, exclude_qty, levels), _best_over(bids, exclude_qty, levels)
+    if ask is None or bid is None:
+        lack = "매도·매수" if ask is None and bid is None else ("매도" if ask is None else "매수")
+        return QuoteFilter(why=f"조건2 미달 — 제외수량 {exclude_qty:,.0f} 넘는 {lack}호가 없음")
+    spread = (ask - bid) / ask
+    if not spread < min_spread:
+        return QuoteFilter(why=f"조건3 미달 — 호가스프레드 {spread * 100:.3f}% ≥ "
+                               f"{min_spread * 100:g}%", ask=ask, bid=bid)
+    return QuoteFilter(price=(ask + bid) * 0.5, ask=ask, bid=bid)
+
+
+def filter_settings_error(st: NxtOpenSettings) -> str | None:
+    """실행 켜기 가드 — 호가 필터 3칸은 셋 다 필수(답 6 "가"). 빈 칸 이름을 든 사유, 다 있으면
+    None."""
+    missing = [name for name, v in (("5호가합", st.sum5_qty), ("호가제외수량", st.exclude_qty),
+                                    ("최소호가스프레드", st.min_spread)) if v is None]
+    if missing:
+        return "호가 필터 값 없음: " + "·".join(missing)
+    return None
 
 
 def order_price(s: float, price_spread: float, fx: float, side: Side,
@@ -411,10 +479,14 @@ def settings_from_dict(raw: object) -> NxtOpenSettings:
     lim = raw.get("range_limit")
     if isinstance(lim, int | float) and not isinstance(lim, bool) and lim >= 0:
         st.range_limit = float(lim)
-    for key in ("sum5_qty", "exclude_qty"):  # 호가 필터(§1a) — 0 이상, 틀리면 기본 0
-        v = raw.get(key)
-        if isinstance(v, int | float) and not isinstance(v, bool) and v >= 0:
-            setattr(st, key, float(v))
+    # 호가 필터(§1a) — 비거나 틀리면 없음(None). 5호가합은 양수만(0은 하한이 아니라 빈칸과 같음 —
+    # 11-17 앞 판이 빈칸을 0으로 저장했던 값도 이렇게 빈칸으로 돌아온다), 호가제외수량은 0 이상
+    v = raw.get("sum5_qty")
+    if isinstance(v, int | float) and not isinstance(v, bool) and v > 0:
+        st.sum5_qty = float(v)
+    v = raw.get("exclude_qty")
+    if isinstance(v, int | float) and not isinstance(v, bool) and v >= 0:
+        st.exclude_qty = float(v)
     ms = raw.get("min_spread")
     if isinstance(ms, int | float) and not isinstance(ms, bool) and ms > 0:
         st.min_spread = float(ms)
@@ -467,13 +539,19 @@ def apply_settings(st: NxtOpenSettings, body: dict[str, Any],
                 for r in rows):
             errors.append("목표수익률은 양수만")
             break
+    # 호가 필터(§1a): 5호가합·최소호가스프레드에 0 이하를 적으면 거부(빈칸은 "없음"으로 저장되고
+    # 실행 켤 때 거부) — 0을 넣었는데 "값 없음"이 나오는 혼동을 막는다(검토 2026-11-17)
+    for key, name in (("sum5_qty", "5호가합은"), ("min_spread", "최소호가스프레드는")):
+        v = body.get(key)
+        if isinstance(v, int | float) and not isinstance(v, bool) and v <= 0:
+            errors.append(f"{name} 양수만")
     if errors:
         return errors
     st.start_s, st.end_s = new.start_s, new.end_s
     st.open_hms, st.entries, st.exits = new.open_hms, new.entries, new.exits
     st.ref_qty = new.ref_qty
     st.hl_base_hms, st.range_limit = new.hl_base_hms, new.range_limit  # 10-29 추가 칸
-    st.sum5_qty, st.exclude_qty, st.min_spread = (  # 11-17 호가 필터 칸(저장만)
+    st.sum5_qty, st.exclude_qty, st.min_spread = (  # 11-17 호가 필터 칸(§1a)
         new.sum5_qty, new.exclude_qty, new.min_spread)
     return []
 

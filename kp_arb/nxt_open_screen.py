@@ -63,6 +63,23 @@ def qty_text(qty: Any) -> str:
     return f"{float(qty):.6f}".rstrip("0").rstrip(".")
 
 
+def opt_qty_of(text: str) -> float | None:
+    """호가 필터 수량 칸(5호가합·호가제외수량, §1a) → 수. **빈칸·오타는 None**(없음) — 셋 다 필수라
+    0과 빈칸을 가른다(사용자 2026-11-17 답 6 "가"). 음수는 없음."""
+    try:
+        v = float(text.strip().replace(",", ""))
+    except ValueError:
+        return None
+    return v if v >= 0 else None
+
+
+def opt_qty_text(qty: Any) -> str:
+    """호가 필터 수량 → 칸 글. 없음(None)은 빈칸, 0은 "0"(qty_text와 달리 0을 지우지 않는다)."""
+    if qty is None:
+        return ""
+    return f"{float(qty):.6f}".rstrip("0").rstrip(".") or "0"
+
+
 def monitor_text(frac: Any) -> str:
     """모니터 수치 — 체결쏴처럼 퍼센트 소수 2자리(0.26). 없으면 '-'."""
     return "-" if frac is None else f"{float(frac) * 100:.2f}"
@@ -103,7 +120,8 @@ def settings_payload(u: Underlying, open_hms: str, start: str, end: str,
                      min_spread: str = "") -> dict[str, Any]:
     """입력 → nxt_open_settings 명령 본문. HL 호가단위는 코어 공용 값(일반주문창에서만 바꿈).
     hl_base_hms·range_limit = 2026-10-29 추가 칸(빈 글 = 기본값 07:59:55·3%). sum5_qty·
-    exclude_qty·min_spread = 2026-11-17 호가 필터 칸(§1a; 빈 글 = 0·0·없음)."""
+    exclude_qty·min_spread = 2026-11-17 호가 필터 칸(§1a; 빈 글 = 없음(None) — 셋 다 필수라 코어가
+    실행 켜기를 거부한다)."""
 
     def _f(text: str, default: float) -> float:
         try:
@@ -118,7 +136,7 @@ def settings_payload(u: Underlying, open_hms: str, start: str, end: str,
             "hl_base_hms": hl_base_hms.strip() or DEFAULT_HL_BASE_HMS,
             "range_limit": (frac_of(range_limit) if frac_of(range_limit) is not None
                             else DEFAULT_RANGE_LIMIT),
-            "sum5_qty": qty_of(sum5_qty), "exclude_qty": qty_of(exclude_qty),
+            "sum5_qty": opt_qty_of(sum5_qty), "exclude_qty": opt_qty_of(exclude_qty),
             "min_spread": frac_of(min_spread)}
 
 
@@ -284,40 +302,27 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     w["end"].insert(0, f"{DEFAULT_END_S:g}")
     w["end"].pack(side="left")
     tk.Label(top, text="초").pack(side="left", padx=(1, 0))
-    # 추가 칸(사용자 2026-10-29 "우선 화면부터"): HL기준시간·범위제한 — 뜻·동작은 [OPEN], 저장만.
-    # 시각 칸이 둘이라 작은 회색 글로 구분한다.
-    tk.Label(top, text="HL기준", fg="gray25", font=T.FONT_LABEL).pack(side="left", padx=(10, 2))
-    w["hl_base"] = tk.Entry(top, width=9, justify="center", validate="key",
-                            validatecommand=vcmd_time, font=T.FONT_NUM_LG)
-    w["hl_base"].insert(0, DEFAULT_HL_BASE_HMS)  # 기본값 07:59:55(사용자 2026-10-29)
-    w["hl_base"].pack(side="left", padx=(0, 4))
-    tk.Label(top, text="범위", fg="gray25", font=T.FONT_LABEL).pack(side="left", padx=(4, 2))
-    w["range"] = tk.Entry(top, width=4, justify="right", validate="key",
-                          validatecommand=vcmd_dec, font=T.FONT_NUM_LG)
-    w["range"].insert(0, f"{DEFAULT_RANGE_LIMIT * 100:g}")  # 기본값 3(%)
-    w["range"].pack(side="left")
-    tk.Label(top, text="%").pack(side="left", padx=(1, 0))
-
-    # ===== 호가 필터 줄(사용자 2026-11-17 "종목콤보 아래에 한 라인 추가") — §1a =====
+    # 호가 필터 3칸(사용자 2026-11-17 그림: 윗줄 오른쪽 — HL기준·범위와 자리 맞바꿈) — §1a
     # 5호가합(잔량 합 하한)·호가제외수량(이 이하 잔량의 호가는 최우선호가에서 뺌)·최소호가스프레드
-    # (%). 화면·저장만 먼저 — 판정에 쓰는 것은 [OPEN] 문답 뒤. 윗줄과 같이 잠긴다(top_states).
-    flt = tk.Frame(root)
-    flt.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 2))
-    tk.Label(flt, text="5호가합", fg="gray25", font=T.FONT_LABEL).pack(side="left", padx=(0, 2))
-    w["sum5"] = tk.Entry(flt, width=7, justify="right", validate="key",
+    # (%). 윗줄 잠금에 포함(top_states).
+    tk.Label(top, text="5호가합", fg="gray25", font=T.FONT_LABEL).pack(side="left", padx=(10, 2))
+    w["sum5"] = tk.Entry(top, width=7, justify="right", validate="key",
                          validatecommand=vcmd_qty, font=T.FONT_NUM_LG)
     w["sum5"].pack(side="left", padx=(0, 8))
-    tk.Label(flt, text="호가제외수량", fg="gray25", font=T.FONT_LABEL).pack(side="left",
+    tk.Label(top, text="호가제외수량", fg="gray25", font=T.FONT_LABEL).pack(side="left",
                                                                        padx=(0, 2))
-    w["excl"] = tk.Entry(flt, width=7, justify="right", validate="key",
+    w["excl"] = tk.Entry(top, width=7, justify="right", validate="key",
                          validatecommand=vcmd_qty, font=T.FONT_NUM_LG)
     w["excl"].pack(side="left", padx=(0, 8))
-    tk.Label(flt, text="최소호가스프레드", fg="gray25", font=T.FONT_LABEL).pack(side="left",
+    tk.Label(top, text="최소호가스프레드", fg="gray25", font=T.FONT_LABEL).pack(side="left",
                                                                          padx=(0, 2))
-    w["min_sprd"] = tk.Entry(flt, width=5, justify="right", validate="key",
+    w["min_sprd"] = tk.Entry(top, width=5, justify="right", validate="key",
                              validatecommand=vcmd_qty, font=T.FONT_NUM_LG)
     w["min_sprd"].pack(side="left")
-    tk.Label(flt, text="%").pack(side="left", padx=(1, 0))
+    tk.Label(top, text="%").pack(side="left", padx=(1, 0))
+
+    # (HL기준시간·범위제한 입력은 표 0행, 진입 괴리 수치 오른쪽 — 아래 w["base"] 다음. 둘째 줄은
+    # 없음: 사용자 2026-11-17 "필터 때문에 추가한 라인을 없애자")
 
     # ===== 표(사용자 2026-10-20): 진입 세트 | 청산 세트를 좌우로, 구분 열 없음 =====
     # 0행 = 모니터 수치(각 Sprd 헤더 위)·환율, 1행 = 헤더(Sprd 수량 주문가 역산가 실행),
@@ -390,10 +395,30 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 넓힌 때 폭이 0이라 글이 잘린다(사용자 2026-10-21 "환율이 가려진다"). 늘어나는 빈 열은 걸치지
     # 않는다 — 걸치면 창을 넓힐 때 환율이 오른쪽 끝으로 따라간다(사용자 2026-10-21 "위치 고정").
     w["fx"].grid(row=0, column=gap_col + 2, columnspan=len(heads) - 1, sticky="e", padx=(0, 2))
-    # HL 기준가·한도(§4b-5) — 진입 세트 위 0행의 역산가~실행 열(사용자 2026-10-29 동그라미 자리),
-    # 환율과 같은 글꼴·색. 코어가 기준시간에 잡은 기준가와 매도(↓)·매수(↑) 한도.
+    # HL 기준가·한도(§4b-5 "HL기준 1,332.5 ↓1,292.5 ↑1,372.5") — 환율과 같은 글꼴·색. 코어가
+    # 기준시간에 잡은 기준가와 매도(↓)·매수(↑) 한도. 자리: 청산 세트 위 0행, 환율 왼쪽(수량~자동청산
+    # 열, 오른쪽 맞춤 — 사용자 2026-11-17 "HL 기준 수치를 환율 왼쪽으로"; 10-29 자리(진입 쪽 역산가~
+    # 실행)는 HL기준 입력 묶음이 쓴다)
+    exit_base = len(heads) + 1
     w["base"] = tk.Label(tbl, text="HL기준 -", font=T.FONT_LABEL, fg="gray25", anchor="e")
-    w["base"].grid(row=0, column=col_px, columnspan=3, sticky="e", padx=(0, 2))
+    w["base"].grid(row=0, column=exit_base + 1, columnspan=col_run - 1, sticky="e", padx=(0, 6))
+    # HL기준시간·범위제한 입력(사용자 2026-10-29 추가 칸) — 2026-11-17 사용자 "HL기준과 범위를 진입
+    # 모니터링 수치 오른쪽에 두고 필터 때문에 추가한 라인을 없애자" → 같은 날 "우측으로 붙이고": 표
+    # 0행, 수량~실행 열에 오른쪽 맞춤(실행 열 끝). 윗줄 잠금에 포함(top_states). 시각 칸이 둘이라
+    # 작은 회색 글로 구분.
+    hlf = tk.Frame(tbl)
+    hlf.grid(row=0, column=1, columnspan=col_run, sticky="e", padx=(0, 2), pady=(0, 2))
+    tk.Label(hlf, text="HL기준", fg="gray25", font=T.FONT_LABEL).pack(side="left", padx=(0, 2))
+    w["hl_base"] = tk.Entry(hlf, width=9, justify="center", validate="key",
+                            validatecommand=vcmd_time, font=T.FONT_NUM_LG)
+    w["hl_base"].insert(0, DEFAULT_HL_BASE_HMS)  # 기본값 07:59:55(사용자 2026-10-29)
+    w["hl_base"].pack(side="left", padx=(0, 4))
+    tk.Label(hlf, text="범위", fg="gray25", font=T.FONT_LABEL).pack(side="left", padx=(2, 2))
+    w["range"] = tk.Entry(hlf, width=4, justify="right", validate="key",
+                          validatecommand=vcmd_dec, font=T.FONT_NUM_LG)
+    w["range"].insert(0, f"{DEFAULT_RANGE_LIMIT * 100:g}")  # 기본값 3(%)
+    w["range"].pack(side="left")
+    tk.Label(hlf, text="%").pack(side="left", padx=(1, 0))
     tbl.grid_columnconfigure(2 * len(heads) + 1, weight=1)  # 남는 폭은 여기로(입력칸은 안 늘어남)
 
     # ===== 상태줄: 창 상태 + 명령 결과 =====
@@ -541,8 +566,8 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                          ("end", f"{float(st.get('end_s', DEFAULT_END_S)):g}"),
                          ("hl_base", st.get("hl_base_hms") or DEFAULT_HL_BASE_HMS),
                          ("range", f"{float(st.get('range_limit', DEFAULT_RANGE_LIMIT)) * 100:g}"),
-                         ("sum5", qty_text(st.get("sum5_qty"))),      # 11-17 호가 필터 줄
-                         ("excl", qty_text(st.get("exclude_qty"))),
+                         ("sum5", opt_qty_text(st.get("sum5_qty"))),  # 11-17 호가 필터 줄
+                         ("excl", opt_qty_text(st.get("exclude_qty"))),  # 0은 "0", 없음은 빈칸
                          ("min_sprd", pct_text(st.get("min_spread")))):
             set_entry(w[key], str(val))
         for block, key in (("entry", "entries"), ("exit", "exits")):

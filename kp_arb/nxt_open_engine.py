@@ -1,9 +1,10 @@
 """오전 NXT 개장 매매 실행 엔진 — DESIGN-nxt-open.md §3·§6.
 
 CoreState.nxt_open(종목별 설정)과 LiveSystem을 묶는다. 이벤트 주도(별도 루프 없음):
-- NXT 주식 1호가(on_quote, market "nxt" — 통합호가 UH1의 NXT 쪽) → 그날 첫 호가면 T0(개장 시각 +
-  유예 안일 때만) + S(1호가 가중값, theory.quote_price) 갱신. 주식 체결은 안 받는다(사용자
-  2026-10-28 "NXT 개장 매매에도 현재가 대신 호가 가중치, 주식 체결 시세 구독 안 해도 될 것 같음")
+- NXT 주식 호가(on_quote, market "nxt" — 통합호가 UH1의 NXT 쪽) → 그날 첫 호가면 T0(개장 시각 +
+  유예 안일 때만) + S 갱신. S = 호가 필터(§1a, 2026-11-17: 5호가합·호가제외수량·최소호가스프레드)
+  세 조건을 통과한 최우선 매도·매수호가의 중간값 — 미달이면 그 틱은 판정하지 않고(창 끝까지 계속)
+  표시용 S는 직전값을 둔다. 주식 체결은 안 받는다(사용자 2026-10-28)
 - HL 호가(on_quote, 선택한 호가단위 적용 1호가)·환율(on_fx) → 괴리 재계산
 - 창 안(T0 + start ~ + end)이고 실행이 켜져 있으면 판정 → 맞는 단을 한꺼번에 HL 묶음 발주, 딱 한 번
 발주 뒤 미체결·포지션은 건드리지 않는다(정리는 사용자). 날짜가 바뀌면 그날 상태를 비운다.
@@ -26,11 +27,13 @@ from .nxt_open import (
     NxtOpenScreen,
     NxtOpenSettings,
     Plan,
+    QuoteFilter,
     Tier,
     auto_exit_price,
     base_due,
     day_over,
     disparity,
+    filter_quote,
     hl_current,
     judge,
     level_price,
@@ -42,7 +45,6 @@ from .nxt_open import (
     t0_verdict,
     window_state,
 )
-from .theory import quote_price
 
 
 class _System(Protocol):
@@ -89,7 +91,14 @@ class DayState:
     fired_wall: float | None = None  # 마지막 발주 시각
     fired_tiers: set[tuple[str, int]] = field(default_factory=set)  # 발주된 단 — 단마다 하루 한 번
     results: list[TierResult] = field(default_factory=list)
-    s: float | None = None
+    s: float | None = None            # 표시용 S — 마지막으로 필터를 통과한 현재가(직전값 유지)
+    s_now: float | None = None        # 지금 틱의 현재가 — 필터 미달이면 None(판정·역산가는 이것)
+    nxt_quote: Quote | None = None    # 마지막 NXT 호가(훅으로 받은 것 — 필터 입력)
+    # NXT 호가가 한쪽만 남으면 파서가 NXT Quote를 안 만들어(DESIGN-ls-xing §9) 마지막 양쪽 호가가
+    # 남는다 → 같은 UH1 건의 통합(uni) 호가가 더 새로우면 낡은 것으로 표시(검토 2026-11-17 지적 2)
+    nxt_stale: bool = False
+    filter_why: str | None = None     # 지금 틱의 필터 미달 사유(통과면 None)
+    filter_noted: str = ""            # 상태줄·로그에 남긴 마지막 미달 사유(같은 글은 한 번)
     hl_bid_n: float | None = None
     hl_ask_n: float | None = None
     entry_disp: float | None = None
@@ -209,16 +218,16 @@ class NxtOpenEngine:
         return d
 
     def _on_nxt_quote(self, quote: Quote) -> None:
-        """NXT 주식 1호가(UH1의 NXT 쪽) — S = 1호가 가중값(현재가 규칙 ①~③), 그날 첫 호가가 T0
-        (사용자 2026-10-28 답 1: 개장 시각 뒤 첫 NXT 호가 — 운영 실측 개장 전 NXT 호가 0건, 08:00
-        첫 분에 체결과 같이 옴). 호가가 비어 S가 없으면(규칙 ①) T0 후보로 안 본다."""
+        """NXT 주식 호가(UH1의 NXT 쪽, 매도·매수 양쪽 다 있을 때만 온다) — 그날 첫 호가가 T0(사용자
+        2026-10-28 답 1: 개장 시각 뒤 첫 NXT 호가 — 운영 실측 개장 전 NXT 호가 0건, 08:00 첫 분에
+        체결과 같이 옴; 2026-11-17 답 4 "T0는 그대로" — 필터 통과와 무관). S는 _compute의 호가
+        필터가 정한다. 양쪽 가격이 없는 호가는 T0 후보로 안 본다."""
         u = quote.underlying
         d = self._day(u)
-        s = quote_price(quote.bid, quote.ask, quote.bid_qty, quote.ask_qty)
-        if s is None:
+        if not (quote.bid > 0 and quote.ask > 0):
             self._evaluate(u)
             return
-        d.s = s
+        d.nxt_quote, d.nxt_stale = quote, False
         if d.t0 is None and not d.t0_rejected:
             now_wall = self._wall()
             st = self.settings(u)
@@ -227,8 +236,10 @@ class NxtOpenEngine:
                 pass  # 개장 전 호가 — T0 후보 아님(무시), 개장 뒤 첫 호가를 기다린다
             elif verdict == "ok":
                 d.t0, d.t0_wall = self._clock(), now_wall
-                self._log.info("[NXT개장] %s 첫 NXT 호가 %s S %s — 창 +%.1f~+%.1f초", u.value,
-                               _hms(now_wall), f"{d.s:,.0f}", st.start_s, st.end_s)
+                self._compute(u, d)  # 첫 호가의 현재가(또는 미달 사유)를 로그에
+                self._log.info("[NXT개장] %s 첫 NXT 호가 %s 현재가 %s — 창 +%.1f~+%.1f초", u.value,
+                               _hms(now_wall), f"{d.s_now:,.0f}" if d.s_now else
+                               f"없음({d.filter_why})", st.start_s, st.end_s)
             else:
                 d.t0_rejected = True
                 d.note = "오늘 판정 없음(개장 밖)"
@@ -241,6 +252,14 @@ class NxtOpenEngine:
             self._evaluate(quote.underlying)
         elif quote.instrument is Instrument.KR_STOCK and quote.market == "nxt":
             self._on_nxt_quote(quote)
+        elif quote.instrument is Instrument.KR_STOCK and quote.market == "uni":
+            # UH1 한 건은 uni → krx → nxt 순으로 갈라져 온다(hotime 같음). uni가 마지막 NXT 호가보다
+            # 새롭거나 같은데 뒤따르는 NXT 호가가 없으면(NXT 한쪽 호가) 마지막 NXT 호가는 낡은 것 —
+            # 같은 건의 NXT 호가가 바로 뒤에 오면 그때 다시 산다. 여기선 판정하지 않는다(같은 건
+            # 사이에서 "호가 없음"을 남기지 않게)
+            d = self._day(quote.underlying)
+            if d.nxt_quote is not None and quote.ts >= d.nxt_quote.ts:
+                d.nxt_stale = True
 
     def _on_fx(self) -> None:
         for u in Underlying:
@@ -262,10 +281,18 @@ class NxtOpenEngine:
         else:
             d.hl_bid_n = level_price(bids, 1)
             d.hl_ask_n = level_price(asks, 1)
-        nq = self._system.quotes.get((u, Instrument.KR_STOCK, "nxt"))
-        s = quote_price(nq.bid, nq.ask, nq.bid_qty, nq.ask_qty) if nq is not None else None
-        if s is not None:  # 호가가 비면(규칙 ①) 마지막 S 유지
-            d.s = s
+        # 현재가 = 호가 필터(§1a) 통과한 NXT 최우선 매도·매수호가의 중간값. 미달이면 지금 틱의
+        # 현재가(s_now)는 없음 — 판정·역산가는 비고, 표시용 S·괴리는 직전값 유지(사용자 2026-11-17
+        # "처음부터 못 구했다면 '-', 중간에 못 구하면 직전값")
+        nq = d.nxt_quote or self._system.quotes.get((u, Instrument.KR_STOCK, "nxt"))
+        if d.nxt_stale:  # NXT가 한쪽 호가뿐 — 마지막 양쪽 호가로 판정하면 안 된다
+            fq = QuoteFilter(why="NXT 호가 없음(한쪽 호가)")
+        else:
+            fq = filter_quote(nq.bids if nq else None, nq.asks if nq else None,
+                              st.sum5_qty, st.exclude_qty, st.min_spread)
+        d.s_now, d.filter_why = fq.price, fq.why
+        if fq.price is not None:
+            d.s = fq.price
         fx = self._system.usdkrw_spot
         d.entry_disp = disparity(fx, d.hl_bid_n, d.s)
         d.exit_disp = disparity(fx, d.hl_ask_n, d.s)
@@ -309,6 +336,20 @@ class NxtOpenEngine:
             return
         if window_state(self._clock(), d.t0, st.start_s, st.end_s) != "open":
             return
+        # 호가 필터(§1a) 미달이면 이 틱은 판정 없음 — 창 끝까지 계속 보고, 사유는 바뀔 때만 상태줄·
+        # 로그(답 5·6). 통과한 틱에만 그 현재가로 판정한다
+        if d.s_now is None:
+            miss = d.filter_why or "현재가 없음"
+            if d.filter_noted != miss:
+                d.filter_noted = miss
+                d.note = miss
+                self._log.info("[NXT개장] %s %s — 판정 안 함", u.value, miss)
+            return
+        if d.filter_noted:  # 통과도 상태 변화 — 옛 미달 사유를 지우고, 다시 막히면 다시 남긴다
+            d.filter_noted = ""
+            d.note = "호가 필터 통과 — 판정 중"
+            self._log.info("[NXT개장] %s 호가 필터 통과(현재가 %s) — 판정 재개", u.value,
+                           f"{d.s_now:,.0f}")
         # 발주된 단은 빼고 판정 — 나머지 단은 창이 끝날 때까지 계속(사용자 2026-10-23)
         plans = judge(d.entry_disp, d.exit_disp, st, d.fired_tiers)
         # §4b 금지: 범위 밖이면 그 단은 이번에 안 내고 발주된 단으로 치지 않는다(창 끝까지 계속
@@ -330,13 +371,16 @@ class NxtOpenEngine:
             return
         d.fired_tiers.update((p.block, p.index) for p in plans)  # 단마다 한 번 — 발주 전에 잠근다
         d.fired, d.fired_wall = True, self._wall()
-        task = asyncio.create_task(self._fire(u, d, plans, d.fired_wall))
+        # 판정한 그 틱의 현재가를 넘긴다 — 태스크가 돌기 전에 다른 시세 이벤트가 s_now를 바꿀 수
+        # 있다
+        task = asyncio.create_task(self._fire(u, d, plans, d.fired_wall, d.s_now))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
     async def _fire(self, u: Underlying, d: DayState, plans: list[Plan],
-                    decided_wall: float | None = None) -> None:
-        fx, s = self._system.usdkrw_spot, d.s
+                    decided_wall: float | None = None, s: float | None = None) -> None:
+        """s = 판정한 그 틱의 현재가(§1a 필터 통과값) — 발주 가격은 이것으로 푼다."""
+        fx = self._system.usdkrw_spot
         info = self._system.instruments.get((u, Instrument.HL_PERP))
         sz_dec = getattr(info, "sz_decimals", None) if info is not None else None
         intents: list[OrderIntent] = []
@@ -499,6 +543,8 @@ class NxtOpenEngine:
                 "fired_tiers": [list(k) for k in sorted(d.fired_tiers)],  # JSON 모양(리스트)
                 "fired_at": _hms(d.fired_wall) if d.fired_wall else None,
                 "s": d.s, "hl_bid": d.hl_bid_n, "hl_ask": d.hl_ask_n,
+                # 호가 필터(§1a) — 지금 틱의 현재가(미달이면 None)와 미달 사유
+                "s_now": d.s_now, "filter_why": d.filter_why,
                 # HL 호가단위 콤보용(체결쏴와 같은 모양) — 지금 가격대의 틱 목록·적용 중인 머지
                 "hl_merge_ticks": self._merge_ticks(u),
                 "hl_merge_active": self._merge_active(u),
@@ -542,7 +588,9 @@ class NxtOpenEngine:
 
     def _tier_prices(self, u: Underlying, d: DayState, tiers: list[Tier],
                      side: Side) -> list[float | None]:
-        fx, s = self._system.usdkrw_spot, d.s
+        # 역산가는 실제 주문가 자리 — 지금 틱의 현재가가 없으면(필터 미달) 바로 "-"(None)(사용자
+        # 2026-11-17 "역산가는 좀 다르지, 실제로 주문 내는 곳이니 현재가 없으면 바로 '-'")
+        fx, s = self._system.usdkrw_spot, d.s_now
         info = self._system.instruments.get((u, Instrument.HL_PERP))
         sz_dec = getattr(info, "sz_decimals", None) if info is not None else None
         out: list[float | None] = []

@@ -79,6 +79,9 @@ def _engine(wall: float) -> tuple[NxtOpenEngine, FakeSystem, Clock, NxtOpenScree
     # NXT 1,729,000 vs HL 매수1 1310 × 1338.4 = 1,753,304 → 진입괴리 +1.406% → 1.2·1.0·0.8 세 단 다
     st.entries = [Tier(0.012, 100, 0.009), Tier(0.010, 100, 0.007), Tier(0.008, 100, 0.005)]
     st.exits = [Tier(-0.004, 100, -0.002), Tier(-0.008, 100, -0.006), Tier(-0.010, 100, -0.008)]
+    # 호가 필터(§1a, 2026-11-17)는 셋 다 필수 — _nxt()의 호가창(잔량 100, 매도 = 매수)이 통과하는
+    # 느슨한 값. 현재가 = (매도 + 매수) × 0.5 = price
+    st.sum5_qty, st.exclude_qty, st.min_spread = 1.0, 0.0, 0.01
     st.run_entry = st.run_exit = True
     eng = NxtOpenEngine(screen, sys_, clock=lambda: clk.mono, wall=lambda: clk.wall)
     # §4b 기준가(2026-10-29): 없으면 전부 금지라 기존 시나리오엔 호가 중간값 1310.25를 잡아 둔다
@@ -87,11 +90,15 @@ def _engine(wall: float) -> tuple[NxtOpenEngine, FakeSystem, Clock, NxtOpenScree
     return eng, sys_, clk, screen
 
 
-def _nxt(price: float) -> Quote:
-    """NXT 1호가(UH1의 NXT 쪽) — 매수1 = 매도1 = price, 잔량 1:1 → S = price(2026-10-28: 체결
-    대신)."""
-    return Quote(underlying=U, instrument=Instrument.KR_STOCK, bid=price, ask=price, ts=0.0,
-                 bid_qty=1.0, ask_qty=1.0, market="nxt")
+def _nxt(price: float, bids: list[tuple[float, float]] | None = None,
+         asks: list[tuple[float, float]] | None = None) -> Quote:
+    """NXT 호가(UH1의 NXT 쪽) — 기본은 매수1 = 매도1 = price, 잔량 100 → 호가 필터(§1a) 통과,
+    현재가 = price. 호가창을 주면 그대로(필터 시험용)."""
+    bids = bids if bids is not None else [(price, 100.0)]
+    asks = asks if asks is not None else [(price, 100.0)]
+    return Quote(underlying=U, instrument=Instrument.KR_STOCK, bid=bids[0][0], ask=asks[0][0],
+                 ts=0.0, bid_qty=bids[0][1], ask_qty=asks[0][1], market="nxt", bids=bids,
+                 asks=asks)
 
 
 async def _settle() -> None:
@@ -474,3 +481,124 @@ async def test_hl_base_captured_at_base_time_only_within_grace() -> None:
     sys2.trades[(U, Instrument.HL_PERP, "hl")] = 1300.0
     eng2._on_quote(sys2.quotes[(U, Instrument.HL_PERP, "hl")])
     assert eng2.live_snapshot()[U.value]["hl_base"] is None
+
+
+async def test_quote_filter_gates_judgment_and_display() -> None:
+    # §1a(사용자 2026-11-17 문답): 필터 미달 틱은 판정 없음(창 끝까지 계속), 사유는 바뀔 때만
+    # 상태줄·로그. 표시: 현재가를 한 번도 못 구했으면 괴리 "-", 중간에 못 구하면 직전값 유지,
+    # 역산가는 지금 틱 현재가가 없으면 바로 "-"(None)
+    eng, sys_, clk, screen = _engine(_wall(8, 0, 1.2))
+    st = screen.of(U)
+    st.sum5_qty, st.exclude_qty, st.min_spread = 300.0, 50.0, 0.005
+    thin = [(1_729_000.0, 100.0), (1_730_000.0, 100.0)]  # 5합 200 < 300 → 조건1 미달
+    eng._on_quote(_nxt(1_729_000.0, bids=thin, asks=thin))  # 첫 호가 — T0는 그대로 잡힌다(답 4)
+    await _settle()
+    snap = eng.live_snapshot()[U.value]
+    assert snap["t0"] is not None and snap["window"] == "before"
+    assert snap["s"] is None and snap["s_now"] is None and snap["entry_disp"] is None  # "-"
+    assert snap["filter_why"] == "조건1 미달 — 매도5호가합 200 < 300"
+    assert snap["entry_prices"] == [None, None, None]
+    clk.advance(1.0)  # 창 안 — 여전히 미달 → 판정 없음, 사유는 상태줄에 한 번
+    eng._on_quote(_nxt(1_729_000.0, bids=thin, asks=thin))
+    await _settle()
+    assert not sys_.placed and eng.live_snapshot()[U.value]["note"] == snap["filter_why"]
+    # 조건 2: 제외수량(50) 이하 잔량의 1호가는 건너뛰고, 조건 3: 스프레드 ≥ 0.5%면 미달
+    asks = [(1_729_000.0, 50.0), (1_740_000.0, 100.0), (1_741_000.0, 100.0), (1_742_000.0, 100.0)]
+    bids = [(1_728_000.0, 50.0), (1_720_000.0, 100.0), (1_719_000.0, 100.0), (1_718_000.0, 100.0)]
+    eng._on_quote(_nxt(1_729_000.0, bids=bids, asks=asks))  # 1,740,000 vs 1,720,000 → 1.149%
+    await _settle()
+    assert not sys_.placed
+    assert eng.live_snapshot()[U.value]["note"] == "조건3 미달 — 호가스프레드 1.149% ≥ 0.5%"
+    # 통과: 최우선 매도 1,730,000·매수 1,728,000(1호가 50은 제외) → 현재가 1,729,000 → 진입 세 단
+    asks = [(1_729_500.0, 50.0), (1_730_000.0, 200.0), (1_731_000.0, 100.0)]
+    bids = [(1_729_000.0, 50.0), (1_728_000.0, 200.0), (1_727_000.0, 100.0)]
+    eng._on_quote(_nxt(1_729_000.0, bids=bids, asks=asks))
+    await _settle()
+    snap = eng.live_snapshot()[U.value]
+    assert snap["s"] == 1_729_000.0 and snap["s_now"] == 1_729_000.0 and snap["filter_why"] is None
+    assert len(sys_.placed) == 1 and sys_.placed[0][0].price == 1303.5  # 1,729,000 기준 주문가
+    assert abs(snap["entry_disp"] - 0.014056) < 1e-5
+    # 다시 미달 — 괴리 수치는 직전값 유지, 역산가(청산 단은 아직 안 나감)는 바로 "-"
+    eng._on_quote(_nxt(1_729_000.0, bids=thin, asks=thin))
+    await _settle()
+    snap = eng.live_snapshot()[U.value]
+    assert snap["s"] == 1_729_000.0 and snap["s_now"] is None
+    assert abs(snap["entry_disp"] - 0.014056) < 1e-5 and snap["exit_prices"] == [None] * 3
+    assert snap["note"] == "조건1 미달 — 매도5호가합 200 < 300" and len(sys_.placed) == 1
+
+
+async def test_one_sided_nxt_quote_marks_last_quote_stale_and_pass_clears_note() -> None:
+    # 검토 2026-11-17 지적 2: NXT가 한쪽 호가만 남으면 파서가 NXT Quote를 안 만들어 마지막 양쪽
+    # 호가가 남는다 — 같은 UH1 건의 통합(uni) 호가가 더 새로우면 낡은 것으로 보고, HL·환율 이벤트로
+    # 판정이 돌아도 그 호가로 발주하지 않는다. 지적 5: 통과하면 옛 미달 사유를 지운다
+    eng, sys_, clk, screen = _engine(_wall(8, 0, 1.2))
+    st = screen.of(U)
+    st.run_entry = False                          # 청산 쪽만 — 진입 세 단이 바로 나가지 않게
+    st.sum5_qty, st.exclude_qty, st.min_spread = 100.0, 0.0, 0.005
+    sys_.trades[(U, Instrument.HL_PERP, "hl")] = 1310.0
+    thin = [(1_770_000.0, 10.0)]                  # 5합 10 < 100 → 조건1 미달
+    q = _nxt(1_770_000.0, bids=thin, asks=thin)
+    q = q.model_copy(update={"ts": 80000.0})
+    eng._on_quote(q)
+    clk.advance(1.0)
+    eng._on_quote(q)                              # 창 안 — 미달 사유 상태줄
+    await _settle()
+    assert eng.live_snapshot()[U.value]["note"] == "조건1 미달 — 매도5호가합 10 < 100"
+    good = _nxt(1_770_000.0).model_copy(update={"ts": 80001.0})  # 통과(현재가 1,770,000)
+    st.exits = [Tier(-0.5, 10, -0.002)]           # 괴리 −2.4% > −50% → 아직 안 맞음(발주 없음)
+    eng._on_quote(good)
+    await _settle()
+    assert not sys_.placed
+    assert eng.live_snapshot()[U.value]["note"] == "호가 필터 통과 — 판정 중"
+    # 같은 건의 uni(같은 ts)가 먼저 오고 NXT가 뒤따르면 낡지 않는다
+    uni = Quote(underlying=U, instrument=Instrument.KR_STOCK, bid=1_770_000.0, ask=1_770_000.0,
+                ts=80001.0, market="uni")
+    eng._on_quote(uni)
+    eng._on_quote(good)
+    assert eng.live_snapshot()[U.value]["s_now"] == 1_770_000.0
+    # 다음 건은 uni만(NXT 한쪽 호가) → 마지막 NXT 호가는 낡음 → HL 이벤트로 판정이 돌아도 발주 없음
+    st.exits = [Tier(-0.004, 10, -0.002)]         # 괴리 −2.4% ≤ −0.4% → 호가가 살아 있으면 발주
+    eng._on_quote(uni.model_copy(update={"ts": 80002.0}))
+    eng._on_quote(sys_.quotes[(U, Instrument.HL_PERP, "hl")])
+    await _settle()
+    snap = eng.live_snapshot()[U.value]
+    assert not sys_.placed and snap["s_now"] is None
+    assert snap["note"] == "NXT 호가 없음(한쪽 호가)" and snap["s"] == 1_770_000.0  # 표시 직전값
+    # 양쪽 호가가 다시 오면 그 틱에 발주
+    eng._on_quote(good.model_copy(update={"ts": 80003.0}))
+    await _settle()
+    assert [o.tag for o in sys_.placed[-1]] == ["청산1"]
+
+
+def test_core_settings_log_tolerates_blank_filters(caplog: Any) -> None:
+    # 검토 2026-11-17 지적 3: 필터 칸이 비면(None) 설정 저장 로그 줄이 %g 때문에 깨지면 안 된다
+    import logging
+
+    state = CoreState()
+    body = {"cmd": "nxt_open_settings", "underlying": "sk_hynix",
+            "sum5_qty": None, "exclude_qty": 0, "min_spread": None}
+    with caplog.at_level(logging.INFO, logger="kp_arb.nxt_open"):
+        assert _nxt_open_command(None, state, body)["ok"]
+    line = [r.getMessage() for r in caplog.records if "설정 저장" in r.getMessage()][-1]
+    assert "5호가합 - 호가제외수량 0 최소호가스프레드 -" in line
+    st = state.nxt_open.of(U)
+    assert (st.sum5_qty, st.exclude_qty, st.min_spread) == (None, 0.0, None)
+    assert _nxt_open_command(None, state, {**body, "sum5_qty": 0})["errors"] == ["5호가합은 양수만"]
+
+
+def test_core_run_refuses_when_quote_filter_blank() -> None:
+    # 답 6 "가": 호가 필터 3칸은 셋 다 필수 — 비면 실행 켜기 거부(단 검사 다음)
+    state = CoreState()
+    st = state.nxt_open.of(U)
+    st.entries = [Tier(0.012, 100, 0.009)]
+    clk = Clock(_wall(7, 50, 0.0))
+    eng = NxtOpenEngine(state.nxt_open, FakeSystem(), clock=lambda: clk.mono,
+                        wall=lambda: clk.wall)
+    run = {"cmd": "nxt_open_run", "underlying": "sk_hynix", "block": "entry", "value": True}
+    assert _nxt_open_command(eng, state, run)["errors"] == [
+        "호가 필터 값 없음: 5호가합·호가제외수량·최소호가스프레드"]
+    st.sum5_qty, st.exclude_qty = 1000.0, 0.0
+    assert _nxt_open_command(eng, state, run)["errors"] == ["호가 필터 값 없음: 최소호가스프레드"]
+    st.min_spread = 0.003
+    assert _nxt_open_command(eng, state, run)["ok"] and st.run_entry
+    assert _nxt_open_command(eng, state, {**run, "value": False})["ok"]  # 끄기는 검사 없음

@@ -15,6 +15,8 @@ from kp_arb.nxt_open import (
     base_due,
     day_over,
     disparity,
+    filter_quote,
+    filter_settings_error,
     hl_current,
     hotime_text,
     judge,
@@ -169,11 +171,21 @@ def test_settings_roundtrip_and_validation() -> None:
     st.sum5_qty, st.exclude_qty, st.min_spread = 1000.0, 30.0, 0.003
     back3 = settings_from_dict(asdict(st))
     assert (back3.sum5_qty, back3.exclude_qty, back3.min_spread) == (1000.0, 30.0, 0.003)
+    # 비거나 틀린 값은 없음(None) — 셋 다 필수(답 6 "가")라 0과 빈칸을 가른다(0은 0으로 복원)
     dflt = settings_from_dict({"sum5_qty": -1, "exclude_qty": "x", "min_spread": 0})
-    assert (dflt.sum5_qty, dflt.exclude_qty, dflt.min_spread) == (0.0, 0.0, None)
+    assert (dflt.sum5_qty, dflt.exclude_qty, dflt.min_spread) == (None, None, None)
+    assert settings_from_dict({"exclude_qty": 0}).exclude_qty == 0.0
+    # 5호가합 0은 하한이 아니라 빈칸(앞 판이 빈칸을 0으로 저장했던 값도 빈칸으로 돌아온다)
+    assert settings_from_dict({"sum5_qty": 0}).sum5_qty is None
+    assert NxtOpenSettings().sum5_qty is None
     st4 = NxtOpenSettings()
     assert apply_settings(st4, {"sum5_qty": 500, "exclude_qty": 10, "min_spread": 0.002}) == []
     assert (st4.sum5_qty, st4.exclude_qty, st4.min_spread) == (500.0, 10.0, 0.002)
+    assert apply_settings(st4, {"sum5_qty": None}) == [] and st4.sum5_qty is None  # 지움
+    # 0 이하를 적으면 거부(빈칸과 구분 — "값 없음"이 나오는 혼동 방지), 호가제외수량 0은 허용
+    assert apply_settings(st4, {"sum5_qty": 0}) == ["5호가합은 양수만"]
+    assert apply_settings(st4, {"min_spread": -0.001}) == ["최소호가스프레드는 양수만"]
+    assert apply_settings(st4, {"exclude_qty": 0}) == [] and st4.exclude_qty == 0.0
     assert apply_settings(st4, {"entries": [{"spread": 0.01, "qty": 1, "price_spread": 0.0,
                                             "target_profit": -0.001}]}) == ["목표수익률은 양수만"]
     assert apply_settings(st4, {"exits": [{"target_profit": -1}]}) == ["목표수익률은 양수만"]
@@ -282,3 +294,52 @@ def test_hotime_text_for_diag_log() -> None:
     # §6 임시 진단 로그(2026-10-30): LS 호가의 거래소 시각 HHMMSS → "HH:MM:SS", 없으면 "-"
     assert hotime_text(80001.0) == "08:00:01" and hotime_text(235959.0) == "23:59:59"
     assert hotime_text(0.0) == "-" and hotime_text(None) == "-" and hotime_text(240000.0) == "-"
+
+
+def test_quote_filter_conditions_in_order() -> None:
+    # §1a(사용자 2026-11-17 문답): NXT 호가창 상위 5단계, 조건 1 → 2 → 3 순서, 통과하면
+    # 현재가 = (최우선 매도 + 매수) × 0.5
+    asks = [(1_001_000.0, 10.0), (1_002_000.0, 40.0), (1_003_000.0, 500.0), (1_004_000.0, 100.0),
+            (1_005_000.0, 100.0), (1_006_000.0, 9_000.0)]   # 6단계째는 합에 안 들어감
+    bids = [(1_000_000.0, 20.0), (999_000.0, 300.0), (998_000.0, 100.0), (997_000.0, 100.0),
+            (996_000.0, 100.0)]
+    # 통과: 매도 5합 750·매수 5합 620 ≥ 600 / 제외 40 → 최우선 매도 1,003,000(10·40 건너뜀 — 40은
+    # "보다 큰"이 아니라 제외)·매수 999,000(20 건너뜀) / 스프레드 4,000/1,003,000 = 0.399% < 0.5%
+    ok = filter_quote(bids, asks, 600.0, 40.0, 0.005)
+    assert ok.why is None and (ok.ask, ok.bid) == (1_003_000.0, 999_000.0)
+    assert ok.price == 1_001_000.0
+    assert filter_quote(bids, asks, 600.0, 30.0, 0.005).ask == 1_002_000.0  # 40 > 30은 포함
+    # 조건 1: 한쪽이라도 5합 미달(6단계째 9,000은 안 센다)
+    assert filter_quote(bids, asks, 700.0, 40.0, 0.005).why == (
+        "조건1 미달 — 매수5호가합 620 < 700")
+    assert filter_quote(bids, asks, 751.0, 40.0, 0.005).why == (
+        "조건1 미달 — 매도5호가합 750 < 751")
+    # 조건 2: 제외수량과 같은 잔량은 건너뜀("보다 큰"); 5단계 안에 없으면 미달
+    assert filter_quote(bids, asks, 600.0, 100.0, 0.01).ask == 1_003_000.0
+    assert filter_quote(bids, asks, 600.0, 300.0, 0.01).why == (
+        "조건2 미달 — 제외수량 300 넘는 매수호가 없음")
+    assert filter_quote(bids, asks, 600.0, 500.0, 0.01).why == (
+        "조건2 미달 — 제외수량 500 넘는 매도·매수호가 없음")
+    # 조건 3: 스프레드가 최소호가스프레드 이상이면 미달(등호 포함), 분모는 매도호가
+    assert filter_quote(bids, asks, 600.0, 40.0, 0.003).why == (
+        "조건3 미달 — 호가스프레드 0.399% ≥ 0.3%")
+    assert filter_quote([(1000.0, 5.0)], [(1000.0, 5.0)], 1.0, 0.0, 0.001).price == 1000.0
+    # 경계(검토 2026-11-17): 조건 1은 합 == 5호가합이면 통과, 조건 3은 스프레드 == 최소면 미달
+    assert filter_quote(bids, asks, 620.0, 40.0, 0.005).why is None
+    assert filter_quote([(999.0, 100.0)], [(1000.0, 100.0)], 1.0, 0.0, 0.001).why == (
+        "조건3 미달 — 호가스프레드 0.100% ≥ 0.1%")
+    assert filter_quote([(999.0, 100.0)], [(1000.0, 100.0)], 1.0, 0.0, 0.0011).price == 999.5
+    # 5단계가 안 되면 있는 만큼 더한다; 양쪽 다 모자라면 매도 쪽 사유
+    assert filter_quote([(999.0, 10.0)], [(1000.0, 10.0)], 11.0, 0.0, 0.01).why == (
+        "조건1 미달 — 매도5호가합 10 < 11")
+    # 값이 비었거나 호가가 없으면 판정 불가
+    assert filter_quote(bids, asks, None, 30.0, 0.005).why == "호가 필터 값 없음"
+    assert filter_quote([], asks, 1.0, 0.0, 0.01).why == "NXT 호가 없음"
+    assert filter_quote(None, None, 1.0, 0.0, 0.01).why == "NXT 호가 없음"
+    # 실행 켜기 가드: 셋 다 필수(답 6 "가")
+    st = NxtOpenSettings()
+    assert filter_settings_error(st) == "호가 필터 값 없음: 5호가합·호가제외수량·최소호가스프레드"
+    st.sum5_qty, st.exclude_qty = 100.0, 0.0
+    assert filter_settings_error(st) == "호가 필터 값 없음: 최소호가스프레드"
+    st.min_spread = 0.003
+    assert filter_settings_error(st) is None
