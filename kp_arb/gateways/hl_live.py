@@ -297,9 +297,26 @@ class HLSdkGateway(HLGateway):
         # HL 주문은 **지정가만**(사용자 확정 2026-09-04, 재확인 2026-09-14: "무조건 지정가"). 옛
         # 시장가→IOC(마크 ±1%) 대용 경로는 Claude가 임의로 둔 것이라 삭제 — 지정가가 아니면 거부.
         if intent.order_type is not OrderType.LIMIT or intent.price is None:
-            raise HLError("HL 주문은 지정가(가격 필수)만 — 시장가·IOC 없음")
-        # post_only는 HL의 Alo(Add-Liquidity-Only=메이커 전용) tif.
-        tif = "Alo" if intent.post_only else "Gtc"
+            raise HLError("HL 주문은 지정가(가격 필수)만 — 시장가 없음")
+        if intent.priority_p:
+            # 우선수수료 p는 action의 grouping이라 SDK order()엔 넣을 수 없다 — 한 건짜리 묶음으로
+            # (DESIGN-hl-priority-fee §4). 결과는 묶음 결과 한 건을 단건 규약(oid 또는 예외)으로.
+            # 통신 오류·응답 없음(comm)은 **거부가 아니라 결과 모름** — OSError 계열로 올려 호출부
+            # (자동M _is_comm_error)가 재발주하지 않게 한다(검토 2026-11-17 H1, L11)
+            sent = int(time.time() * 1000)
+            res = (await self._place_group([intent], [cloid]))[0]
+            if res.order_id is None:
+                if res.comm:
+                    raise ConnectionError(res.error or "HL 응답 없음(결과 모름)")
+                raise HLError(res.error or "HL order not accepted")
+            self._last_place_fill = res.fill
+            order_log.logger_for(Venue.HYPERLIQUID).info(  # 지연 리포트가 읽는 줄(report_latency)
+                "HL 발주 왕복 %d ms #%s cloid=%s", int(time.time() * 1000) - sent, res.order_id,
+                cloid or "-")
+            return res.order_id
+        # post_only는 HL의 Alo(Add-Liquidity-Only=메이커 전용) tif. 코어가 우선수수료 구간에서
+        # tif "Ioc"를 채우면 IOC(DESIGN-hl-priority-fee).
+        tif = self._tif_of(intent)
         order_type: dict[str, Any] = {"limit": {"tif": tif}}
         price = float(intent.price)
         order_log.order_requested(intent, price=price)  # 보내기 직전(응답 전) — 단계 추적
@@ -347,14 +364,17 @@ class HLSdkGateway(HLGateway):
         지정가가 아닌 주문은 보내지 않고 그 자리에 사유를 돌려준다.
         """
         out: list[PlaceResult | None] = [None] * len(intents)
-        groups: dict[bool, list[int]] = {True: [], False: []}
+        # 묶음 키 = (post_only, tif, 우선수수료 p) — 한 요청(action)은 같은 tif·같은 grouping이어야
+        # 한다(DESIGN-hl-priority-fee §4: p는 전부 IOC거나 전부 ALO일 때만, 요청 단위)
+        groups: dict[tuple[bool, str, int | None], list[int]] = {}
         for i, intent in enumerate(intents):
             if intent.venue is not Venue.HYPERLIQUID:
                 out[i] = PlaceResult(None, error="HLSdkGateway only handles Hyperliquid orders")
             elif intent.order_type is not OrderType.LIMIT or intent.price is None:
-                out[i] = PlaceResult(None, error="HL 주문은 지정가(가격 필수)만 — 시장가·IOC 없음")
+                out[i] = PlaceResult(None, error="HL 주문은 지정가(가격 필수)만 — 시장가 없음")
             else:
-                groups[bool(intent.post_only)].append(i)
+                groups.setdefault((bool(intent.post_only), self._tif_of(intent),
+                                   intent.priority_p), []).append(i)
 
         async def send(indexes: list[int]) -> None:
             picked = [intents[i] for i in indexes]
@@ -368,7 +388,9 @@ class HLSdkGateway(HLGateway):
 
     async def _place_group(self, intents: Sequence[OrderIntent],
                            cloids: Sequence[str | None]) -> list[PlaceResult]:
-        """같은 성격(ALO끼리 또는 GTC끼리)의 주문을 요청 하나로 보내고 건별 결과로 나눈다."""
+        """같은 성격(같은 tif·같은 우선수수료 p)의 주문을 요청 하나로 보내고 건별 결과로 나눈다.
+        p가 있으면 action의 grouping을 {"p": p}로(SDK bulk_orders의 grouping 인자 — DESIGN-hl-
+        priority-fee §4)."""
         from hyperliquid.utils.types import Cloid
 
         log = order_log.logger_for(Venue.HYPERLIQUID)
@@ -378,18 +400,30 @@ class HLSdkGateway(HLGateway):
             req: dict[str, Any] = {
                 "coin": self._symbol(intent.underlying), "is_buy": intent.side is Side.BUY,
                 "sz": float(intent.qty), "limit_px": float(intent.price),
-                "order_type": {"limit": {"tif": "Alo" if intent.post_only else "Gtc"}},
+                "order_type": {"limit": {"tif": self._tif_of(intent)}},
                 "reduce_only": intent.reduce_only}
             if cloid:
                 req["cloid"] = Cloid.from_str(cloid)
             reqs.append(req)
             order_log.order_requested(intent, price=float(intent.price))
-        self._log_wire_many(reqs)
+        p = intents[0].priority_p if intents else None
+        grouping: Any = {"p": int(p)} if p else "na"
+        if p and any(r["order_type"]["limit"]["tif"] == "Gtc" for r in reqs):
+            # 문서: p는 전부 IOC거나 전부 ALO일 때만 — GTC에 붙여 보내면 요청째 거부. 보내지 않는다
+            msg = "우선수수료 p는 IOC/ALO 주문에만 — GTC 주문에 붙음(코어 버그)"
+            for intent in intents:
+                order_log.order_rejected(intent, msg)
+            return [PlaceResult(None, error=msg, whole=True) for _ in intents]
+        self._log_wire_many(reqs, grouping)
         sent_ms = int(time.time() * 1000)
         failure: Exception | None = None
         resp: Any = None
         try:
-            resp = await self._exchange_action("orders", self._ex.bulk_orders, reqs)
+            if p:
+                resp = await self._exchange_action("orders", self._ex.bulk_orders, reqs,
+                                                   grouping=grouping)
+            else:
+                resp = await self._exchange_action("orders", self._ex.bulk_orders, reqs)
         except Exception as exc:  # noqa: BLE001 - 통신 오류·시간 초과 = 결과 모름(아래 cloid 조회)
             failure = exc
         took = int(time.time() * 1000) - sent_ms
@@ -449,8 +483,9 @@ class HLSdkGateway(HLGateway):
         self._order_ctx[oid] = (req["coin"], bool(req["is_buy"]), float(intent.qty),
                                 float(req["limit_px"]))
 
-    def _log_wire_many(self, reqs: Sequence[dict[str, Any]]) -> None:
-        """묶음 발주의 요청 패킷(action) 기록 — 한 건짜리 _log_wire와 같은 형식, orders 여러 개."""
+    def _log_wire_many(self, reqs: Sequence[dict[str, Any]], grouping: Any = "na") -> None:
+        """묶음 발주의 요청 패킷(action) 기록 — 한 건짜리 _log_wire와 같은 형식, orders 여러 개.
+        grouping은 실제로 보내는 값({"p": n} 또는 "na")을 그대로."""
         try:
             from hyperliquid.utils.signing import (
                 order_request_to_order_wire,
@@ -461,7 +496,8 @@ class HLSdkGateway(HLGateway):
                      for r in reqs]
             order_log.logger_for(Venue.HYPERLIQUID).info(
                 "HL 요청패킷(묶음 %d건) %s", len(reqs),
-                json.dumps(order_wires_to_order_action(wires), ensure_ascii=False))
+                json.dumps(order_wires_to_order_action(wires, None, grouping),
+                           ensure_ascii=False))
         except Exception as exc:  # noqa: BLE001 - 로그용
             order_log.logger_for(Venue.HYPERLIQUID).warning("HL 요청패킷 기록 실패: %s", exc)
 
@@ -534,6 +570,14 @@ class HLSdkGateway(HLGateway):
                 "HL 요청패킷 %s", json.dumps(action, ensure_ascii=False))
         except Exception as exc:  # noqa: BLE001 - 로그용
             order_log.logger_for(Venue.HYPERLIQUID).warning("HL 요청패킷 기록 실패: %s", exc)
+
+    @staticmethod
+    def _tif_of(intent: OrderIntent) -> str:
+        """HL tif — 코어가 우선수수료 구간에서 "Ioc"를 채우면 Ioc, 아니면 post_only → Alo, 그 밖 Gtc
+        (DESIGN-hl-priority-fee §4)."""
+        if intent.tif == "Ioc":
+            return "Ioc"
+        return "Alo" if intent.post_only else "Gtc"
 
     @staticmethod
     def _parse_place_fill(resp: dict[str, Any]) -> tuple[float, float] | None:

@@ -3,17 +3,15 @@
     python -m kp_arb.report_sprd 20260928 logs   # logs/autom_*_20260928.log → sprd_20260928.csv
     python tools/round_sprd.py 20260928          # real_log/ 기본(운영 로그 복사본)
 
-세 상품을 모두 읽는다(로그 파일 이름으로 구분):
+두 상품을 읽는다(로그 파일 이름으로 구분; HL선 `_sf_hl_first_`는 2026-11-18 제거 — 결정 93):
     autom_<종목>_<날짜>.log              주식선물: 선주문 LS SF → 후주문 HL
     autom_<종목>_stock_<날짜>.log        주식:     선주문 LS 주식 → 후주문 HL
-    autom_<종목>_sf_hl_first_<날짜>.log  HL선:     선주문 HL → 후주문 LS SF
 
 한 판 = 같은 다리(진입|청산)의 선주문 체결 줄들 + 후주문 체결 줄들, 후주문 대기가 0이 되는 줄에서
 끝난다. 중지(halt)로 끝난 미완 판은 **뽑지 않는다**(장부엔 짝 맞은 몫만 들어가지만 Sprd 인자가
-한 판 값이 아님). 판 Sprd는 그 판의 인자만으로 다시 계산한다(exec §10·§7C·§7D, 결정 48):
+한 판 값이 아님). 판 Sprd는 그 판의 인자만으로 다시 계산한다(exec §10·§7C, 결정 48):
     주식선물: (환 × HL평균 − S현재가)/S현재가 − (SF평균 − SF이론가)/SF이론가
     주식:     (환 × HL평균 − S체결평균)/S체결평균          (S = 그 판의 주식 평균 체결가)
-    HL선:     주식선물과 같은 식(HL평균 = HL 선주문, SF평균 = LS 후주문)
 '누적Sprd'는 로그에 찍힌 세트 누적값(장부 기준) — 판 값과 다른 게 정상(가중 평균).
 '주문Sprd'(사용자 2026-10-22)는 그 판에 쓰인 세트 기준값(진입: 주식 진입S·그 외 진입SF, 청산: 청산)
 — 로그의 실행 켬·끔 줄과 세트 설정 줄에서 마지막 값. '주문-판Sprd'는 그 차이.
@@ -29,7 +27,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-_TAG = (r"(?P<tag>(?:(?P<head>주식|HL선) )?(?P<dir>정방향|역방향) (?P<set>\d+)세트 "
+from .domain.enums import Underlying
+
+_TAG = (r"(?P<tag>(?:(?P<head>주식) )?(?P<dir>정방향|역방향) (?P<set>\d+)세트 "
         r"(?P<leg>진입|청산))")
 _NUM = r"[-+]?[\d.,]+(?:[eE][-+]?\d+)?"
 # 완료일·완료시각을 따로(사용자 2026-10-22 "초단위까지") — 한 칸에 "2026-09-28 10:03:53"로 두면
@@ -42,25 +42,26 @@ _RE_TS = re.compile(r"^(?P<day>\d{4}-\d{2}-\d{2}) (?P<hms>\d{2}:\d{2}:\d{2}),\d+
 _SETVALS = r".*?진입SF (?P<en_sf>\S+) 진입S (?P<en_s>\S+) 청산 (?P<ex_sf>\S+)"
 _RE_CMD = re.compile(rf"명령 {_TAG}: 실행 (?:켬|끔) \|{_SETVALS}")
 _RE_SET = re.compile(
-    rf"세트 설정 (?:(?:주식|HL선) )?(?P<dir>정방향|역방향) (?P<set>\d+)세트:{_SETVALS}")
-# 선주문 체결 — LS(주식선물·주식): "선주문 #123 1 @ 270000", HL선: "HL 선주문 #123 1 @ 201.5"
+    rf"세트 설정 (?:주식 )?(?P<dir>정방향|역방향) (?P<set>\d+)세트:{_SETVALS}")
+# 선주문 체결 — LS(주식선물·주식): "선주문 #123 1 @ 270000"
 _RE_PRE = re.compile(
-    rf"체결 {_TAG}: (?P<hl>HL )?선주문 #\S+ (?P<qty>{_NUM}) @ (?P<px>{_NUM})")
+    rf"체결 {_TAG}: 선주문 #\S+ (?P<qty>{_NUM}) @ (?P<px>{_NUM})")
 # 후주문 체결 — HL(주식선물·주식): "후주문 #.. HL 8.046 @ 201.22 ... 환진입가 x S현재가 y
-#   SF이론가 z → RT n HL대기 w ... Sprd s" / HL선: "LS 후주문 #.. SF 1 @ 275,000 ... LS대기 w"
+#   SF이론가 z → RT n HL대기 w ... Sprd s"
 _RE_POST = re.compile(
-    rf"체결 {_TAG}: (?P<ls>LS )?후주문 #\S+ (?:HL|SF) (?P<qty>{_NUM}) @ (?P<px>{_NUM}) .*?"
+    rf"체결 {_TAG}: 후주문 #\S+ HL (?P<qty>{_NUM}) @ (?P<px>{_NUM}) .*?"
     # RT는 역방향이면 0 또는 음수(§7A) — 부호를 안 받으면 역방향 판이 통째로 빠진다
     rf"환진입가 (?P<fx>\S+) S현재가 (?P<s>\S+) SF이론가 (?P<th>\S+) → RT (?P<rt>-?\d+) "
-    rf"(?:HL|LS)대기 (?P<wait>{_NUM}) .*?Sprd (?P<sprd>\S+)")
+    rf"HL대기 (?P<wait>{_NUM}) .*?Sprd (?P<sprd>\S+)")
 _RE_HALT = re.compile(rf"행동 {_TAG}: halt\b")
 _RE_FILE = re.compile(
-    r"^autom_(?P<under>.+?)(?P<suffix>_stock|_sf_hl_first)?_(?P<day>\d{8})\.log$")
+    r"^autom_(?P<under>.+?)(?P<suffix>_stock)?_(?P<day>\d{8})\.log$")
 
 COLUMNS = ("완료일", "완료시각", "종목", "상품", "방향", "세트", "다리", "RT", "선주문수량",
            "선주문평균가", "후주문수량", "후주문평균가", "환진입가", "S현재가", "SF이론가",
            "주문Sprd(%)", "판Sprd(%)", "주문-판Sprd(%)", "누적Sprd(%)", "파일")
-_PRODUCT_NAME = {"stock": "주식", "sf_hl_first": "HL선"}
+_PRODUCT_NAME = {"stock": "주식"}
+_UNDERLYINGS = frozenset(u.value for u in Underlying)  # 로그 파일 이름의 종목 칸 검증용
 
 
 def order_sprd(product: str, leg: str, setvals: dict[str, float | None] | None) -> float | None:
@@ -113,16 +114,13 @@ class _Round:
 
 def round_sprd(product: str, pre_avg: float | None, post_avg: float | None,
                fx: float | None, s_last: float | None, theory: float | None) -> float | None:
-    """한 판의 정산 Sprd(exec §10·§7C·§7D, 결정 48). 인자가 모자라면 None. 순수."""
+    """한 판의 정산 Sprd(exec §10·§7C, 결정 48). 인자가 모자라면 None. 순수."""
     if product == "stock":
         if None in (fx, post_avg, pre_avg) or not pre_avg:
             return None
         assert fx is not None and post_avg is not None and pre_avg is not None
         return (fx * post_avg - pre_avg) / pre_avg
-    if product == "sf_hl_first":
-        hl, sf = pre_avg, post_avg
-    else:
-        hl, sf = post_avg, pre_avg
+    hl, sf = post_avg, pre_avg
     if None in (fx, hl, sf, s_last, theory) or not s_last or not theory:
         return None
     assert fx is not None and hl is not None and sf is not None
@@ -218,8 +216,10 @@ def collect(log_dir: Path, day: str) -> list[dict[str, Any]]:
         m = _RE_FILE.match(path.name)
         if m is None:
             continue
+        if m.group("under") not in _UNDERLYINGS:
+            continue  # 옛 HL선 로그(autom_<종목>_sf_hl_first_…, 2026-11-18 제거) 등 모르는 이름
         suffix = m.group("suffix") or ""
-        product = {"_stock": "stock", "_sf_hl_first": "sf_hl_first"}.get(suffix, "sf")
+        product = "stock" if suffix == "_stock" else "sf"
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:

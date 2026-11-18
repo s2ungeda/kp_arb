@@ -58,6 +58,7 @@ from .strategy_core import (
     apply_balance_watch,
     apply_disconnect_actions,
     apply_dividend,
+    apply_hl_priority_fee,
     dividend_rate,
     parse_operating_hours,
     state_from_dict,
@@ -102,8 +103,8 @@ HISTORY_LIMIT_MAX = 1000
 # --- LS 실시간 구독 계획(DESIGN-ls-xing §9, 2026-10-23 "전략이 쓰는 시세만") ---
 
 def quote_plan_input(state: CoreState, system: Any) -> QuotePlanInput:
-    """설정·종목 상태 → 구독 계획 재료(순수). 종목 = 공통설정 체크, 주식선물 월물 = 주식선물·HL선
-    종목 상태의 월물 합집합(없으면 근월물), 원달러 = 공통설정이 고른 월물. 주식 호가는 통합(UH1)
+    """설정·종목 상태 → 구독 계획 재료(순수). 종목 = 공통설정 체크, 주식선물 월물 = 주식선물
+    종목 상태의 월물(없으면 근월물), 원달러 = 공통설정이 고른 월물. 주식 호가는 통합(UH1)
     하나라 체결쏴 주식의 거래소는 계획과 무관(2026-10-27 오후). system에서는 선물 코드·원달러
     코드만 읽는다(없으면 빈 값)."""
     from .auto_m import book_key
@@ -111,7 +112,7 @@ def quote_plan_input(state: CoreState, system: Any) -> QuotePlanInput:
     on = frozenset(u for u in Underlying if state.settings.quote_symbols.get(u.value, False))
     months: dict[Underlying, frozenset[str]] = {}
     for u in Underlying:
-        used = {bk.future_month for product in ("sf", "sf_hl_first")
+        used = {bk.future_month for product in ("sf",)
                 if (bk := state.autom.books.get(book_key(u, product))) is not None}
         # 동시호가 주문 화면의 월물도 합친다(2026-11-13 수정 — 10-26 동시호가를 만들 때 빠뜨려
         # 동시호가만 차근을 고르면 차근 시세가 등록되지 않았다; 사용자 "큰일날 뻔")
@@ -450,6 +451,9 @@ def apply_command(  # noqa: PLR0911 - 명령 분기표
             apply_balance_watch(g.balance_watch, body.get("balance_watch"))
             # 주식선물 배당율(DESIGN-settings §2, 2026-11-13) — 음수·100% 이상이면 ValueError → 거부
             apply_dividend(g.dividend, body.get("dividend"))
+            # HL 우선수수료(IOC) 시간구간(DESIGN-hl-priority-fee, 2026-11-17) — 틀리면 ValueError
+            # → 거부
+            apply_hl_priority_fee(g.hl_priority_fee, body.get("hl_priority_fee"))
             return _ok()
         if cmd == "fx_month":  # 환율 표시용 원달러선물 월물 (§6.2-7)
             choice = str(body["choice"])
@@ -761,13 +765,6 @@ def _autom_set_from_body(target: Any, body: dict[str, Any]) -> None:
         if offset < 0:
             raise ValueError(f"시작호가는 0 이상이어야 함: {offset}")
         target.price_offset = offset
-    # HL선 선주문 주문단위·시작호가(USD, 결정 55) — 0 = 격자 그대로 / 0 기준
-    for key in ("hl_unit", "hl_offset"):
-        if key in body:
-            val = float(body[key] or 0.0)
-            if val < 0:
-                raise ValueError(f"{key}는 0 이상이어야 함: {val}")
-            setattr(target, key, val)
     for key in ("en_sf", "en_s", "ex_sf"):
         if key in body:
             setattr(target, key, _opt_float(body[key]))
@@ -934,7 +931,6 @@ async def _autom_command(
     cmd = body.get("cmd")
     am = state.autom
     # 상품(exec §7C, 2026-09-17): "sf" 주식선물(기본) / "stock" 주식 — 종목 상태·설정·엔진이 따로
-    # "sf_hl_first" = 주식선물 HL선(선주문 HL ALO·후주문 LS, exec §7D 시험 2026-09-22)
     from .auto_m import PRODUCTS
 
     product = str(body.get("product", "sf"))
@@ -1606,7 +1602,6 @@ def make_app(
     hub: WsHub | None = None,
     autom: AutoMEngine | None = None,
     autom_stock: AutoMEngine | None = None,  # 주식 체결쏴 엔진(exec §7C, 2026-09-17)
-    autom_hl_first: AutoMEngine | None = None,  # 주식선물 HL선 엔진(exec §7D 시험, 2026-09-22)
     nxt_open: NxtOpenEngine | None = None,  # 오전 NXT 개장 매매 엔진(DESIGN-nxt-open, 2026-10-20)
     auction: AuctionOrderEngine | None = None,  # 동시호가 주문 엔진(DESIGN-auction-order, 10-26)
     balance: BalanceWatcher | None = None,  # 토탈잔고 감시(DESIGN-balance-watch, 11-11) — 기준·현재
@@ -1626,6 +1621,8 @@ def make_app(
         if hasattr(system, "set_quote_probe"):
             system.set_quote_probe(state.settings.quote_probe)
         system.set_carry_rates(state.settings.fx_carry_rate, state.settings.eq_carry_rate)
+        if hasattr(system, "set_hl_priority_fee"):  # HL 우선수수료(IOC) 구간 — 테스트 가짜엔 없다
+            system.set_hl_priority_fee(state.settings.hl_priority_fee)
         system.set_fx_fut_window(state.settings.fx_fut_start, state.settings.fx_fut_end,
                                   state.settings.fx_fut_start2, state.settings.fx_fut_end2)
         system.set_fx_futures_code(state.settings.fx_futures_code)
@@ -1662,8 +1659,7 @@ def make_app(
         # 자동M 실시간 상태(세트별 상태·RT·체결차·누적 Sprd) — 엔진 없으면 빈 값
         payload["autom_live"] = {
             **(autom.live_snapshot() if autom is not None else {}),
-            **(autom_stock.live_snapshot() if autom_stock is not None else {}),
-            **(autom_hl_first.live_snapshot() if autom_hl_first is not None else {})}
+            **(autom_stock.live_snapshot() if autom_stock is not None else {})}
         # 오전 NXT 개장 매매 실시간(괴리·창·판정 결과) — 설정은 payload["nxt_open"](CoreState)
         payload["nxt_open_live"] = nxt_open.live_snapshot() if nxt_open is not None else {}
         # 동시호가 주문 실시간(예상주문가·발주 결과·환·HL 행) — 설정은 payload["auction"]
@@ -1749,9 +1745,7 @@ def make_app(
                     payload.get("set", "-"), payload.get("block", "-"),
                     payload.get("value", "-"), lag_ms)
             await _auto_check_symbol(payload, "자동M")
-            result = await _autom_command(
-                {"sf": autom, "stock": autom_stock, "sf_hl_first": autom_hl_first}, state,
-                payload)
+            result = await _autom_command({"sf": autom, "stock": autom_stock}, state, payload)
             if result.get("ok") and save:
                 save()  # 세트 설정·공통설정·RT 저장
             if result.get("ok") and cmd in ("autom_month", "autom_settings"):
@@ -1775,6 +1769,8 @@ def make_app(
                                           state.settings.hl_max_qty_per_order)
             system.set_carry_rates(  # 이자율 즉시 반영(이론가 재계산에 반영)
                 state.settings.fx_carry_rate, state.settings.eq_carry_rate)
+            if hasattr(system, "set_hl_priority_fee"):  # 우선수수료 구간 즉시 반영
+                system.set_hl_priority_fee(state.settings.hl_priority_fee)
             system.set_fx_fut_window(  # 외환선물 우선시간(2구간) 즉시 반영
                 state.settings.fx_fut_start, state.settings.fx_fut_end,
                 state.settings.fx_fut_start2, state.settings.fx_fut_end2)
@@ -1929,7 +1925,6 @@ async def _serve() -> None:
         fx_service = None
         autom_engine = None
         autom_engine_stock = None
-        autom_engine_hl_first = None
         nxt_open_engine = None
         auction_engine = None
         balance_watcher: BalanceWatcher | None = None
@@ -1972,10 +1967,6 @@ async def _serve() -> None:
                 state, system, log_dir=_base_dir() / "logs",
                 save=lambda: save_state(STATE_PATH, state), product="stock",
                 alert=halt_alert)
-            autom_engine_hl_first = _AutoMEngine(  # 주식선물 HL선 시험(exec §7D, 2026-09-22)
-                state, system, log_dir=_base_dir() / "logs",
-                save=lambda: save_state(STATE_PATH, state), product="sf_hl_first",
-                alert=halt_alert)
             # 오전 NXT 개장 매매(DESIGN-nxt-open.md) — 이벤트 주도라 별도 태스크 없음
             from .nxt_open_engine import NxtOpenEngine as _NxtOpenEngine
 
@@ -1993,7 +1984,6 @@ async def _serve() -> None:
             tasks.append(asyncio.create_task(fx_service.run()))
             tasks.append(asyncio.create_task(autom_engine.run()))
             tasks.append(asyncio.create_task(autom_engine_stock.run()))
-            tasks.append(asyncio.create_task(autom_engine_hl_first.run()))
             # 쌍 대조 로그(결정 83, 2026-10-16): 국내 포지션 ↔ HL 포지션 ↔ 세트 장부를 1분마다 재고
             # 바뀌면(또는 10분마다) 코어 로그에 — 잔고 쌍이 어긋난 시각·세트를 로그로 짚기 위해
             from .pair_check import pair_check_loop
@@ -2028,7 +2018,7 @@ async def _serve() -> None:
             save=lambda: save_state(STATE_PATH, state),
             system=system, engine=engine, fx_service=fx_service,
             boot_errors=boot_errors, hub=hub, autom=autom_engine,
-            autom_stock=autom_engine_stock, autom_hl_first=autom_engine_hl_first,
+            autom_stock=autom_engine_stock,
             nxt_open=nxt_open_engine, auction=auction_engine, balance=balance_watcher),
             access_log=None)
         await runner.setup()
@@ -2037,7 +2027,7 @@ async def _serve() -> None:
             tasks.append(asyncio.create_task(quote_plan_loop(state, system)))
         if system is not None:  # 닫힌 주문 주기 정리(검토 2026-11-03 §5B)
             tasks.append(asyncio.create_task(closed_order_prune_loop(
-                system, (autom_engine, autom_engine_stock, autom_engine_hl_first))))
+                system, (autom_engine, autom_engine_stock))))
         site = web.TCPSite(runner, HOST, DEFAULT_PORT)
         await site.start()
         log.info("코어 시동: http://%s:%s (안전종료는 메인 화면에서)", HOST, DEFAULT_PORT)
@@ -2058,8 +2048,6 @@ async def _serve() -> None:
             await autom_engine.shutdown()
         if autom_engine_stock is not None:
             await autom_engine_stock.shutdown()
-        if autom_engine_hl_first is not None:
-            await autom_engine_hl_first.shutdown()
         if auction_engine is not None:  # 동시호가 예약·예약실행 끔(메인 종료 = 모든 자동주문 끔)
             await auction_engine.shutdown()
         if system is not None:

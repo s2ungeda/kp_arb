@@ -69,6 +69,7 @@ from .routing import account_for
 from .session import reference_instrument
 from .session_service import FUTURES_MARKET, STOCK_MARKET, SessionService
 from .strategy.base import Strategy
+from .strategy_core import MANUAL_ORDER_SOURCE, HlPriorityFee, priority_p, priority_window_for
 from .theory import (
     carry_theory,
     days_to_expiry,
@@ -476,6 +477,9 @@ class LiveSystem:
             targets={Underlying.SAMSUNG, Underlying.SK_HYNIX})
         self._hl_filled = DailyFilled()  # HL 당일 체결액(USDC) — 일일 한도용(DESIGN-settings §1)
         self.hl_daily_limit_usdc = 0.0   # HL 일일 한도(USDC, 0=무제한) — 코어가 설정에서 주입
+        # HL 우선수수료(IOC) 시간구간(DESIGN-hl-priority-fee) — 코어가 설정에서 주입, 발주 길에서
+        # 적용
+        self.hl_priority_fee: HlPriorityFee = HlPriorityFee()
         # 리스크 한도(DESIGN-settings §1a) — 주문가격한도 x(소수)·1회수량한도(HL 수량). 0 = 없음
         self.hl_price_limit_pct = 0.0
         self.hl_max_qty_per_order = 0.0
@@ -793,6 +797,29 @@ class LiveSystem:
     def set_hl_daily_limit(self, usdc: float) -> None:
         """HL 일일 체결액 한도(USDC) 반영 — 코어가 설정 변경·시동 시 호출."""
         self.hl_daily_limit_usdc = max(0.0, usdc)
+
+    def set_hl_priority_fee(self, fee: HlPriorityFee) -> None:
+        """HL 우선수수료(IOC) 시간구간 주입(공통설정 저장·시동 때) — DESIGN-hl-priority-fee §2."""
+        self.hl_priority_fee = fee
+
+    def _priority_intent(self, intent: OrderIntent) -> OrderIntent:
+        """HL 주문에 우선수수료 구간 적용(DESIGN-hl-priority-fee §1·§4): 지금 시각이 체크된 구간
+        안이면 tif "Ioc" + p(bp 0이면 IOC만). 일반주문창 출처는 제외(사용자 2026-11-17). 구간 밖이면
+        그대로(GTC/ALO)."""
+        if intent.venue is not Venue.HYPERLIQUID or intent.source == MANUAL_ORDER_SOURCE:
+            return intent
+        # 메이커 전용(ALO, post_only)·걸어 두는 주문(priority_exempt — NXT 자동청산 익절)은 IOC로
+        # 바꾸면 뜻이 없어 그대로(검토 2026-11-17 H2·H3 — 스펙 §1, 사용자 확인 대상)
+        if intent.post_only or intent.priority_exempt:
+            return intent
+        win = priority_window_for(self._clock_time(), self.hl_priority_fee.windows)
+        if win is None:
+            return intent
+        return intent.model_copy(update={"tif": "Ioc", "priority_p": priority_p(win.bp)})
+
+    def _clock_time(self) -> time:
+        """지금 벽시계 시각(datetime.time) — 우선수수료 구간 판정용. 테스트가 바꿔 끼운다."""
+        return datetime.now().time()
 
     def set_carry_rates(self, fx: float, eq: float) -> None:
         """이론가 연이자율 반영(환율=fx / 주식선물=eq) — 코어가 공통설정에서 주입.
@@ -1274,6 +1301,7 @@ class LiveSystem:
         if risk_msg:
             self._record_reject(intent, risk_msg)
             raise RiskLimitExceeded(risk_msg)
+        intent = self._priority_intent(intent)  # 우선수수료 구간이면 IOC + p(일반주문창 제외)
         if cloid is None:
             cloid = self._hl.new_cloid()
         if cloid:
@@ -1317,6 +1345,14 @@ class LiveSystem:
         # apply_place_fill **뒤**에 replay — track 전에 온 이벤트(체결·취소 등) 반영. 겹친
         # 체결은 provisional_filled가 흡수해 이중 반영 없음(주문 역전 대비, LS·HL 공용).
         self.order_book.replay_pending(order_id, venue=Venue.HYPERLIQUID)
+        # IOC(우선수수료 구간)는 호가창에 남지 않는다 — 응답의 체결분을 반영한 뒤 남은 수량은
+        # 거래소가 이미 취소한 것이므로 장부에서 바로 닫는다(취소 통보가 안 와도 열린 주문으로 남지
+        # 않게 — 검토 2026-11-17 M1). 뒤늦은 취소 통보는 닫힌 주문에 와도 무해
+        if intent.tif == "Ioc" and order.is_open and order.remaining_qty > 1e-9:
+            order_log.logger_for(Venue.HYPERLIQUID).info(
+                "IOC 남은 수량 %g 장부 닫음 #%s(체결 %g) — 거래소가 즉시 취소", order.remaining_qty,
+                order_id, order.filled_qty)
+            self.order_book.on_cancel(order_id, venue=Venue.HYPERLIQUID)
 
     async def place_many(self, intents: Sequence[OrderIntent],
                          cloids: Sequence[str | None] | None = None) -> list[PlaceResult]:
@@ -1327,6 +1363,8 @@ class LiveSystem:
         if self._hl is None:
             return [PlaceResult(None, error="HL gateway not configured", whole=True)
                     for _ in intents]
+        # 우선수수료 구간이면 IOC + p(일반주문창 제외) — 등록·거부내역도 바뀐 intent로
+        intents = [self._priority_intent(it) for it in intents]
         out: list[PlaceResult | None] = [None] * len(intents)
         send_idx: list[int] = []
         send_cloids: list[str | None] = []

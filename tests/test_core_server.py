@@ -296,6 +296,30 @@ def test_settings_global_auto_shutdown(tmp_path: Path) -> None:
     assert not broken.settings.auto_shutdown.enabled
 
 
+def test_settings_global_hl_priority_fee() -> None:
+    # DESIGN-hl-priority-fee §2(사용자 2026-11-17) — 시간구간 4개 저장·복원, 틀리면 거부(아무 것도
+    # 안 바꿈), 키 없으면 유지
+    from kp_arb.core_server import snapshot
+    from kp_arb.strategy_core import PriorityWindow, state_from_dict
+
+    state = CoreState()
+    assert not any(w.enabled for w in state.settings.hl_priority_fee.windows)
+    ok = apply_command(state, {"cmd": "settings_global", "hl_priority_fee": {"windows": [
+        {"enabled": True, "start": "08:00:00", "end": "08:05:00", "bp": 2}]}})
+    assert ok["ok"]
+    assert state.settings.hl_priority_fee.windows[0] == PriorityWindow(
+        True, "08:00:00", "08:05:00", 2.0)
+    bad = apply_command(state, {"cmd": "settings_global", "hl_priority_fee": {"windows": [
+        {"enabled": True, "start": "08:10:00", "end": "08:05:00", "bp": 2}]}})
+    assert not bad["ok"] and "시작 < 종료" in bad["errors"][0]
+    assert state.settings.hl_priority_fee.windows[0].start == "08:00:00"  # 거부면 그대로
+    assert apply_command(state, {"cmd": "settings_global", "hl_daily_limit_usdc": 1.0})["ok"]
+    assert state.settings.hl_priority_fee.windows[0].enabled                # 키 없으면 유지
+    back = state_from_dict(snapshot(state))
+    assert back.settings.hl_priority_fee.windows[0] == PriorityWindow(
+        True, "08:00:00", "08:05:00", 2.0)
+
+
 def test_settings_global_balance_watch() -> None:
     # DESIGN-balance-watch §3(사용자 2026-11-11) — 켬+배수 저장, 켬인데 배수 ≤ 0·소수·음수 거부,
     # 끔이면 배수 0 허용, 키 없으면 유지, 저장본 복원도 같은 규칙
@@ -667,7 +691,7 @@ def test_manual_snapshot_carries_rejects() -> None:
 
 def test_quote_symbols_setting_and_plan_input() -> None:
     # DESIGN-ls-xing §9 / DESIGN-settings §4: 시세 구독 종목 체크 저장·복원(모르는 키 무시),
-    # 계획 재료는 체크 종목 + 체결쏴 주식 거래소 + 주식선물·HL선 월물 합집합 + 원달러 코드.
+    # 계획 재료는 체크 종목 + 체결쏴 주식 거래소 + 주식선물 월물 + 원달러 코드.
     # 실행 켜기는 자동 체크.
     from kp_arb.core_server import auto_check_target, ensure_quote_symbol, quote_plan_input
     from kp_arb.domain.enums import Underlying
@@ -684,7 +708,6 @@ def test_quote_symbols_setting_and_plan_input() -> None:
                                                "hyundai": False}
     state.autom.book(Underlying.SAMSUNG, "stock").market = "nxt"
     state.autom.book(Underlying.SAMSUNG, "sf").future_month = "next"
-    state.autom.book(Underlying.SAMSUNG, "sf_hl_first").future_month = "near"
 
     class _Sys:
         futures_symbols = {Underlying.SAMSUNG: "A116B000"}
@@ -696,7 +719,7 @@ def test_quote_symbols_setting_and_plan_input() -> None:
 
     inp = quote_plan_input(state, _Sys())
     assert inp.symbols_on == frozenset({Underlying.SAMSUNG, Underlying.HYUNDAI})
-    assert inp.futures_months[Underlying.SAMSUNG] == frozenset({"near", "next"})
+    assert inp.futures_months[Underlying.SAMSUNG] == frozenset({"next"})
     assert inp.futures_codes[(Underlying.SAMSUNG, "next")] == "A116C000"
     assert inp.fx_code == "A756B000"
     assert quote_plan_input(state, None).fx_code is None and not quote_plan_input(

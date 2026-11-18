@@ -37,16 +37,14 @@ _SCREEN_NAMES = {
     # 주식선물+원달러 동시호가 주문(DESIGN-auction-order) — 화면만 먼저 연결(2026-10-23, 코어
     # 연결 전)
     "kp_arb.auction_order_screen": "동시호가 주문",
-    # 주식선물 HL선(exec §7D) — 시험 중지로 메뉴에서 뺌(2026-10-01, _RETIRED_SCREENS). 모듈은 남김
-    "kp_arb.order_autom_hl_first": "체결쏴(HL선)",
     "kp_arb.monitor": "시세 모니터", "kp_arb.fx_monitor": "FX 노출 감시",
     "kp_arb.order_hl": "HL 일반주문", "kp_arb.order_list": "주문 리스트",
     "kp_arb.fx_auction_order": "원달러선물 동시호가", "kp_arb.settings_window": "공통설정",
     "kp_arb.hl_trades": "HL 체결",
 }
 
-# 메뉴에서 뺀 화면(모듈은 남겨 둠) — 지난 화면 구성 복원에서도 다시 띄우지 않는다.
-# HL선: 시험 중지(사용자 2026-10-01, exec 결정 62)
+# 없앤 화면 — 지난 화면 구성(win_state 저장본)에 이름이 남아 있어도 다시 띄우지 않는다.
+# HL선: 시험 중지(사용자 2026-10-01, exec 결정 62) → 코드 제거(2026-11-18, 결정 93)
 _RETIRED_SCREENS = frozenset({"kp_arb.order_autom_hl_first"})
 
 
@@ -416,8 +414,6 @@ def launch_command(module: str, args: tuple[str, ...]) -> list[str]:
         return [str(exe_dir / "meme.exe"), "nxtopen"]
     if module == "kp_arb.auction_order_screen":
         return [str(exe_dir / "meme.exe"), "auction"]
-    if module == "kp_arb.order_autom_hl_first":
-        return [str(exe_dir / "meme.exe"), "autoMH"]
     return [str(exe_dir / "meme.exe")]
 
 

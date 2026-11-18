@@ -506,9 +506,11 @@ class NxtOpenEngine:
             d.fired, d.fired_wall = True, self._wall()
             self._log.warning("[NXT개장] %s %s청산 안 냄 — %s", u.value, name, why)
             return
+        # 익절 주문은 호가창에 걸어 두는 것 — 우선수수료 구간이어도 IOC로 내지 않는다
+        # (priority_exempt, DESIGN-hl-priority-fee §1 — 검토 2026-11-17 H3)
         intent = OrderIntent(venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
                              side=ae.side, qty=ae.qty, order_type=OrderType.LIMIT, price=price,
-                             source=SOURCE, tag=f"{name}청산")
+                             source=SOURCE, tag=f"{name}청산", priority_exempt=True)
         self._log.info("[NXT개장] %s %s청산 발주 — #%s 전량 체결 평균 %.4f → %s %s @ %s(목표 %g%%)",
                        u.value, name, ae.order_id, avg, ae.side.value, ae.qty, price,
                        ae.target_profit * 100)

@@ -2103,3 +2103,70 @@ async def test_price_limits_seeded_from_snapshot_and_updated_by_jx0() -> None:
     lim = system.price_limits[(SAMSUNG, Instrument.KR_STOCK_FUTURE)]
     assert (lim.upper, lim.lower) == (84_300.0, 56_300.0) and "2/2" in lim.source
     assert system.price_limits[(SAMSUNG, Instrument.KR_STOCK)].upper == 91_300.0  # 주식은 그대로
+
+
+async def test_hl_priority_fee_window_makes_strategy_orders_ioc_but_not_manual() -> None:
+    # DESIGN-hl-priority-fee §1·§4(사용자 2026-11-17): 체크된 시간구간 안이면 전략 HL 주문은
+    # tif Ioc + p(bp × 10,000; bp 0이면 IOC만), 일반주문창 출처는 제외, 구간 밖은 그대로(GTC).
+    # 한 건(place)·묶음(place_many) 둘 다 같은 길
+    from datetime import time as dtime
+
+    from kp_arb.gateways.hl_ws import HLWebSocketClient
+    from kp_arb.gateways.mock_hl import MockHLGateway
+    from kp_arb.strategy_core import HlPriorityFee, PriorityWindow
+
+    hl_gw = MockHLGateway()
+    system = LiveSystem(
+        gateway=MockLSGateway(),  # type: ignore[arg-type]
+        order_book=OrderBook(),
+        session=SessionService(),
+        stock_ws=LSWebSocketClient(FakeConnector([])),
+        hl_gateway=hl_gw,
+        hl_ws=HLWebSocketClient(FakeConnector([])),
+    )
+    await system.start()
+    fee = HlPriorityFee()
+    fee.windows[0] = PriorityWindow(True, "08:00:00", "08:05:00", 2.0)
+    fee.windows[1] = PriorityWindow(True, "09:00:00", "09:01:00", 0.0)
+    system.set_hl_priority_fee(fee)
+    clock = {"t": dtime(8, 1)}
+    system._clock_time = lambda: clock["t"]  # type: ignore[method-assign]
+
+    def intent(source: str) -> OrderIntent:
+        return OrderIntent(venue=Venue.HYPERLIQUID, underlying=SAMSUNG,
+                           instrument=Instrument.HL_PERP, side=Side.SELL, qty=1,
+                           order_type=OrderType.LIMIT, price=1300.0, source=source)
+
+    await system.place(intent("자동M"))
+    assert (hl_gw.placed[-1].tif, hl_gw.placed[-1].priority_p) == ("Ioc", 20_000)
+    await system.place(intent("일반주문창"))                      # 수동은 제외
+    assert (hl_gw.placed[-1].tif, hl_gw.placed[-1].priority_p) == (None, None)
+    clock["t"] = dtime(9, 0, 30)                                   # bp 0 구간 → IOC만
+    await system.place(intent("NXT개장"))
+    assert (hl_gw.placed[-1].tif, hl_gw.placed[-1].priority_p) == ("Ioc", None)
+    clock["t"] = dtime(12, 0)                                      # 구간 밖 → 그대로
+    await system.place(intent("자동M"))
+    assert (hl_gw.placed[-1].tif, hl_gw.placed[-1].priority_p) == (None, None)
+    clock["t"] = dtime(8, 4, 59)
+    res = await system.place_many([intent("동시호가"), intent("일반주문창")])
+    assert all(r.order_id for r in res)
+    assert [(p.tif, p.priority_p) for p in hl_gw.placed[-2:]] == [("Ioc", 20_000), (None, None)]
+    # 장부에도 바뀐 intent로 등록된다
+    assert system.order_book.hl_order(res[0].order_id).intent.tif == "Ioc"  # type: ignore[union-attr]
+    # 검토 2026-11-17 H2·H3: 메이커 전용(ALO)·걸어 두는 주문(priority_exempt)은 구간 안에서도 그대로
+    clock["t"] = dtime(8, 1)
+    await system.place(intent("자동M").model_copy(update={"post_only": True}))
+    assert (hl_gw.placed[-1].tif, hl_gw.placed[-1].priority_p) == (None, None)
+    await system.place(intent("NXT개장").model_copy(update={"priority_exempt": True}))
+    assert (hl_gw.placed[-1].tif, hl_gw.placed[-1].priority_p) == (None, None)
+    # 검토 M1: IOC는 호가창에 남지 않는다 — 응답 체결분(절반)을 반영한 뒤 남은 수량은 장부에서 바로
+    # 닫힌다(취소 통보가 안 와도 열린 주문으로 남지 않음)
+    hl_gw.pop_place_fill = lambda: (0.5, 1300.0)  # type: ignore[method-assign]  # 즉시체결 절반
+    oid = await system.place(intent("자동M").model_copy(update={"qty": 1.0}))
+    order = system.order_book.hl_order(oid)
+    assert order is not None and not order.is_open and order.filled_qty == 0.5
+    # 구간 밖 GTC는 남은 수량이 열린 채 남는다(기존 동작)
+    clock["t"] = dtime(12, 0)
+    oid2 = await system.place(intent("자동M").model_copy(update={"qty": 1.0}))
+    order2 = system.order_book.hl_order(oid2)
+    assert order2 is not None and order2.is_open and order2.filled_qty == 0.5

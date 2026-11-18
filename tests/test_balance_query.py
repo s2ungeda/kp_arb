@@ -44,9 +44,15 @@ def test_screen_cells_drop_sign_show_inner_and_keep_diff_sign() -> None:
     from kp_arb import ui_theme as T
     from kp_arb.balance_query_screen import cell_color, diff_bg, display_cell, table_rows
 
+    # 종목 행·체결차는 부호 그대로(사용자 2026-11-17 "부호 추가"), '합' 행(절대값 합)은 부호 없이
+    assert display_cell("+1,200", "+50", signed=True) == "+1,200(+50)"
+    assert display_cell("-20", "+0", signed=True) == "-20(0)"   # 0은 "0"
+    assert display_cell("+0", "-0", signed=True) == "0(0)"
     assert display_cell("+1,200", "+50") == "1,200(50)" and display_cell("-20", "0") == "20(0)"
     assert display_cell("-310", None) == "310" and display_cell("-10", None, signed=True) == "-10"
     assert display_cell("-", "-") == "-" and display_cell("오류", "오류") == "오류"
+    assert display_cell("-", "-", signed=True) == "-"
+    assert display_cell("오류", None, signed=True) == "오류"
     assert cell_color("+1,200") == T.C_BUY and cell_color("-20") == T.C_SELL
     assert cell_color("0") == T.C_ZERO and cell_color("오류") == T.C_ERR
     assert cell_color("-") == T.C_MUTED
@@ -216,3 +222,26 @@ def test_total_of_and_balance_line_from_query_result() -> None:
     assert balance_line({**res, "baseline": None}) == "기준 -  잔고 : 610"  # 시동 복사본 실패
     assert balance_line(None) == "기준 -  잔고 : -"
     assert balance_line({"ok": False, "errors": ["조회 중"]}) == "기준 -  잔고 : -"
+
+
+def test_priority_fee_tab_rows_roundtrip() -> None:
+    # DESIGN-hl-priority-fee §3: 코어 설정 → 탭 4행(체크·시작·종료·bp 글) / 탭 4행 → settings_global
+    # 본문(hl_priority_fee 키만, bp 빈칸·오타는 0, 시각은 다듬어 그대로 — 검사는 코어)
+    from kp_arb.balance_query import priority_rows_from_settings, priority_rows_payload
+
+    settings = {"hl_priority_fee": {"windows": [
+        {"enabled": True, "start": "08:00:00", "end": "08:05:00", "bp": 2.0},
+        {"enabled": False, "start": "", "end": "", "bp": 0.0}]}}
+    rows = priority_rows_from_settings(settings)
+    assert rows[0] == (True, "08:00:00", "08:05:00", "2") and rows[1] == (False, "", "", "0")
+    assert rows[2] == (False, "", "", "0") and len(rows) == 4           # 모자란 행은 빈 행
+    assert priority_rows_from_settings(None)[0] == (False, "", "", "0")
+    assert priority_rows_from_settings({"hl_priority_fee": "x"})[3] == (False, "", "", "0")
+    body = priority_rows_payload([(True, " 08:00:00 ", "08:05:00", "2"), (False, "", "", ""),
+                                  (True, "09:00:00", "09:01:00", "x"), (False, "", "", "0.5")])
+    assert body["cmd"] == "settings_global" and set(body) == {"cmd", "hl_priority_fee"}
+    wins = body["hl_priority_fee"]["windows"]
+    assert wins[0] == {"enabled": True, "start": "08:00:00", "end": "08:05:00", "bp": 2.0}
+    assert wins[1]["bp"] == 0.0 and wins[2]["bp"] == 0.0 and wins[3]["bp"] == 0.5
+    assert priority_rows_from_settings({"hl_priority_fee": body["hl_priority_fee"]})[0] == (
+        True, "08:00:00", "08:05:00", "2")

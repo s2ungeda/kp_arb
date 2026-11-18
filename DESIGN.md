@@ -11,7 +11,7 @@
 - "무엇을·왜"는 이 문서에서 확정. 커넥터 **내부 구현 디테일**(LS TR 포맷, WS 재연결, OAuth2 갱신 등)은 구현 단계에서 채운다.
 - **이번 버전 핵심:** 전략 로직은 분리(플러그인)하고, FX 헤지는 외부 프로세스(#2)에 위임한다. 즉 **이 시스템은 "거래 인프라 + 전략 플러그인 슬롯 + 노출 보고"** 까지 책임진다.
 - `[OPEN]` 은 리뷰 시 결정할 미결 항목(§13).
-- **분할**: 문서가 커지면 상세를 `DESIGN-*.md`로 떼고 여기엔 제목·요약·링크만 남긴다. 링크된 `DESIGN-*.md`도 **계약의 일부**다(예: 수동 주문 = [DESIGN-manual-order.md](DESIGN-manual-order.md), 화면 공통 스타일 = [DESIGN-ui.md](DESIGN-ui.md), 원달러선물 동시호가 대응주문 = [DESIGN-fx-auction.md](DESIGN-fx-auction.md), 전체 공통설정(일일 한도·알람) = [DESIGN-settings.md](DESIGN-settings.md), 토탈잔고 감시·텔레그램 보고 = [DESIGN-balance-watch.md](DESIGN-balance-watch.md), 잔고 조회 화면(LS·HL 실조회, 보기 전용) = [DESIGN-balance-query.md](DESIGN-balance-query.md), 자동T 전략 = [DESIGN-auto-t.md](DESIGN-auto-t.md)). 이력은 [DESIGN-history.md] 등으로 분리 가능.
+- **분할**: 문서가 커지면 상세를 `DESIGN-*.md`로 떼고 여기엔 제목·요약·링크만 남긴다. 링크된 `DESIGN-*.md`도 **계약의 일부**다(예: 수동 주문 = [DESIGN-manual-order.md](DESIGN-manual-order.md), 화면 공통 스타일 = [DESIGN-ui.md](DESIGN-ui.md), 원달러선물 동시호가 대응주문 = [DESIGN-fx-auction.md](DESIGN-fx-auction.md), 전체 공통설정(일일 한도·알람) = [DESIGN-settings.md](DESIGN-settings.md), 토탈잔고 감시·텔레그램 보고 = [DESIGN-balance-watch.md](DESIGN-balance-watch.md), 잔고 조회 화면(LS·HL 실조회, 보기 전용) = [DESIGN-balance-query.md](DESIGN-balance-query.md), HL 우선수수료(IOC) 시간구간 = [DESIGN-hl-priority-fee.md](DESIGN-hl-priority-fee.md), 자동T 전략 = [DESIGN-auto-t.md](DESIGN-auto-t.md)). 이력은 [DESIGN-history.md] 등으로 분리 가능.
 
 ---
 
@@ -545,7 +545,7 @@
 
 ## 부록: 폐기/제외·변경 이력 (재논의 방지)
 
-- **(2026-11-13, 사용자) 원달러선물 동시호가 주문([DESIGN-fx-auction.md](DESIGN-fx-auction.md))과 주식선물 HL선(DESIGN-auto-m-exec §7D) → 개발 목록에서 제외.** 원달러선물 동시호가 주문 화면은 메인 메뉴에서 뺌(환 대응은 동시호가 주문(주식선물+환)이 맡음 — DESIGN-auction-order.md). 두 기능의 코드·코어 엔진·`/state` 칸은 지우지 않고 남겨 둠(지우기는 별도 결정).
+- **(2026-11-13, 사용자) 원달러선물 동시호가 주문([DESIGN-fx-auction.md](DESIGN-fx-auction.md))과 주식선물 HL선(DESIGN-auto-m-exec §7D) → 개발 목록에서 제외.** 원달러선물 동시호가 주문 화면은 메인 메뉴에서 뺌(환 대응은 동시호가 주문(주식선물+환)이 맡음 — DESIGN-auction-order.md). 두 기능의 코드·코어 엔진·`/state` 칸은 지우지 않고 남겨 둠(지우기는 별도 결정). **→ HL선은 2026-11-18 사용자 "앞으로 안 쓸거다"로 코드까지 제거(DESIGN-auto-m-exec 결정 93).** 원달러선물 동시호가 코드는 그대로.
 - (2026-07-22) 전략 화면 1개(모드 콤보 수동/자동T/자동M + 총진입/1회/진입/청산 세트 3개 + 시작/PAUSE 체크 + 재시도 옵션) → **주문 화면 2개(자동T=HL-S, 자동M=HL-SF, entry/exit 각 3세트)**로 전면 개정(주문화면0722.xlsx). 재시도 옵션 폐기(자동M 후주문 HL 거부만 재시도), 수동 모드 폐기, 모니터링 전용 수량 폐기(est-pr는 1회주문수량으로).
 - C++/Boost.Beast → 생산성 우선이라 Python.
 - ~~xingAPI(OCX, 32비트) → LS 신규 REST/WS로 회피.~~ → 결국 xingAPI로 전환(2026-09-23), REST 코드 제거(2026-11-09).

@@ -18,8 +18,10 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 import threading
+import time
 from typing import Any
 
 from . import ui_theme as T
@@ -33,6 +35,8 @@ from .balance_query import (
     auto_interval_s,
     balance_line,
     empty_table,
+    priority_rows_from_settings,
+    priority_rows_payload,
     status_text,
 )
 from .core_client import core_request_err, screen_log, watch_parent_exit
@@ -77,15 +81,25 @@ def saved_auto(fields: dict[str, Any]) -> tuple[bool, str]:
     return auto, interval
 
 
+def _signed(text: str) -> str:
+    """부호 그대로, 0은 부호 없이 "0"(코어 글 "+0"/"-0" 정리)."""
+    if text in (ERROR_TEXT, NOT_QUERIED):
+        return text
+    try:
+        return "0" if float(text.replace(",", "")) == 0 else text
+    except ValueError:
+        return text
+
+
 def display_cell(outer: str, inner: str | None, *, signed: bool = False) -> str:
-    """칸에 보일 글 — 포지션은 부호 없이 ``100(50)``(사용자 2026-11-16 "부호 표시는 안 해도 됨"),
-    체결차(signed)는 부호 그대로. '-'·'오류'는 그대로(순수)."""
-    if signed:
-        return outer
-    text = _unsigned(outer)
+    """칸에 보일 글 — signed면 부호 그대로 ``+100(+50)``·``-20(-10)``(종목 행·체결차 — 사용자
+    2026-11-17 "부호 추가해줘"; ~~11-16 "부호 표시는 안 해도 됨"~~), 아니면 부호 없이 ``100(50)``
+    ('합' 행 — 절대값 합이라 부호가 뜻이 없음). 0은 "0". '-'·'오류'는 그대로(순수)."""
+    fmt = _signed if signed else _unsigned
+    text = fmt(outer)
     if inner is None or outer in (ERROR_TEXT, NOT_QUERIED):
         return text
-    return f"{text}({_unsigned(inner)})"
+    return f"{text}({fmt(inner)})"
 
 
 def diff_bg(text: str) -> str:
@@ -135,7 +149,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     root.resizable(False, False)
     win_state.attach(root, "balance_query")
 
-    top = tk.Frame(root)
+    # 탭 둘(사용자 2026-11-17 "잔고조회 화면에 탭으로 분류"): 잔고(실조회 표) / 우선수수료(HL IOC
+    # 시간구간, DESIGN-hl-priority-fee §3)
+    nb = ttk.Notebook(root)
+    nb.pack(fill="both", expand=True, padx=4, pady=4)
+    tab_bal = tk.Frame(nb)
+    tab_fee = tk.Frame(nb)
+    nb.add(tab_bal, text=" 잔고 ")
+    nb.add(tab_fee, text=" 우선수수료 ")
+
+    top = tk.Frame(tab_bal)
     top.pack(fill="x", padx=8, pady=(8, 2))
     btn = tk.Button(top, text="조회", width=8)
     btn.pack(side="right")
@@ -149,7 +172,7 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     cmb_interval.pack(side="left")
     tk.Label(top, text="초").pack(side="left", padx=(2, 0))
 
-    grid = tk.Frame(root, bg=T.C_BORDER, bd=1, relief="solid")
+    grid = tk.Frame(tab_bal, bg=T.C_BORDER, bd=1, relief="solid")
     grid.pack(padx=8, pady=4)
     head_bg = "#f0f0f0"
     opts: dict[str, Any] = {"padx": (0, 1), "pady": (0, 1), "sticky": "nsew"}
@@ -179,12 +202,129 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     # 시간과 같은 라인에 두고 우측에") — 기준 = 시동 때 실조회한 토탈잔고(응답 baseline), 잔고 =
     # 이번 조회의 토탈잔고(합 행: 주식 + 주선×10 + HL). 둘 다 실조회 값(장부 아님). 11-11 메인 창 →
     # 11-16 이 창에서 뺌 → 11-17 다시.
-    bar = tk.Frame(root)
+    bar = tk.Frame(tab_bal)
     bar.pack(fill="x", padx=8, pady=(2, 8))
     status = tk.Label(bar, text=status_text(None), anchor="w", fg=T.C_MUTED, font=T.FONT_LABEL)
     status.pack(side="left")
     lbl_balance = tk.Label(bar, text=balance_line(None), anchor="e", font=T.FONT_LABEL)
     lbl_balance.pack(side="right")
+
+    # ===== 우선수수료 탭(DESIGN-hl-priority-fee §3, 사용자 2026-11-17): 4행 [ ] 시작 종료 수수료
+    # bp + [저장] + 상태줄. 저장 버튼 때만 코어로(Enter 저장 없음). 열 때 코어 설정값으로 채운다
+    # (뒷단 스레드가 /state를 읽고 after()로 — L5). 체크된 구간 안의 전략 HL 주문이 IOC + p가 된다.
+    fee_box: dict[str, Any] = {"settings": None, "seq": 0, "saved": None, "sseq": 0}
+    fee_frame = tk.Frame(tab_fee)
+    fee_frame.pack(padx=8, pady=(8, 2), anchor="w")
+    tk.Label(fee_frame, fg="gray25", font=T.FONT_LABEL,
+             text="체크된 구간 안에서만 전략 HL 주문을 IOC + 우선수수료로(일반주문 제외)").grid(
+        row=0, column=0, columnspan=7, sticky="w", pady=(0, 4))
+    for c, head in ((1, "시작"), (3, "종료"), (5, "수수료")):
+        tk.Label(fee_frame, text=head, fg="gray25", font=T.FONT_LABEL).grid(row=1, column=c)
+    fee_rows: list[dict[str, Any]] = []
+    vcmd_time = (root.register(lambda s: all(ch.isdigit() or ch == ":" for ch in s)), "%P")
+    vcmd_dec = (root.register(lambda s: s == "" or s.replace(".", "", 1).isdigit()), "%P")
+    for i in range(4):
+        r = 2 + i
+        var = tk.BooleanVar(value=False)
+        tk.Checkbutton(fee_frame, variable=var, text=f"구간 {i + 1}").grid(
+            row=r, column=0, sticky="w", padx=(0, 6))
+        e_start = tk.Entry(fee_frame, width=9, justify="center", validate="key",
+                           validatecommand=vcmd_time, font=T.FONT_NUM)
+        e_start.grid(row=r, column=1, padx=2, pady=2)
+        tk.Label(fee_frame, text="~").grid(row=r, column=2)
+        e_end = tk.Entry(fee_frame, width=9, justify="center", validate="key",
+                         validatecommand=vcmd_time, font=T.FONT_NUM)
+        e_end.grid(row=r, column=3, padx=2, pady=2)
+        tk.Label(fee_frame, text="  ").grid(row=r, column=4)
+        e_bp = tk.Entry(fee_frame, width=6, justify="right", validate="key",
+                        validatecommand=vcmd_dec, font=T.FONT_NUM)
+        e_bp.grid(row=r, column=5, padx=2, pady=2)
+        tk.Label(fee_frame, text="bp").grid(row=r, column=6, sticky="w")
+        fee_rows.append({"var": var, "start": e_start, "end": e_end, "bp": e_bp})
+    fee_bar = tk.Frame(tab_fee)
+    fee_bar.pack(fill="x", padx=8, pady=(4, 8))
+    fee_status = tk.Label(fee_bar, text="코어 설정 읽는 중 ..." if not preview else "",
+                          anchor="w", fg=T.C_MUTED, font=T.FONT_LABEL)
+    fee_status.pack(side="left")
+    # 저장은 코어 설정을 읽어 채운 뒤에만 — 못 읽은 채 저장하면 빈 4행이 코어 구간을 지운다(검토 M5)
+    btn_fee_save = tk.Button(fee_bar, text="저장", width=8,
+                             state="normal" if preview else "disabled")
+    btn_fee_save.pack(side="right")
+
+    def fee_rows_text() -> list[tuple[bool, str, str, str]]:
+        return [(bool(r["var"].get()), r["start"].get(), r["end"].get(), r["bp"].get())
+                for r in fee_rows]
+
+    def fee_fill(rows: list[tuple[bool, str, str, str]]) -> None:
+        for r, (on, start, end, bp) in zip(fee_rows, rows, strict=True):
+            r["var"].set(on)
+            for key, text in (("start", start), ("end", end), ("bp", bp)):
+                r[key].delete(0, "end")
+                r[key].insert(0, text)
+
+    def fee_load_worker() -> None:  # 뒷단 스레드 — 코어 설정 한 번
+        data, err = core_request_err("/state", None, timeout=5.0)
+        fee_box["settings"] = (data or {}).get("settings") if data else {"_err": err}
+        fee_box["seq"] += 1
+
+    def fee_save_worker(payload: dict[str, Any]) -> None:  # 뒷단 스레드 — 저장 명령 한 번
+        data, err = core_request_err("/command", payload, timeout=10.0)
+        fee_box["saved"] = data if data is not None else {"ok": False,
+                                                          "errors": [f"코어 응답 없음 — {err}"]}
+        fee_box["sseq"] += 1
+
+    def on_fee_save() -> None:
+        btn_fee_save.config(state="disabled")
+        fee_status.config(text="저장 중 ...", fg=T.C_MUTED)
+        payload = priority_rows_payload(fee_rows_text())
+        if preview:
+            fee_box["saved"] = {"ok": True}
+            fee_box["sseq"] += 1
+            return
+        threading.Thread(target=fee_save_worker, args=(payload,), daemon=True).start()
+
+    btn_fee_save.config(command=on_fee_save)
+    if preview:
+        fee_fill([(True, "08:00:00", "08:05:00", "2"), (False, "", "", "0"),
+                  (True, "09:00:00", "09:01:00", "0.5"), (False, "", "", "0")])
+    else:
+        threading.Thread(target=fee_load_worker, daemon=True).start()
+    fee_shown = {"seq": 0, "sseq": 0}
+
+    def fee_poll() -> None:
+        try:
+            if fee_box["seq"] != fee_shown["seq"]:
+                fee_shown["seq"] = fee_box["seq"]
+                st = fee_box["settings"]
+                if isinstance(st, dict) and "_err" in st:
+                    fee_status.config(text=f"코어 설정 못 읽음 — {st['_err']}", fg=T.C_ERR)
+                else:
+                    fee_fill(priority_rows_from_settings(st))
+                    fee_status.config(text="", fg=T.C_MUTED)
+                    btn_fee_save.config(state="normal")  # 읽은 뒤에만 저장 가능
+            if fee_box["sseq"] != fee_shown["sseq"]:
+                fee_shown["sseq"] = fee_box["sseq"]
+                res = fee_box["saved"] or {}
+                if res.get("ok"):
+                    fee_status.config(text=time.strftime("%H:%M:%S") + " 저장 완료",
+                                      fg=T.C_MUTED)
+                else:
+                    fee_status.config(text="저장 거부: " + "; ".join(res.get("errors") or ["?"]),
+                                      fg=T.C_ERR)
+                btn_fee_save.config(state="normal")
+        except tk.TclError:
+            return
+        except Exception:  # noqa: BLE001 - 1회 실패는 기록만 하고 계속
+            screen_log().exception("우선수수료 탭 갱신 실패 — 계속")
+        finally:
+            try:
+                root.after(200, fee_poll)
+            except tk.TclError:
+                pass
+
+    fee_poll()
+    if preview and os.environ.get("KP_PREVIEW_TAB") == "fee":  # 캡처용 — 둘째 탭을 먼저
+        nb.select(tab_fee)  # type: ignore[no-untyped-call]
 
     def show(result: dict[str, Any] | None) -> None:
         if result is None or result.get("ok"):  # 실패 응답(ok=False)은 표를 그대로 두고 상태줄만
@@ -194,9 +334,11 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
                 outer = str(row.get(key, NOT_QUERIED))
                 inner_key = next(i for _h, k, i in SCREEN_COLUMNS if k == key)
                 inner = str(row.get(inner_key, NOT_QUERIED)) if inner_key else None
-                signed = key == "diff"
+                # 종목 행·체결차는 부호 그대로(사용자 2026-11-17), '합' 행 포지션은 절대값 합이라
+                # 부호 없이
+                signed = key == "diff" or rk != "sum"
                 lbl.config(text=display_cell(outer, inner, signed=signed), fg=cell_color(outer),
-                           bg=diff_bg(outer) if signed else "white")
+                           bg=diff_bg(outer) if key == "diff" else "white")
         status.config(text=status_text(result),
                       fg=T.C_ERR if result and (not result.get("ok") or result.get("errors"))
                       else T.C_MUTED)

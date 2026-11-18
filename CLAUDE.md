@@ -47,7 +47,7 @@ kp_arb/
   bootstrap.py (LiveSystem)           # 코어 시동 절차·시세/포지션 저장소·장부 재동기
   core_server.py, core_engine.py      # 코어 HTTP API·엔진 생성·주기 태스크 / 리허설 판정
   order_book.py, strategy_core.py     # 주문·포지션 장부(순수) / 설정·검증·한도(순수)
-  auto_m.py + auto_m_engine.py        # 체결쏴(자동M): 순수 상태변화 + 코어 결합(주식선물·주식·HL선)
+  auto_m.py + auto_m_engine.py        # 체결쏴(자동M): 순수 상태변화 + 코어 결합(주식선물·주식; HL선은 11-18 제거)
   auction_order.py + _engine.py       # 동시호가 주문: 순수 + 엔진
   nxt_open.py + _engine.py, _screen.py # NXT 개장 매매(11-04 원복, 코드만 남음)
   balance_watch.py, pair_check.py, alert.py, telegram_rx.py # 잔고 감시 / 쌍 대조 / 텔레그램 송·수신

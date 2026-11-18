@@ -103,12 +103,16 @@ class StubExchange:
         finally:
             self._exit()
 
-    def bulk_orders(self, reqs: list[dict[str, Any]]) -> dict[str, Any]:
+    def bulk_orders(self, reqs: list[dict[str, Any]], builder: Any = None,
+                    grouping: Any = "na") -> dict[str, Any]:
         """여러 건 한 요청 — statuses는 보낸 순서대로 건별. bulk_status: {가격: 그 주문의 상태}
-        (없으면 resting), bulk_whole_error: 요청 전체 거부 문구, bulk_raise: 통신 오류 흉내."""
+        (없으면 resting), bulk_whole_error: 요청 전체 거부 문구, bulk_raise: 통신 오류 흉내.
+        grouping은 우선수수료 {"p": n}(DESIGN-hl-priority-fee) — bulk_groupings에 기록."""
         self.bulk_orders_calls: list[list[dict[str, Any]]] = getattr(
             self, "bulk_orders_calls", [])
         self.bulk_orders_calls.append([dict(r) for r in reqs])
+        self.bulk_groupings: list[Any] = getattr(self, "bulk_groupings", [])
+        self.bulk_groupings.append(grouping)
         if getattr(self, "bulk_raise", False):
             raise ConnectionError("Connection reset by peer")
         self._enter()
@@ -622,3 +626,44 @@ async def test_lookup_by_cloid_ignores_rejected_or_canceled_order() -> None:
     for alive in ("open", "filled", "triggered", ""):
         inf.order_status = _resp(alive)
         assert await gw.lookup_by_cloid(cloid) == "485478010353", alive
+
+
+async def test_priority_fee_orders_group_by_tif_and_p_and_send_grouping() -> None:
+    # DESIGN-hl-priority-fee §4: 같은 tif·같은 p끼리 한 요청, p가 있으면 grouping {"p": p}, IOC면
+    # tif "Ioc". p 있는 한 건 발주는 SDK order()가 아니라 한 건짜리 묶음으로(grouping은 action 단위)
+    from kp_arb.domain.enums import Instrument, Side, Underlying, Venue
+    from kp_arb.domain.models import OrderIntent
+
+    gw, ex, _inf = _gw()
+
+    def intent(px: float, tif: str | None, p: int | None) -> OrderIntent:
+        return OrderIntent(venue=Venue.HYPERLIQUID, underlying=Underlying.SAMSUNG,
+                           instrument=Instrument.HL_PERP, side=Side.SELL, qty=1, price=px,
+                           tif=tif, priority_p=p)
+
+    out = await gw.place_orders([intent(100.0, "Ioc", 20_000), intent(101.0, None, None),
+                                 intent(102.0, "Ioc", 20_000), intent(103.0, "Ioc", None)])
+    assert all(r.order_id for r in out)
+    calls = {tuple(r["limit_px"] for r in c): g for c, g in zip(ex.bulk_orders_calls,
+                                                                 ex.bulk_groupings, strict=True)}
+    assert calls[(100.0, 102.0)] == {"p": 20_000}       # 같은 p끼리 한 요청
+    assert calls[(101.0,)] == "na" and calls[(103.0,)] == "na"  # GTC / IOC만(p 없음)
+    tifs = {r["limit_px"]: r["order_type"]["limit"]["tif"] for c in ex.bulk_orders_calls
+            for r in c}
+    assert tifs == {100.0: "Ioc", 101.0: "Gtc", 102.0: "Ioc", 103.0: "Ioc"}
+    # 한 건 발주에 p가 있으면 묶음 경로로 — SDK order() 호출 없이 grouping이 붙어 나간다
+    n_before = len(ex.bulk_orders_calls)
+    oid = await gw.place_order(intent(104.0, "Ioc", 5_000), cloid=None)
+    assert oid and len(ex.bulk_orders_calls) == n_before + 1
+    assert ex.bulk_groupings[-1] == {"p": 5_000}
+    assert ex.bulk_orders_calls[-1][0]["order_type"] == {"limit": {"tif": "Ioc"}}
+    # 검토 2026-11-17 H1: p 경로의 통신 오류는 거부(HLError)가 아니라 결과 모름(OSError 계열) —
+    # 자동M이 재발주하지 않게. L3: GTC에 p가 붙어 오면 보내지 않고 거부 결과
+    ex.bulk_raise = True
+    with pytest.raises(ConnectionError):
+        await gw.place_order(intent(105.0, "Ioc", 5_000), cloid=None)
+    ex.bulk_raise = False
+    n_before = len(ex.bulk_orders_calls)
+    bad = await gw.place_orders([intent(106.0, None, 5_000)])
+    assert bad[0].order_id is None and "GTC" in (bad[0].error or "")
+    assert len(ex.bulk_orders_calls) == n_before  # 전송 없음

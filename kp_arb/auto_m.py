@@ -27,12 +27,11 @@ from .ticks import ceil_to_tick, floor_to_tick, tick_for
 
 HL_PER_SF = 10  # SF 1계약 = HL 10계약 (§1)
 CANCEL_ALARM_TRIES = 3   # 취소 전송이 이 횟수를 넘으면 에러 알람 + "취소실패" 표시(exec ㅂ3)
-# 상품(exec §7C·§7D): 주식선물(선 LS·후 HL) / 주식(선 LS 현물·후 HL) / 주식선물 HL선(선 HL ALO·
-# 후 LS, 시험 2026-09-22 — 선주문이 HL이라 수량은 HL 10 단위, 체결이 10에 찰 때마다 LS 1계약)
+# 상품(exec §7C): 주식선물(선 LS·후 HL) / 주식(선 LS 현물·후 HL). 주식선물 HL선(선 HL ALO·후 LS,
+# §7D 시험 2026-09-22)은 2026-11-18 사용자 "앞으로 안 쓸거다"로 코드에서 제거(결정 93)
 PRODUCT_SF = "sf"
 PRODUCT_STOCK = "stock"
-PRODUCT_SF_HL_FIRST = "sf_hl_first"
-PRODUCTS = (PRODUCT_SF, PRODUCT_STOCK, PRODUCT_SF_HL_FIRST)
+PRODUCTS = (PRODUCT_SF, PRODUCT_STOCK)
 
 Levels = Sequence[tuple[float, float]]  # 호가창 [(가격, 잔량), …] 1호가부터
 
@@ -199,20 +198,16 @@ class Signals:
     market_halted: bool = False       # 선물시장 정지 오버레이(exec §8)
     resumed_mono: float | None = None  # 정지가 풀린 시각(재개 딜레이)
     fx: float | None = None           # HL 환산 환율(역산가의 HL괴리에 쓰인 값) — 로그용
-    product: str = "sf"               # "sf" | "stock" | "sf_hl_first" — 주식은 §7C, HL선은 §7D
-    # HL선(§7D) 선주문용 — HL 호가창(1호가부터, N호가 한계용)과 가격 격자 자릿수(szDecimals)
-    hl_bids: Levels = ()
-    hl_asks: Levels = ()
-    hl_sz_decimals: int | None = None
+    product: str = "sf"               # "sf" | "stock" — 주식은 §7C
     # LS 피드(시세·통보·조회 채널)가 살아 있나 — 끊김·정지면 주문 안 냄(G0-1, 2026-09-29 운영 사고)
     ls_feed_ok: bool = True
     # HL 채널도 같은 관문(사용자 2026-10-01 결정 60: 어느 한쪽이라도 끊기면 선주문 취소 후 대기)
     hl_feed_ok: bool = True
     # 주식선물 월물 배당율 q(소수, 공통설정 dividend — 사용자 2026-11-13, exec §6.1): 역산가의
-    # 기준값에 더한다(진입SF·청산SF, 정·역방향). 주식·HL선은 0.
+    # 기준값에 더한다(진입SF·청산SF, 정·역방향). 주식은 0.
     dividend: float = 0.0
     # 주식시장 동시호가 중(결정 57, 사용자 2026-09-30) — 현물이 예상체결가로 움직여 S괴리가
-    # 이상하므로 주식선물·HL선의 G5 S괴리 필터를 건너뛴다(정·역방향). 기준값은 여전히 있어야 한다
+    # 이상하므로 주식선물의 G5 S괴리 필터를 건너뛴다(정·역방향). 기준값은 여전히 있어야 한다
     stock_auction: bool = False
     # 주식 선주문이 나갈 거래소(결정 80: 주문가능시간 구간의 거래소; 주식선물은 ""). 걸린 선주문의
     # 거래소와 다르면 취소 뒤 재발주
@@ -364,7 +359,6 @@ class Leg:
 
     block: Block
     reverse: bool = False       # 역방향 세트의 줄(AutoMSet.__post_init__가 맞춤) — 선·후주문 방향
-    hl_first: bool = False      # HL선 상품의 줄(§7D) — 선주문 HL·후주문 LS(AutoMSet가 맞춤)
     running: bool = False
     status: LegStatus = LegStatus.IDLE
     pre_order_id: str | None = None
@@ -372,14 +366,10 @@ class Leg:
     # 선주문 발주 시점의 HL est(후주문 방향, 후주문 수량만큼 쓸어담은 평균 예상가) — 후주문 체결가와
     # 비교해 "판정 때 본 값대로 잡혔나"를 본다(사용자 2026-09-14). 재발주 때 새 값으로 덮인다.
     pre_est: float | None = None
-    pre_qty: int = 0            # 이번 선주문 계약수(HL선은 HL 계약 = SF계약×10)
+    pre_qty: int = 0            # 이번 선주문 계약수
     pre_market: str = ""       # 이번 선주문이 나간 거래소(주식, 결정 80) — 구간이 바뀌면 재발주
-    pre_filled: int = 0         # 이번 선주문 체결 계약수(HL선은 소수 체결의 내림값 — 취소 판단용)
+    pre_filled: int = 0         # 이번 선주문 체결 계약수
     post_pending: float = 0.0   # 후주문(HL) 체결 대기 계약수 — HL은 소수 체결(0.588 등, 실측 09-07)
-    # HL선(§7D) 전용 — HL 선주문 체결은 소수라 따로 센다. hl_unhedged = LS 후주문을 아직 안 낸 HL
-    # 체결 조각(10 미만) — 선주문이 바뀌어도 이어받아 다음 체결과 합친다(결정 A)
-    pre_filled_f: float = 0.0
-    hl_unhedged: float = 0.0
     delay_until: float | None = None
     replace_pending: bool = False   # 역산가 바뀜 → 취소 보냄, 취소 확인 대기
     cancel_sent: bool = False       # 관문(G2·G5·G6) 취소를 이미 보냄 — 확인 올 때까지 재전송 안 함
@@ -422,19 +412,18 @@ class Leg:
 
     @property
     def pre_side(self) -> Side:
-        """선주문 방향 — 보통 SF 다리, HL선 상품(§7D)은 HL 다리."""
-        return self.hl_side if self.hl_first else self.sf_side
+        """선주문 방향 — SF(국내) 다리."""
+        return self.sf_side
 
     @property
     def post_side(self) -> Side:
-        """후주문 방향 — 선주문의 반대 다리."""
-        return self.sf_side if self.hl_first else self.hl_side
+        """후주문 방향 — HL 다리."""
+        return self.hl_side
 
     def _clear_pre(self) -> None:
         self.pre_order_id = self.pre_price = None
         self.pre_market = ""
         self.pre_qty = self.pre_filled = 0
-        self.pre_filled_f = 0.0
         self.cancel_sent = False
         self.cancel_tries = 0
         self.cancel_alarmed = False
@@ -471,10 +460,6 @@ class AutoMSet:
     hl_net: float = 0.0                     # 이 세트가 잡은 HL 순잔고(계약, 매도 −)
     reverse: bool = False                   # 역방향 세트(진입 = SF 매도 + HL 매수)
     product: str = "sf"                     # "sf" 주식선물 | "stock" 주식(exec §7C, 2026-09-17)
-    # HL선(§7D, 결정 55) 선주문 주문단위·시작호가(USD) — HL 격자 배수. 0 = 격자 그대로 / 0 기준.
-    # 원 단위 pre_tick·price_offset은 주식선물·주식용 그대로(HL선에선 안 씀)
-    hl_unit: float = 0.0
-    hl_offset: float = 0.0
     credit: bool = False                    # 주식 신용 세트(결정 40) — 진입 신용매수·청산 신용상환
     entry: Leg = field(default_factory=lambda: Leg(Block.ENTRY))
     exit: Leg = field(default_factory=lambda: Leg(Block.EXIT))
@@ -483,12 +468,6 @@ class AutoMSet:
 
     def __post_init__(self) -> None:
         self.entry.reverse = self.exit.reverse = self.reverse
-        self.entry.hl_first = self.exit.hl_first = self.hl_first
-
-    @property
-    def hl_first(self) -> bool:
-        """HL선 상품(§7D) — 선주문 HL ALO, 후주문 LS."""
-        return self.product == PRODUCT_SF_HL_FIRST
 
     @property
     def held(self) -> int:
@@ -709,21 +688,6 @@ def stock_monitor_value(sig: Signals, post_side: Side) -> float | None:
     return (est * sig.fx - base) / base
 
 
-def hl_first_monitor_value(sig: Signals, block: Block) -> float | None:
-    """HL선 모니터 수치(exec §7D, 표시만) — 주식선물 화면과 같은 관례(메이커 다리는 자기 1호가,
-    테이커 다리는 상대 호가): 진입 = (HL **매도1호가**(HL 매도 선주문이 서는 자리) × 환율 −
-    S현재가)/S현재가 − (SF 매도1호가(LS가 테이커로 살 값) − 이론가)/이론가, 청산 = HL 매수1호가·SF
-    매수1호가. (처음엔 HL 매수1로 잡아 HL 스프레드가 한 번 더 빠졌음 — 사용자 지적 2026-09-22.)
-    입력이 없으면 None. 순수."""
-    entry = block is Block.ENTRY
-    hl = sig.hl_ask1 if entry else sig.hl_bid1
-    sf = ((sig.sf_asks[0][0] if sig.sf_asks else None) if entry
-          else (sig.sf_bids[0][0] if sig.sf_bids else None))
-    if hl is None or sig.fx is None or not sf or not sig.stock_last or not sig.sf_theory:
-        return None
-    return (hl * sig.fx - sig.stock_last) / sig.stock_last - (sf - sig.sf_theory) / sig.sf_theory
-
-
 def _switch_wait(s: AutoMSet, leg: Leg, mono: float) -> bool:
     """G3 전환대기 — 진입은 직전 청산 체결 뒤, 청산은 직전 진입 체결 뒤 N초."""
     last = s.last_exit_fill_mono if leg.block is Block.ENTRY else s.last_entry_fill_mono
@@ -803,153 +767,10 @@ def _common_gates(
     return qty
 
 
-def hl_first_pre_price(
-    hl_side: Side, stock_last: float, sf_quote: float, sf_theory: float, threshold: float,
-    fx: float, sz_decimals: int | None,
-) -> float:
-    """HL선 역산가(exec §7D) = S현재가 × (1 + SF괴리 + 기준값) / 판정환율 → HL 격자 메이커 맞춤
-    (매도 올림 / 매수 내림). SF괴리 = (SF 최우선호가 − SF이론가)/SF이론가 — 진입은 매도1호가
-    (LS를 테이커로 살 값), 청산은 매수1호가. 그 가격에 잡히고 LS를 그 호가에 잡으면 Sprd =
-    기준값."""
-    from .hl_price import hl_round_price
-
-    sf_disp = (sf_quote - sf_theory) / sf_theory
-    raw = stock_last * (1.0 + sf_disp + threshold) / fx
-    return hl_round_price(raw, hl_side, sz_decimals, maker=True)
-
-
-def hl_snap_to_unit(price: float, side: Side, unit: float, step: float,
-                    offset: float = 0.0) -> float:
-    """HL 가격을 주문단위(unit, USD) 격자(offset + k×unit)에 맞춘다 — 매도 올림 / 매수 내림
-    (메이커: 유리한 쪽). 시작호가 offset(세트설정, 결정 55): 0이면 0·unit·2unit…. 소수 오차는
-    격자(step) 자릿수로 반올림해 지운다. 순수."""
-    from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-
-    q = (Decimal(repr(price)) - Decimal(repr(offset))) / Decimal(repr(unit))
-    n = q.to_integral_value(rounding=ROUND_CEILING if side is Side.SELL else ROUND_FLOOR)
-    out = n * Decimal(repr(unit)) + Decimal(repr(offset))
-    exp = Decimal(repr(step)).normalize().as_tuple().exponent
-    decimals = max(0, -exp) if isinstance(exp, int) else 0
-    return float(round(out, decimals))
-
-
-def _is_multiple(value: float, step: float) -> bool:
-    """value가 step의 (거의) 정수배인가 — 소수 격자(0.1·0.01) 비교용."""
-    if step <= 0:
-        return False
-    q = value / step
-    return abs(q - round(q)) < 1e-6
-
-
-def hl_unit_errors(unit: float, offset: float, step: float | None) -> list[str]:
-    """HL선 세트설정 검사(순수, 결정 55) — 주문단위(USD)는 0(격자) 또는 격자의 배수, 시작호가는 0
-    이상·주문단위 미만·격자의 배수. step(지금 가격대 격자)을 모르면(시세 없음) 배수 검사는 건너뛰고
-    판정(G6)이 잡는다. 사용자 2026-09-30: 잘못 넣으면 경고창."""
-    errs: list[str] = []
-    if unit < 0:
-        errs.append("선주문 주문단위(USD)는 0 이상으로 입력하세요 (0 = HL 호가 격자)")
-    if offset < 0:
-        errs.append("선주문 시작호가(USD)는 0 이상으로 입력하세요")
-    if step:
-        if unit > 0 and not _is_multiple(unit, step):
-            errs.append(f"선주문 주문단위 {unit:g}은(는) HL 호가 격자({step:g})의 배수여야 합니다")
-        if offset > 0 and not _is_multiple(offset, step):
-            errs.append(f"선주문 시작호가 {offset:g}은(는) HL 호가 격자({step:g})의 배수여야 "
-                        "합니다")
-    eff = unit if unit > 0 else (step or 0.0)
-    if offset > 0 and eff > 0 and offset >= eff - 1e-9:
-        errs.append(f"선주문 시작호가 {offset:g}은(는) 주문단위({eff:g}) 미만이어야 합니다")
-    return errs
-
-
 class _Hold(Protocol):
     """evaluate의 hold(근거, 행동=None) — 근거를 줄에 남기고 행동을 돌려준다."""
 
     def __call__(self, reason: str, acts: list[Action] | None = None) -> list[Action]: ...
-
-
-def _evaluate_hl_first(
-    s: AutoMSet, leg: Leg, block: Block, sig: Signals, settings: AutoMSettings, qty: int,
-    hold: _Hold,
-) -> list[Action]:
-    """HL선 상품의 G5·G6(exec §7D) — G5 수치 필터 없음(기준값만 있으면 바로), 역산가는 SF
-    최우선호가 기준, HL 격자, ALO 겹침 회피, 허용범위는 HL 호가창 N호가."""
-    from .hl_price import hl_price_step
-
-    thr = s.threshold(block)
-    if thr is None:
-        return hold("G5 기준값 없음", _cancel_if_resting(leg))
-    # G5 S괴리 필터는 주식선물과 같이 삭제(결정 54로 넣었던 것, 2026-10-14 결정 71) — 기준값만
-    side = leg.pre_side  # HL 다리(정방향 진입 = 매도)
-    # LS 후주문을 테이커로 잡을 SF 호가: HL 매도(LS 매수)면 SF 매도1호가, HL 매수면 SF 매수1호가
-    sf_quote = ((sig.sf_asks[0][0] if sig.sf_asks else None) if side is Side.SELL
-                else (sig.sf_bids[0][0] if sig.sf_bids else None))
-    if (sig.sf_theory is None or sig.stock_last is None or not sf_quote or sig.fx is None
-            or sig.hl_bid1 is None or sig.hl_ask1 is None):
-        return hold(f"G6 입력 없음 (이론가 {sig.sf_theory} S현재가 {sig.stock_last} "
-                    f"SF호가 {sf_quote} HL 1호가 {sig.hl_bid1}/{sig.hl_ask1})")
-    raw_price = hl_first_pre_price(side, sig.stock_last, sf_quote, sig.sf_theory, thr, sig.fx,
-                                   sig.hl_sz_decimals)
-    step = hl_price_step(raw_price, sig.hl_sz_decimals)
-    if step <= 0:
-        return hold(f"G6 HL 격자 계산불가 (역산가 {raw_price})")
-    # 주문단위·시작호가 = 세트설정(USD, 결정 55; 09-22의 화면 콤보는 다른 창과 공유돼 폐기) —
-    # 매도 올림·매수 내림으로 격자(0.1)마다 나던 취소·재발주를 누른다. 0이면 격자 그대로. 격자에
-    # 안 맞으면(가격대가 바뀜 등) 안 낸다 — HL이 격자 밖 가격을 통째로 거부하므로
-    unit = s.hl_unit if s.hl_unit > step + _EPS else step
-    offset = s.hl_offset
-    if hl_unit_errors(unit if s.hl_unit > 0 else 0.0, offset, step):
-        return hold(f"G6 주문단위 {s.hl_unit:g}·시작호가 {offset:g}이 HL 격자 {step:g}에 안 맞음",
-                    _cancel_if_resting(leg))
-    price = hl_snap_to_unit(raw_price, side, unit, step, offset)
-    # ALO 겹침(결정 E): 매도가 매수1호가 이하 / 매수가 매도1호가 이상이면 HL이 거부 → 한 칸 안쪽
-    # (기준값보다 유리한 자리)에 건다
-    if side is Side.SELL and price <= sig.hl_bid1 + _EPS:
-        price = round(sig.hl_bid1 + step, 8)
-    elif side is Side.BUY and price >= sig.hl_ask1 - _EPS:
-        price = round(sig.hl_ask1 - step, 8)
-    # 허용범위(G6): 주식선물과 같은 식 — 매도 = 역산가 ≤ (HL 상대 매수N호가 + 1틱) × (1 + 범위),
-    # 매수는 대칭. N·범위는 공통설정 상대호가 콤보·발주범위(사용자 2026-09-22 확인). 1틱은 호가창
-    # 한 칸 = 호가단위 콤보 값(콤보를 0.1로 두면 HL 호가창도 0.1로 뭉쳐 오므로)
-    rel = (rel_quote(sig.hl_bids, settings.rel_sell) if side is Side.SELL
-           else rel_quote(sig.hl_asks, settings.rel_buy))
-    if rel is None:
-        return hold("G6 HL 호가창 없음")
-    start = range_start(side, rel, unit)
-    limit = limit_price(side, rel, unit, settings.pre_range)
-    rng_txt = f"범위 {start:g}~{limit:g}(호가단위 {unit:g} 격자 {step:g})"
-    if not within_limit(side, price, limit):
-        return hold(f"G6 범위 밖 역산가 {price:g} {rng_txt} 상대호가 {rel:g}",
-                    _cancel_if_resting(leg))
-    sf_disp = (sf_quote - sig.sf_theory) / sig.sf_theory
-    basis = (f"역산가 {price:g}(원값 {raw_price:g}, 주문단위 {unit:g}) = S {sig.stock_last:,.0f}"
-             f"×(1+SF괴리 "
-             f"{sf_disp * 100:.3f}%+{thr * 100:.3f}%)/환율 {sig.fx:,.2f} SF호가 {sf_quote:,.0f} "
-             f"이론가 {sig.sf_theory:,.0f} {rng_txt} HL 매수1 {sig.hl_bid1:g} "
-             f"매도1 {sig.hl_ask1:g}"
-             )
-    hl_qty = qty * s.hl_ratio  # 선주문은 HL 계약(SF 계약 × 10)
-    if leg.pre_order_id is None and leg.status is LegStatus.ARMED:
-        if qty < 1:
-            return hold(f"G4 여유 없음 (목표 {s.target_qty} RT {s.rt})")
-        leg.pre_price, leg.pre_qty, leg.pre_filled = price, hl_qty, 0
-        leg.pre_filled_f = 0.0
-        leg.pre_est = sf_quote  # 후체결(LS) 가격 비교 기준 — 발주 때 본 SF 호가
-        leg.cancel_sent = False
-        leg.status = LegStatus.PRE_RESTING
-        return hold(f"통과 → HL 선주문 {hl_qty}계약 {basis}",
-                    [Action("place_pre", side=side, qty=hl_qty, price=price)])
-    if leg.pre_order_id is not None and leg.pre_price is None:
-        # 번호는 있는데 가격이 없다 = 상태 꼬임(운영 2026-10-14: 다른 계좌 통보가 섞여 판정이 예외로
-        # 죽기를 되풀이). 예외 대신 걸린 주문을 취소해 정리한다
-        return hold("선주문 가격 없음(상태 꼬임) → 취소",
-                    [Action("cancel_pre", order_id=leg.pre_order_id, reason="선주문 가격 없음")])
-    if leg.pre_order_id is not None and leg.pre_price != price:
-        leg.replace_pending = True
-        return hold(f"역산가 변경 {leg.pre_price:g}→{price:g} → 취소 후 재발주 ({basis})",
-                    [Action("cancel_pre", order_id=leg.pre_order_id,
-                            reason=f"역산가 변경 {leg.pre_price:g}→{price:g}")])
-    return hold(f"유지 역산가 {price:g} {rng_txt}")
 
 
 def evaluate(
@@ -972,8 +793,6 @@ def evaluate(
     if not isinstance(gate, int):
         return hold(*gate)
     qty = gate
-    if s.hl_first:
-        return _evaluate_hl_first(s, leg, block, sig, settings, qty, hold)
     # G5 — 기준값만 본다(수치 필터 없음, 결정 71)
     if not _passes_signal(s, leg, sig):
         why = (f"G5 {'진입' if s.product == 'stock' else '진입SF'} 기준값 없음"
@@ -1191,7 +1010,7 @@ def on_pre_fill(
 def _apply_rt(s: AutoMSet, block: Block, qty: int) -> None:
     """RT선진입은 **국내(SF) 체결 계약수** 기준(사용자 확정 2026-09-08) — HL 체결(소수·부분)로
     환산하지 않는다. 정방향: 진입 +, 청산 −(0 아래로는 안 감). 역방향: 진입 −, 청산 +(0 위로는
-    안 감) — RT는 항상 0 또는 음수(사용자 확정 2026-09-14, §7A). HL선 상품은 LS 후체결 때."""
+    안 감) — RT는 항상 0 또는 음수(사용자 확정 2026-09-14, §7A)."""
     if block is Block.ENTRY:
         s.rt += -qty if s.reverse else qty
     else:
@@ -1230,111 +1049,6 @@ def on_pre_cancelled(s: AutoMSet, block: Block, mono: float, settings: AutoMSett
     leg._clear_pre()
     if post_done(leg):
         leg.status = LegStatus.ARMED if leg.running else LegStatus.IDLE
-
-
-# ------------------------------------------------- HL선 상품(exec §7D) 주문 사건 ---
-
-def on_hl_pre_fill(s: AutoMSet, block: Block, hl_qty: float, hl_price: float,
-                   mono: float) -> list[Action]:
-    """HL선 선주문(HL ALO) 체결 — 소수 조각을 장부·판 버퍼에 쌓고, 미헤지 HL이 10에 찰 때마다
-    LS 후주문 1계약(결정 A). 10 미만 조각은 hl_unhedged에 남아 다음 체결과 합친다."""
-    leg = s.leg(block)
-    leg.pre_filled_f += hl_qty
-    leg.reject_streak = 0
-    leg.pending.hl_qty += hl_qty
-    leg.pending.hl_px_sum += hl_price * hl_qty
-    s.hl_net += -hl_qty if leg.hl_side is Side.SELL else hl_qty
-    if leg.pre_qty > 0 and leg.pre_filled_f + _EPS >= leg.pre_qty:
-        leg.pre_filled = leg.pre_qty  # 전량 — 취소할 잔량 없음(_cancel_if_resting 판단용)
-    else:
-        leg.pre_filled = int(leg.pre_filled_f + _EPS)
-    leg.hl_unhedged += hl_qty
-    contracts = int((leg.hl_unhedged + _EPS) / s.hl_ratio)
-    if contracts >= 1:
-        leg.hl_unhedged = max(0.0, leg.hl_unhedged - contracts * s.hl_ratio)
-        leg.post_pending += contracts
-    if leg.status is not LegStatus.HALTED:
-        full = leg.pre_qty > 0 and leg.pre_filled >= leg.pre_qty
-        leg.status = LegStatus.POST_PENDING if full else LegStatus.PRE_PARTIAL
-    _refresh_fill_diff(s)
-    if contracts < 1:
-        return []
-    return [Action("place_post", side=leg.post_side, qty=contracts)]
-
-
-def on_ls_post_fill(
-    s: AutoMSet, block: Block, qty: int, price: float, fx_quote: float | None, mono: float,
-    settings: AutoMSettings, stock_last: float | None = None, sf_theory: float | None = None,
-) -> list[Action]:
-    """HL선 후주문(LS SF 테이커) 체결 — SF 장부·RT 갱신, 기준값(환진입가·S현재가·SF이론가)은
-    **이 시점** 값을 HL 수량(계약×10)으로 가중 기록(결정 C). 후주문 대기가 0이고 선주문도 끝났으면
-    판 끝."""
-    leg = s.leg(block)
-    hl_units = float(qty * s.hl_ratio)
-    leg.pending.sf_qty += qty
-    leg.pending.sf_px_sum += price * qty
-    if fx_quote:
-        leg.pending.fx_sum += fx_quote * hl_units
-        leg.pending.fx_qty += hl_units
-    if stock_last and sf_theory:
-        leg.pending.s_px_sum += stock_last * hl_units
-        leg.pending.theory_sum += sf_theory * hl_units
-        leg.pending.ref_qty += hl_units
-    leg.post_pending = max(0.0, leg.post_pending - qty)
-    s.sf_net += qty if leg.sf_side is Side.BUY else -qty
-    _apply_rt(s, block, qty)
-    if block is Block.ENTRY:
-        s.last_entry_fill_mono = mono
-    else:
-        s.last_exit_fill_mono = mono
-    _refresh_fill_diff(s)
-    if not post_done(leg):
-        return []
-    pre_open = (leg.pre_order_id is not None and leg.pre_qty > 0
-                and leg.pre_filled < leg.pre_qty and leg.status is not LegStatus.HALTED)
-    if pre_open:
-        # 선주문이 아직 걸려 있고 조각만 헤지된 상태 — 판은 선주문이 끝날 때 닫는다
-        leg.status = LegStatus.PRE_PARTIAL
-        return []
-    return _finish_round(s, block, mono, settings)
-
-
-def on_ls_post_reject(s: AutoMSet, block: Block, reason: str = "") -> list[Action]:
-    """HL선 후주문(LS)이 안 잡힌 채 끝남(거부·응답 없음·밖에서 취소) — 결정 B: **재전송 없이 세트
-    중지**(HL은 잡혔는데 LS가 없으니 헤지가 깨짐, CLAUDE.md §7 주문 자동 재전송 금지). 응답 없음은
-    '결과 모름'이라 사유에 그대로 남긴다."""
-    leg = s.leg(block)
-    leg.post_pending = 0.0
-    _refresh_fill_diff(s)
-    return _halt_set(s, block, f"LS 후주문 실패{(': ' + reason) if reason else ''} — 재전송 없이 "
-                               f"중지(체결차 {s.fill_diff:g}, 사람이 정리)")
-
-
-def on_hl_pre_reject(s: AutoMSet, block: Block, mono: float, settings: AutoMSettings,
-                     reason: str = "", alo_cross: bool = False,
-                     shared: bool = False) -> list[Action]:
-    """HL선 선주문 거부. ALO 겹침(넣는 순간 체결될 가격 — 호가가 그새 움직임)은 정상 거부라
-    **연속 거부에 세지 않고** 딜레이 뒤 재역산(사용자 2026-09-22). 그 밖의 거부는 결정 29(연속
-    3회 → 중지)대로.
-
-    shared=True: 여러 세트를 묶어 보낸 요청이 **통째로** 거부됐거나 응답이 없었다(exec §7D 묶음
-    전송) — 누구 탓인지 알 수 없으니 연속 거부에 세지 않는다(사용자 2026-09-30). 되풀이는 엔진이
-    막는다(그 세트들의 다음 발주는 한 건씩 따로 → 원인인 주문만 거부로 센다)."""
-    if not alo_cross and not shared:
-        return on_pre_reject(s, block, mono, settings, reason)
-    leg = s.leg(block)
-    leg.replace_pending = False
-    leg._clear_pre()
-    if leg.status is LegStatus.HALTED:
-        return []
-    _start_delay(leg, mono, settings)
-    if alo_cross:
-        leg.last_reject = f"ALO 겹침 거부(연속 거부에 안 셈): {reason or '-'}"
-        return [Action("notify",
-                       reason=f"HL 선주문 ALO 겹침 거부 — 딜레이 뒤 재역산({reason or '-'})")]
-    leg.last_reject = f"묶음 전체 거부(연속 거부에 안 셈, 다음엔 한 건씩): {reason or '-'}"
-    return [Action("notify",
-                   reason=f"HL 선주문 묶음 전체 거부 — 딜레이 뒤 한 건씩 재발주({reason or '-'})")]
 
 
 def on_post_fill(
@@ -1387,17 +1101,6 @@ def _over_limit(s: AutoMSet, diff: float) -> bool:
     return abs(diff) >= (limit - _EPS if limit > 0 else _EPS)
 
 
-def _carry_hl_leftover(pending: Accum) -> None:
-    """판을 닫을 때 짝 안 맞은 HL 조각만 남기고 나머지를 비운다(HL선, 결정 A). 조각의 평균가는
-    그 판의 HL 평균가로 둔다."""
-    leftover = round(pending.hl_qty - pending.matched_hl(), 9)
-    avg = pending.hl_avg() or 0.0
-    pending.clear()
-    if leftover > _EPS:
-        pending.hl_qty = leftover
-        pending.hl_px_sum = avg * leftover
-
-
 def _finish_round(s: AutoMSet, block: Block, mono: float, settings: AutoMSettings,
                   shortfall: str = "") -> list[Action]:
     """후주문 대기가 0이 된 순간(판 끝) — 매매결과 합산·체결차 판정(사용자 확정 2026-09-10).
@@ -1409,18 +1112,10 @@ def _finish_round(s: AutoMSet, block: Block, mono: float, settings: AutoMSetting
     leg = s.leg(block)
     diff = round(fill_diff(s.sf_net, s.hl_net, s.hl_ratio), 6)
     s.fill_diff = diff
-    if s.hl_first:
-        # HL선(§7D): 후주문이 LS라 모자라는 쪽은 SF. 짝 안 맞은 HL 조각(10 미만)은 버리지 않고
-        # 판 버퍼에 이월 — 다음 판의 LS 체결과 짝을 맞춘다(결정 A)
-        clean = leg.pending.sf_qty * s.hl_ratio + _EPS >= leg.pending.hl_qty
-        _snapshot_round(leg)
-        leg.acc.add_round(leg.pending, matched_only=not clean)
-        _carry_hl_leftover(leg.pending)
-    else:
-        clean = leg.pending.hl_qty + _EPS >= leg.pending.sf_qty * s.hl_ratio
-        _snapshot_round(leg)  # 마지막 판 스냅샷(화면 오른쪽 아래 블록)
-        leg.acc.add_round(leg.pending, matched_only=not clean)
-        leg.pending.clear()
+    clean = leg.pending.hl_qty + _EPS >= leg.pending.sf_qty * s.hl_ratio
+    _snapshot_round(leg)  # 마지막 판 스냅샷(화면 오른쪽 아래 블록)
+    leg.acc.add_round(leg.pending, matched_only=not clean)
+    leg.pending.clear()
     limit = diff_limit(s)
     acts: list[Action] = []
     if leg.status is LegStatus.HALTED:
@@ -1630,7 +1325,6 @@ class AutoMBook:
             # "sf"일 때 계산해 주식 세트가 ×10으로 보였다(운영 11-09 화면: 주식 80/−80 세트가 −720).
             st.fill_diff = round(fill_diff(st.sf_net, st.hl_net, ratio), 6)
             for leg in (st.entry, st.exit):
-                leg.hl_first = st.hl_first  # 선·후주문 다리(§7D)
                 for acc in (leg.acc, leg.pending, leg.last_round):
                     if acc is not None:
                         acc.ratio, acc.stock = ratio, self.product == "stock"
@@ -1638,11 +1332,6 @@ class AutoMBook:
     @property
     def hl_ratio(self) -> int:
         return 1 if self.product == "stock" else HL_PER_SF
-
-    @property
-    def hl_first(self) -> bool:
-        """HL선 상품(§7D) — 선주문 HL ALO, 후주문 LS."""
-        return self.product == PRODUCT_SF_HL_FIRST
 
     def sets_of(self, reverse: bool) -> list[AutoMSet]:
         return self.rev_sets if reverse else self.sets
@@ -1835,8 +1524,6 @@ def _sets_from_dict(targets: list[AutoMSet], sets: object) -> None:
                 target.switch_delay_s = int(rs.get("switch_delay_s", target.switch_delay_s))
                 target.price_offset = int(rs.get("price_offset", target.price_offset) or 0)
                 target.pre_tick = int(rs.get("pre_tick", target.pre_tick) or 0)
-                target.hl_unit = float(rs.get("hl_unit", target.hl_unit) or 0.0)  # HL선(결정 55)
-                target.hl_offset = float(rs.get("hl_offset", target.hl_offset) or 0.0)
                 target.credit = bool(rs.get("credit", target.credit))  # 주식 신용 세트(결정 40)
                 target.en_sf = _opt_float(rs.get("en_sf"))
                 target.en_s = _opt_float(rs.get("en_s"))

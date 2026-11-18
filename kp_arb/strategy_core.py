@@ -8,6 +8,8 @@ DESIGN §6.2 전면 개정 2026-07-22 (원본 주문화면0722.xlsx):
 """
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 from datetime import time as dtime
 from enum import StrEnum
@@ -214,6 +216,82 @@ class BalanceWatch:
     step: int = 150       # 비교잔고배수(주 단위) — 켬이면 양의 정수. 기본 150(사용자 2026-11-11)
 
 
+PRIORITY_WINDOWS = 4      # HL 우선수수료(IOC) 시간구간 수(DESIGN-hl-priority-fee §2)
+_HMS_RE = re.compile(r"\d{2}:\d{2}:\d{2}")  # 구간 시각은 꼭 HH:MM:SS 두 자리씩(검토 11-17 L4)
+P_PER_BP = 10_000         # 우선수수료 p = bp × 10,000(HL 문서: 수수료율 = p ÷ 100,000,000)
+MANUAL_ORDER_SOURCE = "일반주문창"  # 우선수수료·IOC 제외 출처(사용자 2026-11-17)
+
+
+@dataclass
+class PriorityWindow:
+    """HL 우선수수료(IOC) 시간구간 하나(DESIGN-hl-priority-fee §2) — 체크·시작·종료(HH:MM:SS)·
+    수수료(bp)."""
+
+    enabled: bool = False
+    start: str = ""
+    end: str = ""
+    bp: float = 0.0
+
+
+@dataclass
+class HlPriorityFee:
+    """시간구간 4개(공통, 종목 무관). 체크된 구간 안의 전략 HL 주문은 IOC + p(bp 0이면 IOC만)."""
+
+    windows: list[PriorityWindow] = field(
+        default_factory=lambda: [PriorityWindow() for _ in range(PRIORITY_WINDOWS)])
+
+
+def apply_hl_priority_fee(h: HlPriorityFee, raw: object) -> None:
+    """`hl_priority_fee` {windows: [{enabled, start, end, bp} × 4]} → 설정. 없거나 dict가 아니면
+    그대로. 체크된 구간은 시각 둘 다 HH:MM:SS·start < end·bp ≥ 0이어야 하며 틀리면 ValueError
+    (명령은 거부, 저장본 복원은 기본값). 구간 수가 4보다 적으면 나머지는 빈 구간."""
+    if not isinstance(raw, dict):
+        return
+    rows = raw.get("windows")
+    if not isinstance(rows, list) or len(rows) > PRIORITY_WINDOWS:
+        raise ValueError("우선수수료 구간 값 오류")
+    out: list[PriorityWindow] = []
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict):
+            raise ValueError(f"우선수수료 구간 {i + 1} 값 오류")
+        enabled, start, end, bp = (r.get("enabled", False), r.get("start", ""), r.get("end", ""),
+                                   r.get("bp", 0.0))
+        if (not isinstance(enabled, bool) or not isinstance(start, str) or not isinstance(end, str)
+                or isinstance(bp, bool) or not isinstance(bp, int | float)):
+            raise ValueError(f"우선수수료 구간 {i + 1} 값 오류")
+        start, end = start.strip(), end.strip()
+        if not math.isfinite(bp) or bp < 0:  # NaN·inf는 다른 클라이언트 JSON으로 들어올 수 있다
+            raise ValueError(f"구간 {i + 1} 수수료는 0 이상(bp)")
+        if enabled:
+            if not (_HMS_RE.fullmatch(start) and _HMS_RE.fullmatch(end)):
+                raise ValueError(f"구간 {i + 1} 시각은 HH:MM:SS 형식")
+            if parse_hhmm(start) >= parse_hhmm(end):
+                raise ValueError(f"구간 {i + 1}은 시작 < 종료(자정 넘김 없음)")
+        out.append(PriorityWindow(enabled, start, end, float(bp)))
+    while len(out) < PRIORITY_WINDOWS:
+        out.append(PriorityWindow())
+    h.windows = out
+
+
+def priority_window_for(now: dtime, windows: list[PriorityWindow]) -> PriorityWindow | None:
+    """지금 시각이 든 **첫** 체크 구간(start ≤ now < end), 없으면 None(= GTC). 순수."""
+    for w in windows:
+        if not w.enabled:
+            continue
+        try:
+            if parse_hhmm(w.start) <= now < parse_hhmm(w.end):
+                return w
+        except ValueError:
+            continue
+    return None
+
+
+def priority_p(bp: float) -> int | None:
+    """bp → 우선수수료 p(정수). bp 0 이하면 None(IOC만, p 안 붙임 — 사용자 답 1)."""
+    p = round(bp * P_PER_BP)
+    return p if p > 0 else None
+
+
 @dataclass
 class SoundSetting:
     """알람 사운드 1종 — 재생 여부 + wav 파일 경로 (DESIGN-settings §2)."""
@@ -262,6 +340,9 @@ class GlobalSettings:
     auto_shutdown: AutoShutdown = field(default_factory=AutoShutdown)
     # 토탈잔고 감시(DESIGN-balance-watch, 2026-11-11) — 판정·전송은 코어
     balance_watch: BalanceWatch = field(default_factory=BalanceWatch)
+    # HL 우선수수료(IOC) 시간구간(DESIGN-hl-priority-fee, 사용자 2026-11-17) — 발주 길에서 코어가
+    # 적용
+    hl_priority_fee: HlPriorityFee = field(default_factory=HlPriorityFee)
     # 주식선물 배당율(DESIGN-settings §2, 사용자 2026-11-13) — {종목키: {near: q, next: q}}, 소수
     # (0.012 = 1.2%). 이론가에는 안 쓰고 체결쏴 주식선물 역산가·리스크방지, 동시호가 행 가격의
     # 기준값에 더한다. 월물 교체·배당락 뒤 값 변경은 사용자가 직접.
@@ -477,6 +558,10 @@ def _global_settings_from_dict(s: GlobalSettings, raw: object) -> None:
         apply_balance_watch(s.balance_watch, raw.get("balance_watch"))
     except ValueError:  # 저장본의 배수가 깨졌으면 그 항목만 기본값(끔)
         s.balance_watch = BalanceWatch()
+    try:
+        apply_hl_priority_fee(s.hl_priority_fee, raw.get("hl_priority_fee"))
+    except ValueError:  # 저장본의 구간이 깨졌으면 전부 빈 구간(= GTC)
+        s.hl_priority_fee = HlPriorityFee()
     try:
         apply_dividend(s.dividend, raw.get("dividend"))
     except ValueError:  # 저장본의 배당율이 깨졌으면 전부 0

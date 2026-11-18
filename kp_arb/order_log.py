@@ -48,7 +48,10 @@ def _fmt(intent: OrderIntent, *, with_price: bool = True) -> str:
          f"{intent.side.value} {intent.qty:g}")
     if with_price and intent.price is not None:
         s += f" @ {intent.price}"
-    return s + f"{' reduce' if intent.reduce_only else ''}{' post' if intent.post_only else ''}"
+    s += f"{' reduce' if intent.reduce_only else ''}{' post' if intent.post_only else ''}"
+    if intent.tif == "Ioc":  # 우선수수료 구간(DESIGN-hl-priority-fee) — 사람이 읽는 줄에도 남긴다
+        s += " ioc" + (f" p={intent.priority_p}" if intent.priority_p else "")
+    return s
 
 
 def order_requested(intent: OrderIntent, *, price: float | None = None) -> None:

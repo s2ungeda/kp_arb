@@ -429,7 +429,18 @@
 - **결정 92 — 주문 키 = (거래소, 계좌, 주문번호)(사용자 2026-11-17 "일관성을 위해서는 거래소, 계좌, 주문번호 이 3개가 키가 되어야 한다" → "A로 전수 적용"):** 결정 73의 (계좌, 번호)는 거래소를 "계좌 None = HL"이라는 암묵 규칙으로 구분했고, HL oid와 LS 주문번호가 같은 숫자면 번호만 보는 자리(NXT 개장 자동청산 체결 누적, 자동M 엔진 추적 `_orders`·등록 전 체결 보관함, 동시호가 `_on_fill`)에서 섞일 수 있었다(검토 2026-11-17 지적 — 그날 자동청산이 체결가까지 더하게 되면서 원화 체결가가 HL 평균가에 섞일 위험). 규칙: ① 체결·주문 통보(`Fill`·`OrderEvent`)는 **거래소를 반드시 싣는다**(LS 파서 LS, HL 파서 HL). ② 장부 `OrderBook`의 키 `OrderKey = (Venue, Account | None, 번호)` — 추적·미아 보관·닫힌 주문 정리 전부; `on_fill/on_ack/on_cancel/on_reject/replay_pending/order`가 거래소를 받는다. 거래소 없이 찾는 조회(화면·옛 호출자)는 **찾기**(HL 먼저 → 번호가 한 LS 계좌뿐일 때만). ③ 엔진은 자기 주문을 같은 세 값으로 든다 — 자동M `_orders`·`_orphan_fills`·`_seen_status`를 `OrderKey`로(`_key(ref, oid)`: 선주문 LS(HL선이면 HL)·후주문 HL(HL선이면 LS)), 체결 훅은 `OrderBook.key_of(order.intent, oid)`로 찾아 옛 계좌 재검사는 키로 대체; 동시호가는 (LS, 선물옵션계좌) 통보만; NXT 개장 자동청산은 HL 통보만. ④ 게이트웨이 안의 주문 문맥(LS `ls.py _orders`·`ls_ws _org_by_cancel`, HL `hl_live.note_identified`)은 거래소가 고정이라 (계좌, 번호)/번호 그대로. 코어 `LiveSystem.cancel/amend_price/cancel_many`는 `venue` 인자를 받고 엔진·수동 명령(상품 → 거래소·계좌)이 넘긴다; 취소내역 중복 방지도 키로(검토 2026-11-17 반영). ⑤ L12대로 번호를 쓰는 자리를 전수로 바꿨다(장부·bootstrap·core_server 정리 루프·세 엔진·테스트 5파일 70여 곳의 통보 생성).
 - **주문 꼬리표(주문리스트 '세트' 칸):** 상품 글자를 앞에 — 주식선물 `선정3진`/`선역4청`, 주식 `주정3진`/`주역4청`(주식 역방향이 뒤에 붙을 수 있어 자리 확보). 옛 `정3진입` 형식은 폐기.
 
-## 7D. 주식선물 HL선(先) 버전 — 선주문 HL 메이커, 후주문 LS (시험, 사용자 결정 2026-09-22) — **개발 목록에서 제외(사용자 2026-11-13, DESIGN.md 부록; 코드는 남김)**
+- **결정 93 — 주식선물 HL선(§7D) 코드 제거(사용자 2026-11-18 "우선 HL선 전략은 제거.. 앞으로 안 쓸거다"):** 11-13 개발 목록
+  제외에 이어 코드까지 걷어냄. 뺀 것: 상품 `sf_hl_first`(`auto_m.PRODUCTS`), 세트의 `hl_unit`/`hl_offset`·줄의 `pre_filled_f`/
+  `hl_unhedged`, HL선 판정(`_evaluate_hl_first`·`hl_first_pre_price`·`hl_snap_to_unit`·`hl_unit_errors`)·주문 사건(`on_hl_pre_fill`·
+  `on_ls_post_fill`·`on_ls_post_reject`·`on_hl_pre_reject`)·모니터 수치, 엔진의 HL 선주문·묶음 전송(`_place_hl_pre[_batch]`·
+  `_cancel_pre_batch`)·LS 후주문·`is_alo_cross_reject`, 코어의 HL선 엔진 생성·명령 키·`hl_step`, 화면 모듈
+  `order_autom_hl_first.py`·exe 인자 `autoMH`·메뉴·세트설정 USD 칸, 리포트의 HL선 파일·식, 테스트 `test_auto_m_hl_first.py`와
+  엔진 HL선 테스트 12건. 남긴 것: 메인 `_RETIRED_SCREENS`의 모듈 이름(옛 화면 구성 저장본이 띄우지 않게), 사고 기록 주석(09-29
+  COM 정지·10-13 검토 등 — 역사), `hl_price.hl_round_price(maker=True)`(NXT 개장매매가 씀). 저장본 `core_state.json`의
+  `종목|sf_hl_first` 종목 상태는 복원 때 모르는 상품으로 무시된다(`parse_book_key`가 PRODUCTS 밖이면 None). 묶음 전송(결정
+  2026-09-30)은 HL선 전용이라 같이 빠졌다 — 주식선물·주식 선주문은 원래 한 건씩. §7D 본문은 역사로 남긴다.
+
+## 7D. 주식선물 HL선(先) 버전 — 선주문 HL 메이커, 후주문 LS (시험, 사용자 결정 2026-09-22) — **개발 목록에서 제외(사용자 2026-11-13) → 코드 제거(사용자 2026-11-18, 결정 93) — 아래는 역사 기록**
 
 > **시험 중지 (사용자 2026-10-01, 결정 62):** "테스트해 보니 득이 없다고 판단" — 시험을 멈추고 **메인 메뉴에서 뺐다.** 버리지는 않는다: 화면 모듈(`order_autom_hl_first`)·코어 엔진(`sf_hl_first`)·테스트·이 절은 그대로 둔다(지난 화면 구성 복원에서도 이 화면은 다시 띄우지 않는다). 아래 [OPEN]·사용자 확인 필요 항목은 시험을 다시 시작할 때 본다.
 

@@ -121,6 +121,42 @@ def empty_table() -> dict[str, Any]:
             "sum": dict.fromkeys(COLUMNS, NOT_QUERIED)}
 
 
+PRIORITY_ROWS = 4  # 우선수수료 탭 행 수(DESIGN-hl-priority-fee §2·§3 = strategy_core 구간 수)
+
+
+def priority_rows_from_settings(settings: object) -> list[tuple[bool, str, str, str]]:
+    """코어 설정(`/state`의 settings.hl_priority_fee.windows) → 탭 4행 (체크, 시작, 종료, bp 글).
+    없거나 모양이 틀리면 빈 행. bp 0은 "0"(순수)."""
+    rows: list[tuple[bool, str, str, str]] = []
+    wins: Any = None
+    if isinstance(settings, dict):
+        fee = settings.get("hl_priority_fee")
+        wins = fee.get("windows") if isinstance(fee, dict) else None
+    for i in range(PRIORITY_ROWS):
+        w = (wins[i] if isinstance(wins, list) and i < len(wins) and isinstance(wins[i], dict)
+             else {})
+        bp = w.get("bp", 0.0)
+        bp_text = (f"{float(bp):g}" if isinstance(bp, int | float) and not isinstance(bp, bool)
+                   else "")
+        rows.append((bool(w.get("enabled", False)), str(w.get("start", "") or ""),
+                     str(w.get("end", "") or ""), bp_text))
+    return rows
+
+
+def priority_rows_payload(rows: list[tuple[bool, str, str, str]]) -> dict[str, Any]:
+    """탭 4행 → `settings_global` 명령 본문(`hl_priority_fee` 키만). bp 빈칸·오타는 0(= IOC만),
+    시각은 다듬어 그대로(검사는 코어 — 틀리면 코어가 거부). 순수."""
+    wins: list[dict[str, Any]] = []
+    for enabled, start, end, bp_text in rows[:PRIORITY_ROWS]:
+        try:
+            bp = float(bp_text.strip().replace(",", ""))
+        except ValueError:
+            bp = 0.0
+        wins.append({"enabled": bool(enabled), "start": start.strip(), "end": end.strip(),
+                     "bp": bp})
+    return {"cmd": "settings_global", "hl_priority_fee": {"windows": wins}}
+
+
 def total_of(sum_row: dict[str, Any] | None) -> float | None:
     """'합' 행(문자열) → 토탈잔고 = Σ|주식| + Σ|주식선물|×10 + Σ|HL|(DESIGN-balance-watch §0의 옛
     정의, 실조회 값). 세 칸 중 하나라도 조회 전·오류면 None. 순수."""

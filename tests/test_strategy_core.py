@@ -6,12 +6,17 @@ import pytest
 from kp_arb.domain.enums import Instrument, Side, Venue
 from kp_arb.strategy_core import (
     Block,
+    HlPriorityFee,
+    PriorityWindow,
     ScreenKind,
     ScreenState,
     allowed_order_qty,
+    apply_hl_priority_fee,
     hl_qty_for,
     in_operating_window,
     plan_order,
+    priority_p,
+    priority_window_for,
     taker_price,
     validate_run,
 )
@@ -147,3 +152,45 @@ def test_operating_hours_override() -> None:
     assert not in_screen_operating_window(screen, time(12, 0))
     screen.settings.operating_hours = "broken"
     assert in_screen_operating_window(screen, time(12, 0))      # 형식 오류 → 기본값
+
+
+def test_hl_priority_fee_windows_apply_and_judge() -> None:
+    # DESIGN-hl-priority-fee §2(사용자 2026-11-17): 시간구간 4개(체크·시작·종료·bp), 체크된 첫 구간
+    # [start, end) 안이면 그 구간, 아니면 None(= GTC). p = bp × 10,000, bp 0이면 None(IOC만)
+    fee = HlPriorityFee()
+    assert len(fee.windows) == 4 and not any(w.enabled for w in fee.windows)
+    apply_hl_priority_fee(fee, {"windows": [
+        {"enabled": True, "start": " 08:00:00 ", "end": "08:05:00", "bp": 2},
+        {"enabled": False, "start": "", "end": "", "bp": 0},
+        {"enabled": True, "start": "09:00:00", "end": "09:01:00", "bp": 0.5}]})
+    assert fee.windows[0] == PriorityWindow(True, "08:00:00", "08:05:00", 2.0)
+    assert fee.windows[3] == PriorityWindow()                    # 모자란 구간은 빈 구간
+    assert priority_window_for(time(8, 0, 0), fee.windows) is fee.windows[0]
+    assert priority_window_for(time(8, 4, 59), fee.windows) is fee.windows[0]
+    assert priority_window_for(time(8, 5, 0), fee.windows) is None  # 종료는 열린 끝
+    assert priority_window_for(time(9, 0, 30), fee.windows) is fee.windows[2]
+    assert priority_window_for(time(12, 0), fee.windows) is None
+    # 겹치면 위 구간이 이긴다
+    fee.windows[1] = PriorityWindow(True, "08:00:00", "08:10:00", 9.0)
+    assert priority_window_for(time(8, 1), fee.windows) is fee.windows[0]
+    assert priority_window_for(time(8, 7), fee.windows) is fee.windows[1]
+    assert priority_p(2.0) == 20_000 and priority_p(0.5) == 5_000 and priority_p(0.0) is None
+    # 거부: 체크 구간의 시각 형식·순서, 음수 bp, 구간 5개, dict 아님. 키 없음·dict 아님은 그대로
+    for bad in ({"windows": [{"enabled": True, "start": "8:00", "end": "08:05:00", "bp": 1}]},
+                {"windows": [{"enabled": True, "start": "09:00:00", "end": "08:05:00", "bp": 1}]},
+                {"windows": [{"enabled": False, "start": "", "end": "", "bp": -1}]},
+                {"windows": [{} for _ in range(5)]},
+                {"windows": "x"}):
+        with pytest.raises(ValueError):
+            apply_hl_priority_fee(fee, bad)
+    before = [PriorityWindow(**vars(w)) for w in fee.windows]
+    apply_hl_priority_fee(fee, None)
+    assert fee.windows == before
+    apply_hl_priority_fee(fee, {"windows": []})                 # 빈 목록 = 전부 빈 구간(GTC)
+    assert priority_window_for(time(8, 1), fee.windows) is None
+    # 검토 2026-11-17 M6·L4: NaN·inf 거부(다른 클라이언트 JSON), 시각은 두 자리씩만
+    for bad in ({"windows": [{"enabled": False, "start": "", "end": "", "bp": float("nan")}]},
+                {"windows": [{"enabled": False, "start": "", "end": "", "bp": float("inf")}]},
+                {"windows": [{"enabled": True, "start": "8:0:0", "end": "08:05:00", "bp": 1}]}):
+        with pytest.raises(ValueError):
+            apply_hl_priority_fee(fee, bad)

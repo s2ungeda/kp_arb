@@ -45,26 +45,14 @@ ST_C_POST = ("2026-09-28 10:03:53,592 INFO 체결 주식 정방향 1세트 청�
              "HL 1 @ 202.63 기준est 203 차이 +0.37(+0.182%) 현est 203 환진입가 1356.9 "
              "S현재가 276500.0 SF이론가 None → RT 1 HL대기 0 | 장부 SF -1 HL 1 체결차 0 "
              "| 누적 HL 1 SF 1 환평균 1356.9 HL평균 202.63 SF평균 277000.0 Sprd -0.741%")
-# HL선(§7D) — 선주문 HL, 후주문 LS SF(엔진 로그 형식)
-HF_PRE = ("2026-09-28 11:00:00,100 INFO 체결 HL선 정방향 1세트 진입: HL 선주문 #558 10 @ 201.5 "
-          "(발주 때 SF호가 275,000) → 누적 10/10, 미헤지 조각 0, LS 대기 1 | 장부 SF 0 HL -10 "
-          "체결차 -10")
-HF_POST = ("2026-09-28 11:00:01,200 INFO 체결 HL선 정방향 1세트 진입: LS 후주문 #9001 SF 1 "
-           "@ 275,000 기준 SF매도1 275,000 환진입가 1358.0 S현재가 274750.0 SF이론가 274,976 "
-           "→ RT 1 LS대기 0 | 장부 SF 1 HL -10 체결차 0 | 누적 HL 10 SF 1 환평균 1358.0 "
-           "HL평균 201.5 SF평균 275000.0 Sprd 0.111%")
-
-
 def _sf_formula(fx: float, hl: float, s: float, sf: float, th: float) -> float:
     return (fx * hl - s) / s - (sf - th) / th
 
 
 def test_round_sprd_formulas_per_product() -> None:
-    # 주식선물/HL선: HL 항 − SF 항. 주식: HL 항만, 분모는 주식 체결 평균가(결정 48).
+    # 주식선물: HL 항 − SF 항. 주식: HL 항만, 분모는 주식 체결 평균가(결정 48).
     sf = round_sprd("sf", 270_000.0, 201.24, 1358.2, 274_750.0, 274_976.0)
     assert sf == pytest.approx(_sf_formula(1358.2, 201.24, 274_750, 270_000, 274_976))
-    hf = round_sprd("sf_hl_first", 201.5, 275_000.0, 1358.0, 274_750.0, 274_976.0)
-    assert hf == pytest.approx(_sf_formula(1358.0, 201.5, 274_750, 275_000, 274_976))
     st = round_sprd("stock", 277_000.0, 202.63, 1356.9, 276_500.0, None)
     assert st == pytest.approx((1356.9 * 202.63 - 277_000) / 277_000)  # S현재가는 안 씀
     assert round_sprd("stock", None, 202.63, 1356.9, None, None) is None
@@ -89,9 +77,9 @@ def test_parse_rounds_closes_on_zero_wait_and_weights_partials() -> None:
     assert want is not None and r["판Sprd(%)"] == pytest.approx(round(want * 100, 4))
 
 
-def test_parse_rounds_skips_halted_partial_round_and_reads_stock_and_hl_first() -> None:
+def test_parse_rounds_skips_halted_partial_round_and_reads_stock() -> None:
     # 주식 하이닉스: 부분체결 판 + 중지 → 뽑지 않음. 삼성 청산 완결 판은 지수 표기·None 이론가도
-    # 처리. HL선은 선주문 HL·후주문 LS를 바꿔 읽는다.
+    # 처리.
     rows = parse_rounds([ST_PRE1, ST_POST1, ST_PRE2, ST_HALT, ST_C_PRE, ST_C_POST],
                         underlying="samsung", product="stock")
     assert len(rows) == 1
@@ -99,50 +87,45 @@ def test_parse_rounds_skips_halted_partial_round_and_reads_stock_and_hl_first() 
     assert r["다리"] == "청산" and r["선주문평균가"] == 277_000.0 and r["SF이론가"] is None
     assert r["판Sprd(%)"] == pytest.approx(round((1356.9 * 202.63 - 277_000) / 277_000 * 100, 4))
     assert r["누적Sprd(%)"] == -0.741
-    hf = parse_rounds([HF_PRE, HF_POST], underlying="samsung", product="sf_hl_first")
-    assert len(hf) == 1 and hf[0]["상품"] == "HL선"
-    assert hf[0]["선주문평균가"] == 201.5 and hf[0]["후주문평균가"] == 275_000.0
-    assert hf[0]["판Sprd(%)"] == pytest.approx(round(
-        _sf_formula(1358.0, 201.5, 274_750, 275_000, 274_976) * 100, 4))
 
 
 def test_parse_rounds_reads_reverse_rounds_with_negative_rt() -> None:
     # 역방향은 RT가 0 또는 음수(§7A) — 전엔 RT를 부호 없는 숫자로만 읽어 역방향 판이 통째로 빠졌다.
-    # 줄은 엔진 로그 형식 그대로(HL선 역방향 진입: HL 매수 선주문 → LS SF 매도 후주문).
-    pre = ("2026-09-30 10:00:00,100 INFO 체결 HL선 역방향 1세트 진입: HL 선주문 #O1 10 @ 1183.6 "
-           "(발주 때 SF호가 1.598e+06) → 누적 10/10, 미헤지 조각 0, LS 대기 1 | 장부 SF 0 HL 10 "
-           "체결차 10")
-    post = ("2026-09-30 10:00:00,900 INFO 체결 HL선 역방향 1세트 진입: LS 후주문 #O2 SF 1 "
-            "@ 1,598,000 기준est 1.598e+06 차이 +0(+0.000%) 환진입가 1356 S현재가 1600000.0 "
-            "SF이론가 1,605,000 → RT -1 LS대기 0 | 장부 SF -1 HL 10 체결차 0 | 누적 HL 10 SF 1 "
+    # 줄은 엔진 로그 형식 그대로(주식선물 역방향 진입: SF 매도 선주문 → HL 매수 후주문).
+    pre = ("2026-09-30 10:00:00,100 INFO 체결 역방향 1세트 진입: 선주문 #O1 1 @ 1598000 "
+           "기준est 1183.6 현est 1183.6 → 누적 1/1, HL 대기 10 | 장부 SF -1 HL 0 체결차 -10")
+    post = ("2026-09-30 10:00:00,900 INFO 체결 역방향 1세트 진입: 후주문 #O2 HL 10 @ 1183.6 "
+            "기준est 1183.6 차이 +0(+0.000%) 현est 1183.6 환진입가 1356 S현재가 1600000.0 "
+            "SF이론가 1,605,000 → RT -1 HL대기 0 | 장부 SF -1 HL 10 체결차 0 | 누적 HL 10 SF 1 "
             "환평균 1356.0 HL평균 1183.6 SF평균 1598000.0 Sprd 0.746%")
-    rows = parse_rounds([pre, post], underlying="sk_hynix", product="sf_hl_first")
+    rows = parse_rounds([pre, post], underlying="sk_hynix", product="sf")
     assert len(rows) == 1
     r = rows[0]
     assert (r["방향"], r["다리"], r["RT"]) == ("역방향", "진입", -1)
-    assert r["선주문평균가"] == 1183.6 and r["후주문평균가"] == 1_598_000.0
+    assert r["선주문평균가"] == 1_598_000.0 and r["후주문평균가"] == 1183.6
     assert r["판Sprd(%)"] == pytest.approx(round(
         _sf_formula(1356.0, 1183.6, 1_600_000, 1_598_000, 1_605_000) * 100, 4))
     assert r["누적Sprd(%)"] == 0.746
 
 
-def test_collect_reads_three_products_by_filename_and_writes_csv(tmp_path: Path) -> None:
+def test_collect_reads_products_by_filename_and_writes_csv(tmp_path: Path) -> None:
     (tmp_path / "autom_samsung_20260928.log").write_text(
         "\n".join([SF_PRE, SF_POST_PARTIAL, SF_POST_REST]), encoding="utf-8")
     (tmp_path / "autom_samsung_stock_20260928.log").write_text(
         "\n".join([ST_C_PRE, ST_C_POST]), encoding="utf-8")
-    (tmp_path / "autom_samsung_sf_hl_first_20260928.log").write_text(
-        "\n".join([HF_PRE, HF_POST]), encoding="utf-8")
+    # 옛 HL선 로그 파일(_sf_hl_first_, 2026-11-18 제거)은 이름이 안 맞아 건너뛴다
+    (tmp_path / "autom_samsung_sf_hl_first_20260928.log").write_text(SF_POST_REST,
+                                                                      encoding="utf-8")
     (tmp_path / "autom_samsung_20260927.log").write_text(SF_POST_REST, encoding="utf-8")
     rows = collect(tmp_path, "20260928")
     assert [(r["완료시각"], r["상품"]) for r in rows] == [
-        ("10:03:53", "주식"), ("10:15:40", "주식선물"), ("11:00:01", "HL선")]  # 완료시각순
+        ("10:03:53", "주식"), ("10:15:40", "주식선물")]  # 완료시각순
     out = tmp_path / "sprd.csv"
     write_csv(rows, out)
     text = out.read_text(encoding="utf-8-sig").splitlines()
     assert text[0].startswith("완료일,완료시각,종목,상품,방향,세트,다리,RT,")
     assert ",주문Sprd(%),판Sprd(%),주문-판Sprd(%),누적Sprd(%),파일" in text[0]
-    assert len(text) == 4 and "주식선물" in text[2]
+    assert len(text) == 3 and "주식선물" in text[2]
     assert text[1].startswith("2026-09-28,10:03:53,samsung,주식,")
     assert text[1].endswith("autom_samsung_stock_20260928.log")
 

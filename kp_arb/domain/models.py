@@ -83,6 +83,13 @@ class OrderIntent(BaseModel):
     account: Account | None = None  # LS 전용. None이면 instrument로 자동 라우팅.
     reduce_only: bool = False       # HL 전용 — 청산전용(포지션 증가 금지). LS는 무시.
     post_only: bool = False         # HL 전용 — 메이커 전용(tif=Alo). LS는 무시.
+    # HL 전용(DESIGN-hl-priority-fee, 2026-11-17) — 코어가 발주 길에서 시간구간을 보고 채운다:
+    # tif "Ioc"(체크 구간 안의 전략 주문), priority_p = 우선수수료 p(bp × 10,000; 없으면 None)
+    tif: str | None = None
+    priority_p: int | None = None
+    # 우선수수료·IOC 제외 표시 — 전략이 호가창에 "걸어 두는" 주문(NXT 개장 자동청산 익절 등)은 IOC로
+    # 내면 뜻이 없어 구간 안에서도 그대로 GTC(검토 2026-11-17 H3)
+    priority_exempt: bool = False
     source: str = ""                # 발주 출처(로그용): 일반주문창·따라가기·자동M 등. 빈값=미상.
     tag: str = ""                   # 세트 꼬리표(자동M "정3진입"·"역1청산") — 주문 리스트 '세트' 칸
     # LS 현물 전용(2026-09-17, 체결쏴 주식) — 신용거래코드(MgntrnCode, "000" 보통)와 주문 시장

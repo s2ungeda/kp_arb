@@ -55,8 +55,9 @@ def test_layout_choices_lists_generations_with_names() -> None:
 
 
 def test_retired_hl_first_screen_is_not_restored() -> None:
-    # 사용자 2026-10-01(exec 결정 62): HL선 시험 중지 — 메인 메뉴에서 뺐고(모듈은 남김), 지난 화면
-    # 구성에 남아 있어도 시동 복원·"화면 구성 되돌리기"에서 다시 띄우지 않는다.
+    # 사용자 2026-10-01(exec 결정 62): HL선 시험 중지 → 2026-11-18 코드 제거(결정 93). 지난 화면
+    # 구성(win_state 저장본)에 모듈 이름이 남아 있어도 시동 복원·"화면 구성 되돌리기"에서 띄우지
+    # 않는다.
     from kp_arb.main_window import restorable_screens
 
     saved = {"screens": ["kp_arb.order_autom", "kp_arb.order_autom_hl_first",
@@ -148,7 +149,6 @@ def test_launch_command_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
     assert launch_command("kp_arb.monitor", ())[-1] == "monitor"
     assert launch_command("kp_arb.order_autom", ())[-1] == "autoM"
     assert launch_command("kp_arb.order_autom_stock", ())[-1] == "autoMS"  # 주식 화면(09-16)
-    assert launch_command("kp_arb.order_autom_hl_first", ())[-1] == "autoMH"  # HL선 시험(09-22)
     assert launch_command("kp_arb.balance_query_screen", ())[-1] == "balance"  # 잔고 조회(11-13)
     assert launch_command("kp_arb.main_window", ())[0].endswith("meme.exe")
 

@@ -740,9 +740,9 @@ def test_missing_judgment_fx_holds_orders_without_halting() -> None:
 
 
 def test_ls_feed_down_holds_orders_and_cancels_resting() -> None:
-    # G0-1(운영 사고 2026-09-29 14:55): xing COM 스레드가 멈춰 LS가 전부 섰는데 HL선이 HL 선주문을
-    # 계속 냈다 → LS 피드가 끊김/정지면 주문 안 냄 + 걸어둔 선주문 취소, 세트는 실행 유지, 회복하면
-    # 재개.
+    # G0-1(운영 사고 2026-09-29 14:55): xing COM 스레드가 멈춰 LS가 전부 섰는데 (당시 HL선 전략이)
+    # HL 주문을 계속 냈다 → LS 피드가 끊김/정지면 주문 안 냄 + 걸어둔 선주문 취소, 세트는 실행 유지,
+    # 회복하면 재개.
     s = _set()
     set_running(s, Block.ENTRY, True)
     assert evaluate(s, Block.ENTRY, _sig(ls_feed_ok=False), SETTINGS, U) == []
