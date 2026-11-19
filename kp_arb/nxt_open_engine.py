@@ -408,6 +408,21 @@ class NxtOpenEngine:
                        [(r.block, r.index + 1, r.side, r.qty, r.price) for r in results])
         if not intents:
             return
+        # 결정 94(exec, 사용자 2026-11-19): 보내기 직전 HL 호가 5단(양쪽)과 단별 est(그 방향 호가를
+        # 수량만큼 쓸어담은 평균 예상가) — 체결가와의 갭을 "발주→체결"로 가르고 잔량 부족/가격
+        # 이동을 구분
+        hq = self._system.quotes.get((u, Instrument.HL_PERP, "hl"))
+        if hq is not None and hq.bid and hq.ask:
+            bids = hq.bids or [(hq.bid, hq.bid_qty or 1.0)]
+            asks = hq.asks or [(hq.ask, hq.ask_qty or 1.0)]
+            ests = [(it.tag,
+                     f"{est_price(bids if it.side is Side.SELL else asks, float(it.qty)):g}")
+                    for it in intents]
+            self._log.info("[NXT개장] %s 발주 직전 HL 호가 — 매수측 %s / 매도측 %s / 단별 est %s",
+                           u.value, " ".join(f"{p:g}×{q:g}" for p, q in bids[:5]),
+                           " ".join(f"{p:g}×{q:g}" for p, q in asks[:5]), ests)
+        else:
+            self._log.info("[NXT개장] %s 발주 직전 HL 호가 없음", u.value)
         cloids = [self._system.new_hl_cloid() for _ in intents]
         try:
             outs = await self._system.place_many(intents, cloids)

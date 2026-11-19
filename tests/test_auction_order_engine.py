@@ -255,6 +255,8 @@ async def test_process3_fills_to_four_hl_orders_then_amend_and_cancel() -> None:
     await asyncio.sleep(FILL_DEBOUNCE_S + 0.05)
     d = eng._day(U)
     hl = [i for i in sys_.placed if i.venue is Venue.HYPERLIQUID]
+    # 동시호가 HL 주문은 GTC 그대로 — 우선수수료(IOC) 구간 제외 표시(사용자 2026-11-18)
+    assert all(i.priority_exempt for i in hl)
     # 선물 매수 3계약 → HL 매도 30 → 7.5씩, 매도는 기준가 1332.5 − 오프셋(사용자 2026-10-28 — 매도면
     # 입력값에 −1: 양수 = 상대호가 쪽 아래, 음수 = 위 메이커)
     assert [(i.tag, i.side, i.qty, i.price) for i in hl] == [
@@ -268,6 +270,7 @@ async def test_process3_fills_to_four_hl_orders_then_amend_and_cancel() -> None:
     assert sys_.cancelled == ["O2"] and b.hl_orders["a"] == "O6"
     new = sys_.placed[-1]
     assert (new.tag, new.side, new.qty, new.price) == ("HLa정정", Side.SELL, 7.5, 1331.3)
+    assert new.priority_exempt  # 정정 신규도 GTC 그대로(우선수수료 제외)
     assert await eng.amend(U, "b") == "b 행 정정PT가 없습니다"
     # 음수 정정PT(2026-10-28 시험용): 매도 d를 1333.5 + 0.5 = 1334.0으로(반대쪽 — 체결 안 되게)
     b.settings.hl_pt["d"] = -0.5

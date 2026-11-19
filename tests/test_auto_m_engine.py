@@ -1190,6 +1190,9 @@ async def test_engine_writes_per_underlying_log(tmp_path: Any) -> None:
     assert "행동 정방향 1세트 진입: place_pre buy 10 1602000" in text
     assert "체결 정방향 1세트 진입: 선주문 #O1" in text and "누적 4/10, HL 대기 40" in text
     assert "행동 정방향 1세트 진입: place_post sell 40" in text
+    # 결정 94(사용자 2026-11-19): 후주문 보내기 직전 est(수량만큼 쓸어담은 예상가)와 그 방향
+    # 호가 5단 — HL 매도 → 매수호가 1184×500 한 단뿐이라 est 1184, 호가 한 칸
+    assert "후주문 발주 정방향 1세트 진입: sell 40 @ 1172.1 est 1184 호가 1184×500" in text
     # 발주 때 보관한 est와 체결 순간 다시 계산한 est를 나란히(사용자 2026-09-15) — 호가창이
     # 그대로면 둘이 같다(매수호가 1184 × 500 → 40계약 est 1184). 후주문 체결가 대비 차이는 유리 +.
     assert "선주문 #O1 4 @ 1,602,000 기준est 1184 현est 1184 → 누적" in text

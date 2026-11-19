@@ -169,3 +169,123 @@ def test_summarize_fills_groups_pieces_by_tx_hash() -> None:
     assert line.startswith("체결 매도 100 @평균 1,083.600 (2조각, ")
     assert "테이커) 수수료 8.4000 USDC #1" in line
     assert "메이커" in format_fill(out["0xbb"])
+
+
+def test_weekdays_and_day_table_for_multi_day_fee_survey() -> None:
+    # 사용자 2026-11-18 "block_fees.bat는 건건이 봐야 해서 여러 날 보기 힘들다 / 내 주문 빼고 특정
+    # 시간대 수수료만": 날짜 범위 → 평일 목록, 하루 합계 → 표 한 줄(IOC만), 표에 합계·실패 줄
+    from collections import Counter
+    from datetime import date
+
+    from kp_arb.hl_block_fees import DayRow, day_row, format_day_table, weekdays_between
+
+    days = weekdays_between(date(2026, 11, 13), date(2026, 11, 17))  # 금~화: 토·일 제외
+    assert [d.day for d in days] == [13, 16, 17]
+    assert weekdays_between(date(2026, 11, 17), date(2026, 11, 16)) == []
+    by_tif = {"Ioc": Counter({"없음(na)": 6, "<1bp": 2, "1~8bp": 2}), "Alo": Counter({"p=0": 9})}
+    r1 = day_row("2026-11-13", 27, by_tif, {"Ioc": 82200, "Alo": 0})
+    assert (r1.blocks, sum(r1.ioc.values()), r1.max_p) == (27, 10, 82200)
+    r2 = day_row("2026-11-16", 30, {"Alo": Counter({"p=0": 1})}, {})   # IOC 없음
+    r3 = DayRow("2026-11-17", 0, error="HTTPError: 429")
+    lines = format_day_table([r1, r2, r3])
+    assert lines[0].startswith("위치 = ")                     # 설명 줄 → 머리 → 구분선 → 날짜들
+    assert lines[1].startswith("날짜       블록     IOC  없음   p≈0  <1bp 1~8bp  ≥8bp 최대bp |")
+    assert "2026-11-13   27      10   60%    0%   20%   20%    0%   8.22" in lines[3]
+    assert "2026-11-16   30       0     -     -     -     -     -      -" in lines[4]
+    assert lines[5] == "2026-11-17 실패: HTTPError: 429"
+    assert lines[-1].startswith("합계         57      10   60%    0%   20%   20%    0%   8.22 |")
+
+
+def test_ioc_block_positions_by_fee_group() -> None:
+    # 사용자 2026-11-18 "수수료 높은 주문이 먼저 체결됐다고 볼 수 있나 → 그 열 추가": IOC마다
+    # 블록 안 상대 위치(0 맨 앞~1 맨 뒤)를 수수료 묶음(≥1bp / <1bp / 무료)별로 모아 평균
+    # — 하루 줄·표 열
+    from collections import Counter
+
+    from kp_arb.hl_block_fees import (
+        day_row,
+        format_day_table,
+        format_positions,
+        ioc_positions,
+        pos_group,
+        summarize_block,
+    )
+
+    assert [pos_group(p) for p in (None, 0, 99, 100, 9_999, 10_000, 90_000)] == [
+        "무료", "무료", "무료", "<1bp", "<1bp", "≥1bp", "≥1bp"]
+    ioc = {"t": {"limit": {"tif": "Ioc"}}}
+    block = {"blockTime": 1, "txs": [
+        _tx("0x1", "order", [ioc], {"p": 20_000}),   # 위치 0/4 = 0.00 (≥1bp)
+        _tx("0x2", "cancel"),
+        _tx("0x3", "order", [ioc]),             # 위치 2/4 = 0.50 (무료)
+        _tx("0x4", "order", [ioc], {"p": 500}),      # 위치 3/4 = 0.75 (<1bp)
+        _tx("0x5", "order", [ioc]),             # 위치 4/4 = 1.00 (무료)
+    ]}
+    s = summarize_block(7, block)
+    assert s.ioc_pos == {"≥1bp": [0.0], "무료": [0.5, 1.0], "<1bp": [0.75]}
+    pos = ioc_positions([s, s])
+    assert pos == {"≥1bp": (2, 0.0), "<1bp": (2, 0.75), "무료": (4, 0.75)}
+    assert format_positions(pos) == (
+        "IOC 블록 안 평균 위치(0%=맨 앞): ≥1bp 0%(2건) / <1bp 75%(2건) / 무료 75%(4건)")
+    assert format_positions({}) == "IOC 블록 안 평균 위치(0%=맨 앞): IOC 없음"
+    # 표: 날짜 줄·합계 줄의 위치 열(건수 가중 평균), 없는 묶음은 "-"
+    r1 = day_row("2026-11-13", 1, {"Ioc": Counter({"없음(na)": 2})}, {},
+                 {"≥1bp": (2, 0.0), "무료": (2, 0.5)})
+    r2 = day_row("2026-11-16", 1, {"Ioc": Counter({"없음(na)": 6})}, {}, {"무료": (6, 0.9)})
+    lines = format_day_table([r1, r2])
+    assert lines[3].endswith("|       0%        -      50%")
+    assert lines[4].endswith("|        -        -      90%")
+    assert lines[-1].endswith("|       0%        -      80%")     # (2×0.5 + 6×0.9) / 8
+
+
+def test_explorer_error_response_is_reported_not_keyerror(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # 2026-11-18 실측: 탐색기 일일 한도("More than 100 archived blocks queried in one day")를
+    # 넘으면 블록 대신 {"type": "error", "message": …}가 와서 KeyError 'blockTime'으로 보였다
+    # → 사유 그대로 ExplorerError, 한도 문구 판정(순수)
+    import pytest
+
+    from kp_arb import hl_block_fees_tool as tool
+
+    monkeypatch.setattr(tool, "rpc", lambda payload: {
+        "type": "error", "message": "More than 100 archived blocks queried in one day"})
+    with pytest.raises(tool.ExplorerError, match="archived blocks"):
+        tool.block_details(1)
+    assert tool.quota_exceeded("탐색기 오류: More than 100 archived blocks queried in one day")
+    assert not tool.quota_exceeded("탐색기 오류: unknown block")
+    monkeypatch.setattr(tool, "rpc", lambda payload: {"blockDetails": {"blockTime": 5, "txs": []}})
+    assert tool.block_details(1)["blockTime"] == 5
+
+
+def test_competitors_ahead_of_my_order_in_block() -> None:
+    # 개장매매 2번(사용자 2026-11-18 "개장매매 2번 진행해"): 내 주문 tx 앞에 선 같은 종목 주문 —
+    # IOC/그 밖, 같은 방향 IOC, 그중 수수료 낸 것(bp×수량). 다른 종목·내 뒤의 주문은 안 센다
+    from kp_arb.hl_block_fees import competitors_ahead, format_ahead, summarize_block
+
+    me = "0xME"
+    ioc = {"t": {"limit": {"tif": "Ioc"}}}
+    alo = {"t": {"limit": {"tif": "Alo"}}}
+
+    def order(a: int, buy: bool, sz: str, tif: dict[str, object]) -> dict[str, object]:
+        return {"a": a, "b": buy, "s": sz, **tif}
+
+    txs = [
+        _tx("0x1", "order", [order(110022, False, "5", ioc)], {"p": 20_000}),   # 같은 방향 2bp
+        _tx("0x2", "order", [order(110022, True, "3", ioc)]),                    # 반대 방향
+        _tx("0x3", "order", [order(110034, False, "9", ioc)], {"p": 50_000}),   # 다른 종목
+        _tx("0x4", "cancel"),
+        _tx("0x5", "order", [order(110022, False, "7", alo)]),                   # ALO
+        _tx("0x6", "order", [order(110022, False, "1", ioc)], {"p": 50}),       # p≈0(무료 취급)
+        _tx(me, "order", [order(110022, False, "100", ioc)]),                    # 내 주문(위치 6)
+        _tx("0x8", "order", [order(110022, False, "4", ioc)], {"p": 80_000}),   # 내 뒤
+    ]
+    ahead = competitors_ahead(txs, 6)
+    assert [(c.index, c.tif, c.same_side, c.p) for c in ahead] == [
+        (0, "Ioc", True, 20_000), (1, "Ioc", False, None), (4, "Alo", True, None),
+        (5, "Ioc", True, 50)]
+    assert format_ahead(ahead) == (
+        "앞선 같은 종목 주문 4건(IOC 3, ALO/GTC 1) — 같은 방향 IOC 2건, 그중 수수료 낸 것 1건"
+        " [2bp×5]")
+    assert format_ahead([]) == "앞선 같은 종목 주문 없음(블록 안 그 종목 첫 주문)"
+    assert competitors_ahead(txs, 3) == []                      # 내 tx가 주문이 아니면 빈 목록
+    s = summarize_block(9, {"blockTime": 1, "txs": txs}, me)
+    assert list(s.mine_ahead) == [6] and len(s.mine_ahead[6]) == 4

@@ -41,14 +41,15 @@ rem HL block priority-fee probe (public explorer, read-only, no orders) -> logs\
     echo @echo off
     echo cd /d "%%~dp0"
     echo echo HL block priority-fee probe, read-only, no orders. p / 10000 = bp.
-    echo set /p D=Date YYYY-MM-DD: 
+    echo set /p D=Date YYYY-MM-DD, or a range A..B for weekdays like 2026-11-10..2026-11-18:
     echo set /p T=Time HH:MM:SS this PC timezone: 
     echo set /p S=Seconds, default 2: 
     echo if "%%S%%"=="" set S=2
-    echo set /p F=Coins ours or all, default ours: 
+    echo set /p F=Coins: ours, all, or a list like xyz:SMSN,xyz:SKHX, default ours:
     echo if "%%F%%"=="" set F=ours
     echo set OPT=
-    echo if "%%F%%"=="ours" set OPT=--ours
+    echo if /i "%%F%%"=="ours" set OPT=--ours
+    echo if /i not "%%F%%"=="ours" if /i not "%%F%%"=="all" set OPT=--coin %%F%%
     echo "%%~dp0meme-core.exe" blockfees %%D%% %%T%% %%S%% %%OPT%%
     echo pause
 ) > "dist\meme\block_fees.bat"

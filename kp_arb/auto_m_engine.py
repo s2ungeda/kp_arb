@@ -998,6 +998,16 @@ class AutoMEngine:
                 "(직전 저장 %.1fms)",
                 self._tag(u, index, block, reverse), (t_task - t_fill) * 1000,
                 (now - t_fill) * 1000, self._persist_ms)
+        # 결정 94(사용자 2026-11-19): 보내기 직전의 est(후주문 수량만큼 쓸어담은 평균 예상가)와
+        # 그 방향 호가 5단 — 체결가와의 갭을 "판정→발주"와 "발주→체결"로 나누고, 잔량 부족/가격
+        # 이동을 가른다
+        levels = ((hl.bids or [(hl.bid, hl.bid_qty or 1.0)]) if act.side is Side.SELL
+                  else (hl.asks or [(hl.ask, hl.ask_qty or 1.0)]))
+        self.ulog(u).info(
+            "후주문 발주 %s: %s %d @ %g est %s 호가 %s",
+            self._tag(u, index, block, reverse), act.side.value, act.qty, price,
+            self._fmt_est(est_price(levels, float(act.qty))),
+            " ".join(f"{p:g}×{q:g}" for p, q in levels[:5]))
         try:
             oid = await self._system.place(intent, cloid=cloid)
         except Exception as exc:  # noqa: BLE001 - 후주문 거부 → 체결차 누적, 한도 넘으면 중지(ㄹ2)

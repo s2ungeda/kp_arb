@@ -245,3 +245,14 @@ def test_priority_fee_tab_rows_roundtrip() -> None:
     assert wins[1]["bp"] == 0.0 and wins[2]["bp"] == 0.0 and wins[3]["bp"] == 0.5
     assert priority_rows_from_settings({"hl_priority_fee": body["hl_priority_fee"]})[0] == (
         True, "08:00:00", "08:05:00", "2")
+
+
+def test_priority_fee_bp_input_filter_caps_at_ten() -> None:
+    # 사용자 2026-11-18 "수수료 최대 10까지 입력 가능하게": 칸 키 입력 검사(순수) — 빈칸·숫자·
+    # 소수점 하나, 값 0~10. "10."은 입력 중이라 통과, 10 넘는 값·글자·소수점 둘·점만은 안 받음
+    from kp_arb.balance_query import bp_text_ok
+
+    for ok in ("", "0", "9.5", "10", "10.", "10.0", "0.25"):
+        assert bp_text_ok(ok), ok
+    for bad in ("10.1", "11", "100", "a", "1.2.3", "-1", "."):
+        assert not bp_text_ok(bad), bad

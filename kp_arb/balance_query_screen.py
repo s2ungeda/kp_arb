@@ -34,6 +34,7 @@ from .balance_query import (
     ROW_ORDER,
     auto_interval_s,
     balance_line,
+    bp_text_ok,
     empty_table,
     priority_rows_from_settings,
     priority_rows_payload,
@@ -215,14 +216,16 @@ def main() -> None:  # noqa: PLR0915 - 화면 조립은 한 함수가 읽기 쉽
     fee_box: dict[str, Any] = {"settings": None, "seq": 0, "saved": None, "sseq": 0}
     fee_frame = tk.Frame(tab_fee)
     fee_frame.pack(padx=8, pady=(8, 2), anchor="w")
-    tk.Label(fee_frame, fg="gray25", font=T.FONT_LABEL,
-             text="체크된 구간 안에서만 전략 HL 주문을 IOC + 우선수수료로(일반주문 제외)").grid(
+    # 제외 문구는 둘째 줄(한 줄이면 창 너비가 늘어남 — 사용자 2026-11-18 "줄 바꿔서")
+    tk.Label(fee_frame, fg="gray25", font=T.FONT_LABEL, justify="left",
+             text="체크된 구간 안에서만 전략 HL 주문을 IOC + 우선수수료로\n"
+                  "(일반주문, 개장매매 청산주문, 동시호가 HL주문 제외)").grid(
         row=0, column=0, columnspan=7, sticky="w", pady=(0, 4))
     for c, head in ((1, "시작"), (3, "종료"), (5, "수수료")):
         tk.Label(fee_frame, text=head, fg="gray25", font=T.FONT_LABEL).grid(row=1, column=c)
     fee_rows: list[dict[str, Any]] = []
     vcmd_time = (root.register(lambda s: all(ch.isdigit() or ch == ":" for ch in s)), "%P")
-    vcmd_dec = (root.register(lambda s: s == "" or s.replace(".", "", 1).isdigit()), "%P")
+    vcmd_dec = (root.register(bp_text_ok), "%P")  # 숫자·소수점, 0~10bp(사용자 "최대 10까지")
     for i in range(4):
         r = 2 + i
         var = tk.BooleanVar(value=False)

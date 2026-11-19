@@ -106,8 +106,11 @@ async def _settle() -> None:
         await asyncio.sleep(0)
 
 
-async def test_first_trade_opens_window_and_fires_once() -> None:
+async def test_first_trade_opens_window_and_fires_once(caplog: Any) -> None:
     eng, sys_, clk, _ = _engine(_wall(8, 0, 1.2))
+    import logging
+
+    caplog.set_level(logging.INFO, logger="kp_arb.nxt_open")
     eng._on_quote(_nxt(1_729_000.0))                 # 첫 체결 → T0
     await _settle()
     snap = eng.live_snapshot()[U.value]
@@ -133,6 +136,13 @@ async def test_first_trade_opens_window_and_fires_once() -> None:
     assert o.price == 1303.5 and sys_.placed[0][2].price == 1298.4   # 0.5%: 1298.32 → 1298.4
     snap = eng.live_snapshot()[U.value]
     assert snap["fired"] and [r["order_id"] for r in snap["results"]] == ["O1", "O2", "O3"]
+    # exec 결정 94(사용자 2026-11-19): 보내기 직전 HL 호가 5단(양쪽)과 단별 est — 매도 단 100은
+    # 매수측 1310×50 + 1309.9×50 → 1309.95
+    pre = [r.getMessage() for r in caplog.records
+           if "발주 직전 HL 호가" in r.getMessage()]
+    assert len(pre) == 1 and pre[0].startswith(
+        "[NXT개장] sk_hynix 발주 직전 HL 호가 — 매수측 1310×50 1309.9×80"
+        " / 매도측 1310.5×40 1310.6×90 / 단별 est [('진입1', '1309.95'), ")
     # 나간 단(진입 1~3)은 다시 안 낸다 — 창 안에서 더 와도, 창이 닫혀도. 청산 단은 남아 있어 실행은
     # 아직 켜져 있다(사용자 2026-10-23 "주문 나간 세트만 멈추고 설정한 시간까지는 계속")
     clk.advance(1.0)
@@ -377,6 +387,8 @@ async def test_auto_exit_handles_fill_notified_before_place_response() -> None:
     assert eng.live_snapshot()[U.value]["auto_pending"] == []
     # 보관했던 체결의 가격(= 주문가 1303.5)으로 평균가 → × 0.998 = 1300.893 → 매수 내림 1300.8
     assert (sys_.placed[1][0].side, sys_.placed[1][0].price) == (Side.BUY, 1300.8)
+    # 자동청산은 GTC 그대로 — 우선수수료(IOC) 구간 제외 표시(사용자 2026-11-18 "청산주문은 GTC")
+    assert sys_.placed[1][0].priority_exempt and not sys_.placed[0][0].priority_exempt
 
 
 async def test_auto_exit_of_exit_tier_sells_above_avg_and_ignores_ls_fills() -> None:

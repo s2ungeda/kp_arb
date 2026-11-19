@@ -17,6 +17,7 @@ HL 게이트웨이는 슬롯만 예비(라이브 결선 시 추가).
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from collections import deque
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
@@ -806,7 +807,9 @@ class LiveSystem:
         """HL 주문에 우선수수료 구간 적용(DESIGN-hl-priority-fee §1·§4): 지금 시각이 체크된 구간
         안이면 tif "Ioc" + p(bp 0이면 IOC만). 일반주문창 출처는 제외(사용자 2026-11-17). 구간 밖이면
         그대로(GTC/ALO)."""
-        if intent.venue is not Venue.HYPERLIQUID or intent.source == MANUAL_ORDER_SOURCE:
+        if intent.venue is not Venue.HYPERLIQUID:
+            return intent
+        if intent.source == MANUAL_ORDER_SOURCE:
             return intent
         # 메이커 전용(ALO, post_only)·걸어 두는 주문(priority_exempt — NXT 자동청산 익절)은 IOC로
         # 바꾸면 뜻이 없어 그대로(검토 2026-11-17 H2·H3 — 스펙 §1, 사용자 확인 대상)
@@ -1546,8 +1549,6 @@ class LiveSystem:
         LS REST에는 '현재 장상태' 조회 TR이 없다 — 표준 운영은 **개장 전 시동**
         (JIF 카운트다운을 자연 수신). 미설정/미지 값이면 보수적 DEAD 유지.
         """
-        import os
-
         from .domain.enums import SessionPhase
 
         raw = os.environ.get("KP_SESSION_INIT", "").strip().lower()

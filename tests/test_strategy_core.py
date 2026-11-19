@@ -175,10 +175,12 @@ def test_hl_priority_fee_windows_apply_and_judge() -> None:
     assert priority_window_for(time(8, 1), fee.windows) is fee.windows[0]
     assert priority_window_for(time(8, 7), fee.windows) is fee.windows[1]
     assert priority_p(2.0) == 20_000 and priority_p(0.5) == 5_000 and priority_p(0.0) is None
-    # 거부: 체크 구간의 시각 형식·순서, 음수 bp, 구간 5개, dict 아님. 키 없음·dict 아님은 그대로
+    # 거부: 체크 구간의 시각 형식·순서, 음수 bp, bp > 10(사용자 2026-11-18 "최대 10까지"), 구간 5개,
+    # dict 아님. 키 없음·dict 아님은 그대로
     for bad in ({"windows": [{"enabled": True, "start": "8:00", "end": "08:05:00", "bp": 1}]},
                 {"windows": [{"enabled": True, "start": "09:00:00", "end": "08:05:00", "bp": 1}]},
                 {"windows": [{"enabled": False, "start": "", "end": "", "bp": -1}]},
+                {"windows": [{"enabled": False, "start": "", "end": "", "bp": 10.01}]},
                 {"windows": [{} for _ in range(5)]},
                 {"windows": "x"}):
         with pytest.raises(ValueError):

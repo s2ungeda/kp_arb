@@ -219,6 +219,7 @@ class BalanceWatch:
 PRIORITY_WINDOWS = 4      # HL 우선수수료(IOC) 시간구간 수(DESIGN-hl-priority-fee §2)
 _HMS_RE = re.compile(r"\d{2}:\d{2}:\d{2}")  # 구간 시각은 꼭 HH:MM:SS 두 자리씩(검토 11-17 L4)
 P_PER_BP = 10_000         # 우선수수료 p = bp × 10,000(HL 문서: 수수료율 = p ÷ 100,000,000)
+PRIORITY_BP_MAX = 10.0    # 수수료 입력 상한(bp) — 사용자 2026-11-18 "최대 10까지"(공식 상한 아님)
 MANUAL_ORDER_SOURCE = "일반주문창"  # 우선수수료·IOC 제외 출처(사용자 2026-11-17)
 
 
@@ -260,8 +261,9 @@ def apply_hl_priority_fee(h: HlPriorityFee, raw: object) -> None:
                 or isinstance(bp, bool) or not isinstance(bp, int | float)):
             raise ValueError(f"우선수수료 구간 {i + 1} 값 오류")
         start, end = start.strip(), end.strip()
-        if not math.isfinite(bp) or bp < 0:  # NaN·inf는 다른 클라이언트 JSON으로 들어올 수 있다
-            raise ValueError(f"구간 {i + 1} 수수료는 0 이상(bp)")
+        # NaN·inf는 다른 클라이언트 JSON으로 들어올 수 있다. 상한 10은 사용자 입력 한도(§2)
+        if not math.isfinite(bp) or bp < 0 or bp > PRIORITY_BP_MAX:
+            raise ValueError(f"구간 {i + 1} 수수료는 0~{PRIORITY_BP_MAX:g}(bp)")
         if enabled:
             if not (_HMS_RE.fullmatch(start) and _HMS_RE.fullmatch(end)):
                 raise ValueError(f"구간 {i + 1} 시각은 HH:MM:SS 형식")

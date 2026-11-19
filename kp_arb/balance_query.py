@@ -14,6 +14,7 @@ from typing import Any
 from .auto_m import HL_PER_SF
 from .domain.enums import Account, Instrument, Underlying
 from .domain.models import Position
+from .strategy_core import PRIORITY_BP_MAX
 
 # 응답 칸 키 — hl 퍼프 / stock 주식(현금+신용 합) / credit 신용 / sf 주선(최근+차근 합) /
 # sf_next 차근 / diff 체결차
@@ -141,6 +142,17 @@ def priority_rows_from_settings(settings: object) -> list[tuple[bool, str, str, 
         rows.append((bool(w.get("enabled", False)), str(w.get("start", "") or ""),
                      str(w.get("end", "") or ""), bp_text))
     return rows
+
+
+def bp_text_ok(text: str) -> bool:
+    """수수료 칸 글자 검사(키 입력마다): 빈칸·숫자·소수점 하나, 값은 0~PRIORITY_BP_MAX(사용자
+    2026-11-18 "최대 10까지"). "10."·"9.5"는 통과, "10.1"·"11"·점만("." — 예전 칸과 같음)은 안
+    받음. 순수."""
+    if text == "":
+        return True
+    if not text.replace(".", "", 1).isdigit():
+        return False
+    return float(text) <= PRIORITY_BP_MAX
 
 
 def priority_rows_payload(rows: list[tuple[bool, str, str, str]]) -> dict[str, Any]:

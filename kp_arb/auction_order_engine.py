@@ -545,10 +545,11 @@ class AuctionOrderEngine:
             px = hl_order_price(base, book.settings.hl_off.get(name, 0.0), side, sz)
             d.hl[name] = HlRow(side=side.value, price=px, qty=qty)
             names.append(name)
+            # 동시호가 HL 주문은 GTC 그대로 — 우선수수료(IOC) 구간에서도 제외(사용자 2026-11-18)
             intents.append(OrderIntent(venue=Venue.HYPERLIQUID, underlying=u,
                                        instrument=Instrument.HL_PERP, side=side, qty=qty,
                                        order_type=OrderType.LIMIT, price=px, source=SOURCE,
-                                       tag=f"HL{name}"))
+                                       tag=f"HL{name}", priority_exempt=True))
         self._log.info("[동시호가] %s 프로세스3 HL %s 기준가 %s (순 체결 %s %d계약): %s",
                        u.value, side.value, base, sf_side.value, contracts,
                        [(n, d.hl[n].qty, d.hl[n].price) for n in names])
@@ -617,7 +618,7 @@ class AuctionOrderEngine:
             return f"{name} 행은 취소 전에 전량 체결됐습니다"
         intent = OrderIntent(venue=Venue.HYPERLIQUID, underlying=u, instrument=Instrument.HL_PERP,
                              side=side, qty=remaining, order_type=OrderType.LIMIT, price=new_px,
-                             source=SOURCE, tag=f"HL{name}정정")
+                             source=SOURCE, tag=f"HL{name}정정", priority_exempt=True)  # GTC 그대로
         try:
             new_oid = await self._system.place(intent, cloid=self._system.new_hl_cloid())
         except Exception as exc:  # noqa: BLE001 - 신규 실패 = 취소만 된 채 끝(사람이 정리)
