@@ -54,7 +54,10 @@ class FakeSystem:
         self.sf_entry, self.s_entry, self.sf_exit = 0.01, 0.01, -0.01
 
     def pair_signal(self, u: Underlying, instrument: Instrument, entry_qty: int,
-                    exit_qty: int) -> tuple[float | None, float | None]:
+                    exit_qty: int, *,
+                    hl_bbo_clip: bool = False) -> tuple[float | None, float | None]:
+        self.clip_calls = getattr(self, "clip_calls", 0) + int(hl_bbo_clip)
+        self.pair_calls = getattr(self, "pair_calls", 0) + 1
         if instrument is Instrument.KR_STOCK:
             return self.s_entry, getattr(self, "s_exit", None)  # 매도 쪽 S괴리(역방향 진입 G5)
         return self.sf_entry, self.sf_exit
@@ -1890,3 +1893,60 @@ async def test_hl_fill_with_same_number_as_ls_pre_order_is_not_the_pre_fill() ->
                                  venue=Venue.LS))                # 진짜 선주문 체결
     await _settle()
     assert s.entry.pre_filled == 10
+
+
+def test_build_signals_est_uses_bbo_clipped_hl_book() -> None:
+    # exec 결정 95(사용자 2026-11-19): 체결쏴 est는 더 새로운 bbo가 지나간 호가를 뺀 호가창으로.
+    # 스프레드(pair_signal)도 같은 호가창을 쓰도록 hl_bbo_clip=True로 부른다.
+    eng, sys_, state = _engine()
+    book = state.autom.book(U)
+    s = book.sets[0]
+    key = (U, Instrument.HL_PERP, "hl")
+    now = datetime(2026, 11, 19, 10, 0, 0)
+    # 호가창(시각 1): 매수 1185×500, 1184×500 / bbo(시각 2): 매수 1184 → 1185는 지나간 호가
+    sys_.quotes[key] = Quote(
+        underlying=U, instrument=Instrument.HL_PERP, bid=1184.0, ask=1184.5, ts=2.0, market="hl",
+        bids=[(1185.0, 500.0), (1184.0, 500.0)], asks=[(1184.5, 500.0)],
+        bbo_bid=1184.0, bbo_ask=1184.5, bbo_ts=2.0, depth_ts=1.0)
+    sig = eng.build_signals(U, book, s, Block.ENTRY, now, 100.0, False)
+    assert sig.hl_est_bid == 1184.0 and sig.hl_est_ask == 1184.5
+    assert sys_.clip_calls == sys_.pair_calls == 2  # SF괴리·S괴리 둘 다 거른 호가창으로
+    assert eng._current_est(U, s.leg(Block.ENTRY)) == 1184.0  # "현est"도 같은 식
+
+    # 호가창이 bbo보다 새로우면(시각 3) 거르지 않는다 → 1185부터
+    sys_.quotes[key] = sys_.quotes[key].model_copy(update={"depth_ts": 3.0})
+    sig = eng.build_signals(U, book, s, Block.ENTRY, now, 100.0, False)
+    assert sig.hl_est_bid == 1185.0
+
+    # 전부 지나갔으면 est 없음(판정 불가)
+    sys_.quotes[key] = sys_.quotes[key].model_copy(
+        update={"depth_ts": 1.0, "bbo_bid": 1180.0, "bbo_ask": 1190.0})
+    sig = eng.build_signals(U, book, s, Block.ENTRY, now, 100.0, False)
+    assert sig.hl_est_bid is None and sig.hl_est_ask is None
+
+
+async def test_hl_sweep_cancels_resting_pre_order_and_resumes() -> None:
+    # 결정 95(사용자 2026-11-19 "호가가 없으니 판정하지 못할 거고, 이럴 때는 시세 급변이라 판단,
+    # 이미 나가 있는 선주문은 취소해야지"): 더 새로운 bbo로 거르니 호가창 한쪽이 전부 지나감 →
+    # 걸린 선주문 취소 + 대기(실행은 그대로). 다음 호가창이 오면 다시 낸다.
+    eng, sys_, state = _engine()
+    eng.set_running(U, 0, Block.ENTRY, True)
+    now = datetime(2026, 9, 4, 10, 0, 0)
+    eng.tick(now, 100.0)
+    await _settle()
+    s = state.autom.book(U).sets[0]
+    assert s.entry.pre_order_id == "O1"
+    key = (U, Instrument.HL_PERP, "hl")
+    normal = sys_.quotes[key]
+    # 호가창(시각 1)의 매수 1184는 bbo(시각 2, 매수 1180)보다 높다 → 매수 쪽이 한 줄도 안 남음
+    sys_.quotes[key] = normal.model_copy(update={
+        "bid": 1180.0, "ask": 1180.5, "bbo_bid": 1180.0, "bbo_ask": 1180.5,
+        "bbo_ts": 2.0, "depth_ts": 1.0})
+    eng.tick(now, 100.1)
+    await _settle()
+    assert sys_.cancelled == ["O1"] and len(sys_.placed) == 1
+    assert "HL 시세 급변" in s.entry.block_reason and s.entry.running
+    sys_.quotes[key] = normal  # 새 호가창 도착(거를 것 없음) → 재개
+    eng.tick(now, 100.2)
+    await _settle()
+    assert len(sys_.placed) == 2 and s.entry.pre_order_id == "O2"

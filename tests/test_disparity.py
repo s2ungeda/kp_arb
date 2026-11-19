@@ -114,3 +114,37 @@ def test_net_exit() -> None:
     assert net_exit(PairSpread(entry=0.0050, exit=0.0060)) == pytest.approx(0.0055)
     assert net_exit(PairSpread(entry=-0.0007, exit=0.0003)) == pytest.approx(-0.0002)
     assert net_exit(PairSpread(entry=None, exit=0.1)) is None
+
+
+def test_bbo_clip_drops_levels_the_newer_bbo_passed() -> None:
+    # exec 결정 95(사용자 2026-11-19): 호가창(500ms)이 bbo(100~200ms)보다 낡았으면 매수호가는 bbo
+    # 매수호가 이하만, 매도호가는 bbo 매도호가 이상만 남긴다. 남은 첫 줄이 1호가, 잔량은 호가창 것.
+    from kp_arb.disparity import bbo_clip
+
+    bids = [(100.0, 5.0), (99.9, 7.0), (99.8, 9.0)]
+    asks = [(100.1, 4.0), (100.2, 6.0), (100.3, 8.0)]
+    # bbo가 더 새롭고(시각 2 > 1) 매수 99.9·매도 100.2 → 매수 100.0·매도 100.1은 지나간 호가
+    b, a = bbo_clip(bids, asks, 99.9, 100.2, depth_ts=1.0, bbo_ts=2.0)
+    assert b == [(99.9, 7.0), (99.8, 9.0)] and a == [(100.2, 6.0), (100.3, 8.0)]
+    assert est_price(b, 10.0) == pytest.approx((99.9 * 7 + 99.8 * 3) / 10)
+    # 호가창이 bbo와 같거나 더 새로우면 거르지 않는다
+    assert bbo_clip(bids, asks, 99.9, 100.2, depth_ts=2.0, bbo_ts=2.0) == (bids, asks)
+    assert bbo_clip(bids, asks, 99.9, 100.2, depth_ts=3.0, bbo_ts=2.0) == (bids, asks)
+    # 시각을 모르면(None·0) 그냥 거른다(요구사항 "없다면 단순 계산")
+    assert bbo_clip(bids, asks, 99.9, 100.2) == (b, a)
+    assert bbo_clip(bids, asks, 99.9, 100.2, depth_ts=0.0, bbo_ts=0.0) == (b, a)
+
+
+def test_bbo_clip_keeps_book_when_bbo_is_better_or_missing() -> None:
+    from kp_arb.disparity import bbo_clip
+
+    bids = [(100.0, 5.0), (99.9, 7.0)]
+    asks = [(100.1, 4.0), (100.2, 6.0)]
+    # bbo가 호가창 1호가보다 더 좋은 가격(매수 100.05 > 100.0) — 끼워 넣지 않고 호가창 그대로
+    # (사용자 답 2026-11-19 "호가창 그대로 쓰기")
+    assert bbo_clip(bids, asks, 100.05, 100.08, depth_ts=1.0, bbo_ts=2.0) == (bids, asks)
+    # bbo가 없으면 그대로
+    assert bbo_clip(bids, asks, None, None) == (bids, asks)
+    # 전부 지나갔으면 빈 목록 → est 없음(판정 불가)
+    b, a = bbo_clip(bids, asks, 99.0, 101.0, depth_ts=1.0, bbo_ts=2.0)
+    assert b == [] and a == [] and est_price(b, 1.0) is None

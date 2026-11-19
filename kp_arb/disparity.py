@@ -46,6 +46,35 @@ def est_price(levels: Sequence[tuple[float, float]], qty: float) -> float | None
     return max(average, best)      # 매도 호가창(오름차순, 단일 호가 포함)
 
 
+Levels = list[tuple[float, float]]
+
+
+def bbo_clip(
+    bids: Sequence[tuple[float, float]],
+    asks: Sequence[tuple[float, float]],
+    bbo_bid: float | None,
+    bbo_ask: float | None,
+    depth_ts: float | None = None,
+    bbo_ts: float | None = None,
+) -> tuple[Levels, Levels]:
+    """호가창(약 500ms 주기)에서 bbo(약 100~200ms 주기)가 이미 지나간 호가를 걸러 낸다 — 체결쏴
+    est 전용(exec 결정 95, 사용자 2026-11-19).
+
+    - 매수호가는 bbo 매수호가 **이하**만, 매도호가는 bbo 매도호가 **이상**만 남긴다. 남은 첫 줄이
+      1호가. 잔량은 호가창 것 그대로이고 bbo를 끼워 넣지 않는다(bbo가 더 좋은 가격이면 호가창
+      그대로).
+    - 두 거래소 시각(ms)이 다 있고 호가창이 bbo보다 같거나 새로우면 거르지 않는다. 시각이 없으면
+      (None·0) 그냥 거른다.
+    - bbo가 없으면 그대로. 전부 걸러지면 빈 목록(est 없음 = 판정 불가).
+    """
+    b, a = list(bids), list(asks)
+    if bbo_bid is None or bbo_ask is None:
+        return b, a
+    if depth_ts and bbo_ts and depth_ts >= bbo_ts:
+        return b, a
+    return ([lv for lv in b if lv[0] <= bbo_bid], [lv for lv in a if lv[0] >= bbo_ask])
+
+
 def maker_price_for_spread(
     base: float, hl_disp_est: float, threshold: float
 ) -> float:

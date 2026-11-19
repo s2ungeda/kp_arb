@@ -2170,3 +2170,80 @@ async def test_hl_priority_fee_window_makes_strategy_orders_ioc_but_not_manual()
     oid2 = await system.place(intent("자동M").model_copy(update={"qty": 1.0}))
     order2 = system.order_book.hl_order(oid2)
     assert order2 is not None and order2.is_open and order2.filled_qty == 0.5
+
+
+async def test_refresh_quote_plan_applies_checked_symbols_to_hl() -> None:
+    # DESIGN-ls-xing §9(사용자 2026-11-19): 구독 계획을 맞출 때 HL 호가·체결(bbo·l2Book·trades)도
+    # 같은 종목 체크로. 마크(activeAssetCtx)는 전 종목 그대로.
+    from kp_arb.gateways.hl_ws import HLWebSocketClient
+    from kp_arb.quote_plan import QuotePlanInput
+
+    system, _, _ = _system([])
+    hl_ws = HLWebSocketClient(FakeConnector([]))
+    hl_ws.subscribe_marks()
+    hl_ws.subscribe_bbo()
+    hl_ws.subscribe_l2book()
+    hl_ws.subscribe_trades()
+    system._hl_ws = hl_ws
+
+    await system.refresh_quote_plan(QuotePlanInput(symbols_on=frozenset({SAMSUNG})))
+
+    by_type: dict[str, set[str]] = {}
+    for sub in hl_ws._subs:
+        by_type.setdefault(str(sub["type"]), set()).add(str(sub["coin"]))
+    samsung = hl_ws._symbols[SAMSUNG]
+    assert by_type["bbo"] == by_type["l2Book"] == by_type["trades"] == {samsung}
+    assert by_type["activeAssetCtx"] == set(hl_ws._symbols.values())
+
+
+def test_pair_signal_bbo_clip_only_when_asked() -> None:
+    # exec 결정 95: 체결쏴만 hl_bbo_clip=True로 부른다 — 더 새로운 bbo가 지나간 호가를 뺀 호가창으로
+    # est. 기본(다른 화면·판정)은 호가창 그대로.
+    from kp_arb.domain.models import Quote
+
+    system, _, _ = _system([])
+    system.usdkrw_theory = 1_000.0
+    for market in ("krx", "uni"):
+        system.quotes[(SAMSUNG, Instrument.KR_STOCK, market)] = Quote(
+            underlying=SAMSUNG, instrument=Instrument.KR_STOCK,
+            bid=100_000.0, ask=100_000.0, ts=0.0, market=market)
+    # 호가창(시각 1)의 매수1 101.0은 bbo(시각 2, 매수 100.0)가 이미 지나간 호가
+    system.quotes[(SAMSUNG, Instrument.HL_PERP, "hl")] = Quote(
+        underlying=SAMSUNG, instrument=Instrument.HL_PERP, bid=100.0, ask=102.0, ts=2.0,
+        market="hl", bids=[(101.0, 50.0), (100.0, 50.0)], asks=[(102.0, 50.0)],
+        bbo_bid=100.0, bbo_ask=102.0, bbo_ts=2.0, depth_ts=1.0)
+
+    raw, _ = system.pair_signal(SAMSUNG, Instrument.KR_STOCK, 10, 10)
+    clipped, _ = system.pair_signal(SAMSUNG, Instrument.KR_STOCK, 10, 10, hl_bbo_clip=True)
+
+    assert raw is not None and clipped is not None
+    # 주식 매수1 = 기준가라 국내 괴리 0 → 진입 = HL 매수 est 괴리: 그대로 101 → +1%, 거르면 100 → 0
+    assert raw == pytest.approx(0.01) and clipped == pytest.approx(0.0)
+
+
+async def test_refresh_quote_plan_keeps_last_hl_values_of_unsubscribed_symbol() -> None:
+    # 구독을 뗀 종목의 마지막 HL 호가·체결 값은 LS처럼 지우지 않는다(사용자 2026-11-19 "모든 전략은
+    # '적'을 눌러야 되는데, 그때 새로운 데이터들을 받기 때문에 굳이 안 지워도"). 새 값이 안 올 뿐.
+    from kp_arb.domain.models import Quote
+    from kp_arb.gateways.hl_ws import HLWebSocketClient
+    from kp_arb.quote_plan import QuotePlanInput
+
+    system, _, _ = _system([])
+    hl_ws = HLWebSocketClient(FakeConnector([]))
+    hl_ws.subscribe_bbo()
+    hl_ws.subscribe_l2book()
+    hl_ws.subscribe_trades()
+    system._hl_ws = hl_ws
+    hynix = Underlying.SK_HYNIX
+    for u in (SAMSUNG, hynix):
+        system.quotes[(u, Instrument.HL_PERP, "hl")] = Quote(
+            underlying=u, instrument=Instrument.HL_PERP, bid=100.0, ask=101.0, ts=1.0, market="hl")
+        system.trades[(u, Instrument.HL_PERP, "hl")] = 100.5
+
+    await system.refresh_quote_plan(QuotePlanInput(symbols_on=frozenset({SAMSUNG})))
+
+    assert Underlying.SK_HYNIX in hl_ws._quote_off  # 구독은 뗐다
+    assert (hynix, Instrument.HL_PERP, "hl") in system.quotes
+    assert system.trades[(hynix, Instrument.HL_PERP, "hl")] == 100.5
+    assert (SAMSUNG, Instrument.HL_PERP, "hl") in system.quotes
+    assert system.trades[(SAMSUNG, Instrument.HL_PERP, "hl")] == 100.5

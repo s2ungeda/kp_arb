@@ -107,9 +107,19 @@ def quote_plan_input(state: CoreState, system: Any) -> QuotePlanInput:
     종목 상태의 월물(없으면 근월물), 원달러 = 공통설정이 고른 월물. 주식 호가는 통합(UH1)
     하나라 체결쏴 주식의 거래소는 계획과 무관(2026-10-27 오후). system에서는 선물 코드·원달러
     코드만 읽는다(없으면 빈 값)."""
-    from .auto_m import book_key
+    from .auto_m import LegStatus, book_key, parse_book_key
 
-    on = frozenset(u for u in Underlying if state.settings.quote_symbols.get(u.value, False))
+    checked = {u for u in Underlying if state.settings.quote_symbols.get(u.value, False)}
+    # 체결쏴가 돌고 있는(실행 켜짐·주문이 걸렸거나 후주문 대기) 종목은 체크를 꺼도 구독을 유지한다
+    # (2026-11-19 검토 지적: 실행 중 체크를 끄면 HL 호가가 멈춘 채 후주문 가격이 정해진다). 멈추면
+    # 다음 따라잡기(2초)에서 해제.
+    for key, am_book in state.autom.books.items():
+        parsed = parse_book_key(key)
+        if parsed is not None and any(
+                leg.running or leg.status not in (LegStatus.IDLE, LegStatus.HALTED)
+                for _rev, _i, s in am_book.all_sets() for leg in (s.entry, s.exit)):
+            checked.add(parsed[0])
+    on = frozenset(checked)
     months: dict[Underlying, frozenset[str]] = {}
     for u in Underlying:
         used = {bk.future_month for product in ("sf",)

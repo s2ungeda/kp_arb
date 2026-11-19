@@ -203,6 +203,9 @@ class Signals:
     ls_feed_ok: bool = True
     # HL 채널도 같은 관문(사용자 2026-10-01 결정 60: 어느 한쪽이라도 끊기면 선주문 취소 후 대기)
     hl_feed_ok: bool = True
+    # HL 시세 급변(결정 95, 사용자 2026-11-19): 더 새로운 bbo로 호가창을 거르니 매수·매도 어느
+    # 한쪽이 한 줄도 안 남음(약 0.5초 안에 5호가가 전부 지나감) — est가 없어 선주문 취소 후 대기
+    hl_swept: bool = False
     # 주식선물 월물 배당율 q(소수, 공통설정 dividend — 사용자 2026-11-13, exec §6.1): 역산가의
     # 기준값에 더한다(진입SF·청산SF, 정·역방향). 주식은 0.
     dividend: float = 0.0
@@ -741,6 +744,10 @@ def _common_gates(
         return "LS 피드 끊김/정지 — 주문 안 냄", _cancel_if_resting(leg)
     if not sig.hl_feed_ok:
         return "HL 피드 끊김 — 주문 안 냄", _cancel_if_resting(leg)
+    # HL 시세 급변(결정 95) — est를 못 구한다. 사용자 2026-11-19 "호가가 없으니 판정하지 못할 거고,
+    # 이럴 때는 시세 급변이라 판단, 이미 나가 있는 선주문은 취소해야지". 다음 호가창이 오면 재개.
+    if sig.hl_swept:
+        return "HL 시세 급변(호가창 5단이 전부 지나감) — 주문 안 냄", _cancel_if_resting(leg)
     # 시장 정지(exec §8) — 신규·정정 중단 + 미체결 취소, HL은 손대지 않음
     if sig.market_halted:
         return "시장 정지 — 신규·정정 중단", _cancel_if_resting(leg)

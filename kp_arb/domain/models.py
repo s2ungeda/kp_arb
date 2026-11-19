@@ -17,6 +17,12 @@ class Quote(BaseModel):
     market: str = "krx"           # 가격 원천 시장: "krx" | "nxt" | "hl"
     bids: list[tuple[float, float]] | None = None  # 다단계 매수호가 [(가격, 잔량), ...]
     asks: list[tuple[float, float]] | None = None  # 다단계 매도호가
+    # HL 전용(체결쏴 est의 bbo 거르기 — exec 결정 95): 마지막 bbo 1호가와 그 거래소 시각(ms),
+    # bids/asks(l2Book 호가창)의 거래소 시각. 없으면 None(LS·옛 프레임)
+    bbo_bid: float | None = None
+    bbo_ask: float | None = None
+    bbo_ts: float | None = None
+    depth_ts: float | None = None
 
     @property
     def mid(self) -> float:

@@ -28,6 +28,7 @@ from . import order_log
 from .config import CarryRates, FeeRates, LSAccounts
 from .disparity import (
     PairBoard,
+    bbo_clip,
     disp,
     est_price,
     est_side_disp,
@@ -1903,6 +1904,11 @@ class LiveSystem:
         """LS 실시간 구독을 계획(DESIGN-ls-xing §9)에 맞춘다 — 차이만 등록·해제. 돌려주는 값 =
         지금 계획 전체. 원달러선물(FC9/YF9)은 그 채널이 따로면 그쪽에."""
         wanted = plan(inp)
+        if self._hl_ws is not None:
+            # HL 호가·체결(bbo·l2Book·trades)도 같은 종목 체크로(§9, 사용자 2026-11-19). LS 적용이
+            # 실패해도 HL은 맞도록 먼저. 뗀 종목의 마지막 호가·체결 값은 LS처럼 지우지 않는다
+            # (사용자 2026-11-19: 전략은 '적'을 눌러야 돌고 그때 새 데이터를 받는다).
+            self._hl_ws.apply_symbols(inp.symbols_on)
         fx_ws = self._fx_ws()
         if fx_ws is self._stock_ws:
             await self._stock_ws.apply_plan(wanted)
@@ -2197,9 +2203,12 @@ class LiveSystem:
 
     def pair_signal(
         self, u: Underlying, instrument: Instrument,
-        entry_qty: int, exit_qty: int,
+        entry_qty: int, exit_qty: int, *, hl_bbo_clip: bool = False,
     ) -> tuple[float | None, float | None]:
         """est 기반 진입/청산 스프레드(소수) — 주문 화면 표시·판정 루프 공용 (§6.2).
+
+        hl_bbo_clip=True(체결쏴만 켠다 — exec 결정 95): HL 호가창에서 더 새로운 bbo가 이미 지나간
+        호가를 걸러 낸 뒤 est(`disparity.bbo_clip`). 기본은 호가창 그대로.
 
         진입 = HL매수d(est) − 국내매수d(1호가 maker) / 청산 = HL매도d(est) − 국내매도d.
         est는 각 블록 수량(국내 단위)을 HL 계약으로 환산(주식 1:1, 선물 1:10)해 산정 —
@@ -2210,9 +2219,14 @@ class LiveSystem:
         if quote is None:
             return None, None
         ratio = 10.0 if instrument.is_stock_future else 1.0
-        est_bid = (est_price(quote.bids or [], entry_qty * ratio)
+        hl_bids: Sequence[tuple[float, float]] = quote.bids or []
+        hl_asks: Sequence[tuple[float, float]] = quote.asks or []
+        if hl_bbo_clip:
+            hl_bids, hl_asks = bbo_clip(hl_bids, hl_asks, quote.bbo_bid, quote.bbo_ask,
+                                        quote.depth_ts, quote.bbo_ts)
+        est_bid = (est_price(hl_bids, entry_qty * ratio)
                    if entry_qty > 0 else None)
-        est_ask = (est_price(quote.asks or [], exit_qty * ratio)
+        est_ask = (est_price(hl_asks, exit_qty * ratio)
                    if exit_qty > 0 else None)
         fx, _ = self.usdkrw_effective()
         stock = self.stock_last(u)

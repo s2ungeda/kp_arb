@@ -18,7 +18,7 @@ import json
 import logging
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -32,6 +32,8 @@ from .hl_live import HL_SYMBOLS
 from .ls_ws import Fill, TradeTick, WSConnection, WSConnector
 
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
+# 종목 체크(시세 구독 종목)를 따르는 구독 — 호가·체결. 마크(activeAssetCtx)는 전 종목 유지
+QUOTE_SUB_TYPES = ("bbo", "l2Book", "trades")
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,12 @@ class HLWebSocketClient:
         self._depth: dict[
             Underlying, tuple[list[tuple[float, float]], list[tuple[float, float]]]
         ] = {}
+        # 그 호가창의 거래소 시각(ms)과 마지막 bbo(매수1, 매도1, 거래소 시각) — 체결쏴 est가 어느
+        # 쪽이 새로운지 보고 낡은 호가를 거른다(exec 결정 95)
+        self._depth_ts: dict[Underlying, float] = {}
+        self._bbo: dict[Underlying, tuple[float, float, float]] = {}
+        # 종목 체크로 호가·체결 구독을 뗀 종목(apply_symbols) — 해제 직후 날아오는 프레임을 버린다
+        self._quote_off: set[Underlying] = set()
         # l2Book 호가단위 머지 상태(coin별 nSigFigs/mantissa — 비면 원시) + 제어 큐
         self._l2_extra: dict[str, dict[str, int]] = {}
         self._control: deque[dict[str, Any]] = deque()  # 활성 연결로 보낼 (un)subscribe
@@ -189,13 +197,17 @@ class HLWebSocketClient:
         coin = self._symbols[underlying]
         target = next((s for s in self._subs
                        if s.get("type") == "l2Book" and s.get("coin") == coin), None)
-        if target is None:
-            return  # l2Book 미구독
         extra: dict[str, int] = {}
         if n_sig_figs is not None:
             extra["nSigFigs"] = n_sig_figs
             if mantissa is not None:
                 extra["mantissa"] = mantissa
+        if target is None:
+            # l2Book 미구독 — 종목 체크로 뗀 종목(apply_symbols)이면 단위만 기억해 두었다가 다시
+            # 붙을 때 그 단위로 붙는다. 호가 구독을 한 번도 안 건 연결이면 아무 일도 없다.
+            if underlying in self._quote_off:
+                self._l2_extra[coin] = extra
+            return
         if self._l2_extra.get(coin, {}) == extra:
             return  # 같은 단위 — 재구독하면 호가창만 잠깐 비니 건너뜀(자동M '적' 반복, 2026-09-07)
         self._control.append({"method": "unsubscribe", "subscription": dict(target)})
@@ -204,7 +216,53 @@ class HLWebSocketClient:
         target.update(extra)
         self._l2_extra[coin] = extra
         self._depth.pop(underlying, None)  # 옛 단위 호가창 폐기
+        self._depth_ts.pop(underlying, None)
         self._control.append({"method": "subscribe", "subscription": dict(target)})
+
+    def apply_symbols(
+        self, on: Iterable[Underlying]
+    ) -> tuple[list[Underlying], list[Underlying]]:
+        """호가·체결 구독(bbo·l2Book·trades)을 고른 종목에만 맞춘다(DESIGN-ls-xing §9, 사용자
+        2026-11-19 "HL도 선택한 종목의 시세만") — 차이만 구독·해제. 마크(activeAssetCtx)와 계좌
+        통보는 건드리지 않는다. 다시 붙는 l2Book은 그 종목의 지금 호가단위 머지로. 접속 전이면
+        희망 목록만 바뀌어 접속 때 그대로 나간다. 돌려주는 값 = (새로 붙인 종목, 뗀 종목)."""
+        want = set(on)
+        added: list[Underlying] = []
+        removed: list[Underlying] = []
+        for underlying, coin in self._symbols.items():
+            mine = [s for s in self._subs
+                    if s.get("type") in QUOTE_SUB_TYPES and s.get("coin") == coin]
+            if underlying in want:
+                self._quote_off.discard(underlying)
+                have = {s.get("type") for s in mine}
+                new: list[dict[str, Any]] = []
+                if "bbo" not in have:
+                    new.append({"type": "bbo", "coin": coin})
+                if "l2Book" not in have:
+                    new.append({"type": "l2Book", "coin": coin, "fast": True,
+                                **self._l2_extra.get(coin, {})})
+                if "trades" not in have:
+                    new.append({"type": "trades", "coin": coin})
+                for sub in new:
+                    self._subs.append(sub)
+                    self._control.append({"method": "subscribe", "subscription": dict(sub)})
+                if new:
+                    added.append(underlying)
+            elif mine:
+                self._quote_off.add(underlying)
+                for sub in mine:
+                    self._subs.remove(sub)
+                    self._control.append({"method": "unsubscribe", "subscription": dict(sub)})
+                self._depth.pop(underlying, None)
+                self._depth_ts.pop(underlying, None)
+                self._bbo.pop(underlying, None)
+                removed.append(underlying)
+        if added or removed:
+            logging.getLogger("kp_arb.hl_ws").info(
+                "HL 구독 종목 — 등록 %s / 해제 %s (bbo·l2Book·trades)",
+                " ".join(u.value for u in added) or "-",
+                " ".join(u.value for u in removed) or "-")
+        return added, removed
 
     def l2_aggregation(
         self, underlying: Underlying
@@ -235,7 +293,9 @@ class HLWebSocketClient:
                 conn = await self._connector.connect()
                 self.status.on_connect()
                 self._control.clear()  # 재연결이면 희망 상태로 전부 재구독 — 옛 제어 폐기
-                for sub in self._subs:
+                # 복사본으로 돈다 — 보내는 사이 apply_symbols가 목록을 바꾸면 건너뛰는 구독이
+                # 생긴다. 그 사이 바뀐 것은 제어 큐에 쌓여 이 뒤에 나가므로 순서가 맞다.
+                for sub in [dict(s) for s in self._subs]:
                     await conn.send(json.dumps({"method": "subscribe", "subscription": sub}))
                 if self.status.connects > 1:  # 재연결(최초 아님) → 스냅샷 처리 뒤 재동기 훅
                     # 훅(REST 재동기)이 스냅샷보다 먼저 장부를 맞추면 뒤늦게 적용되는 스냅샷
@@ -448,6 +508,8 @@ class HLWebSocketClient:
         levels = data.get("bbo")
         if underlying is None or not isinstance(levels, list) or len(levels) != 2:
             return None
+        if underlying in self._quote_off:
+            return None  # 구독을 뗀 종목 — 해제 직후 날아온 프레임
         bid, ask = levels[0] or {}, levels[1] or {}
         if "px" not in bid or "px" not in ask:
             return None
@@ -459,17 +521,23 @@ class HLWebSocketClient:
         depth = self._depth.get(underlying)
         bids = depth[0] if depth is not None else None
         asks = depth[1] if depth is not None else None
+        ts = float(data.get("time", 0.0) or 0.0)
+        self._bbo[underlying] = (top_bid[0], top_ask[0], ts)
         return Quote(
             underlying=underlying,
             instrument=Instrument.HL_PERP,
             bid=top_bid[0],
             ask=top_ask[0],
-            ts=float(data.get("time", 0.0)),
+            ts=ts,
             bid_qty=top_bid[1],
             ask_qty=top_ask[1],
             market="hl",
             bids=bids,
             asks=asks,
+            bbo_bid=top_bid[0],
+            bbo_ask=top_ask[0],
+            bbo_ts=ts,
+            depth_ts=self._depth_ts.get(underlying) if depth is not None else None,
         )
 
     def _parse_l2book(self, data: dict[str, Any]) -> Quote | None:
@@ -478,6 +546,8 @@ class HLWebSocketClient:
         levels = data.get("levels")
         if underlying is None or not isinstance(levels, list) or len(levels) != 2:
             return None
+        if underlying in self._quote_off:
+            return None  # 구독을 뗀 종목 — 해제 직후 날아온 프레임
         # 서버 최대인 한쪽당 20단계까지 보관 (est-pr·머지 표시용).
         bids = [(float(x["px"]), float(x.get("sz", 0) or 0))
                 for x in (levels[0] or [])[:20] if isinstance(x, dict) and "px" in x]
@@ -485,18 +555,25 @@ class HLWebSocketClient:
                 for x in (levels[1] or [])[:20] if isinstance(x, dict) and "px" in x]
         if not bids or not asks:
             return None
+        ts = float(data.get("time", 0.0) or 0.0)
         self._depth[underlying] = (bids, asks)
+        self._depth_ts[underlying] = ts
+        bbo = self._bbo.get(underlying)  # 이 프레임보다 새 bbo가 있었으면 est가 그걸로 거른다
         return Quote(
             underlying=underlying,
             instrument=Instrument.HL_PERP,
             bid=bids[0][0],
             ask=asks[0][0],
-            ts=float(data.get("time", 0.0)),
+            ts=ts,
             bid_qty=bids[0][1],
             ask_qty=asks[0][1],
             market="hl",
             bids=bids,
             asks=asks,
+            bbo_bid=bbo[0] if bbo is not None else None,
+            bbo_ask=bbo[1] if bbo is not None else None,
+            bbo_ts=bbo[2] if bbo is not None else None,
+            depth_ts=ts,
         )
 
     def _parse_trades(self, data: list[Any]) -> list[TradeTick]:
@@ -506,7 +583,7 @@ class HLWebSocketClient:
             if not isinstance(t, dict):
                 continue
             underlying = self._by_symbol.get(str(t.get("coin", "")))
-            if underlying is None or "px" not in t:
+            if underlying is None or "px" not in t or underlying in self._quote_off:
                 continue
             # side: HL 표기 그대로 "B"=매수(taker 매수), "A"=매도
             # (사용자 확정 2026-09-15: HL 앱과 같게)

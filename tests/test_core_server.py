@@ -884,3 +884,28 @@ async def test_balance_query_command_returns_strings_and_rejects_overlap() -> No
         assert not body["ok"] and body["errors"] == ["코어 미접속"]
     finally:
         await client.close()
+
+
+def test_quote_plan_keeps_symbol_while_auto_m_is_active() -> None:
+    # 검토 2026-11-19: 체결쏴가 도는 종목의 체크를 끄면 HL 호가가 멈춘 채 후주문 가격이 정해진다 →
+    # 실행 켜짐·주문 걸림·후주문 대기인 종목은 체크와 무관하게 구독 유지, 멈추면 빠진다.
+    from kp_arb.auto_m import LegStatus
+    from kp_arb.core_server import quote_plan_input
+
+    state = CoreState()
+    state.settings.quote_symbols.update({"samsung": True, "sk_hynix": False, "hyundai": False})
+    assert quote_plan_input(state, None).symbols_on == frozenset({Underlying.SAMSUNG})
+
+    leg = state.autom.book(Underlying.SK_HYNIX, "stock").sets[0].entry
+    leg.running = True
+    assert quote_plan_input(state, None).symbols_on == frozenset(
+        {Underlying.SAMSUNG, Underlying.SK_HYNIX})
+
+    leg.running = False  # 실행은 껐지만 선주문이 아직 걸려 있음 → 유지
+    leg.status = LegStatus.PRE_RESTING
+    assert Underlying.SK_HYNIX in quote_plan_input(state, None).symbols_on
+
+    leg.status = LegStatus.IDLE  # 다 정리됨 → 체크대로
+    assert quote_plan_input(state, None).symbols_on == frozenset({Underlying.SAMSUNG})
+    leg.status = LegStatus.HALTED  # 중지(사람이 해제할 때까지 주문 없음)도 유지 대상 아님
+    assert quote_plan_input(state, None).symbols_on == frozenset({Underlying.SAMSUNG})

@@ -48,7 +48,7 @@ from .auto_m import (
     wake_times,
 )
 from .auto_m import _halt_set as halt_set
-from .disparity import disp, est_price
+from .disparity import bbo_clip, disp, est_price
 from .domain.enums import Account, Block, Instrument, OrderType, Side, Underlying, Venue
 from .domain.models import InstrumentInfo, OrderIntent, PriceLimits, Quote
 from .gateways.base import PlaceResult
@@ -117,7 +117,8 @@ class _SystemLike(Protocol):
     error_seq: int
 
     def pair_signal(self, u: Underlying, instrument: Instrument, entry_qty: int,
-                    exit_qty: int) -> tuple[float | None, float | None]: ...
+                    exit_qty: int, *,
+                    hl_bbo_clip: bool = False) -> tuple[float | None, float | None]: ...
     def stock_futures_theory(self, underlying: Underlying,
                              instrument: Instrument = ...) -> float | None: ...
     def stock_last(self, underlying: Underlying) -> float | None: ...
@@ -548,11 +549,12 @@ class AutoMEngine:
         inst = self._counterpart(book)
         qty = (order_qty(block, s.per_qty, s.target_qty, s.rt, s.reverse)
                or s.leg(block).pre_qty or 1)
-        sf_entry, sf_exit = self._system.pair_signal(u, inst, qty, qty)
+        # HL est는 bbo로 낡은 호가를 거른 호가창으로(결정 95) — 스프레드도 같은 호가창
+        sf_entry, sf_exit = self._system.pair_signal(u, inst, qty, qty, hl_bbo_clip=True)
         # S괴리는 매수·매도 쪽 둘 다 — 정방향 진입은 매수 쪽(entry), 역방향 진입은 매도 쪽(exit)
         ratio = book.hl_ratio  # 주식선물 10 / 주식 1
         s_entry, s_exit = self._system.pair_signal(u, Instrument.KR_STOCK, qty * ratio,
-                                                   qty * ratio)
+                                                   qty * ratio, hl_bbo_clip=True)
         hl = self._system.quotes.get((u, Instrument.HL_PERP, "hl"))
         # 시세 신선도 규칙(옛 결정 86 ③)은 폐지(사용자 2026-11-04) — 마지막 값이 현재가(결정 47),
         # 피드 끊김은 G0-1이 막는다. 11-03 저녁 드문 CUR 틱이 "묵음"에 걸려 모니터 "-"·주문 안 냄
@@ -560,11 +562,14 @@ class AutoMEngine:
         stock = self._stock_last_for(u, book)
         hl_bid_d = hl_ask_d = None
         est_bid = est_ask = None
+        # 거른 호가창의 어느 한쪽이 비면 시세 급변 → 선주문 취소 후 대기(결정 95)
+        hl_swept = hl is not None and not all(self._hl_est_levels(hl))
         if hl is not None and fx is not None:
             # est는 HL 호가창·환율만으로 — 주식 상품(§7C)은 현재가를 안 쓰므로 현재가 없이도 계산
             # (2026-11-04: 현재가 조건에 묶여 NXT 구간 모니터 "-"·"G6 입력 없음"이던 결함 수정)
-            est_bid = est_price(hl.bids or [(hl.bid, hl.bid_qty or 1.0)], qty * ratio)
-            est_ask = est_price(hl.asks or [(hl.ask, hl.ask_qty or 1.0)], qty * ratio)
+            hl_bids, hl_asks = self._hl_est_levels(hl)
+            est_bid = est_price(hl_bids, qty * ratio)
+            est_ask = est_price(hl_asks, qty * ratio)
             if stock:
                 hl_bid_d = disp(est_bid * fx if est_bid else None, stock)
                 hl_ask_d = disp(est_ask * fx if est_ask else None, stock)
@@ -593,6 +598,7 @@ class AutoMEngine:
             hl_ask1=hl.ask if hl is not None else None,
             hl_est_bid=est_bid, hl_est_ask=est_ask,
             ls_feed_ok=self._system.ls_feed_ok(), hl_feed_ok=self._hl_feed_ok(),
+            hl_swept=hl_swept,
             stock_auction=self._system.stock_auction(),
             repay_wait=self._repay_wait_note(u, mono),
             limit_up=lim.upper if lim is not None else None,
@@ -1001,8 +1007,8 @@ class AutoMEngine:
         # 결정 94(사용자 2026-11-19): 보내기 직전의 est(후주문 수량만큼 쓸어담은 평균 예상가)와
         # 그 방향 호가 5단 — 체결가와의 갭을 "판정→발주"와 "발주→체결"로 나누고, 잔량 부족/가격
         # 이동을 가른다
-        levels = ((hl.bids or [(hl.bid, hl.bid_qty or 1.0)]) if act.side is Side.SELL
-                  else (hl.asks or [(hl.ask, hl.ask_qty or 1.0)]))
+        est_bids, est_asks = self._hl_est_levels(hl)  # 판정과 같은 호가창(bbo로 거른 것, 결정 95)
+        levels = est_bids if act.side is Side.SELL else est_asks
         self.ulog(u).info(
             "후주문 발주 %s: %s %d @ %g est %s 호가 %s",
             self._tag(u, index, block, reverse), act.side.value, act.qty, price,
@@ -1207,9 +1213,18 @@ class AutoMEngine:
         if hl is None or not hl.bid or not hl.ask:
             return None
         qty = (leg.pre_qty or 1) * self._book(u).hl_ratio
-        if leg.post_side is Side.SELL:
-            return est_price(hl.bids or [(hl.bid, hl.bid_qty or 1.0)], qty)
-        return est_price(hl.asks or [(hl.ask, hl.ask_qty or 1.0)], qty)
+        bids, asks = self._hl_est_levels(hl)
+        return est_price(bids if leg.post_side is Side.SELL else asks, qty)
+
+    @staticmethod
+    def _hl_est_levels(
+        hl: Quote
+    ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """체결쏴 est에 쓰는 HL 호가창(매수, 매도) — 호가창(없으면 1호가)에서 더 새로운 bbo가 이미
+        지나간 호가를 걸러 낸 것(결정 95, `disparity.bbo_clip`). 전부 걸러지면 빈 목록(est 없음)."""
+        return bbo_clip(hl.bids or [(hl.bid, hl.bid_qty or 1.0)],
+                        hl.asks or [(hl.ask, hl.ask_qty or 1.0)],
+                        hl.bbo_bid, hl.bbo_ask, hl.depth_ts, hl.bbo_ts)
 
     @staticmethod
     def _fmt_est(est: float | None) -> str:
@@ -1486,8 +1501,9 @@ class AutoMEngine:
         # 청산 = 매도호가창; 역방향은 반대(진입 = 매도호가창, 청산 = 매수호가창).
         q = max(1, book.ref_qty)
         ratio = book.hl_ratio
-        sf_en, sf_ex = self._system.pair_signal(u, inst, q, q)
-        s_en, s_ex = self._system.pair_signal(u, Instrument.KR_STOCK, q * ratio, q * ratio)
+        sf_en, sf_ex = self._system.pair_signal(u, inst, q, q, hl_bbo_clip=True)  # 결정 95
+        s_en, s_ex = self._system.pair_signal(u, Instrument.KR_STOCK, q * ratio, q * ratio,
+                                              hl_bbo_clip=True)
         monitor = {"fwd": {"en_sf": sf_en, "en_s": s_en, "ex_sf": sf_ex},
                    "rev": {"en_sf": sf_ex, "en_s": s_ex, "ex_sf": sf_en}}
         if book.product == "stock":  # exec §7C: (HL est×환율 − 1호가)/1호가, 기준수량 est

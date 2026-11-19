@@ -490,3 +490,145 @@ async def test_reconnect_cutoff_uses_last_received_frame_not_detection_time() ->
     assert [f.fill_id for f in got] == ["100", "200"]
     assert client._disconnected_at_ms is not None
     assert abs(client._disconnected_at_ms - now_ms) < 5_000  # 끊김 = 마지막 수신 근처(감지 30초 전)
+
+
+async def test_quotes_carry_bbo_and_depth_times_for_est_clip() -> None:
+    # exec 결정 95: 체결쏴 est가 어느 쪽이 새로운지 알 수 있게 HL 호가에 마지막 bbo 1호가·시각과
+    # 호가창 시각을 실어 준다. 호가창(bids/asks)·스칼라는 전과 같다.
+    client = HLWebSocketClient(FakeConnector([l2book_frame(), bbo_frame(), l2book_frame()]))
+    quotes = []
+    client.on_quote.append(quotes.append)
+
+    await client.run()
+
+    first, bbo, second = quotes
+    assert (first.depth_ts, first.bbo_bid, first.bbo_ts) == (1000.0, None, None)  # bbo 전
+    assert (bbo.bbo_bid, bbo.bbo_ask, bbo.bbo_ts, bbo.depth_ts) == (183.55, 183.65, 1001.0, 1000.0)
+    assert bbo.bids is not None and bbo.bids[0] == (183.5, 10.0)  # 호가창은 l2Book 그대로
+    # 뒤에 온 호가창 프레임도 마지막 bbo를 들고 간다(이 프레임이 더 낡았으면 est가 거른다)
+    assert (second.bbo_bid, second.bbo_ts, second.depth_ts) == (183.55, 1001.0, 1000.0)
+
+
+async def test_bbo_without_l2book_has_no_depth_time() -> None:
+    client = HLWebSocketClient(FakeConnector([bbo_frame()]))
+    quotes = []
+    client.on_quote.append(quotes.append)
+
+    await client.run()
+
+    assert quotes[0].depth_ts is None and quotes[0].bbo_bid == 183.55
+
+
+def _sub_types(client: HLWebSocketClient, u: Underlying) -> set[str]:
+    coin = client._symbols[u]
+    return {str(s.get("type")) for s in client._subs if s.get("coin") == coin}
+
+
+def test_apply_symbols_keeps_quote_subs_only_for_checked_symbols() -> None:
+    # DESIGN-ls-xing §9(사용자 2026-11-19 "HL도 선택한 종목의 시세만 구독"): 체크된 종목만
+    # bbo·l2Book·trades, 마크(activeAssetCtx)와 계좌 통보는 그대로.
+    client = HLWebSocketClient(connector=None)  # type: ignore[arg-type]
+    client.subscribe_marks()
+    client.subscribe_bbo()
+    client.subscribe_l2book()
+    client.subscribe_trades()
+    client.subscribe_user_fills(ADDR)
+    client.subscribe_order_updates(ADDR)
+    hynix = client._symbols[Underlying.SK_HYNIX]
+    client._parse_l2book({"coin": hynix, "time": 1, "levels": [
+        [{"px": "184.1", "sz": "5"}], [{"px": "184.2", "sz": "7"}]]})
+
+    added, removed = client.apply_symbols({Underlying.SAMSUNG})
+
+    assert added == [] and Underlying.SAMSUNG not in removed
+    assert Underlying.SK_HYNIX in removed and len(removed) == len(client._symbols) - 1
+    assert _sub_types(client, Underlying.SAMSUNG) == {"activeAssetCtx", "bbo", "l2Book", "trades"}
+    assert _sub_types(client, Underlying.SK_HYNIX) == {"activeAssetCtx"}  # 마크는 전 종목 유지
+    assert {"userFills", "orderUpdates"} <= {str(s.get("type")) for s in client._subs}
+    sent = [(m["method"], m["subscription"]["type"], m["subscription"]["coin"])
+            for m in client._control]
+    assert ("unsubscribe", "bbo", hynix) in sent and ("unsubscribe", "l2Book", hynix) in sent
+    assert ("unsubscribe", "trades", hynix) in sent
+    assert not [m for m in sent if m[1] == "activeAssetCtx" or m[0] == "subscribe"]
+    assert Underlying.SK_HYNIX not in client._depth  # 뗀 종목의 보관 호가창은 버린다
+    # 같은 체크로 다시 부르면 아무것도 안 보낸다
+    client._control.clear()
+    assert client.apply_symbols({Underlying.SAMSUNG}) == ([], []) and not client._control
+
+
+def test_apply_symbols_resubscribes_with_current_merge() -> None:
+    # 다시 켠 종목의 l2Book은 그 종목의 지금 호가단위 머지로 붙는다. 해제는 붙어 있던 그대로.
+    client = HLWebSocketClient(connector=None)  # type: ignore[arg-type]
+    client.subscribe_bbo()
+    client.subscribe_l2book()
+    client.subscribe_trades()
+    client.set_l2_aggregation(Underlying.SK_HYNIX, 5, 5)
+    client._control.clear()
+    hynix = client._symbols[Underlying.SK_HYNIX]
+    everyone = set(client._symbols)
+
+    client.apply_symbols(everyone - {Underlying.SK_HYNIX})
+    off = next(m for m in client._control if m["subscription"]["type"] == "l2Book"
+               and m["subscription"]["coin"] == hynix)
+    assert off["method"] == "unsubscribe" and off["subscription"]["mantissa"] == 5
+
+    client._control.clear()
+    added, removed = client.apply_symbols(everyone)
+    assert added == [Underlying.SK_HYNIX] and removed == []
+    on = {m["subscription"]["type"]: m for m in client._control}
+    assert set(on) == {"bbo", "l2Book", "trades"}
+    assert all(m["method"] == "subscribe" for m in on.values())
+    assert on["l2Book"]["subscription"] == {"type": "l2Book", "coin": hynix, "fast": True,
+                                            "nSigFigs": 5, "mantissa": 5}
+    assert client.l2_aggregation(Underlying.SK_HYNIX) == (5, 5)
+
+
+async def test_apply_symbols_before_connect_sends_only_checked_on_connect() -> None:
+    # 접속 전에 체크가 정해지면 접속 때 그 종목 것만 나간다(해제를 따로 보낼 일 없음).
+    connector = FakeConnector([])
+    client = HLWebSocketClient(connector)
+    client.subscribe_marks()
+    client.subscribe_bbo()
+    client.subscribe_l2book()
+    client.subscribe_trades()
+    client.apply_symbols({Underlying.SK_HYNIX})
+
+    await client.run()
+
+    subs = [json.loads(m) for m in connector.conn.sent]
+    assert all(m["method"] == "subscribe" for m in subs)
+    quote_coins = {m["subscription"]["coin"] for m in subs
+                   if m["subscription"]["type"] in ("bbo", "l2Book", "trades")}
+    assert quote_coins == {client._symbols[Underlying.SK_HYNIX]}
+    mark_coins = {m["subscription"]["coin"] for m in subs
+                  if m["subscription"]["type"] == "activeAssetCtx"}
+    assert mark_coins == set(client._symbols.values())
+
+
+def test_unsubscribed_symbol_drops_late_frames_and_remembers_merge() -> None:
+    # 검토 2026-11-19: 구독을 뗀 직후 날아오는 프레임이 보관 호가창을 다시 채우면 다시 켰을 때 낡은
+    # 호가가 섞인다 → 뗀 종목의 호가·체결 프레임은 버린다. 그 사이 바뀐 호가단위는 기억해 두었다가
+    # 다시 붙을 때 그 단위로.
+    client = HLWebSocketClient(connector=None)  # type: ignore[arg-type]
+    client.subscribe_bbo()
+    client.subscribe_l2book()
+    client.subscribe_trades()
+    hynix = client._symbols[Underlying.SK_HYNIX]
+    client.apply_symbols(set(client._symbols) - {Underlying.SK_HYNIX})
+
+    assert client._parse_l2book({"coin": hynix, "time": 5, "levels": [
+        [{"px": "184.1", "sz": "5"}], [{"px": "184.2", "sz": "7"}]]}) is None
+    assert client._parse_bbo({"coin": hynix, "time": 6, "bbo": [
+        {"px": "184.1", "sz": "1"}, {"px": "184.2", "sz": "2"}]}) is None
+    assert client._parse_trades([{"coin": hynix, "px": "184.1", "sz": "1", "side": "B"}]) == []
+    assert Underlying.SK_HYNIX not in client._depth and Underlying.SK_HYNIX not in client._bbo
+
+    client.set_l2_aggregation(Underlying.SK_HYNIX, 5, 2)  # 뗀 동안 호가단위 변경 — 기억만
+    assert client.l2_aggregation(Underlying.SK_HYNIX) == (5, 2)
+    client._control.clear()
+    client.apply_symbols(set(client._symbols))
+    l2 = next(m for m in client._control if m["subscription"]["type"] == "l2Book")
+    assert l2["method"] == "subscribe" and l2["subscription"]["mantissa"] == 2
+    # 다시 붙은 뒤에는 프레임을 받는다
+    assert client._parse_bbo({"coin": hynix, "time": 7, "bbo": [
+        {"px": "184.1", "sz": "1"}, {"px": "184.2", "sz": "2"}]}) is not None
